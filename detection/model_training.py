@@ -44,7 +44,7 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42) -> dict:
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
         "xgboost": XGBClassifier(eval_metric="logloss", random_state=random_state),
-        "lightgbm": LGBMClassifier(random_state=random_state),
+        "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1),
     }
 
     results = {}
@@ -76,5 +76,30 @@ def save_models(results: dict, model_dir: str | None = None) -> None:
 
 
 if __name__ == "__main__":
-    # TODO: load labelled training data from the ledgerlens-data repo
-    raise SystemExit("Provide a labelled feature DataFrame via the ledgerlens-data pipeline")
+    # The ledgerlens-data repo does not yet provide a labelled dataset, so
+    # default to a synthetic one for local training/testing.
+    import logging
+
+    from detection.dataset import build_training_dataset
+    from ingestion.synthetic_data import generate_synthetic_dataset
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("ledgerlens.model_training")
+
+    trades, account_metadata, order_book_events, labels = generate_synthetic_dataset(
+        n_normal_accounts=60, n_wash_rings=10, ring_size=3
+    )
+    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=order_book_events)
+
+    results = train_ensemble(df)
+    for name, result in results.items():
+        logger.info(
+            "%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f",
+            name,
+            result["auc_roc"],
+            result["pr_auc"],
+            result["f1"],
+        )
+
+    save_models(results)
+    logger.info("Saved models to %s", settings.model_dir)
