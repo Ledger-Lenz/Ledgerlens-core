@@ -51,9 +51,28 @@ def list_scores(
     min_score: int = 0,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    benford_flag: bool | None = Query(
+        default=None,
+        description="Filter by the Benford detector flag when provided.",
+    ),
+    ml_flag: bool | None = Query(
+        default=None,
+        description="Filter by the machine-learning detector flag when provided.",
+    ),
+    sort_by: str = Query(
+        default="score",
+        pattern="^(score|confidence|timestamp)$",
+        description="Sort descending by score, confidence, or timestamp.",
+    ),
 ) -> list[RiskScore]:
-    """Return the latest score for each (wallet, asset_pair), optionally filtered by `min_score`."""
-    scores = get_latest_scores(limit=limit, offset=offset)
+    """Return latest scores filtered by score, flags, paging, and `sort_by` ordering."""
+    scores = get_latest_scores(
+        limit=limit,
+        offset=offset,
+        benford_flag=benford_flag,
+        ml_flag=ml_flag,
+        sort_by=sort_by,
+    )
     return [s for s in scores if s.score >= min_score]
 
 

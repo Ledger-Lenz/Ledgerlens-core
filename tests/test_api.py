@@ -1,6 +1,6 @@
 import base64
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -29,15 +29,24 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
-def _score(wallet, asset_pair, score) -> RiskScore:
+def _score(
+    wallet,
+    asset_pair,
+    score,
+    *,
+    benford_flag=None,
+    ml_flag=None,
+    confidence=90,
+    timestamp=None,
+) -> RiskScore:
     return RiskScore(
         wallet=wallet,
         asset_pair=asset_pair,
         score=score,
-        benford_flag=score > 50,
-        ml_flag=score > 50,
-        confidence=90,
-        timestamp=datetime.now(timezone.utc),
+        benford_flag=score > 50 if benford_flag is None else benford_flag,
+        ml_flag=score > 50 if ml_flag is None else ml_flag,
+        confidence=confidence,
+        timestamp=timestamp or datetime.now(timezone.utc),
     )
 
 
@@ -68,6 +77,98 @@ def test_list_scores_and_filter_by_min_score(client, monkeypatch):
     body = response.json()
     assert len(body) == 1
     assert body[0]["wallet"] == "GABC"
+
+
+def test_list_scores_filters_by_benford_flag(client):
+    import detection.storage as storage_module
+
+    save_scores(
+        [
+            _score("GBENFORD", "XLM/USDC", 60, benford_flag=True, ml_flag=False),
+            _score("GCLEAN", "XLM/USDC", 95, benford_flag=False, ml_flag=True),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    response = client.get("/scores?benford_flag=true")
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["wallet"] for item in body] == ["GBENFORD"]
+
+
+def test_list_scores_filters_by_ml_flag_false(client):
+    import detection.storage as storage_module
+
+    save_scores(
+        [
+            _score("GML", "XLM/USDC", 95, benford_flag=False, ml_flag=True),
+            _score("GNO_ML", "XLM/USDC", 60, benford_flag=True, ml_flag=False),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    response = client.get("/scores?ml_flag=false")
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["wallet"] for item in body] == ["GNO_ML"]
+
+
+def test_list_scores_combines_flag_filters_and_min_score(client):
+    import detection.storage as storage_module
+
+    save_scores(
+        [
+            _score("GMATCH", "XLM/USDC", 80, benford_flag=True, ml_flag=False),
+            _score("GLOW", "XLM/USDC", 40, benford_flag=True, ml_flag=False),
+            _score("GWRONG_FLAG", "XLM/USDC", 95, benford_flag=True, ml_flag=True),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    response = client.get("/scores?min_score=50&benford_flag=true&ml_flag=false")
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["wallet"] for item in body] == ["GMATCH"]
+
+
+def test_list_scores_sorts_by_confidence(client):
+    import detection.storage as storage_module
+
+    save_scores(
+        [
+            _score("GLOW_CONF", "XLM/USDC", 95, confidence=20),
+            _score("GHIGH_CONF", "XLM/USDC", 80, confidence=99),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    response = client.get("/scores?sort_by=confidence")
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["wallet"] for item in body] == ["GHIGH_CONF", "GLOW_CONF"]
+
+
+def test_list_scores_sorts_by_timestamp(client):
+    import detection.storage as storage_module
+
+    now = datetime.now(timezone.utc)
+    save_scores(
+        [
+            _score("GOLDER", "XLM/USDC", 95, timestamp=now - timedelta(minutes=10)),
+            _score("GNEWER", "XLM/USDC", 80, timestamp=now),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    response = client.get("/scores?sort_by=timestamp")
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["wallet"] for item in body] == ["GNEWER", "GOLDER"]
+
+
+def test_list_scores_rejects_invalid_sort_by(client):
+    response = client.get("/scores?sort_by=invalid")
+    assert response.status_code == 422
 
 
 def test_wallet_scores_not_found(client):

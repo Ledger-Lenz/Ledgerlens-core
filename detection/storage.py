@@ -91,13 +91,24 @@ def get_latest_scores(
     limit: int | None = None,
     offset: int = 0,
     db_path: str | None = None,
+    benford_flag: bool | None = None,
+    ml_flag: bool | None = None,
+    sort_by: str = "score",
 ) -> list[RiskScore]:
     """Return the most recent score for each (wallet, asset_pair) pair.
 
-    If `wallet` is given, restrict to that wallet.
-
+    If `wallet` is given, restrict to that wallet. Optional flag filters are
+    applied to the latest rows in SQLite, ordered by `sort_by` descending.
     Paging is done in SQL (via LIMIT/OFFSET), not Python.
     """
+    sort_columns = {
+        "score": "rs.score",
+        "confidence": "rs.confidence",
+        "timestamp": "rs.timestamp",
+    }
+    if sort_by not in sort_columns:
+        raise ValueError("sort_by must be one of: score, confidence, timestamp")
+
     init_db(db_path)
 
     query = """
@@ -111,15 +122,26 @@ def get_latest_scores(
         ON rs.wallet = latest.wallet
         AND rs.asset_pair = latest.asset_pair
         AND rs.timestamp = latest.max_ts
-        ORDER BY rs.score DESC
+        {outer_where}
+        ORDER BY {order_by} DESC
         {limit_offset}
     """
-
     params: list = []
     where = ""
     if wallet is not None:
         where = "WHERE wallet = ?"
         params.append(wallet)
+
+    outer_conditions = []
+    if benford_flag is not None:
+        outer_conditions.append("rs.benford_flag = ?")
+        params.append(int(benford_flag))
+    if ml_flag is not None:
+        outer_conditions.append("rs.ml_flag = ?")
+        params.append(int(ml_flag))
+    outer_where = ""
+    if outer_conditions:
+        outer_where = "WHERE " + " AND ".join(outer_conditions)
 
     limit_offset = ""
     if limit is not None:
@@ -127,7 +149,15 @@ def get_latest_scores(
         params.extend([limit, offset])
 
     with _connect(db_path) as conn:
-        rows = conn.execute(query.format(where=where, limit_offset=limit_offset), tuple(params)).fetchall()
+        rows = conn.execute(
+            query.format(
+                where=where,
+                outer_where=outer_where,
+                order_by=sort_columns[sort_by],
+                limit_offset=limit_offset,
+            ),
+            tuple(params),
+        ).fetchall()
 
     return [_row_to_score(row) for row in rows]
 

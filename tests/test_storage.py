@@ -54,6 +54,78 @@ def test_get_latest_scores_filters_by_wallet(db_path):
     assert scores[0].wallet == "GXYZ"
 
 
+def test_get_latest_scores_filters_flags_in_sql(monkeypatch):
+    executed = []
+
+    class FakeCursor:
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def executescript(self, _script):
+            return None
+
+        def commit(self):
+            return None
+
+        def execute(self, query, params):
+            executed.append((query, params))
+            return FakeCursor()
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_connect(_db_path=None):
+        yield FakeConnection()
+
+    monkeypatch.setattr("detection.storage._connect", fake_connect)
+
+    get_latest_scores(benford_flag=True, ml_flag=False, db_path="fake.db")
+
+    query, params = executed[-1]
+    compact_query = " ".join(query.split())
+    assert "rs.benford_flag = ?" in compact_query
+    assert "rs.ml_flag = ?" in compact_query
+    assert params == (1, 0)
+
+
+def test_get_latest_scores_sorts_by_requested_column_in_sql(monkeypatch):
+    executed = []
+
+    class FakeCursor:
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def executescript(self, _script):
+            return None
+
+        def commit(self):
+            return None
+
+        def execute(self, query, params):
+            executed.append((query, params))
+            return FakeCursor()
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_connect(_db_path=None):
+        yield FakeConnection()
+
+    monkeypatch.setattr("detection.storage._connect", fake_connect)
+
+    get_latest_scores(sort_by="confidence", db_path="fake.db")
+
+    query, _params = executed[-1]
+    assert "ORDER BY rs.confidence DESC" in " ".join(query.split())
+
+
+def test_get_latest_scores_rejects_invalid_sort_by(db_path):
+    with pytest.raises(ValueError, match="sort_by"):
+        get_latest_scores(sort_by="invalid", db_path=db_path)
+
+
 def test_save_scores_noop_on_empty_list(db_path):
     save_scores([], db_path)
     assert get_latest_scores(db_path=db_path) == []
