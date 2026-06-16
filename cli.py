@@ -7,6 +7,7 @@ otherwise run as separate scripts/modules:
     python -m cli train           # train the ensemble on synthetic data
     python -m cli score            # run the detection pipeline and store scores
     python -m cli serve            # serve the local FastAPI app
+    python -m cli webhook-worker   # run the webhook delivery worker
 """
 
 import logging
@@ -93,6 +94,18 @@ def serve(
     import uvicorn
 
     uvicorn.run("api.main:app", host=host, port=port, reload=reload)
+
+
+@app.command("webhook-worker")
+def webhook_worker(
+    interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
+) -> None:
+    """Run the webhook delivery worker as a foreground process."""
+    import asyncio
+
+    from detection.webhook_worker import run_delivery_worker
+
+    asyncio.run(run_delivery_worker(interval_seconds=interval))
 
 
 if __name__ == "__main__":

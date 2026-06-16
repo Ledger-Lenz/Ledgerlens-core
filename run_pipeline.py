@@ -66,7 +66,24 @@ def run(asset_pairs: list[tuple[str | None, str | None]] | None = None) -> list[
 
     logger.info("Computed %d risk scores", len(scores))
     save_scores(scores)
+
+    _enqueue_webhook_alerts(scores)
+
     return scores
+
+
+def _enqueue_webhook_alerts(scores: list[RiskScore]) -> None:
+    try:
+        from detection.webhook_queue import enqueue, init_db as init_q
+        from detection.webhook_registry import get_matching_subscribers, init_db as init_r
+
+        init_r()
+        init_q()
+        for score in scores:
+            for sub in get_matching_subscribers(score):
+                enqueue(sub.subscriber_id, score.model_dump())
+    except Exception:
+        logger.exception("Failed to enqueue webhook alerts")
 
 
 if __name__ == "__main__":
