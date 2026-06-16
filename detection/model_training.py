@@ -22,17 +22,44 @@ def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     """Split `df` into `(X, y)`, ordering feature columns by `FEATURE_NAMES`
     so training and inference (`model_inference.score_feature_vector`) never drift.
     """
-    X = df[FEATURE_NAMES]
+    X = df[FEATURE_NAMES].fillna(0.0)
     y = df["label"]
     return X, y
 
 
-def train_ensemble(df: pd.DataFrame, random_state: int = 42) -> dict:
+def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment: bool = True) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
 
     Applies SMOTE to the training split to address class imbalance, since
     confirmed wash-trade examples are rare relative to clean activity.
+
+    When ``adversarial_augment=True``, generates 3 additional datasets with
+    mixed evasion strategies and concatenates them before SMOTE resampling,
+    forcing the models to learn adversarial meta-signatures.
     """
+    if adversarial_augment:
+        from detection.dataset import build_training_dataset
+        from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
+
+        augment_dfs = [df]
+        strategy_groups = [
+            ALL_STRATEGIES[:2],
+            ALL_STRATEGIES[2:4],
+            ALL_STRATEGIES,
+        ]
+        for i, strats in enumerate(strategy_groups):
+            trades, meta, events, labels = generate_adversarial_dataset(
+                n_normal_accounts=50,
+                n_wash_rings=10,
+                ring_size=4,
+                evasion_strategies=strats,
+                seed=random_state + i + 1,
+            )
+            augment_dfs.append(
+                build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
+            )
+        df = pd.concat(augment_dfs, ignore_index=True)
+
     X, y = _split_features_labels(df)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=random_state, stratify=y

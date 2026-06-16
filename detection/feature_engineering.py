@@ -54,6 +54,16 @@ FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES + TRADE_PATTERN_FEATURE_NAMES + VOLUME_TIMING_FEATURE_NAMES + WALLET_GRAPH_FEATURE_NAMES
 )
 
+# Adversarial meta-features are appended after the baseline features so that
+# existing model checkpoints remain loadable (new features default to 0.0
+# during inference against old models).
+try:
+    from detection.adversarial_features import ADVERSARIAL_FEATURE_NAMES, compute_adversarial_features as _compute_adv
+    FEATURE_NAMES = FEATURE_NAMES + ADVERSARIAL_FEATURE_NAMES  # type: ignore[assignment]
+    _HAS_ADVERSARIAL = True
+except ImportError:  # pragma: no cover
+    _HAS_ADVERSARIAL = False
+
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
     start = as_of - window
@@ -286,4 +296,6 @@ def build_feature_vector(
             "account_age_days": account_age_days(account, as_of, account_metadata),
         }
     )
+    if _HAS_ADVERSARIAL:
+        features.update(_compute_adv(trades, account))
     return features
