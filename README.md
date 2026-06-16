@@ -274,7 +274,128 @@ python cli.py generate-data   # write synthetic trades/labels to CSV
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
 python cli.py serve           # serve the local API
+python cli.py webhook-worker  # run the webhook delivery worker
 ```
+
+## Webhook Alerts
+
+LedgerLens can push risk-score alerts to subscriber URLs via webhooks.
+When the detection pipeline (`run_pipeline.py`) produces scores above a
+subscriber's threshold, a signed payload is POSTed to their endpoint.
+
+### Subscriber Registration
+
+Register a webhook subscriber via the API:
+
+```bash
+curl -X POST http://localhost:8000/webhooks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://my-protocol.xyz/webhook",
+    "secret": "whsec_your_hmac_secret",
+    "min_score": 70
+  }'
+```
+
+Optional filters restrict alerts by wallet or asset pair:
+
+```json
+{
+  "url": "https://my-protocol.xyz/webhook",
+  "secret": "whsec_your_hmac_secret",
+  "min_score": 80,
+  "wallet_filter": "GABC123,GDEF456",
+  "asset_pair_filter": "XLM/USDC"
+}
+```
+
+The response returns a `subscriber_id` (UUID) used for management.
+
+### Management Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST`   | `/webhooks`                  | Register a subscriber        |
+| `GET`    | `/webhooks`                  | List active subscribers      |
+| `DELETE` | `/webhooks/{subscriber_id}`  | Deactivate a subscriber      |
+| `GET`    | `/webhooks/dead-letters`     | List permanently failed deliveries |
+
+### Payload Format
+
+Every webhook POST carries this JSON body:
+
+```json
+{
+  "event": "risk_score_alert",
+  "data": {
+    "wallet": "GABCDEF123...",
+    "asset_pair": "XLM/USDC",
+    "score": 85,
+    "benford_flag": true,
+    "ml_flag": true,
+    "confidence": 90,
+    "timestamp": "2026-06-16T12:00:00Z"
+  },
+  "timestamp": "2026-06-16T12:00:05Z"
+}
+```
+
+### HMAC Verification
+
+Each request includes a `X-LedgerLens-Signature` header:
+
+```
+X-LedgerLens-Signature: sha256=<hex-digest>
+```
+
+The digest is an HMAC-SHA256 of the raw request body using the
+subscriber's `secret`. Receivers **must** verify this signature before
+trusting the payload. Example verification in Python:
+
+```python
+import hmac, hashlib
+
+def verify_ledgerlens_webhook(body: bytes, secret: str, signature: str) -> bool:
+    expected = "sha256=" + hmac.new(
+        secret.encode(), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
+```
+
+The `X-LedgerLens-Timestamp` header contains the Unix epoch second when
+the delivery was attempted. Receivers SHOULD reject timestamps older than
+5 minutes to prevent replay attacks.
+
+### Delivery Guarantees
+
+- **At-least-once delivery**: unacknowledged items stay `pending` in the
+  queue and are retried on worker restart.
+- **Exponential backoff**: attempt N is retried at `now + 2^N × 5s`
+  (capped at 1 hour).
+- **Dead-letter queue**: after 8 consecutive failures the item moves to
+  `dead` status. Inspect via `GET /webhooks/dead-letters`.
+- **Concurrency limit**: at most 10 deliveries run in parallel; slow
+  subscribers do not block others.
+
+### Running the Delivery Worker
+
+```bash
+python cli.py webhook-worker --interval 5
+```
+
+This polls the delivery queue every 5 seconds and delivers due webhooks.
+Run as a long-lived foreground process (e.g., under systemd or supervisor).
+
+### Security Notes
+
+- Subscriber URLs must use `https://`. HTTP URLs and private/reserved IPs
+  are rejected at registration (SSRF protection).
+- HMAC secrets are encrypted at rest with AES-256-GCM. The encryption key
+  is loaded from `LEDGERLENS_WEBHOOK_ENCRYPTION_KEY` (32-byte base64,
+  stored in the environment **only**).
+- Raw secrets never appear in API responses, logs, or error messages.
+- The response body from the webhook receiver is discarded entirely to
+  prevent log injection.
 
 ## Testing
 

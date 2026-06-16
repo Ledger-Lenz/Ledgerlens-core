@@ -7,25 +7,38 @@ local SQLite store (`detection.storage`) by `run_pipeline.py` or
 production version of these endpoints (`/score`, `/alerts`,
 `/assets/risk-ranking`) — see README's "LedgerLens Organization" section.
 
+Also exposes webhook subscriber management endpoints.
+
 Run with:
 
     uvicorn api.main:app --reload
 """
 
+import json
 from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException, Query
-
+from pydantic import BaseModel
 
 from config.settings import settings
 from detection.risk_score import RiskScore
 from detection.storage import get_latest_scores
+from detection.webhook_queue import get_dead_letters
+from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
 app = FastAPI(
     title="LedgerLens (local)",
     description="Local read-only API serving RiskScore records from the detection engine.",
     version="0.1.0",
 )
+
+
+class WebhookCreate(BaseModel):
+    url: str
+    secret: str
+    min_score: int = 70
+    wallet_filter: str | None = None
+    asset_pair_filter: str | None = None
 
 
 @app.get("/health")
@@ -78,3 +91,65 @@ def asset_risk_ranking() -> list[dict]:
         for pair, values in by_pair.items()
     ]
     return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Webhook subscriber management
+# ---------------------------------------------------------------------------
+
+
+@app.post("/webhooks", status_code=201)
+def create_webhook(body: WebhookCreate) -> dict:
+    """Register a new webhook subscriber."""
+    try:
+        subscriber_id = register_subscriber(
+            url=body.url,
+            secret=body.secret,
+            min_score=body.min_score,
+            wallet_filter=body.wallet_filter,
+            asset_pair_filter=body.asset_pair_filter,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"subscriber_id": subscriber_id}
+
+
+@app.get("/webhooks")
+def list_webhooks() -> list[dict]:
+    """Return all active subscribers (secrets are masked)."""
+    return [
+        {
+            "subscriber_id": s.subscriber_id,
+            "url": s.url,
+            "secret": s.masked_secret(),
+            "min_score": s.min_score,
+            "wallet_filter": ",".join(s.wallet_filter) if s.wallet_filter else None,
+            "asset_pair_filter": ",".join(s.asset_pair_filter) if s.asset_pair_filter else None,
+            "created_at": s.created_at,
+        }
+        for s in list_subscribers()
+    ]
+
+
+@app.delete("/webhooks/{subscriber_id}")
+def delete_webhook(subscriber_id: str) -> dict:
+    """Deactivate a webhook subscriber."""
+    if not deactivate_subscriber(subscriber_id):
+        raise HTTPException(status_code=404, detail="Subscriber not found")
+    return {"status": "deactivated"}
+
+
+@app.get("/webhooks/dead-letters")
+def dead_letters() -> list[dict]:
+    """Return all deliveries that have permanently failed."""
+    return [
+        {
+            "id": d.id,
+            "subscriber_id": d.subscriber_id,
+            "payload": json.loads(d.payload_json),
+            "attempt_count": d.attempt_count,
+            "last_error": d.last_error,
+            "created_at": d.created_at,
+        }
+        for d in get_dead_letters()
+    ]
