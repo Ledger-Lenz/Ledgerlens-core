@@ -131,7 +131,7 @@ def test_create_webhook(client):
     assert response.status_code == 201
     body = response.json()
     assert "subscriber_id" in body
-    assert len(body["subscriber_id"]) == 36  # UUID
+    assert len(body["subscriber_id"]) == 36
 
 
 def test_create_webhook_rejects_http(client):
@@ -139,7 +139,7 @@ def test_create_webhook_rejects_http(client):
         "/webhooks",
         json={"url": "http://evil.com/webhook", "secret": "whsec_test"},
     )
-    assert response.status_code == 422  # Validation error
+    assert response.status_code == 422
 
 
 def test_list_webhooks(client):
@@ -152,7 +152,6 @@ def test_list_webhooks(client):
     body = response.json()
     assert len(body) == 1
     assert body[0]["url"] == "https://example.com/webhook"
-    # secret must be masked
     assert "****" in body[0]["secret"]
     assert "whsec_test" not in body[0]["secret"]
 
@@ -169,12 +168,9 @@ def test_delete_webhook(client):
         json={"url": "https://example.com/webhook", "secret": "whsec_test"},
     )
     sid = resp.json()["subscriber_id"]
-
     response = client.delete(f"/webhooks/{sid}")
     assert response.status_code == 200
     assert response.json() == {"status": "deactivated"}
-
-    # no longer in active list
     assert len(client.get("/webhooks").json()) == 0
 
 
@@ -201,9 +197,60 @@ def test_create_webhook_with_filters(client):
         },
     )
     assert response.status_code == 201
-
     body = client.get("/webhooks").json()
     assert len(body) == 1
     assert body[0]["wallet_filter"] == "GABC,GDEF"
     assert body[0]["asset_pair_filter"] == "XLM/USDC"
     assert body[0]["min_score"] == 80
+
+
+def test_list_scores_accepts_limit_offset(client):
+    import detection.storage as storage_module
+
+    save_scores(
+        [
+            _score("W1", "XLM/USDC", 10),
+            _score("W2", "XLM/USDC", 20),
+            _score("W3", "XLM/USDC", 30),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    resp = client.get("/scores?limit=2&offset=1")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 2
+    assert [row["wallet"] for row in body] == ["W2", "W1"]
+
+
+def test_alerts_accepts_limit_offset(client):
+    import config.settings as settings_module
+    import detection.storage as storage_module
+
+    object.__setattr__(settings_module.settings, "risk_score_threshold", 0)
+
+    save_scores(
+        [
+            _score("W1", "XLM/USDC", 10),
+            _score("W2", "XLM/USDC", 20),
+            _score("W3", "XLM/USDC", 30),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    resp = client.get("/alerts?limit=2&offset=0")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 2
+    assert [row["wallet"] for row in body] == ["W3", "W2"]
+
+
+def test_limit_offset_out_of_range_returns_422(client):
+    resp = client.get("/scores?limit=0&offset=0")
+    assert resp.status_code == 422
+
+    resp = client.get("/scores?limit=1001&offset=0")
+    assert resp.status_code == 422
+
+    resp = client.get("/scores?limit=10&offset=-1")
+    assert resp.status_code == 422

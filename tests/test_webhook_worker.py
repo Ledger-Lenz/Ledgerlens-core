@@ -4,14 +4,11 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import json
 import os
-from datetime import datetime, timezone
 
 import httpx
 import pytest
 
-from detection.risk_score import RiskScore
 
 
 @pytest.fixture(autouse=True)
@@ -121,7 +118,7 @@ async def test_deliver_success_marks_delivered(db_path):
 
 @pytest.mark.asyncio
 async def test_deliver_http_500_triggers_retry(db_path):
-    from detection.webhook_queue import enqueue, get_dead_letters, get_due_deliveries
+    from detection.webhook_queue import enqueue, get_due_deliveries
     from detection.webhook_registry import get_subscriber, register_subscriber
     from detection.webhook_worker import _deliver
 

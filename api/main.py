@@ -17,7 +17,7 @@ Run with:
 import json
 from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from config.settings import settings
@@ -47,10 +47,15 @@ def health() -> dict:
 
 
 @app.get("/scores", response_model=list[RiskScore])
-def list_scores(min_score: int = 0) -> list[RiskScore]:
+def list_scores(
+    min_score: int = 0,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[RiskScore]:
     """Return the latest score for each (wallet, asset_pair), optionally filtered by `min_score`."""
-    scores = get_latest_scores()
+    scores = get_latest_scores(limit=limit, offset=offset)
     return [s for s in scores if s.score >= min_score]
+
 
 
 @app.get("/scores/{wallet}", response_model=list[RiskScore])
@@ -63,10 +68,14 @@ def wallet_scores(wallet: str) -> list[RiskScore]:
 
 
 @app.get("/alerts", response_model=list[RiskScore])
-def alerts() -> list[RiskScore]:
+def alerts(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[RiskScore]:
     """Return scores at or above `settings.risk_score_threshold`."""
-    scores = get_latest_scores()
+    scores = get_latest_scores(limit=limit, offset=offset)
     return [s for s in scores if s.score >= settings.risk_score_threshold]
+
 
 
 @app.get("/assets/risk-ranking")

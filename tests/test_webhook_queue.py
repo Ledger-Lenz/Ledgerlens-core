@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from detection.webhook_queue import MAX_ATTEMPTS, Delivery
+from detection.webhook_queue import MAX_ATTEMPTS
 
 
 @pytest.fixture
