@@ -108,3 +108,59 @@ def test_asset_risk_ranking(client):
     assert body[0]["asset_pair"] == "XLM/USDC"
     assert body[0]["average_score"] == 60.0
     assert body[0]["wallet_count"] == 2
+
+
+def test_list_scores_accepts_limit_offset(client):
+    import detection.storage as storage_module
+
+    # Create 3 wallets, each with the same asset_pair, so we have 3 "latest" rows.
+    save_scores(
+        [
+            _score("W1", "XLM/USDC", 10),
+            _score("W2", "XLM/USDC", 20),
+            _score("W3", "XLM/USDC", 30),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    resp = client.get("/scores?limit=2&offset=1")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 2
+
+    # Ordering is by rs.score desc: [30, 20, 10]; offset=1 -> [20, 10]
+    assert [row["wallet"] for row in body] == ["W2", "W1"]
+
+
+def test_alerts_accepts_limit_offset(client):
+    import config.settings as settings_module
+    import detection.storage as storage_module
+
+    object.__setattr__(settings_module.settings, "risk_score_threshold", 0)
+
+    save_scores(
+        [
+            _score("W1", "XLM/USDC", 10),
+            _score("W2", "XLM/USDC", 20),
+            _score("W3", "XLM/USDC", 30),
+        ],
+        storage_module.settings.db_path,
+    )
+
+    resp = client.get("/alerts?limit=2&offset=0")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 2
+    assert [row["wallet"] for row in body] == ["W3", "W2"]
+
+
+def test_limit_offset_out_of_range_returns_422(client):
+    resp = client.get("/scores?limit=0&offset=0")
+    assert resp.status_code == 422
+
+    resp = client.get("/scores?limit=1001&offset=0")
+    assert resp.status_code == 422
+
+    resp = client.get("/scores?limit=10&offset=-1")
+    assert resp.status_code == 422
+

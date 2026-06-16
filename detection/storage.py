@@ -86,12 +86,20 @@ def _row_to_score(row: tuple) -> RiskScore:
     )
 
 
-def get_latest_scores(wallet: str | None = None, db_path: str | None = None) -> list[RiskScore]:
+def get_latest_scores(
+    wallet: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[RiskScore]:
     """Return the most recent score for each (wallet, asset_pair) pair.
 
     If `wallet` is given, restrict to that wallet.
+
+    Paging is done in SQL (via LIMIT/OFFSET), not Python.
     """
     init_db(db_path)
+
     query = """
         SELECT rs.* FROM risk_scores rs
         JOIN (
@@ -104,17 +112,25 @@ def get_latest_scores(wallet: str | None = None, db_path: str | None = None) -> 
         AND rs.asset_pair = latest.asset_pair
         AND rs.timestamp = latest.max_ts
         ORDER BY rs.score DESC
+        {limit_offset}
     """
-    params: tuple = ()
+
+    params: list = []
     where = ""
     if wallet is not None:
         where = "WHERE wallet = ?"
-        params = (wallet,)
+        params.append(wallet)
+
+    limit_offset = ""
+    if limit is not None:
+        limit_offset = "LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
 
     with _connect(db_path) as conn:
-        rows = conn.execute(query.format(where=where), params).fetchall()
+        rows = conn.execute(query.format(where=where, limit_offset=limit_offset), tuple(params)).fetchall()
 
     return [_row_to_score(row) for row in rows]
+
 
 
 if __name__ == "__main__":
