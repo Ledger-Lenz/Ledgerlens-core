@@ -164,6 +164,46 @@ pub struct RiskScore {
 
 This composability lets AMMs, lending protocols, and DEX aggregators on Stellar query LedgerLens scores natively — for example, gating liquidity provision from wallets above a configurable risk threshold — without an external oracle.
 
+### Soroban Integration (`detection/soroban_publisher.py`)
+
+After each pipeline run, all `RiskScore` records above `RISK_SCORE_THRESHOLD` are submitted on-chain via `SorobanPublisher.submit_batch()`. This transforms LedgerLens from a standalone detection tool into composable on-chain financial infrastructure.
+
+**Configuration** (see `.env.example` for defaults):
+
+| Variable | Purpose |
+|---|---|
+| `LEDGERLENS_SCORE_CONTRACT_ID` | Soroban contract ID of the deployed `ledgerlens-score` contract |
+| `LEDGERLENS_SERVICE_SECRET_KEY` | **Secret**: Stellar account key authorized to call `submit_score()` on the contract |
+| `SOROBAN_RPC_URL` | Soroban RPC endpoint (separate from Horizon; defaults to Testnet) |
+| `NETWORK_PASSPHRASE` | Stellar network passphrase (must match the network the contract is on) |
+| `SOROBAN_CIRCUIT_BREAKER_THRESHOLD` | Consecutive failures before the circuit opens (default: 5) |
+| `SOROBAN_CIRCUIT_RESET_SECONDS` | Seconds until the circuit resets (default: 300) |
+
+**Transaction lifecycle**:
+
+1. **Build** — create an `InvokeContractFunction` operation for `submit_score(wallet, asset_pair, score, timestamp)`
+2. **Simulate** — call `simulate_transaction` to obtain the resource fee
+3. **Sign** — sign with the service account keypair (in-process; the key never leaves the machine)
+4. **Submit** — `send_transaction` with the signed transaction
+5. **Poll** — `get_transaction` every 1 second until `SUCCESS` or `FAILED`
+
+**Error handling & retry logic**:
+
+- `tx_bad_seq` — refresh the account sequence number and retry once
+- `INSUFFICIENT_FEE` — multiply the fee by 1.5 and retry once
+- Soroban `auth_failed` — log `ERROR` and raise `SorobanSubmissionError` immediately (do not retry — the service key is misconfigured)
+- All other errors — log `WARNING`, record the failure, and include the error in the `submit_batch` results dict
+
+**Circuit breaker**: after `SOROBAN_CIRCUIT_BREAKER_THRESHOLD` consecutive failures within a 60-second rolling window, the publisher stops calling the contract and raises `SorobanCircuitOpenError`. The circuit auto-resets after `SOROBAN_CIRCUIT_RESET_SECONDS`. This prevents submission storms on contract failures without blocking the pipeline.
+
+**Security**:
+- `LEDGERLENS_SERVICE_SECRET_KEY` is converted to a `Keypair` at construction time; the raw key string is not retained as an instance variable
+- The keypair object's secret is never included in `__repr__`, logs, or the `on_chain_submissions` audit table
+- The publisher overrides `__getstate__` to exclude the keypair from pickle serialization
+- Running with `--no-submit` (via `cli.py score --no-submit`) skips all on-chain calls
+
+**Audit log**: every submission attempt (success, failure, or skip) is written to the `on_chain_submissions` table in the local SQLite store. The table records wallet, asset pair, score, transaction hash (if available), status, error message, and timestamp.
+
 ## Repository Structure
 
 This repository (`ledgerlens-core`) contains only the detection engine. The
