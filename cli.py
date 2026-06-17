@@ -75,11 +75,13 @@ def train(
 
 
 @app.command("score")
-def score() -> None:
+def score(
+    no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
+) -> None:
     """Run the detection pipeline against live Horizon data and store the resulting scores."""
     import run_pipeline
 
-    scores = run_pipeline.run()
+    scores = run_pipeline.run(no_submit=no_submit)
     for s in scores:
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
 

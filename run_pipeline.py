@@ -32,7 +32,7 @@ logger = logging.getLogger("ledgerlens.pipeline")
 
 def run(
     asset_pairs: list[tuple[str | None, str | None]] | None = None,
-    multi_pair: bool = False,
+    no_submit: bool = False,
 ) -> list[RiskScore]:
     """Run one scoring pass over the given asset pairs and return the resulting scores.
 
@@ -128,6 +128,8 @@ def run(
 
     _enqueue_webhook_alerts(scores)
 
+    _submit_on_chain(scores, no_submit=no_submit)
+
     return scores
 
 
@@ -143,6 +145,37 @@ def _enqueue_webhook_alerts(scores: list[RiskScore]) -> None:
                 enqueue(sub.subscriber_id, score.model_dump())
     except Exception:
         logger.exception("Failed to enqueue webhook alerts")
+
+
+def _submit_on_chain(scores: list[RiskScore], no_submit: bool = False) -> None:
+    """Submit high-risk scores to the Soroban contract."""
+    if no_submit:
+        logger.info("On-chain submission skipped via --no-submit")
+        return
+    if not settings.score_contract_id or not settings.service_secret_key:
+        return
+
+    try:
+        from detection.soroban_publisher import SorobanPublisher
+
+        publisher = SorobanPublisher(
+            contract_id=settings.score_contract_id,
+            secret_key=settings.service_secret_key,
+            soroban_rpc_url=settings.soroban_rpc_url,
+            network_passphrase=settings.network_passphrase,
+            circuit_breaker_threshold=settings.soroban_circuit_breaker_threshold,
+            circuit_reset_seconds=settings.soroban_circuit_reset_seconds,
+        )
+        high_risk = [s for s in scores if s.score >= settings.risk_score_threshold]
+        if high_risk:
+            results = publisher.submit_batch(high_risk)
+            success_count = sum(
+                1 for v in results.values()
+                if isinstance(v, str) and v != "skipped" and not v.startswith("ERROR: ")
+            )
+            logger.info("Submitted %d scores on-chain", success_count)
+    except Exception:
+        logger.exception("Failed to submit scores on-chain")
 
 
 if __name__ == "__main__":
