@@ -215,13 +215,14 @@ def run_drift_report(
         logger.info("No scored features found in the last %d days", days_back)
         return {}
 
+    scored_names = set(scored_df["feature_name"].unique())
+    feature_names = [
+        f for f in FEATURE_NAMES if f in training_df.columns and f in scored_names
+    ]
+
     # Compute PSI for each feature
     report = {}
-    for feature_name in FEATURE_NAMES:
-        if feature_name not in training_df.columns:
-            logger.warning("Feature %s not in training dataset", feature_name)
-            continue
-
+    for feature_name in feature_names:
         training_dist = training_df[feature_name].dropna().values
         scored_dist = scored_df[scored_df["feature_name"] == feature_name]["feature_value"].values
 

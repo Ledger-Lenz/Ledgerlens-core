@@ -14,6 +14,7 @@ from detection.drift_monitor import (
     record_scored_features,
     run_drift_report,
 )
+from detection.feature_engineering import FEATURE_NAMES
 
 
 class TestComputePSI:
@@ -194,19 +195,20 @@ class TestRunDriftReport:
 
     def test_run_drift_report_returns_dict(self, tmp_path):
         """run_drift_report should return a dict of PSI values."""
+        feature_a, feature_b = FEATURE_NAMES[0], FEATURE_NAMES[1]
         # Create a minimal training dataset
         training_csv = tmp_path / "training.csv"
         df = pd.DataFrame({
-            "feature_a": [1.0, 2.0, 3.0, 4.0, 5.0],
-            "feature_b": [10.0, 20.0, 30.0, 40.0, 50.0],
+            feature_a: [1.0, 2.0, 3.0, 4.0, 5.0],
+            feature_b: [10.0, 20.0, 30.0, 40.0, 50.0],
         })
         df.to_csv(training_csv, index=False)
 
         # Create mock database with recent scored features
         db_path = str(tmp_path / "test.db")
         features = [
-            {"feature_a": 1.5, "feature_b": 15.0},
-            {"feature_a": 2.5, "feature_b": 25.0},
+            {feature_a: 1.5, feature_b: 15.0},
+            {feature_a: 2.5, feature_b: 25.0},
         ]
         record_scored_features(features, db_path=db_path)
 
@@ -214,9 +216,8 @@ class TestRunDriftReport:
         report = run_drift_report(str(training_csv), db_path=db_path)
 
         assert isinstance(report, dict)
-        # Only feature_a and feature_b should be in report
-        assert "feature_a" in report
-        assert "feature_b" in report
+        assert feature_a in report
+        assert feature_b in report
 
     def test_run_drift_report_handles_missing_training_file(self, tmp_path):
         """run_drift_report should handle missing training file gracefully."""
@@ -240,18 +241,19 @@ class TestIntegrationRecordAndDetect:
 
     def test_record_then_detect_drift(self, tmp_path):
         """Should correctly detect drift in recorded features."""
+        feature_name = FEATURE_NAMES[0]
         db_path = str(tmp_path / "test.db")
         training_csv = tmp_path / "training.csv"
 
         # Create training data with normal distribution
         training_df = pd.DataFrame({
-            "feature_a": np.random.normal(0, 1, 1000),
+            feature_name: np.random.normal(0, 1, 1000),
         })
         training_df.to_csv(training_csv, index=False)
 
         # Record shifted features (simulating drift)
         shifted_features = [
-            {"feature_a": v}
+            {feature_name: v}
             for v in np.random.normal(2, 1, 100)  # Mean shifted from 0 to 2
         ]
         record_scored_features(shifted_features, db_path=db_path)
@@ -260,5 +262,5 @@ class TestIntegrationRecordAndDetect:
         report = run_drift_report(str(training_csv), db_path=db_path)
 
         # Should detect drift
-        assert report.get("feature_a", 0) > 0.20
-        assert is_drift_detected(report) is True
+        assert report.get(feature_name, 0) > 0.20
+        assert is_drift_detected(report, min_drifted_features=1) is True

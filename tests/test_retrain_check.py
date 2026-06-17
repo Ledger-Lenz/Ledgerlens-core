@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from detection.drift_monitor import record_scored_features
+from detection.feature_engineering import FEATURE_NAMES
 
 
 @pytest.fixture
@@ -63,8 +64,8 @@ def training_metadata(tmp_path):
 class TestRetrainCheckCommand:
     """Tests for the retrain-check CLI command."""
 
-    @patch("cli.run_drift_report")
-    @patch("cli.is_drift_detected")
+    @patch("detection.drift_monitor.run_drift_report")
+    @patch("detection.drift_monitor.is_drift_detected")
     def test_retrain_check_skipped_when_no_drift(self, mock_is_drift, mock_drift_report, runner, mock_settings, tmp_path):
         """retrain-check should skip retraining when drift is not detected."""
         mock_drift_report.return_value = {"feature_a": 0.10, "feature_b": 0.15}
@@ -96,8 +97,8 @@ class TestRetrainCheckCommand:
             assert is_drifted is False
 
     @patch("cli.train_ensemble")
-    @patch("cli.run_drift_report")
-    @patch("cli.is_drift_detected")
+    @patch("detection.drift_monitor.run_drift_report")
+    @patch("detection.drift_monitor.is_drift_detected")
     def test_retrain_check_triggered_on_drift(self, mock_is_drift, mock_drift_report, mock_train, runner, tmp_path):
         """retrain-check should trigger retraining when drift is detected."""
         mock_drift_report.return_value = {"feature_a": 0.25, "feature_b": 0.22, "feature_c": 0.21}
@@ -186,23 +187,24 @@ class TestDriftDetectionIntegration:
 
     def test_record_features_then_detect_drift(self, tmp_path):
         """Should correctly detect drift after recording features."""
+        feature_a, feature_b, feature_c = FEATURE_NAMES[0], FEATURE_NAMES[1], FEATURE_NAMES[2]
         db_path = str(tmp_path / "test.db")
         training_csv = tmp_path / "training.csv"
 
         # Create training reference with normal distribution
         training_df = pd.DataFrame({
-            "feature_a": np.random.normal(0, 1, 500),
-            "feature_b": np.random.normal(0, 1, 500),
-            "feature_c": np.random.normal(0, 1, 500),
+            feature_a: np.random.normal(0, 1, 500),
+            feature_b: np.random.normal(0, 1, 500),
+            feature_c: np.random.normal(0, 1, 500),
         })
         training_df.to_csv(training_csv, index=False)
 
         # Record shifted features (simulating drift)
         shifted_features = [
             {
-                "feature_a": v_a,
-                "feature_b": v_b,
-                "feature_c": v_c,
+                feature_a: v_a,
+                feature_b: v_b,
+                feature_c: v_c,
             }
             for v_a, v_b, v_c in zip(
                 np.random.normal(2, 1, 100),  # Mean shift for feature_a
@@ -226,19 +228,20 @@ class TestDriftDetectionIntegration:
 
     def test_no_drift_detection_with_consistent_features(self, tmp_path):
         """Should not detect drift when features remain consistent."""
+        feature_name = FEATURE_NAMES[0]
         db_path = str(tmp_path / "test.db")
         training_csv = tmp_path / "training.csv"
 
         # Create training reference
         np.random.seed(42)
         training_data = np.random.normal(0, 1, 500)
-        training_df = pd.DataFrame({"feature_a": training_data})
+        training_df = pd.DataFrame({feature_name: training_data})
         training_df.to_csv(training_csv, index=False)
 
         # Record similar features (same distribution)
         np.random.seed(43)  # Different seed but same parameters
         similar_features = [
-            {"feature_a": v}
+            {feature_name: v}
             for v in np.random.normal(0, 1, 100)
         ]
         record_scored_features(similar_features, db_path=db_path)
@@ -249,7 +252,7 @@ class TestDriftDetectionIntegration:
         report = run_drift_report(str(training_csv), db_path=db_path)
 
         # PSI should be low for consistent features
-        assert report.get("feature_a", 1.0) < 0.20
+        assert report.get(feature_name, 1.0) < 0.20
 
         # Drift should not be detected
         assert is_drift_detected(report) is False
