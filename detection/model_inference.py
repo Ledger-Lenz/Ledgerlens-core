@@ -14,9 +14,6 @@ _MODEL_FILENAMES = {
     "lightgbm": "lightgbm.joblib",
 }
 
-# Ensemble weights; XGBoost is the primary classifier per the project design.
-_ENSEMBLE_WEIGHTS = {"random_forest": 0.25, "xgboost": 0.5, "lightgbm": 0.25}
-
 
 def load_models(model_dir: str | None = None) -> dict:
     """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
@@ -29,6 +26,14 @@ def load_models(model_dir: str | None = None) -> dict:
     if not models:
         raise FileNotFoundError(f"No trained models found in {model_dir}. Run model_training first.")
     return models
+
+
+def _get_ensemble_weights() -> dict[str, float]:
+    return {
+        "random_forest": settings.ensemble_weight_rf,
+        "xgboost": settings.ensemble_weight_xgb,
+        "lightgbm": settings.ensemble_weight_lgbm,
+    }
 
 
 def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, float]:
@@ -48,8 +53,11 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
             ordered = X
         probabilities[name] = model.predict_proba(ordered)[0, 1]
 
-    total_weight = sum(_ENSEMBLE_WEIGHTS[n] for n in probabilities)
-    weighted_prob = sum(probabilities[n] * _ENSEMBLE_WEIGHTS[n] for n in probabilities) / total_weight
+    weights = _get_ensemble_weights()
+    total_weight = sum(weights[n] for n in probabilities)
+    if total_weight <= 0:
+        raise ValueError("At least one loaded model must have a positive ensemble weight.")
+    weighted_prob = sum(probabilities[n] * weights[n] for n in probabilities) / total_weight
 
     confidence = 1.0 - float(np.std(list(probabilities.values())))
     return float(weighted_prob), max(0.0, min(1.0, confidence))
