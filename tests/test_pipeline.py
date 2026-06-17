@@ -18,7 +18,7 @@ import sys as _sys
 _sys.modules.setdefault("stellar_sdk", MagicMock())
 _sys.modules.setdefault("stellar_sdk.operation", MagicMock())
 # Pre-import so patching detection.soroban_publisher.SorobanPublisher works
-from detection import soroban_publisher as _soroban_publisher  # noqa: F811
+from detection import soroban_publisher as _soroban_publisher  # noqa: E402, F401
 
 
 @pytest.fixture
@@ -89,7 +89,7 @@ def test_submit_batch_called_for_high_risk_scores(model_dir, monkeypatch):
     mock_publisher.submit_batch.return_value = {"G0000:XLM/USDC": "mock_tx_hash"}
 
     with patch("detection.soroban_publisher.SorobanPublisher", return_value=mock_publisher):
-        scores = run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
+        run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
 
     mock_publisher.submit_batch.assert_called_once()
     passed_scores = mock_publisher.submit_batch.call_args[0][0]
@@ -113,7 +113,7 @@ def test_no_submit_flag_skips_on_chain(model_dir, monkeypatch):
 
     mock_publisher = MagicMock()
     with patch("detection.soroban_publisher.SorobanPublisher", return_value=mock_publisher):
-        scores = run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")], no_submit=True)
+        run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")], no_submit=True)
 
     mock_publisher.submit_batch.assert_not_called()
 
@@ -136,6 +136,6 @@ def test_submit_skipped_when_not_configured(model_dir, monkeypatch):
 
     mock_publisher = MagicMock()
     with patch("detection.soroban_publisher.SorobanPublisher", return_value=mock_publisher):
-        scores = run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
+        run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
 
     mock_publisher.submit_batch.assert_not_called()

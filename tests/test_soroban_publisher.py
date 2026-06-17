@@ -9,7 +9,7 @@ import logging
 import sys
 import time
 from datetime import datetime, timezone
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,8 +20,8 @@ sys.modules["stellar_sdk"] = _mock_stellar_sdk
 sys.modules["stellar_sdk.operation"] = _mock_stellar_sdk.operation
 sys.modules["stellar_sdk.soroban_rpc"] = MagicMock()
 
-from detection.risk_score import RiskScore
-from detection.soroban_publisher import (
+from detection.risk_score import RiskScore  # noqa: E402
+from detection.soroban_publisher import (  # noqa: E402
     SorobanCircuitOpenError,
     SorobanPublisher,
     SorobanSubmissionError,
