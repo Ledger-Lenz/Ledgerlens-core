@@ -90,9 +90,18 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
     return results
 
 
-def save_models(results: dict, model_dir: str | None = None) -> None:
-    """Persist trained models to `model_dir` (defaults to `settings.model_dir`)."""
+def save_models(results: dict, model_dir: str | None = None, training_dataset_path: str | None = None) -> None:
+    """Persist trained models to `model_dir` (defaults to `settings.model_dir`).
+
+    Also writes training_metadata.json with model versions, AUC-ROC scores,
+    and training dataset path for drift detection and rollback.
+    """
+    import hashlib
+    import json
     import os
+    from datetime import datetime, timezone
+
+    from detection.model_registry import _compute_version_hash
 
     model_dir = model_dir or settings.model_dir
     os.makedirs(model_dir, exist_ok=True)
@@ -100,6 +109,48 @@ def save_models(results: dict, model_dir: str | None = None) -> None:
     for name, result in results.items():
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
+
+    # Write training_metadata.json
+    if training_dataset_path:
+        try:
+            # Compute training dataset hash for versioning
+            train_df = pd.read_csv(training_dataset_path)
+            training_row_count = len(train_df)
+            column_hash = hashlib.sha256(
+                ",".join(train_df.columns).encode()
+            ).hexdigest()[:8]
+        except Exception:
+            training_row_count = 0
+            column_hash = "unknown"
+    else:
+        training_row_count = 0
+        column_hash = "unknown"
+
+    version = _compute_version_hash(training_row_count, column_hash)
+
+    metadata = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": version,
+        "training_dataset_path": training_dataset_path or "",
+        "training_row_count": training_row_count,
+        "column_hash": column_hash,
+        "model_metrics": {
+            name: {
+                "auc_roc": result.get("auc_roc", 0.0),
+                "pr_auc": result.get("pr_auc", 0.0),
+                "f1": result.get("f1", 0.0),
+            }
+            for name, result in results.items()
+        },
+    }
+
+    metadata_path = os.path.join(model_dir, "training_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    import logging
+    logger = logging.getLogger("ledgerlens.model_training")
+    logger.info("Wrote training metadata to %s", metadata_path)
 
 
 if __name__ == "__main__":

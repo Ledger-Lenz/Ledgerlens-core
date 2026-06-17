@@ -56,6 +56,8 @@ def train(
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
 ) -> None:
     """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
+    import os
+
     from config.settings import settings
     from detection.dataset import build_training_dataset
     from detection.model_training import save_models, train_ensemble
@@ -66,12 +68,146 @@ def train(
     )
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
+    # Save training dataset for drift detection reference
+    os.makedirs(settings.model_dir, exist_ok=True)
+    training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
+    df.to_csv(training_dataset_path, index=False)
+    logger.info("Saved training reference to %s", training_dataset_path)
+
     results = train_ensemble(df)
     for name, result in results.items():
         logger.info("%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
-    save_models(results)
+    save_models(results, training_dataset_path=training_dataset_path)
     logger.info("Saved models to %s", settings.model_dir)
+
+
+@app.command("retrain-check")
+def retrain_check(
+    psi_threshold: float = typer.Option(0.20, help="PSI threshold for drift detection"),
+    min_drifted_features: int = typer.Option(3, help="Minimum number of drifted features to trigger retraining"),
+    force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
+) -> None:
+    """Check for distribution drift and retrain the ensemble if detected.
+
+    Computes Population Stability Index (PSI) on recent scored features
+    against the training reference distribution. If drift is detected
+    (>= min_drifted_features with PSI > psi_threshold), triggers a
+    full retraining cycle. New model is promoted only if it matches or
+    outperforms the previous model on AUC-ROC.
+    """
+    import json
+    import os
+    from datetime import datetime
+
+    from config.settings import settings
+    from detection.dataset import build_training_dataset
+    from detection.drift_monitor import is_drift_detected, run_drift_report
+    from detection.model_registry import (
+        get_current_version,
+        load_latest_model,
+        rollback_model,
+        save_versioned_model,
+    )
+    from detection.model_training import save_models, train_ensemble
+    from ingestion.synthetic_data import generate_synthetic_dataset
+
+    # Read training metadata
+    metadata_path = os.path.join(settings.model_dir, "training_metadata.json")
+    if not os.path.exists(metadata_path):
+        logger.warning("Training metadata not found at %s; cannot run drift check", metadata_path)
+        return
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+
+    training_dataset_path = metadata.get("training_dataset_path", "")
+
+    # Run drift report
+    report = run_drift_report(training_dataset_path)
+    if not report:
+        logger.warning("Could not compute drift report; skipping retrain check")
+        return
+
+    logger.info("Drift report: %s", report)
+
+    # Check if drift detected
+    drift_detected = is_drift_detected(report, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
+
+    if not drift_detected and not force_retrain:
+        logger.info("No drift detected; skipping retrain")
+        return
+
+    if force_retrain:
+        logger.info("Forcing retrain (force_retrain=True)")
+
+    # Retrain the ensemble
+    logger.info("Starting retrain cycle…")
+    trades, account_metadata, events, labels = generate_synthetic_dataset(
+        n_normal_accounts=60, n_wash_rings=10, ring_size=3, seed=42
+    )
+    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
+
+    new_results = train_ensemble(df)
+    for name, result in new_results.items():
+        logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
+
+    # Compare new models with previous models
+    previous_metrics = metadata.get("model_metrics", {})
+    promoted = False
+    old_version = get_current_version("random_forest", settings.model_dir)
+
+    for model_name, new_result in new_results.items():
+        old_auc = previous_metrics.get(model_name, {}).get("auc_roc", 0.0)
+        new_auc = new_result.get("auc_roc", 0.0)
+
+        if new_auc >= old_auc:
+            logger.info(
+                "%s: AUC-ROC improved from %.3f to %.3f; promoting",
+                model_name,
+                old_auc,
+                new_auc,
+            )
+            promoted = True
+        else:
+            logger.warning(
+                "%s: AUC-ROC degraded from %.3f to %.3f; reverting to previous version",
+                model_name,
+                old_auc,
+                new_auc,
+            )
+
+    # Save models and metadata
+    training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
+    df.to_csv(training_dataset_path, index=False)
+
+    if promoted:
+        save_models(new_results, training_dataset_path=training_dataset_path)
+        logger.info("Promoted new models to production")
+    else:
+        logger.info("New models not promoted; keeping previous versions")
+        if old_version:
+            for model_name in new_results.keys():
+                rollback_model(model_name, old_version, settings.model_dir)
+
+    # Write drift report
+    drift_report_dir = "./drift_reports"
+    os.makedirs(drift_report_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    report_path = os.path.join(drift_report_dir, f"{timestamp}.json")
+    with open(report_path, "w") as f:
+        json.dump(
+            {
+                "timestamp": timestamp,
+                "drift_detected": drift_detected,
+                "psi_report": report,
+                "promoted": promoted,
+                "new_model_metrics": {k: v.get("auc_roc") for k, v in new_results.items()},
+            },
+            f,
+            indent=2,
+        )
+    logger.info("Wrote drift report to %s", report_path)
 
 
 @app.command("score")

@@ -139,3 +139,65 @@ def test_submit_skipped_when_not_configured(model_dir, monkeypatch):
         run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
 
     mock_publisher.submit_batch.assert_not_called()
+
+
+def test_run_records_scored_features(model_dir, monkeypatch):
+    """Scored features should be recorded for drift detection."""
+    trades, account_metadata, events, _labels = generate_synthetic_dataset(
+        n_normal_accounts=3, n_wash_rings=1, ring_size=2, trades_per_normal=4, trades_per_wash=4
+    )
+
+    monkeypatch.setattr(run_pipeline, "load_historical_trades", lambda **kwargs: trades)
+    monkeypatch.setattr(run_pipeline, "load_account_metadata", lambda accounts: account_metadata)
+    monkeypatch.setattr(run_pipeline, "load_order_book_events_for_pair", lambda base, counter, since: [])
+
+    with patch("run_pipeline.record_scored_features") as mock_record:
+        scores = run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
+
+        # Verify record_scored_features was called
+        mock_record.assert_called_once()
+
+        # Verify it was called with feature vectors and wallet IDs
+        args, _kwargs = mock_record.call_args
+        feature_vectors, wallet_ids, asset_pairs = args
+
+        assert len(feature_vectors) > 0
+        assert len(wallet_ids) == len(feature_vectors)
+        assert len(asset_pairs) == len(feature_vectors)
+        assert all(isinstance(fv, dict) for fv in feature_vectors)
+
+
+def test_async_run_records_scored_features(model_dir, monkeypatch):
+    """Async run should also record scored features for drift detection."""
+    import asyncio
+
+    trades, account_metadata, events, _labels = generate_synthetic_dataset(
+        n_normal_accounts=3, n_wash_rings=1, ring_size=2, trades_per_normal=4, trades_per_wash=4
+    )
+
+    async def fake_async_load(*args, **kwargs):
+        return trades
+
+    async def fake_async_metadata(*args, **kwargs):
+        return account_metadata
+
+    async def fake_async_order_book(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(run_pipeline, "async_load_historical_trades", fake_async_load)
+    monkeypatch.setattr(run_pipeline, "async_load_account_metadata", fake_async_metadata)
+    monkeypatch.setattr(run_pipeline, "async_load_order_book_events_for_pair", fake_async_order_book)
+
+    with patch("run_pipeline.record_scored_features") as mock_record:
+        scores = asyncio.run(run_pipeline.async_run(asset_pairs=[(None, "USDC:ISSUER")]))
+
+        # Verify record_scored_features was called
+        mock_record.assert_called_once()
+
+        # Verify it was called with feature vectors and wallet IDs
+        args, _kwargs = mock_record.call_args
+        feature_vectors, wallet_ids, asset_pairs = args
+
+        assert len(feature_vectors) > 0
+        assert len(wallet_ids) == len(feature_vectors)
+        assert len(asset_pairs) == len(feature_vectors)

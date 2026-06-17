@@ -313,9 +313,155 @@ docker compose up --build
 python cli.py generate-data   # write synthetic trades/labels to CSV
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
+python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 ```
+
+## Continuous Retraining
+
+LedgerLens models are trained once on synthetic data, but in production, wash-trading strategies evolve — bots adapt their lot sizes, timing patterns, and circular routing to evade detection. Without detecting and responding to this **concept drift**, model performance silently degrades over time.
+
+The continuous retraining pipeline automatically monitors the distribution of features in production scoring and triggers retraining when drift is detected, with safe rollback to the previous model if the new model underperforms.
+
+### Drift Detection Methodology
+
+Drift is detected using the **Population Stability Index (PSI)**, a statistical measure of how much a feature distribution has shifted between training and production:
+
+$$\text{PSI} = \sum_{i=1}^{n} \left( \text{current}_i - \text{training}_i \right) \times \ln\left(\frac{\text{current}_i}{\text{training}_i}\right)$$
+
+**PSI Interpretation:**
+- **PSI = 0**: Distributions are identical
+- **0 < PSI < 0.10**: Negligible drift; no action needed
+- **0.10 ≤ PSI < 0.20**: Small drift; monitor closely
+- **PSI ≥ 0.20**: Significant drift; retraining recommended
+- **PSI > 0.25**: Severe drift; retraining strongly advised
+
+Drift is declared when **at least 3 features** exceed PSI threshold (default 0.20). This threshold minimizes false positives from natural market dynamics while capturing genuine performance-degrading drift.
+
+### Running Drift Checks
+
+After the pipeline records scored features (automatic on each `python cli.py score` run), trigger a drift check and potential retrain:
+
+```bash
+python cli.py retrain-check
+```
+
+**Options:**
+- `--psi-threshold 0.20`: PSI threshold for marking a feature as drifted (default 0.20)
+- `--min-drifted-features 3`: Minimum number of drifted features to trigger retraining (default 3)
+- `--force-retrain`: Force retraining even if no drift detected (useful for manual updates)
+
+**What happens:**
+1. Computes PSI for all features, comparing production data (last 30 days) against training reference
+2. If drift detected (or force-retrain enabled), trains a new ensemble on the original training distribution (synthetic data)
+3. Compares new models' AUC-ROC scores against previous models
+4. **Promotes** new models only if AUC-ROC ≥ previous version (safer rollout)
+5. **Reverts** to previous version if new models underperform
+6. Writes a drift report to `./drift_reports/YYYYMMDD_HHMM.json` with PSI values and promotion decision
+
+### Model Versioning and Rollback
+
+Each trained model is stored with a version hash (SHA-256[:8] of training data fingerprint + timestamp):
+
+```
+models/
+├── random_forest_v12a3b4c5.joblib      # Versioned model
+├── random_forest_latest.txt              # Points to current version
+├── xgboost_v12a3b4c5.joblib
+├── xgboost_latest.txt
+├── lightgbm_v12a3b4c5.joblib
+├── lightgbm_latest.txt
+├── training_reference.csv                # Reference dataset for drift detection
+└── training_metadata.json                # Training metadata, AUC-ROC scores, etc.
+```
+
+If a newly promoted model degrades performance, rollback is automatic:
+
+```bash
+# Manual rollback (if needed):
+# Edit random_forest_latest.txt, xgboost_latest.txt, lightgbm_latest.txt
+# to point to a previous version (e.g., 12a3b4c5)
+```
+
+### Feature Distribution Tracking
+
+Every time the scoring pipeline runs, feature vectors are persisted to SQLite for drift monitoring:
+
+```sql
+CREATE TABLE feature_distribution_snapshots (
+    id INTEGER PRIMARY KEY,
+    wallet TEXT,
+    asset_pair TEXT,
+    feature_name TEXT,
+    feature_value REAL,
+    recorded_at TIMESTAMP
+);
+```
+
+**Storage budget**: At 1,000 wallets/run × 4 runs/day × 30 days × 26 features × ~8 bytes/float ≈ 25 MB. Hard cap: **500,000 rows**; oldest rows are pruned to 450,000 when exceeded.
+
+### Scheduling Retrain Checks
+
+For production deployments, schedule retrain checks via cron or systemd timer:
+
+**Cron example (daily at 2 AM):**
+```cron
+0 2 * * * cd /path/to/ledgerlens-core && python cli.py retrain-check >> /var/log/ledgerlens-retrain.log 2>&1
+```
+
+**Systemd timer example:**
+
+`/etc/systemd/system/ledgerlens-retrain.service`
+```ini
+[Unit]
+Description=LedgerLens Continuous Retrain Check
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/ledgerlens-core
+ExecStart=/usr/bin/python cli.py retrain-check
+StandardOutput=journal
+StandardError=journal
+```
+
+`/etc/systemd/system/ledgerlens-retrain.timer`
+```ini
+[Unit]
+Description=Daily LedgerLens Retrain Check
+
+[Timer]
+OnCalendar=daily
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable and start:
+```bash
+systemctl enable ledgerlens-retrain.timer
+systemctl start ledgerlens-retrain.timer
+```
+
+### Monitoring and Alerts
+
+Inspect drift reports to monitor model stability:
+
+```bash
+ls -lh ./drift_reports/
+# Example output:
+# 20240615_0200.json: {"drift_detected": true, "promoted": true, ...}
+# 20240614_0200.json: {"drift_detected": false, "promoted": false, ...}
+```
+
+**Alert on failures**: If `promoted: false` but `drift_detected: true`, the new models failed to outperform the current ones. Investigate feature shifts in the drift report's `psi_report` field and consider:
+
+- Expanding the training dataset with recent adversarial examples
+- Adjusting feature engineering (e.g., new adversarial or graph features)
+- Lowering the PSI threshold if the drift is natural (market regime change) rather than evasion
 
 ## Webhook Alerts
 
