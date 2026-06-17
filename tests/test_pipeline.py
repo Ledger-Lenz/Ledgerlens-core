@@ -152,7 +152,7 @@ def test_run_records_scored_features(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "load_order_book_events_for_pair", lambda base, counter, since: [])
 
     with patch("run_pipeline.record_scored_features") as mock_record:
-        scores = run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
+        run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
 
         # Verify record_scored_features was called
         mock_record.assert_called_once()
@@ -189,7 +189,7 @@ def test_async_run_records_scored_features(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "async_load_order_book_events_for_pair", fake_async_order_book)
 
     with patch("run_pipeline.record_scored_features") as mock_record:
-        scores = asyncio.run(run_pipeline.async_run(asset_pairs=[(None, "USDC:ISSUER")]))
+        asyncio.run(run_pipeline.async_run(asset_pairs=[(None, "USDC:ISSUER")]))
 
         # Verify record_scored_features was called
         mock_record.assert_called_once()

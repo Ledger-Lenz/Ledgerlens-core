@@ -6,7 +6,6 @@ the training distribution. Persists scored feature vectors to SQLite and
 provides drift detection thresholds.
 """
 
-import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone

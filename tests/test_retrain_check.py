@@ -1,8 +1,6 @@
 """Tests for continuous retraining with drift detection."""
 
 import json
-import os
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -10,7 +8,6 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
-from cli import app
 from detection.drift_monitor import record_scored_features
 
 

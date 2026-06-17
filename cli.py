@@ -105,9 +105,7 @@ def retrain_check(
     from detection.drift_monitor import is_drift_detected, run_drift_report
     from detection.model_registry import (
         get_current_version,
-        load_latest_model,
         rollback_model,
-        save_versioned_model,
     )
     from detection.model_training import save_models, train_ensemble
     from ingestion.synthetic_data import generate_synthetic_dataset

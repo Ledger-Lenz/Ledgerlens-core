@@ -1,7 +1,6 @@
 """Tests for drift detection and feature distribution monitoring."""
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
