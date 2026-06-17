@@ -10,6 +10,10 @@ ledgerlens = "cli:app"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "auto"
+markers = [
+    "benchmark: performance benchmarks (excluded from standard CI; run with -m benchmark)",
+]
 
 [tool.ruff]
 line-length = 100

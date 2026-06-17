@@ -77,11 +77,17 @@ def train(
 @app.command("score")
 def score(
     no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
+    use_async: bool = typer.Option(False, "--async", help="Use async pipeline for concurrent I/O and batched inference"),
 ) -> None:
     """Run the detection pipeline against live Horizon data and store the resulting scores."""
+    import asyncio
+
     import run_pipeline
 
-    scores = run_pipeline.run(no_submit=no_submit)
+    if use_async:
+        scores = asyncio.run(run_pipeline.async_run())
+    else:
+        scores = run_pipeline.run(no_submit=no_submit)
     for s in scores:
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
 

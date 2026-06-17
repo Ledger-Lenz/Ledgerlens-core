@@ -22,7 +22,7 @@ import httpx
 
 from config.settings import settings
 from ingestion.data_models import OrderBookEvent
-from ingestion.http_client import get_with_retry
+from ingestion.http_client import AsyncHorizonClient, get_with_retry
 
 OFFER_OPERATION_TYPES = ("manage_buy_offer", "manage_sell_offer", "create_passive_sell_offer")
 PAGE_LIMIT = 200
@@ -166,3 +166,33 @@ def load_order_book_events_for_pair(
         if event.timestamp >= cutoff and _matches_asset_pair(event, base_asset, counter_asset):
             events.append(event)
     return events
+
+
+def _filter_order_book_records(
+    records: list[dict],
+    base_asset: str | None,
+    counter_asset: str | None,
+    cutoff: datetime,
+) -> list[OrderBookEvent]:
+    events: list[OrderBookEvent] = []
+    for record in records:
+        if not _is_offer_operation(record):
+            continue
+        event = _parse_event(record)
+        if event.timestamp >= cutoff and _matches_asset_pair(event, base_asset, counter_asset):
+            events.append(event)
+    return events
+
+
+async def async_load_order_book_events_for_pair(
+    base_asset: str | None,
+    counter_asset: str | None,
+    since: datetime,
+    client: AsyncHorizonClient,
+    limit: int = PAGE_LIMIT,
+) -> list[OrderBookEvent]:
+    """Async variant of `load_order_book_events_for_pair` using `AsyncHorizonClient`."""
+    cutoff = _parse_since(since)
+    data = await client.get("/operations", params={"order": "desc", "limit": limit})
+    records = data.get("_embedded", {}).get("records", [])
+    return _filter_order_book_records(records, base_asset, counter_asset, cutoff)

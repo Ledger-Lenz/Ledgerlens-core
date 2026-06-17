@@ -61,3 +61,44 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
 
     confidence = 1.0 - float(np.std(list(probabilities.values())))
     return float(weighted_prob), max(0.0, min(1.0, confidence))
+
+
+def score_feature_matrix(
+    models: dict,
+    feature_vectors: list[dict],
+) -> list[tuple[float, float]]:
+    """Score a batch of feature vectors with a single `predict_proba` call per model.
+
+    For N accounts this makes len(models) predict_proba calls on an N-row
+    matrix instead of N × len(models) calls, reducing Python overhead and
+    enabling scikit-learn's internal parallelism.
+
+    Returns a list of (probability, confidence) tuples, one per input vector,
+    in the same order as `feature_vectors`. Results are numerically identical
+    to calling `score_feature_vector` for each vector individually.
+    """
+    if not feature_vectors:
+        return []
+
+    X = np.array([[fv[name] for name in FEATURE_NAMES] for fv in feature_vectors])
+    weights = _get_ensemble_weights()
+
+    model_probs: dict[str, np.ndarray] = {}
+    for name, model in models.items():
+        if hasattr(model, "feature_names_in_"):
+            col_idx = [FEATURE_NAMES.index(f) for f in model.feature_names_in_]
+            ordered = X[:, col_idx]
+        else:
+            ordered = X
+        model_probs[name] = model.predict_proba(ordered)[:, 1]
+
+    total_weight = sum(weights[n] for n in model_probs)
+    if total_weight <= 0:
+        raise ValueError("At least one loaded model must have a positive ensemble weight.")
+
+    weighted_probs = sum(model_probs[n] * weights[n] for n in model_probs) / total_weight
+
+    all_probs = np.stack(list(model_probs.values()), axis=0)  # (M, N)
+    confidences = np.clip(1.0 - np.std(all_probs, axis=0), 0.0, 1.0)  # (N,)
+
+    return [(float(weighted_probs[i]), float(confidences[i])) for i in range(len(feature_vectors))]
