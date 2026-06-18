@@ -315,6 +315,7 @@ python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
+python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
 
 ## Webhook Alerts

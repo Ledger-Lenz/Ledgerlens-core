@@ -4,6 +4,14 @@
 integration point is wired up (see README's "Open Integration Points"),
 `run_pipeline.py` and the local API (`api/main.py`) persist and read
 `RiskScore` records here.
+
+## How to add a new migration
+1. Append a tuple to `_MIGRATIONS`:
+       (version, "short description", "ALTER TABLE ... or CREATE TABLE ...")
+   where `version` is `len(_MIGRATIONS) + 1` before your append (i.e. next int).
+2. The SQL is applied automatically the next time `init_db()` is called on an
+   older database.  Each migration is applied exactly once and tracked in the
+   `schema_migrations` log table.
 """
 
 import sqlite3
@@ -13,44 +21,67 @@ from datetime import datetime, timezone
 from config.settings import settings
 from detection.risk_score import RiskScore
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS risk_scores (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet TEXT NOT NULL,
-    asset_pair TEXT NOT NULL,
-    score INTEGER NOT NULL,
-    benford_flag INTEGER NOT NULL,
-    ml_flag INTEGER NOT NULL,
-    confidence INTEGER NOT NULL,
-    timestamp TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_risk_scores_wallet ON risk_scores (wallet);
-CREATE INDEX IF NOT EXISTS idx_risk_scores_asset_pair ON risk_scores (asset_pair);
 
-CREATE TABLE IF NOT EXISTS on_chain_submissions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet TEXT NOT NULL,
-    asset_pair TEXT NOT NULL,
-    score INTEGER NOT NULL,
-    tx_hash TEXT,
-    status TEXT NOT NULL,
-    error_message TEXT,
-    submitted_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_submissions_wallet ON on_chain_submissions (wallet);
-CREATE INDEX IF NOT EXISTS idx_submissions_status ON on_chain_submissions (status);
-CREATE TABLE IF NOT EXISTS pair_correlations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pair_a TEXT NOT NULL,
-    pair_b TEXT NOT NULL,
-    correlation_r REAL NOT NULL,
-    method TEXT NOT NULL,
-    shared_wallet_count INTEGER NOT NULL,
-    timestamp TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
-CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
-"""
+class SchemaMigrationError(RuntimeError):
+    """Raised when a previously interrupted migration is detected on startup."""
+
+
+# ---------------------------------------------------------------------------
+# Migration registry
+# Each entry: (version: int, description: str, sql: str)
+# The SQL for version 1 must create every table that the rest of the module
+# depends on.  Subsequent entries add incremental changes.
+# ---------------------------------------------------------------------------
+_MIGRATIONS: list[tuple[int, str, str]] = [
+    (
+        1,
+        "initial schema",
+        """
+        CREATE TABLE IF NOT EXISTS risk_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            benford_flag INTEGER NOT NULL,
+            ml_flag INTEGER NOT NULL,
+            confidence INTEGER NOT NULL,
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_risk_scores_wallet ON risk_scores (wallet);
+        CREATE INDEX IF NOT EXISTS idx_risk_scores_asset_pair ON risk_scores (asset_pair);
+
+        CREATE TABLE IF NOT EXISTS on_chain_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            tx_hash TEXT,
+            status TEXT NOT NULL,
+            error_message TEXT,
+            submitted_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_submissions_wallet ON on_chain_submissions (wallet);
+        CREATE INDEX IF NOT EXISTS idx_submissions_status ON on_chain_submissions (status);
+
+        CREATE TABLE IF NOT EXISTS pair_correlations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_a TEXT NOT NULL,
+            pair_b TEXT NOT NULL,
+            correlation_r REAL NOT NULL,
+            method TEXT NOT NULL,
+            shared_wallet_count INTEGER NOT NULL,
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
+        CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
+        """,
+    ),
+    (
+        2,
+        "add shap_json column to risk_scores",
+        "ALTER TABLE risk_scores ADD COLUMN shap_json TEXT;",
+    ),
+]
 
 
 @contextmanager
@@ -62,11 +93,121 @@ def _connect(db_path: str | None = None):
         conn.close()
 
 
-def init_db(db_path: str | None = None) -> None:
-    """Create the `risk_scores` table if it does not already exist."""
-    with _connect(db_path) as conn:
-        conn.executescript(_SCHEMA)
+def _ensure_meta_tables(conn: sqlite3.Connection) -> None:
+    """Create the schema_version and schema_migrations tracking tables if absent."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        """
+    )
+    conn.commit()
+
+
+def get_schema_version(conn: sqlite3.Connection) -> int:
+    """Return the current schema version; 0 if the table is absent or empty."""
+    try:
+        rows = conn.execute("SELECT MAX(version) FROM schema_version", ()).fetchall()
+        return rows[0][0] if rows and rows[0][0] is not None else 0
+    except sqlite3.OperationalError:
+        return 0
+
+
+def migrate_db(conn: sqlite3.Connection) -> list[int]:
+    """Apply any pending migrations and return the list of versions applied.
+
+    Uses an application-level state machine per migration:
+    - Before running migration N, writes a log row with status='applying'.
+    - On success, updates the row to status='applied'.
+    - On failure, leaves the row as 'applying' and raises.
+    On the *next* startup, if a row with status='applying' is detected,
+    `SchemaMigrationError` is raised immediately so the operator can recover.
+
+    Note: SQLite DDL statements (CREATE TABLE, ALTER TABLE) cannot be rolled
+    back inside an explicit transaction — they auto-commit.  The state-machine
+    approach here gives the next-best safety guarantee: the interrupted
+    migration version is visible in the log so the operator knows exactly what
+    happened and can either apply the remaining SQL manually or restore from a
+    backup.
+    """
+    _ensure_meta_tables(conn)
+
+    # Detect any previously interrupted migration.
+    interrupted = conn.execute(
+        "SELECT version FROM schema_migrations WHERE status = 'applying' ORDER BY version", ()
+    ).fetchall()
+    if interrupted:
+        versions = [r[0] for r in interrupted]
+        raise SchemaMigrationError(
+            f"Migration(s) {versions} were interrupted during a previous run "
+            f"(status='applying' in schema_migrations). "
+            f"Recover by completing the migration SQL manually or restoring from a backup, "
+            f"then update the status to 'applied' before restarting."
+        )
+
+    current = get_schema_version(conn)
+    applied: list[int] = []
+
+    for version, description, sql in _MIGRATIONS:
+        if version <= current:
+            continue
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO schema_migrations (version, description, status, started_at) VALUES (?, ?, 'applying', ?)",
+            (version, description, now),
+        )
         conn.commit()
+
+        try:
+            conn.executescript(sql)
+            conn.commit()
+        except Exception as exc:
+            conn.execute(
+                "UPDATE schema_migrations SET error = ? WHERE version = ? AND status = 'applying'",
+                (str(exc), version),
+            )
+            conn.commit()
+            raise
+
+        finished = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE schema_migrations SET status = 'applied', finished_at = ? WHERE version = ? AND status = 'applying'",
+            (finished, version),
+        )
+        # Upsert schema_version: keep a single row with the latest version.
+        count_rows = conn.execute("SELECT COUNT(*) FROM schema_version", ()).fetchall()
+        existing = count_rows[0][0] if count_rows else 0
+        if existing == 0:
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, finished),
+            )
+        else:
+            conn.execute(
+                "UPDATE schema_version SET version = ?, applied_at = ?",
+                (version, finished),
+            )
+        conn.commit()
+        applied.append(version)
+
+    return applied
+
+
+def init_db(db_path: str | None = None) -> None:
+    """Initialise or upgrade the database schema via the migration system."""
+    with _connect(db_path) as conn:
+        migrate_db(conn)
 
 
 def save_scores(scores: list[RiskScore], db_path: str | None = None) -> None:
@@ -129,7 +270,7 @@ def save_submission(
 
 
 def _row_to_score(row: tuple) -> RiskScore:
-    _, wallet, asset_pair, score, benford_flag, ml_flag, confidence, timestamp = row
+    _, wallet, asset_pair, score, benford_flag, ml_flag, confidence, timestamp = row[:8]
     return RiskScore(
         wallet=wallet,
         asset_pair=asset_pair,

@@ -180,6 +180,26 @@ def serve(
     uvicorn.run("api.main:app", host=host, port=port, reload=reload)
 
 
+@app.command("db-migrate")
+def db_migrate(
+    db_path: str = typer.Option(None, "--db-path", help="Path to the SQLite database (defaults to LEDGERLENS_DB_PATH)"),
+) -> None:
+    """Apply any pending schema migrations to the database and report the result."""
+    from detection.storage import _connect, get_schema_version, migrate_db
+
+    with _connect(db_path) as conn:
+        before = get_schema_version(conn)
+
+    with _connect(db_path) as conn:
+        applied = migrate_db(conn)
+        after = get_schema_version(conn)
+
+    if applied:
+        typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
+    else:
+        typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+
 @app.command("webhook-worker")
 def webhook_worker(
     interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
