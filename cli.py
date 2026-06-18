@@ -108,6 +108,7 @@ def retrain_check(
         rollback_model,
     )
     from detection.model_training import save_models, train_ensemble
+    from detection.storage import save_drift_report, save_retrain_run
     from ingestion.synthetic_data import generate_synthetic_dataset
 
     # Read training metadata
@@ -132,6 +133,13 @@ def retrain_check(
     # Check if drift detected
     drift_detected = is_drift_detected(report, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
 
+    drift_report_id = save_drift_report(
+        drift_detected=drift_detected,
+        psi_report=report,
+        psi_threshold=psi_threshold,
+        min_drifted_features=min_drifted_features,
+    )
+
     if not drift_detected and not force_retrain:
         logger.info("No drift detected; skipping retrain")
         return
@@ -153,11 +161,13 @@ def retrain_check(
     # Compare new models with previous models
     previous_metrics = metadata.get("model_metrics", {})
     promoted = False
-    old_version = get_current_version("random_forest", settings.model_dir)
+    old_versions = {model_name: get_current_version(model_name, settings.model_dir) for model_name in new_results}
+    auc_by_model: dict[str, tuple[float, float]] = {}
 
     for model_name, new_result in new_results.items():
         old_auc = previous_metrics.get(model_name, {}).get("auc_roc", 0.0)
         new_auc = new_result.get("auc_roc", 0.0)
+        auc_by_model[model_name] = (old_auc, new_auc)
 
         if new_auc >= old_auc:
             logger.info(
@@ -184,9 +194,22 @@ def retrain_check(
         logger.info("Promoted new models to production")
     else:
         logger.info("New models not promoted; keeping previous versions")
-        if old_version:
-            for model_name in new_results.keys():
+        for model_name, old_version in old_versions.items():
+            if old_version:
                 rollback_model(model_name, old_version, settings.model_dir)
+
+    for model_name in new_results:
+        old_auc, new_auc = auc_by_model[model_name]
+        save_retrain_run(
+            drift_report_id=drift_report_id,
+            model_name=model_name,
+            old_version=old_versions[model_name],
+            new_version=get_current_version(model_name, settings.model_dir),
+            old_auc_roc=old_auc,
+            new_auc_roc=new_auc,
+            promoted=promoted,
+            forced=force_retrain,
+        )
 
     # Write drift report
     drift_report_dir = "./drift_reports"

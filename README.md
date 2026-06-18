@@ -464,6 +464,24 @@ ls -lh ./drift_reports/
 - Adjusting feature engineering (e.g., new adversarial or graph features)
 - Lowering the PSI threshold if the drift is natural (market regime change) rather than evasion
 
+### Model Observability API
+
+Every `cli.py retrain-check` run also persists its drift report and per-model retrain outcome to SQLite, queryable over HTTP instead of grepping `./drift_reports/`:
+
+| Method | Endpoint                | Description                                  |
+|--------|--------------------------|-----------------------------------------------|
+| `GET`  | `/admin/drift-reports`   | Most recent drift checks (PSI report, threshold, detected flag) |
+| `GET`  | `/admin/retrain-runs`    | Most recent per-model retrain outcomes (old/new version, AUC-ROC, promoted, forced); filter with `?model_name=` |
+
+Both endpoints require an admin key, since they expose internal model governance data. Set `LEDGERLENS_ADMIN_API_KEY` and pass it via the `X-LedgerLens-Admin-Key` header:
+
+```bash
+export LEDGERLENS_ADMIN_API_KEY="$(openssl rand -hex 32)"
+curl -H "X-LedgerLens-Admin-Key: $LEDGERLENS_ADMIN_API_KEY" http://localhost:8000/admin/retrain-runs?model_name=random_forest
+```
+
+If `LEDGERLENS_ADMIN_API_KEY` is unset, both endpoints return `503` rather than allowing unauthenticated access.
+
 ## Webhook Alerts
 
 LedgerLens can push risk-score alerts to subscriber URLs via webhooks.

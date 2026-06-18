@@ -536,6 +536,96 @@ def test_explain_503_when_models_not_loaded(client_no_models):
     assert "Models not loaded" in resp.json()["detail"]
 
 
+# ---------------------------------------------------------------------------
+# /admin/drift-reports and /admin/retrain-runs (admin-key gated)
+# ---------------------------------------------------------------------------
+
+
+def test_drift_reports_503_when_admin_key_not_configured(client):
+    resp = client.get("/admin/drift-reports")
+    assert resp.status_code == 503
+
+
+def test_drift_reports_401_when_header_missing(client, monkeypatch):
+    import config.settings as settings_module
+
+    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
+
+    resp = client.get("/admin/drift-reports")
+    assert resp.status_code == 401
+
+
+def test_drift_reports_403_when_header_wrong(client, monkeypatch):
+    import config.settings as settings_module
+
+    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
+
+    resp = client.get("/admin/drift-reports", headers={"X-LedgerLens-Admin-Key": "wrong"})
+    assert resp.status_code == 403
+
+
+def test_drift_reports_returns_saved_reports(client, monkeypatch):
+    import config.settings as settings_module
+    import detection.storage as storage_module
+
+    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
+
+    storage_module.save_drift_report(
+        drift_detected=True,
+        psi_report={"benford_mad_24h": 0.31},
+        psi_threshold=0.20,
+        min_drifted_features=3,
+        db_path=storage_module.settings.db_path,
+    )
+
+    resp = client.get("/admin/drift-reports", headers={"X-LedgerLens-Admin-Key": "secret-key"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["drift_detected"] is True
+    assert body[0]["psi_report"] == {"benford_mad_24h": 0.31}
+
+
+def test_retrain_runs_returns_saved_runs_filtered_by_model(client, monkeypatch):
+    import config.settings as settings_module
+    import detection.storage as storage_module
+
+    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
+
+    storage_module.save_retrain_run(
+        drift_report_id=None,
+        model_name="random_forest",
+        old_version="aaa11111",
+        new_version="bbb22222",
+        old_auc_roc=0.91,
+        new_auc_roc=0.93,
+        promoted=True,
+        forced=False,
+        db_path=storage_module.settings.db_path,
+    )
+    storage_module.save_retrain_run(
+        drift_report_id=None,
+        model_name="xgboost",
+        old_version="ccc33333",
+        new_version="ddd44444",
+        old_auc_roc=0.90,
+        new_auc_roc=0.89,
+        promoted=False,
+        forced=False,
+        db_path=storage_module.settings.db_path,
+    )
+
+    resp = client.get(
+        "/admin/retrain-runs?model_name=random_forest",
+        headers={"X-LedgerLens-Admin-Key": "secret-key"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["model_name"] == "random_forest"
+    assert body[0]["promoted"] is True
+
+
 def test_explain_response_time_under_100ms(client_with_models):
     """Cache-hit response must be served in < 100 ms."""
     import time

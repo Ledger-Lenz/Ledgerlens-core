@@ -35,6 +35,8 @@ class Settings:
     soroban_circuit_breaker_threshold: int = field(default_factory=lambda: int(os.getenv("SOROBAN_CIRCUIT_BREAKER_THRESHOLD", "5")))
     soroban_circuit_reset_seconds: int = field(default_factory=lambda: int(os.getenv("SOROBAN_CIRCUIT_RESET_SECONDS", "300")))
 
+    admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
+
     def __post_init__(self) -> None:
         weights = (
             self.ensemble_weight_rf,
