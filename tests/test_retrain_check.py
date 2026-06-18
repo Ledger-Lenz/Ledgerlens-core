@@ -35,6 +35,7 @@ class TestRetrainCheckCommand:
     def test_retrain_check_skipped_when_no_drift(self, monkeypatch, tmp_path):
         """retrain-check should skip retraining when drift is not detected."""
         metadata_dir = tmp_path / "models"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
         training_csv = metadata_dir / "training_reference.csv"
         pd.DataFrame({"feature_a": [1.0, 2.0], "feature_b": [3.0, 4.0]}).to_csv(training_csv, index=False)
         self._write_training_metadata(metadata_dir, training_csv)
@@ -57,6 +58,7 @@ class TestRetrainCheckCommand:
     def test_retrain_check_triggered_on_drift(self, monkeypatch, tmp_path):
         """retrain-check should trigger retraining when drift is detected."""
         metadata_dir = tmp_path / "models"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
         training_csv = metadata_dir / "training_reference.csv"
         pd.DataFrame({
             "feature_a": np.random.normal(0, 1, 50),
