@@ -49,6 +49,11 @@ async def _deliver(
     subscriber,
     db_path: str | None = None,
 ) -> bool:
+    from config.telemetry import get_tracer
+    from api.metrics import webhook_deliveries_total
+
+    tracer = get_tracer("ledgerlens.webhook")
+
     score_data = json.loads(delivery.payload_json)
     payload = build_webhook_payload(score_data)
     body = json.dumps(payload).encode()
@@ -60,24 +65,34 @@ async def _deliver(
         "X-LedgerLens-Timestamp": str(int(datetime.now(timezone.utc).timestamp())),
     }
 
-    try:
-        resp = await client.post(
-            subscriber.url,
-            content=body,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        mark_delivered(delivery.id, resp.status_code, db_path=db_path)
-        return True
-    except httpx.HTTPStatusError as exc:
-        error = f"HTTP {exc.response.status_code}"
-        mark_failed(delivery.id, error, db_path=db_path)
-        return False
-    except Exception as exc:
-        error = str(exc)[:200]
-        mark_failed(delivery.id, error, db_path=db_path)
-        return False
+    with tracer.start_as_current_span("webhook.deliver") as span:
+        span.set_attribute("webhook.subscriber_id", str(delivery.subscriber_id))
+        span.set_attribute("webhook.attempt", delivery.attempt_count)
+
+        try:
+            resp = await client.post(
+                subscriber.url,
+                content=body,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            mark_delivered(delivery.id, resp.status_code, db_path=db_path)
+            webhook_deliveries_total.labels(result="delivered").inc()
+            return True
+        except httpx.HTTPStatusError as exc:
+            error = f"HTTP {exc.response.status_code}"
+            mark_failed(delivery.id, error, db_path=db_path)
+            # Check if now dead-lettered
+            _result = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            webhook_deliveries_total.labels(result=_result).inc()
+            return False
+        except Exception as exc:
+            error = str(exc)[:200]
+            mark_failed(delivery.id, error, db_path=db_path)
+            _result = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            webhook_deliveries_total.labels(result=_result).inc()
+            return False
 
 
 async def run_delivery_worker(

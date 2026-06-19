@@ -14,8 +14,11 @@ import logging
 
 import typer
 
+from config.logging_config import configure_logging
+
+configure_logging("ledgerlens-cli")
+
 app = typer.Typer(help="LedgerLens detection engine CLI")
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
 
 

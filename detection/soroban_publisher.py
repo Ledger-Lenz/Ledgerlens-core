@@ -104,29 +104,61 @@ class SorobanPublisher:
         Raises SorobanSubmissionError on unrecoverable failure.
         Raises SorobanCircuitOpenError when the circuit breaker is open.
         """
-        try:
-            self._check_circuit()
-        except SorobanCircuitOpenError:
-            save_submission(score.wallet, score.asset_pair, score.score, "skipped", error_message="Circuit breaker open")
-            raise
+        from config.correlation import get_correlation_id, mask_wallet
+        from config.telemetry import get_tracer
+        from api.metrics import (
+            soroban_submissions_total,
+            soroban_submission_latency_seconds,
+            circuit_breaker_open_total,
+        )
 
-        if dry_run:
-            save_submission(score.wallet, score.asset_pair, score.score, "skipped")
-            return None
+        tracer = get_tracer("ledgerlens.soroban")
 
-        server = SorobanServer(self._soroban_rpc_url)
-        try:
-            tx_hash = self._execute_with_retries(server, score)
-            save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash)
-            return tx_hash
-        except SorobanSubmissionError:
-            save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Submission failed after retries")
-            raise
-        except Exception:
-            save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error")
-            raise
-        finally:
-            server.close()
+        with tracer.start_as_current_span("soroban.submit_score") as span:
+            span.set_attribute("soroban.wallet", mask_wallet(score.wallet))
+            span.set_attribute("soroban.score", score.score)
+            span.set_attribute("soroban.dry_run", dry_run)
+
+            cid = get_correlation_id()
+
+            try:
+                self._check_circuit()
+            except SorobanCircuitOpenError:
+                circuit_breaker_open_total.inc()
+                save_submission(score.wallet, score.asset_pair, score.score, "skipped", error_message="Circuit breaker open")
+                logger.warning(
+                    "Soroban circuit breaker open, skipping submission",
+                    extra={"correlation_id": cid, "wallet": mask_wallet(score.wallet)},
+                )
+                raise
+
+            if dry_run:
+                save_submission(score.wallet, score.asset_pair, score.score, "skipped")
+                soroban_submissions_total.labels(status="skipped").inc()
+                return None
+
+            server = SorobanServer(self._soroban_rpc_url)
+            _t = time.time()
+            try:
+                tx_hash = self._execute_with_retries(server, score)
+                soroban_submission_latency_seconds.observe(time.time() - _t)
+                soroban_submissions_total.labels(status="submitted").inc()
+                save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash)
+                logger.info(
+                    "Soroban submission succeeded",
+                    extra={"correlation_id": cid, "wallet": mask_wallet(score.wallet), "tx_hash": tx_hash},
+                )
+                return tx_hash
+            except SorobanSubmissionError:
+                soroban_submissions_total.labels(status="failed").inc()
+                save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Submission failed after retries")
+                raise
+            except Exception:
+                soroban_submissions_total.labels(status="failed").inc()
+                save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error")
+                raise
+            finally:
+                server.close()
 
     def submit_batch(self, scores: list[RiskScore], dry_run: bool = False) -> dict[str, str]:
         """Submit a list of scores.

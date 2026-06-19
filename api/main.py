@@ -23,10 +23,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from api.auth import require_admin_key
+from api.metrics import api_request_duration_seconds, metrics_response
+from config.correlation import CorrelationIDMiddleware
+from config.logging_config import configure_logging
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.risk_score import RiskScore
@@ -44,6 +47,14 @@ from detection.webhook_registry import deactivate_subscriber, list_subscribers, 
 
 logger = logging.getLogger("ledgerlens.api")
 
+# Module-level soroban circuit status — updated by the publisher when circuit opens/resets
+_soroban_circuit_open: bool = False
+
+
+def set_soroban_circuit_open(open: bool) -> None:  # noqa: A002
+    global _soroban_circuit_open
+    _soroban_circuit_open = open
+
 # ---------------------------------------------------------------------------
 # Model loading — done once at startup so request handlers stay fast.
 # ---------------------------------------------------------------------------
@@ -54,6 +65,15 @@ _models: dict = {}
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; release nothing at shutdown."""
+    configure_logging("ledgerlens-api")
+
+    # Instrument FastAPI with OTel
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(application)
+    except Exception as exc:
+        logger.warning("FastAPI OTel instrumentation unavailable: %s", exc)
+
     global _models
     try:
         from detection.model_inference import load_models
@@ -72,6 +92,7 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+app.add_middleware(CorrelationIDMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_allowed_origins),
@@ -89,6 +110,13 @@ class WebhookCreate(BaseModel):
     asset_pair_filter: str | None = None
 
 
+@app.get("/metrics")
+def metrics_endpoint() -> Response:
+    """Prometheus metrics scrape endpoint (no auth — standard scrape)."""
+    body, content_type = metrics_response()
+    return Response(content=body, media_type=content_type)
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     """Returns 200 when healthy, 503 when any component check fails.
@@ -96,14 +124,18 @@ def health() -> JSONResponse:
     Checks:
     - DB connectivity: executes SELECT 1 via the existing _connect helper.
     - Model files: each expected .joblib file exists and is non-empty.
+    - pipeline_last_run_at: timestamp of the last completed pipeline run.
+    - soroban_circuit_status: "closed" or "open".
+    - webhook_dead_letter_count: integer count of unresolved dead letters.
+    - drift_status: "ok" or "drifted".
 
-    The response body names every component but never leaks local filesystem
-    paths — errors are logged server-side at ERROR level.
+    Returns 503 when any check fails or when soroban_circuit_status=="open",
+    drift_status=="drifted", or webhook_dead_letter_count > 0.
     """
     from detection.model_inference import _MODEL_FILENAMES
     from detection.storage import _connect
 
-    status: dict[str, str] = {}
+    status: dict = {}
     healthy = True
 
     # --- DB check ---
@@ -116,7 +148,7 @@ def health() -> JSONResponse:
         status["db"] = "error: database unreachable"
         healthy = False
 
-    # --- Model files check (existence + non-zero size only; no deserialization) ---
+    # --- Model files check ---
     missing = [
         name
         for name, filename in _MODEL_FILENAMES.items()
@@ -127,6 +159,39 @@ def health() -> JSONResponse:
         healthy = False
     else:
         status["models"] = "ok"
+
+    # --- Pipeline last run ---
+    try:
+        with _connect() as conn:
+            row = conn.execute("SELECT MAX(timestamp) FROM risk_scores").fetchone()
+        status["pipeline_last_run_at"] = row[0] if row and row[0] else None
+    except Exception:
+        status["pipeline_last_run_at"] = None
+
+    # --- Soroban circuit status ---
+    status["soroban_circuit_status"] = "open" if _soroban_circuit_open else "closed"
+    if _soroban_circuit_open:
+        healthy = False
+
+    # --- Webhook dead letter count ---
+    try:
+        dead_count = len(get_dead_letters())
+        status["webhook_dead_letter_count"] = dead_count
+        if dead_count > 0:
+            healthy = False
+    except Exception:
+        status["webhook_dead_letter_count"] = 0
+
+    # --- Drift status ---
+    try:
+        reports = get_drift_reports(limit=1)
+        if reports and reports[0].get("drift_detected"):
+            status["drift_status"] = "drifted"
+            healthy = False
+        else:
+            status["drift_status"] = "ok"
+    except Exception:
+        status["drift_status"] = "ok"
 
     status["status"] = "ok" if healthy else "degraded"
     http_status = 200 if healthy else 503

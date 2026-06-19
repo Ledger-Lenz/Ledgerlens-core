@@ -10,12 +10,15 @@ the other repos in the org.
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 import pandas as pd
 
 from config.settings import settings
+from config.correlation import set_correlation_id
+from config.telemetry import get_tracer
 from detection.cross_pair_engine import (
     build_volume_time_series,
     find_correlated_pairs,
@@ -66,140 +69,159 @@ def run(
     The resulting cross-pair features are included in each account's
     feature vector.
     """
-    asset_pairs = asset_pairs or [
-        (None, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
-    ]
-    models = load_models()
-    scores: list[RiskScore] = []
-    scored_features: list[dict] = []
-    scored_wallets: list[str] = []
-    scored_pairs: list[str] = []
+    # Assign a fresh correlation ID for this pipeline pass
+    set_correlation_id(str(uuid.uuid4()))
 
-    # Pre-load all trades when running in multi-pair mode
-    trades_by_pair: dict[str, pd.DataFrame] = {}
-    correlated_pairs: list[tuple[str, str, float]] = []
-    cross_pair_wallets_map: dict[str, list[str]] = {}
+    from api.metrics import pipeline_run_duration_seconds, wallets_scored_total, scoring_latency_seconds
 
-    if multi_pair:
-        for base_asset, counter_asset in asset_pairs:
-            pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
-            trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
-            if not trades.empty:
-                trades_by_pair[pair_key] = trades
+    tracer = get_tracer("ledgerlens.pipeline")
+    _t_start = time.monotonic()
 
-        if trades_by_pair:
-            volume_matrix = build_volume_time_series(trades_by_pair)
-            correlated_pairs = find_correlated_pairs(volume_matrix)
-            cross_pair_wallets_map = find_cross_pair_wallets(trades_by_pair, correlated_pairs)
+    with tracer.start_as_current_span("pipeline.run") as span:
+        asset_pairs = asset_pairs or [
+            (None, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+        ]
+        span.set_attribute("pipeline.pair_count", len(asset_pairs))
 
-            shared_counts: dict[tuple[str, str], int] = {}
-            for pa, pb, _ in correlated_pairs:
-                count = sum(
-                    1 for w_pairs in cross_pair_wallets_map.values()
-                    if pa in w_pairs and pb in w_pairs
-                )
-                shared_counts[(pa, pb)] = count
-            save_pair_correlations(correlated_pairs, "spearman", shared_counts)
-            logger.info("Found %d correlated pair combinations", len(correlated_pairs))
+        models = load_models()
+        scores: list[RiskScore] = []
+        scored_features: list[dict] = []
+        scored_wallets: list[str] = []
+        scored_pairs: list[str] = []
 
-    for base_asset, counter_asset in asset_pairs:
-        pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
+        # Pre-load all trades when running in multi-pair mode
+        trades_by_pair: dict[str, pd.DataFrame] = {}
+        correlated_pairs: list[tuple[str, str, float]] = []
+        cross_pair_wallets_map: dict[str, list[str]] = {}
 
         if multi_pair:
-            trades = trades_by_pair.get(pair_key, pd.DataFrame())
-        else:
-            trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+            for base_asset, counter_asset in asset_pairs:
+                pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
+                trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+                if not trades.empty:
+                    trades_by_pair[pair_key] = trades
 
-        if trades.empty:
-            logger.info("No trades found for %s/%s", base_asset, counter_asset)
-            continue
+            if trades_by_pair:
+                volume_matrix = build_volume_time_series(trades_by_pair)
+                correlated_pairs = find_correlated_pairs(volume_matrix)
+                cross_pair_wallets_map = find_cross_pair_wallets(trades_by_pair, correlated_pairs)
 
-        as_of = pd.Timestamp(trades["ledger_close_time"].max())
-        accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
-        accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
-        account_metadata = load_account_metadata(list(accounts))
-        since = as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days)
-        all_order_book_events = load_order_book_events_for_pair(
-            base_asset,
-            counter_asset,
-            since=since,
-        )
-        order_book_events = pd.DataFrame([e.model_dump() for e in all_order_book_events])
-
-        if "trade_type" in trades.columns:
-            pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
-            save_liquidity_pool_trades(pool_trades)
-
-        path_payments = load_path_payments_for_accounts(list(accounts), since)
-        save_path_payments(path_payments)
-        circular_routes = detect_atomic_circular_routes(path_payments)
-        save_circular_routes(circular_routes)
-
-        for account in accounts:
-            features = build_feature_vector(
-                trades,
-                account,
-                as_of,
-                order_book_events=order_book_events,
-                account_metadata=account_metadata,
-                trades_by_pair=trades_by_pair if multi_pair else None,
-                correlated_pairs=correlated_pairs if multi_pair else None,
-                cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
-                path_payments=path_payments,
-            )
-            probability, confidence = score_feature_vector(models, features)
-
-            score = RiskScore.combine(
-                wallet=account,
-                asset_pair=pair_key,
-                benford_mad=features.get("benford_mad_24h", 0.0),
-                benford_mad_threshold=settings.benford_mad_threshold,
-                ml_probability=probability,
-                ml_confidence=confidence,
-            )
-            scores.append(score)
-            scored_features.append(features)
-            scored_wallets.append(account)
-            scored_pairs.append(pair_key)
-
-    logger.info("Computed %d risk scores", len(scores))
-
-    # Record scored features for drift detection
-    if scored_features:
-        try:
-            record_scored_features(scored_features, scored_wallets, scored_pairs)
-        except Exception:
-            logger.exception("Failed to record scored features for drift detection")
-
-    save_scores(scores)
-
-    # Persist feature vectors and compute+cache SHAP values using XGBoost model.
-    if scored_features:
-        feature_vec_rows = [
-            {"wallet": w, "asset_pair": p, "features": f}
-            for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
-        ]
-        save_feature_vectors(feature_vec_rows)
-        xgb_model = models.get("xgboost")
-        if xgb_model is not None:
-            from detection.storage import save_shap_values
-
-            for row in feature_vec_rows:
-                try:
-                    explanation = explain_score(xgb_model, row["features"])
-                    top = top_contributing_features(explanation, n=5)
-                    shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
-                    save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
-                except Exception:
-                    logger.exception(
-                        "Failed to compute SHAP for wallet=%s pair=%s",
-                        row["wallet"],
-                        row["asset_pair"],
+                shared_counts: dict[tuple[str, str], int] = {}
+                for pa, pb, _ in correlated_pairs:
+                    count = sum(
+                        1 for w_pairs in cross_pair_wallets_map.values()
+                        if pa in w_pairs and pb in w_pairs
                     )
+                    shared_counts[(pa, pb)] = count
+                save_pair_correlations(correlated_pairs, "spearman", shared_counts)
+                logger.info("Found %d correlated pair combinations", len(correlated_pairs))
 
-    _enqueue_webhook_alerts(scores)
+        for base_asset, counter_asset in asset_pairs:
+            pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
 
-    _submit_on_chain(scores, no_submit=no_submit)
+            if multi_pair:
+                trades = trades_by_pair.get(pair_key, pd.DataFrame())
+            else:
+                trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+
+            if trades.empty:
+                logger.info("No trades found for %s/%s", base_asset, counter_asset)
+                continue
+
+            as_of = pd.Timestamp(trades["ledger_close_time"].max())
+            accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
+            accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
+            account_metadata = load_account_metadata(list(accounts))
+            since = as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days)
+            all_order_book_events = load_order_book_events_for_pair(
+                base_asset,
+                counter_asset,
+                since=since,
+            )
+            order_book_events = pd.DataFrame([e.model_dump() for e in all_order_book_events])
+
+            if "trade_type" in trades.columns:
+                pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+                save_liquidity_pool_trades(pool_trades)
+
+            path_payments = load_path_payments_for_accounts(list(accounts), since)
+            save_path_payments(path_payments)
+            circular_routes = detect_atomic_circular_routes(path_payments)
+            save_circular_routes(circular_routes)
+
+            for account in accounts:
+                _t_acct = time.monotonic()
+                features = build_feature_vector(
+                    trades,
+                    account,
+                    as_of,
+                    order_book_events=order_book_events,
+                    account_metadata=account_metadata,
+                    trades_by_pair=trades_by_pair if multi_pair else None,
+                    correlated_pairs=correlated_pairs if multi_pair else None,
+                    cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
+                    path_payments=path_payments,
+                )
+                probability, confidence = score_feature_vector(models, features)
+
+                score = RiskScore.combine(
+                    wallet=account,
+                    asset_pair=pair_key,
+                    benford_mad=features.get("benford_mad_24h", 0.0),
+                    benford_mad_threshold=settings.benford_mad_threshold,
+                    ml_probability=probability,
+                    ml_confidence=confidence,
+                )
+                scores.append(score)
+                scored_features.append(features)
+                scored_wallets.append(account)
+                scored_pairs.append(pair_key)
+
+                _elapsed = time.monotonic() - _t_acct
+                scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
+                _result = "above_threshold" if score.score >= settings.risk_score_threshold else "below_threshold"
+                wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
+
+        logger.info("Computed %d risk scores", len(scores))
+
+        # Record scored features for drift detection
+        if scored_features:
+            try:
+                record_scored_features(scored_features, scored_wallets, scored_pairs)
+            except Exception:
+                logger.exception("Failed to record scored features for drift detection")
+
+        save_scores(scores)
+
+        # Persist feature vectors and compute+cache SHAP values using XGBoost model.
+        if scored_features:
+            feature_vec_rows = [
+                {"wallet": w, "asset_pair": p, "features": f}
+                for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
+            ]
+            save_feature_vectors(feature_vec_rows)
+            xgb_model = models.get("xgboost")
+            if xgb_model is not None:
+                from detection.storage import save_shap_values
+
+                for row in feature_vec_rows:
+                    try:
+                        explanation = explain_score(xgb_model, row["features"])
+                        top = top_contributing_features(explanation, n=5)
+                        shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
+                        save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
+                    except Exception:
+                        logger.exception(
+                            "Failed to compute SHAP for wallet=%s pair=%s",
+                            row["wallet"],
+                            row["asset_pair"],
+                        )
+
+        _enqueue_webhook_alerts(scores)
+
+        _submit_on_chain(scores, no_submit=no_submit)
+
+        pipeline_run_duration_seconds.observe(time.monotonic() - _t_start)
 
     return scores
 

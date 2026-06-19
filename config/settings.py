@@ -43,6 +43,12 @@ class Settings:
         )
     )
     admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
+    webhook_encryption_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_WEBHOOK_ENCRYPTION_KEY", ""))
+    otel_exporter_otlp_endpoint: str = field(default_factory=lambda: os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""))
+    otel_exporter_otlp_certificate: str = field(default_factory=lambda: os.getenv("OTEL_EXPORTER_OTLP_CERTIFICATE", ""))
+    otel_exporter_otlp_client_key: str = field(default_factory=lambda: os.getenv("OTEL_EXPORTER_OTLP_CLIENT_KEY", ""))
+    otel_exporter_otlp_client_certificate: str = field(default_factory=lambda: os.getenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", ""))
+    cursor_path: str = field(default_factory=lambda: os.getenv("CURSOR_PATH", "./horizon_cursor.txt"))
 
     def __post_init__(self) -> None:
         weights = (
