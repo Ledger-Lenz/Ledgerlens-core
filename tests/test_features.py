@@ -8,6 +8,7 @@ from detection.feature_engineering import (
     build_feature_vector,
     counterparty_concentration_ratio,
     funding_source_similarity_score,
+    graph_ring_features,
     intra_minute_clustering_coefficient,
     network_centrality,
     off_hours_activity_ratio,
@@ -250,6 +251,43 @@ def test_build_feature_vector_returns_all_feature_names():
     features = build_feature_vector(trades, "A", as_of)
 
     assert set(features.keys()) == set(FEATURE_NAMES)
+    assert "wash_ring_membership" in features
+    assert "wash_ring_size" in features
+    assert "cycle_volume_ratio" in features
+    assert "timing_tightness_score" in features
+
+
+def test_graph_ring_features_zero_for_non_member():
+    assert graph_ring_features("D", {}) == {
+        "wash_ring_membership": 0.0,
+        "wash_ring_size": 0.0,
+        "cycle_volume_ratio": 0.0,
+        "timing_tightness_score": 0.0,
+    }
+
+
+def test_graph_ring_features_for_ring_member():
+    from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
+
+    base = pd.Timestamp("2026-06-12T00:00:00Z")
+    trades = pd.DataFrame(
+        [
+            {"ledger_close_time": base, "base_account": "A", "counter_account": "B", "base_amount": 100.0},
+                {"ledger_close_time": base + pd.Timedelta(seconds=1), "base_account": "B", "counter_account": "C", "base_amount": 100.0},
+                {"ledger_close_time": base + pd.Timedelta(seconds=2), "base_account": "C", "counter_account": "A", "base_amount": 100.0},
+
+        ]
+    )
+    graph = build_transaction_graph(trades)
+    rings = find_wash_rings(graph)
+    membership = build_ring_membership_index(rings, trades=trades)
+
+    features = graph_ring_features("A", membership)
+
+    assert features["wash_ring_membership"] == 1.0
+    assert features["wash_ring_size"] == 3.0
+    assert features["cycle_volume_ratio"] == 1.0
+    assert features["timing_tightness_score"] == 1.0
 
 
 # ---------------------------------------------------------------------------

@@ -51,6 +51,10 @@ WALLET_GRAPH_FEATURE_NAMES = [
     "funding_source_similarity_score",
     "network_centrality",
     "account_age_days",
+    "wash_ring_membership",
+    "wash_ring_size",
+    "cycle_volume_ratio",
+    "timing_tightness_score",
 ]
 
 CROSS_PAIR_FEATURE_NAMES = [
@@ -293,6 +297,29 @@ def account_age_days(account: str, as_of: pd.Timestamp, account_metadata: dict[s
     return float((as_of - pd.Timestamp(created_at)).total_seconds() / 86400)
 
 
+def graph_ring_features(account: str, ring_membership: dict[str, dict] | None) -> dict:
+    """Compute graph-structural wash-ring features for `account`."""
+    zero = {
+        "wash_ring_membership": 0.0,
+        "wash_ring_size": 0.0,
+        "cycle_volume_ratio": 0.0,
+        "timing_tightness_score": 0.0,
+    }
+    if not ring_membership:
+        return zero
+
+    metadata = ring_membership.get(account)
+    if metadata is None:
+        return zero
+
+    return {
+        "wash_ring_membership": 1.0,
+        "wash_ring_size": float(metadata.get("wash_ring_size", metadata.get("ring_size", 0.0))),
+        "cycle_volume_ratio": float(metadata.get("cycle_volume_ratio", 0.0)),
+        "timing_tightness_score": float(metadata.get("timing_tightness_score", 0.0)),
+    }
+
+
 def cross_pair_features(
     account: str,
     trades_by_pair: dict[str, pd.DataFrame] | None,
@@ -505,6 +532,7 @@ def build_feature_vector(
             "account_age_days": account_age_days(account, as_of, account_metadata),
         }
     )
+    features.update(graph_ring_features(account, ring_membership))
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))

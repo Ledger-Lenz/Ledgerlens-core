@@ -55,6 +55,7 @@ graph TB
     subgraph Detection["Layer 2: Detection Engine"]
         BENF[benford_engine.py]
         FEAT[feature_engineering.py]
+        GRAPH[graph_engine.py]
         TRAIN[model_training.py]
         INFER[model_inference.py]
         SHAP[shap_explainer.py]
@@ -79,6 +80,8 @@ graph TB
     STREAM --> FEAT
     HIST --> FEAT
     FEAT --> BENF
+    FEAT --> GRAPH
+    GRAPH --> FEAT
     FEAT --> TRAIN
     TRAIN --> INFER
     BENF --> SCORE
@@ -101,6 +104,7 @@ graph TB
 - **ingestion/account_loader.py**: Account funding-source and creation-time metadata for wallet-graph features
 - **ingestion/data_models.py**: Pydantic schemas for trade, asset, and order-book records
 - **detection/benford_engine.py**: Benford's Law feature computation (chi-square, Z-score, MAD)
+- **detection/graph_engine.py**: Directed trade graph construction, SCC wash-ring discovery, and ring membership indexing
 - **detection/feature_engineering.py**: On-chain ML feature extraction
 - **detection/risk_score.py**: Shared `RiskScore` schema and Benford+ML score blending
 - **detection/model_training.py**: Trains the Random Forest / XGBoost / LightGBM ensemble
@@ -125,12 +129,30 @@ Benford signals alone are insufficient (legitimate market makers can also be non
 
 ## Machine Learning Layer
 
-### Feature groups (26 features, see `detection/feature_engineering.FEATURE_NAMES`)
+### Feature groups (35 baseline features, see `detection/feature_engineering.FEATURE_NAMES`)
 
 - **Benford features (15)**: Chi-square, Z-score, and MAD across 5 rolling windows (1h, 4h, 24h, 7d, 30d)
 - **Trade pattern features (4)**: counterparty concentration ratio, round-trip trade frequency, self-matching rate, order cancellation rate
 - **Volume and timing features (4)**: volume-to-unique-counterparty ratio, intra-minute clustering, off-hours activity ratio, volume spike frequency
-- **Wallet graph features (3)**: funding source similarity, network centrality within the trading graph, account age at time of activity
+- **Wallet graph features (7)**: funding source similarity, network centrality within the trading graph, account age, wash-ring membership, largest ring size, cycle volume ratio, and timing tightness score
+- **Cross-pair features (5)**: cross-pair activity count, synchrony score, burst overlap ratio, shared wallet cluster size, and volume concentration
+
+## Graph-Based Ring Detection
+
+`detection/graph_engine.py` builds a directed weighted trade graph where nodes are Stellar accounts and edges point from seller/base account to buyer/counter account. Each edge stores aggregate `total_volume` and `trade_count`, and preserves trade timestamps for timing analysis.
+
+Wash-ring discovery uses Tarjan's strongly connected components (SCCs) rather than pairwise thresholds. Any SCC with at least three accounts is treated as a candidate wash ring. For SCCs up to `max_ring_size`, the detector evaluates simple cycles and reports the highest bottleneck cycle volume. Larger SCCs are not enumerated; they are returned as one `truncated=True` descriptor with a conservative `cycle_volume = total_volume * 0.5` estimate so operators still see the risk without risking Johnson-style exponential cycle enumeration.
+
+The four graph-structural ML features are:
+
+| Feature | Meaning |
+|---|---|
+| `wash_ring_membership` | `1.0` when the account belongs to any detected SCC ring, else `0.0` |
+| `wash_ring_size` | Size of the largest ring containing the account, else `0.0` |
+| `cycle_volume_ratio` | Fraction of the account's outgoing volume explained by complete ring cycles |
+| `timing_tightness_score` | `1 / (1 + timing_tightness)` for the account's tightest ring, else `0.0` |
+
+The local API exposes the latest detected rings with `GET /rings`. Each response row includes `accounts`, `total_volume`, `cycle_volume`, and `detected_at`, plus ring metadata such as average trade count, timing tightness, and truncation status.
 
 ### Models
 
@@ -235,6 +257,7 @@ ledgerlens-core/
 │
 ├── detection/
 │   ├── benford_engine.py             ← Benford's Law feature computation
+│   ├── graph_engine.py               ← Directed trade graph and SCC ring detection
 │   ├── feature_engineering.py        ← On-chain ML feature extraction
 │   ├── dataset.py                    ← Labelled feature dataset builder (training)
 │   ├── model_training.py             ← Train ensemble classifiers
@@ -293,8 +316,8 @@ This scores each wallet/asset-pair combination and writes the resulting
 python cli.py serve --reload
 ```
 
-Exposes `/health`, `/scores`, `/scores/{wallet}`, `/alerts`, and
-`/assets/risk-ranking` over the locally stored `RiskScore` records — a
+Exposes `/health`, `/scores`, `/scores/{wallet}`, `/alerts`, `/assets/risk-ranking`,
+`/correlations`, and `/rings` over the locally stored `RiskScore` records — a
 stand-in for `ledgerlens-api` during local development.
 
 #### CORS configuration
@@ -656,7 +679,8 @@ pytest
 
 Covers:
 - ✅ Benford's Law feature computation
-- ✅ ML feature engineering (trade pattern, volume/timing features)
+- ✅ ML feature engineering (trade pattern, volume/timing, graph-ring features)
+- ✅ Graph-based wash-ring discovery and ring storage
 - ✅ Synthetic data generation and labelled dataset building
 - ✅ RiskScore combination logic and SQLite storage
 - ✅ Local API and CLI

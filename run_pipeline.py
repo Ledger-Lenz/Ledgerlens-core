@@ -23,6 +23,7 @@ from detection.cross_pair_engine import (
 )
 from detection.drift_monitor import record_scored_features
 from detection.feature_engineering import build_feature_vector
+from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.risk_score import RiskScore
@@ -115,6 +116,10 @@ def run(
             continue
 
         as_of = pd.Timestamp(trades["ledger_close_time"].max())
+        graph = build_transaction_graph(trades)
+        rings = find_wash_rings(graph)
+        all_rings.extend(rings)
+        ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
         account_metadata = load_account_metadata(list(accounts))
@@ -172,6 +177,7 @@ def run(
             logger.exception("Failed to record scored features for drift detection")
 
     save_scores(scores)
+    save_rings(all_rings)
 
     # Persist feature vectors and compute+cache SHAP values using XGBoost model.
     if scored_features:
@@ -264,6 +270,7 @@ async def async_run(
     ]
     models = load_models()
     scores: list[RiskScore] = []
+    all_rings: list[dict] = []
 
     scored_features: list[dict] = []
     scored_wallets: list[str] = []
@@ -345,6 +352,7 @@ async def async_run(
             logger.exception("Failed to record scored features for drift detection")
 
     save_scores(scores)
+    save_rings(all_rings)
     _enqueue_webhook_alerts(scores)
     _submit_on_chain(scores)
 

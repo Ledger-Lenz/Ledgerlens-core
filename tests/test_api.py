@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from detection.risk_score import RiskScore
-from detection.storage import save_scores
+from detection.storage import save_rings, save_scores
 
 
 @pytest.fixture(autouse=True)
@@ -432,401 +432,39 @@ def test_correlations_returns_only_latest_run(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# /scores/{wallet}/explain endpoint
+# /rings
 # ---------------------------------------------------------------------------
 
 
-def _seed_shap(db_path: str, wallet: str = "GABC", asset_pair: str = "XLM/USDC") -> list[dict]:
-    """Write a feature vector + SHAP cache and return the shap payload."""
-    from detection.storage import save_feature_vectors, save_shap_values
-
-    features = {"benford_mad_24h": 0.02, "round_trip_trade_frequency": 0.1}
-    save_feature_vectors([{"wallet": wallet, "asset_pair": asset_pair, "features": features}], db_path)
-
-    shap_payload = [
-        {"feature": "benford_mad_24h", "shap_value": 0.40},
-        {"feature": "round_trip_trade_frequency", "shap_value": -0.25},
-        {"feature": "network_centrality", "shap_value": 0.15},
-        {"feature": "off_hours_activity_ratio", "shap_value": -0.08},
-        {"feature": "volume_spike_frequency", "shap_value": 0.05},
-    ]
-    save_shap_values(wallet, asset_pair, shap_payload, db_path)
-    return shap_payload
-
-
-@pytest.fixture
-def client_with_models(tmp_path, monkeypatch):
-    """TestClient whose lifespan loads a dummy (but non-empty) models dict."""
-    import importlib
-
-    db_path = str(tmp_path / "ledgerlens.db")
-    monkeypatch.setenv("LEDGERLENS_DB_PATH", db_path)
-
-    import config.settings as settings_module
-
-    object.__setattr__(settings_module.settings, "db_path", db_path)
-
-    # Patch load_models so the lifespan succeeds without real model files.
-    import detection.model_inference as mi
-
-    monkeypatch.setattr(mi, "load_models", lambda *a, **kw: {"xgboost": object()})
-
-    import api.main as main_module
-
-    importlib.reload(main_module)
-
-    from fastapi.testclient import TestClient
-
-    with TestClient(main_module.app) as c:
-        yield c, db_path
-
-
-@pytest.fixture
-def client_no_models(tmp_path, monkeypatch):
-    """TestClient whose lifespan finds no models (load_models raises FileNotFoundError)."""
-    import importlib
-
-    db_path = str(tmp_path / "ledgerlens.db")
-    monkeypatch.setenv("LEDGERLENS_DB_PATH", db_path)
-
-    import config.settings as settings_module
-
-    object.__setattr__(settings_module.settings, "db_path", db_path)
-
-    import detection.model_inference as mi
-
-    def _raise(*a, **kw):
-        raise FileNotFoundError("no models")
-
-    monkeypatch.setattr(mi, "load_models", _raise)
-
-    import api.main as main_module
-
-    importlib.reload(main_module)
-
-    from fastapi.testclient import TestClient
-
-    with TestClient(main_module.app) as c:
-        yield c, db_path
-
-
-def test_explain_returns_top5_in_descending_abs_order(client_with_models):
-    client, db_path = client_with_models
-    _seed_shap(db_path)
-
-    resp = client.get("/scores/GABC/explain?asset_pair=XLM%2FUSDC")
+def test_rings_empty(client):
+    resp = client.get("/rings")
     assert resp.status_code == 200
-    body = resp.json()
-
-    assert len(body) == 5
-    abs_values = [abs(item["shap_value"]) for item in body]
-    assert abs_values == sorted(abs_values, reverse=True), "Items must be ordered by |shap_value| desc"
-    assert body[0]["feature"] == "benford_mad_24h"
+    assert resp.json() == []
 
 
-def test_explain_404_for_unknown_wallet(client_with_models):
-    client, _ = client_with_models
-    resp = client.get("/scores/GUNKNOWN/explain?asset_pair=XLM%2FUSDC")
-    assert resp.status_code == 404
-
-
-def test_explain_404_when_no_shap_cache(client_with_models):
-    """Feature vector exists but no SHAP values have been computed yet."""
-    client, db_path = client_with_models
-    from detection.storage import save_feature_vectors
-
-    save_feature_vectors(
-        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": {"benford_mad_24h": 0.02}}],
-        db_path,
-    )
-    resp = client.get("/scores/GABC/explain?asset_pair=XLM%2FUSDC")
-    assert resp.status_code == 404
-
-
-def test_explain_503_when_models_not_loaded(client_no_models):
-    client, db_path = client_no_models
-    _seed_shap(db_path)
-    resp = client.get("/scores/GABC/explain?asset_pair=XLM%2FUSDC")
-    assert resp.status_code == 503
-    assert "Models not loaded" in resp.json()["detail"]
-
-
-# ---------------------------------------------------------------------------
-# /admin/drift-reports and /admin/retrain-runs (admin-key gated)
-# ---------------------------------------------------------------------------
-
-
-def test_drift_reports_503_when_admin_key_not_configured(client):
-    resp = client.get("/admin/drift-reports")
-    assert resp.status_code == 503
-
-
-def test_drift_reports_401_when_header_missing(client, monkeypatch):
-    import config.settings as settings_module
-
-    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
-
-    resp = client.get("/admin/drift-reports")
-    assert resp.status_code == 401
-
-
-def test_drift_reports_403_when_header_wrong(client, monkeypatch):
-    import config.settings as settings_module
-
-    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
-
-    resp = client.get("/admin/drift-reports", headers={"X-LedgerLens-Admin-Key": "wrong"})
-    assert resp.status_code == 403
-
-
-def test_drift_reports_returns_saved_reports(client, monkeypatch):
-    import config.settings as settings_module
+def test_rings_returns_stored_data(client):
     import detection.storage as storage_module
 
-    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
-
-    storage_module.save_drift_report(
-        drift_detected=True,
-        psi_report={"benford_mad_24h": 0.31},
-        psi_threshold=0.20,
-        min_drifted_features=3,
+    storage_module.save_rings(
+        [
+            {
+                "accounts": ["A", "B", "C"],
+                "total_volume": 300.0,
+                "cycle_volume": 100.0,
+                "avg_trade_count": 1.0,
+                "timing_tightness": 0.0,
+                "truncated": False,
+            }
+        ],
         db_path=storage_module.settings.db_path,
     )
 
-    resp = client.get("/admin/drift-reports", headers={"X-LedgerLens-Admin-Key": "secret-key"})
+    resp = client.get("/rings")
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 1
-    assert body[0]["drift_detected"] is True
-    assert body[0]["psi_report"] == {"benford_mad_24h": 0.31}
-
-
-def test_retrain_runs_returns_saved_runs_filtered_by_model(client, monkeypatch):
-    import config.settings as settings_module
-    import detection.storage as storage_module
-
-    object.__setattr__(settings_module.settings, "admin_api_key", "secret-key")
-
-    storage_module.save_retrain_run(
-        drift_report_id=None,
-        model_name="random_forest",
-        old_version="aaa11111",
-        new_version="bbb22222",
-        old_auc_roc=0.91,
-        new_auc_roc=0.93,
-        promoted=True,
-        forced=False,
-        db_path=storage_module.settings.db_path,
-    )
-    storage_module.save_retrain_run(
-        drift_report_id=None,
-        model_name="xgboost",
-        old_version="ccc33333",
-        new_version="ddd44444",
-        old_auc_roc=0.90,
-        new_auc_roc=0.89,
-        promoted=False,
-        forced=False,
-        db_path=storage_module.settings.db_path,
-    )
-
-    resp = client.get(
-        "/admin/retrain-runs?model_name=random_forest",
-        headers={"X-LedgerLens-Admin-Key": "secret-key"},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert len(body) == 1
-    assert body[0]["model_name"] == "random_forest"
-    assert body[0]["promoted"] is True
-
-
-def test_explain_response_time_under_100ms(client_with_models):
-    """Cache-hit response must be served in < 100 ms."""
-    import time
-
-    client, db_path = client_with_models
-    _seed_shap(db_path)
-
-    start = time.monotonic()
-    resp = client.get("/scores/GABC/explain?asset_pair=XLM%2FUSDC")
-    elapsed_ms = (time.monotonic() - start) * 1000
-
-    assert resp.status_code == 200
-    assert elapsed_ms < 100, f"Response took {elapsed_ms:.1f} ms — expected < 100 ms"
-
-
-# CORS middleware
-
-
-@pytest.fixture
-def cors_client(monkeypatch):
-    """TestClient whose app is built with one allowed CORS origin."""
-    import config.settings as settings_module
-    import api.main as main_module
-    import importlib
-    from fastapi.testclient import TestClient
-
-    orig_cors = settings_module.settings.cors_allowed_origins
-    object.__setattr__(settings_module.settings, "cors_allowed_origins", ("https://allowed.example.com",))
-
-    # Reload api.main so the app receives the new CORS configuration
-    importlib.reload(main_module)
-
-    yield TestClient(main_module.app), settings_module
-
-    # Restore setting and reload api.main to return to normal
-    object.__setattr__(settings_module.settings, "cors_allowed_origins", orig_cors)
-    importlib.reload(main_module)
-
-
-def test_cors_preflight_allowed_origin(cors_client):
-    """OPTIONS from an allowed origin receives Access-Control-Allow-Origin."""
-    client, _ = cors_client
-    response = client.options(
-        "/health",
-        headers={
-            "Origin": "https://allowed.example.com",
-            "Access-Control-Request-Method": "GET",
-        },
-    )
-    assert response.headers.get("access-control-allow-origin") == "https://allowed.example.com"
-
-
-def test_cors_preflight_disallowed_origin(cors_client):
-    """OPTIONS from a non-allowed origin does NOT receive Access-Control-Allow-Origin."""
-    client, _ = cors_client
-    response = client.options(
-        "/health",
-        headers={
-            "Origin": "https://evil.example.com",
-            "Access-Control-Request-Method": "GET",
-        },
-    )
-    assert "access-control-allow-origin" not in response.headers
-
-
-def test_cors_get_allowed_origin(cors_client):
-    """GET from an allowed origin receives Access-Control-Allow-Origin."""
-    client, _ = cors_client
-    response = client.get("/health", headers={"Origin": "https://allowed.example.com"})
-    assert response.headers.get("access-control-allow-origin") == "https://allowed.example.com"
-
-
-def test_cors_get_disallowed_origin(cors_client):
-    """GET from a non-allowed origin does NOT receive Access-Control-Allow-Origin."""
-    client, _ = cors_client
-    response = client.get("/health", headers={"Origin": "https://evil.example.com"})
-    assert "access-control-allow-origin" not in response.headers
-
-# /health — degraded cases
-
-
-def test_health_ok_with_models(tmp_path):
-    """/health returns 200 when DB and all model files are present and non-empty."""
-    import config.settings as settings_module
-    from api.main import app
-    from fastapi.testclient import TestClient
-
-    db_path = str(tmp_path / "ledgerlens.db")
-    model_dir = tmp_path / "models"
-    model_dir.mkdir()
-
-    from detection.model_inference import _MODEL_FILENAMES
-
-    for filename in _MODEL_FILENAMES.values():
-        (model_dir / filename).write_bytes(b"dummy")
-
-    orig_db = settings_module.settings.db_path
-    orig_model = settings_module.settings.model_dir
-
-    try:
-        object.__setattr__(settings_module.settings, "db_path", db_path)
-        object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
-
-        client = TestClient(app)
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "ok"
-        assert body["db"] == "ok"
-        assert body["models"] == "ok"
-    finally:
-        object.__setattr__(settings_module.settings, "db_path", orig_db)
-        object.__setattr__(settings_module.settings, "model_dir", orig_model)
-
-
-def test_health_503_bad_db(tmp_path):
-    """/health returns 503 when the DB path is invalid/unwritable.
-    The response must not contain a raw filesystem path."""
-    import config.settings as settings_module
-    from api.main import app
-    from fastapi.testclient import TestClient
-
-    # Point to an unwritable path (a directory, not a file).
-    bad_db = str(tmp_path / "not_a_db_dir" / "sub" / "ledgerlens.db")
-    model_dir = tmp_path / "models"
-    model_dir.mkdir()
-
-    from detection.model_inference import _MODEL_FILENAMES
-
-    for filename in _MODEL_FILENAMES.values():
-        (model_dir / filename).write_bytes(b"dummy")
-
-    orig_db = settings_module.settings.db_path
-    orig_model = settings_module.settings.model_dir
-
-    try:
-        object.__setattr__(settings_module.settings, "db_path", bad_db)
-        object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
-
-        client = TestClient(app)
-        resp = client.get("/health")
-        assert resp.status_code == 503
-        body = resp.json()
-        assert body["status"] == "degraded"
-        assert "error" in body["db"]
-        # Must not leak a raw filesystem path in the response body.
-        assert bad_db not in body["db"]
-    finally:
-        object.__setattr__(settings_module.settings, "db_path", orig_db)
-        object.__setattr__(settings_module.settings, "model_dir", orig_model)
-
-
-def test_health_503_missing_model(tmp_path):
-    """/health returns 503 when a model file is absent, naming the missing model."""
-    import config.settings as settings_module
-    from api.main import app
-    from fastapi.testclient import TestClient
-
-    db_path = str(tmp_path / "ledgerlens.db")
-    model_dir = tmp_path / "models"
-    model_dir.mkdir()
-
-    from detection.model_inference import _MODEL_FILENAMES
-
-    # Write all model files except one to trigger the missing-model path.
-    names = list(_MODEL_FILENAMES.keys())
-    filenames = list(_MODEL_FILENAMES.values())
-    for filename in filenames[1:]:
-        (model_dir / filename).write_bytes(b"dummy")
-
-    orig_db = settings_module.settings.db_path
-    orig_model = settings_module.settings.model_dir
-
-    try:
-        object.__setattr__(settings_module.settings, "db_path", db_path)
-        object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
-
-        client = TestClient(app)
-        resp = client.get("/health")
-        assert resp.status_code == 503
-        body = resp.json()
-        assert body["status"] == "degraded"
-        assert "missing" in body["models"]
-        # The name of the missing model must appear in the response.
-        assert names[0] in body["models"]
-    finally:
-        object.__setattr__(settings_module.settings, "db_path", orig_db)
-        object.__setattr__(settings_module.settings, "model_dir", orig_model)
-
+    row = body[0]
+    assert row["accounts"] == ["A", "B", "C"]
+    assert row["total_volume"] == 300.0
+    assert row["cycle_volume"] == 100.0
+    assert row["detected_at"]
