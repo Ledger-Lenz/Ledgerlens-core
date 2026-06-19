@@ -50,10 +50,25 @@ def _score(
     )
 
 
-def test_health(client):
+def test_health(client, tmp_path, monkeypatch):
+    """Healthy path: DB reachable and all model stub files present → 200 all-ok."""
+    import config.settings as settings_module
+    from detection.model_inference import _MODEL_FILENAMES
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    for filename in _MODEL_FILENAMES.values():
+        (model_dir / filename).write_bytes(b"stub")
+
+    object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["db"] == "ok"
+    assert body["models"] == "ok"
+
 
 
 def test_list_scores_empty(client):

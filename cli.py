@@ -337,6 +337,17 @@ def serve(
     uvicorn.run("api.main:app", host=host, port=port, reload=reload)
 
 
+@app.command("stream")
+def stream(
+    batch_size: int = typer.Option(500, "--batch-size", help="Number of trades to accumulate before scoring"),
+    flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
+) -> None:
+    """Stream trades from Horizon SSE and score wallets in near-real-time."""
+    import run_pipeline
+
+    run_pipeline.run_streaming(batch_size=batch_size, flush_interval_seconds=flush_interval)
+
+
 @app.command("db-migrate")
 def db_migrate(
     db_path: str = typer.Option(None, "--db-path", help="Path to the SQLite database (defaults to LEDGERLENS_DB_PATH)"),

@@ -56,6 +56,16 @@ def stream_trades(cursor: str = "now") -> Iterator[Trade]:
         Horizon paging token to resume from, or "now" to start streaming
         from the current ledger.
     """
+    for trade, _ in stream_trades_with_cursor(cursor):
+        yield trade
+
+
+def stream_trades_with_cursor(cursor: str = "now") -> Iterator[tuple[Trade, str]]:
+    """Yield ``(Trade, cursor)`` tuples as trades occur on the SDEX.
+
+    The second element is the SSE event ID (Horizon paging token) which can
+    be persisted and passed back as ``cursor`` to resume from that point.
+    """
     url = f"{settings.horizon_stream_url}/trades?cursor={cursor}"
     headers = {"Accept": "text/event-stream"}
 
@@ -65,7 +75,7 @@ def stream_trades(cursor: str = "now") -> Iterator[Trade]:
             continue
         record = _decode_event(event.data)
         if record is not None:
-            yield _parse_trade(record)
+            yield _parse_trade(record), event.id or cursor
 
 
 def _decode_event(data: str) -> dict | None:

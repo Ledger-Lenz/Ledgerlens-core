@@ -16,10 +16,14 @@ Run with:
 
 import json
 import logging
+import os
+import sqlite3
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from api.auth import require_admin_key
@@ -28,9 +32,11 @@ from detection.amm_engine import pool_risk_from_trade_rows
 from detection.risk_score import RiskScore
 from detection.storage import (
     get_circular_routes,
+    get_drift_reports,
     get_latest_scores,
     get_liquidity_pool_trades,
     get_pair_correlations,
+    get_retrain_runs,
     get_shap_values,
 )
 from detection.webhook_queue import get_dead_letters
@@ -66,6 +72,14 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(settings.cors_allowed_origins),
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
 
 class WebhookCreate(BaseModel):
     url: str
@@ -76,8 +90,55 @@ class WebhookCreate(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
+def health() -> JSONResponse:
+    """Returns 200 when healthy, 503 when any component check fails.
+
+    Checks:
+    - DB connectivity: executes SELECT 1 via the existing _connect helper.
+    - Model files: each expected .joblib file exists and is non-empty.
+
+    The response body names every component but never leaks local filesystem
+    paths — errors are logged server-side at ERROR level.
+    """
+    from detection.model_inference import _MODEL_FILENAMES
+    from detection.storage import _connect
+
+    status: dict[str, str] = {}
+    healthy = True
+
+    # --- DB check ---
+    try:
+        with _connect() as conn:
+            conn.execute("SELECT 1")
+        status["db"] = "ok"
+    except sqlite3.Error as exc:
+        logger.error("Health check: DB connectivity failure: %s", exc)
+        status["db"] = "error: database unreachable"
+        healthy = False
+
+    # --- Model files check (existence + non-zero size only; no deserialization) ---
+    missing = [
+        name
+        for name, filename in _MODEL_FILENAMES.items()
+        if not _model_file_ok(os.path.join(settings.model_dir, filename))
+    ]
+    if missing:
+        status["models"] = f"missing: {', '.join(sorted(missing))}"
+        healthy = False
+    else:
+        status["models"] = "ok"
+
+    status["status"] = "ok" if healthy else "degraded"
+    http_status = 200 if healthy else 503
+    return JSONResponse(content=status, status_code=http_status)
+
+
+def _model_file_ok(path: str) -> bool:
+    """Return True iff `path` exists as a non-empty regular file."""
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
 
 
 @app.get("/scores", response_model=list[RiskScore])

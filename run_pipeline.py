@@ -9,8 +9,10 @@ the other repos in the org.
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from datetime import timedelta
-
+from pathlib import Path
 import pandas as pd
 
 from config.settings import settings
@@ -35,8 +37,9 @@ from detection.storage import (
 )
 from detection.shap_explainer import explain_score, top_contributing_features
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
-from ingestion.data_models import TradeType
+from ingestion.data_models import Trade, TradeType
 from ingestion.historical_loader import async_load_historical_trades, load_historical_trades
+from ingestion.horizon_streamer import stream_trades_with_cursor
 from ingestion.http_client import AsyncHorizonClient
 from ingestion.operations_loader import (
     async_load_order_book_events_for_pair,
@@ -354,6 +357,132 @@ async def async_run(
     _submit_on_chain(scores)
 
     return scores
+
+
+def run_streaming(
+    asset_pair: tuple[str | None, str | None] | None = None,
+    batch_size: int = 500,
+    flush_interval_seconds: float = 30.0,
+    _now: Callable[[], float] = time.monotonic,
+) -> None:
+    """Stream trades from Horizon and score in rolling batches.
+
+    Parameters
+    ----------
+    asset_pair:
+        ``(base_asset, counter_asset)`` tuple in ``CODE:ISSUER`` form
+        (``None`` for native XLM). Defaults to XLM/USDC.
+    batch_size:
+        Number of trades to accumulate before triggering a flush.
+    flush_interval_seconds:
+        Maximum seconds to wait before flushing a partial batch.
+    _now:
+        Injectable time source (defaults to ``time.monotonic``). Test code
+        can monkey-patch this to advance time without sleeping.
+    """
+    asset_pair = asset_pair or (
+        None,
+        "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    )
+    models = load_models()
+    pair_key = f"{asset_pair[0] or 'XLM'}/{asset_pair[1] or 'XLM'}"
+
+    # Read cursor from file so we resume where we left off.
+    cursor = "now"
+    cursor_path = Path(settings.cursor_path)
+    if cursor_path.exists():
+        cursor = cursor_path.read_text().strip()
+        logger.info("Resuming stream from cursor %s", cursor)
+
+    buffer: list[Trade] = []
+    last_flush_time = _now()
+    last_cursor: str = cursor
+
+    try:
+        for trade, event_cursor in stream_trades_with_cursor(cursor=cursor):
+            buffer.append(trade)
+            if event_cursor:
+                last_cursor = event_cursor
+
+            now = _now()
+            if len(buffer) >= batch_size or (now - last_flush_time) >= flush_interval_seconds:
+                _flush_streaming_buffer(buffer, models, pair_key, asset_pair, last_cursor)
+                buffer.clear()
+                last_flush_time = now
+    except KeyboardInterrupt:
+        logger.info("Stream interrupted, flushing remaining %d trades", len(buffer))
+        if buffer:
+            _flush_streaming_buffer(buffer, models, pair_key, asset_pair, last_cursor)
+        raise
+
+
+def _flush_streaming_buffer(
+    buffer: list[Trade],
+    models: dict,
+    pair_key: str,
+    asset_pair: tuple[str | None, str | None],
+    cursor: str,
+) -> None:
+    """Score all accounts in *buffer* and persist results + cursor."""
+    if not buffer:
+        return
+
+    t0 = time.monotonic()
+    trades_df = pd.DataFrame([t.model_dump() for t in buffer])
+
+    as_of = pd.Timestamp(trades_df["ledger_close_time"].max())
+    accounts = pd.unique(trades_df[["base_account", "counter_account"]].values.ravel())
+    accounts = [a for a in accounts if pd.notna(a) and a]
+    account_metadata = load_account_metadata(accounts)
+
+    scores: list[RiskScore] = []
+    scored_features: list[dict] = []
+    scored_wallets: list[str] = []
+    scored_pairs: list[str] = []
+
+    for account in accounts:
+        features = build_feature_vector(
+            trades_df,
+            account,
+            as_of,
+            account_metadata=account_metadata,
+        )
+        probability, confidence = score_feature_vector(models, features)
+
+        score = RiskScore.combine(
+            wallet=account,
+            asset_pair=pair_key,
+            benford_mad=features.get("benford_mad_24h", 0.0),
+            benford_mad_threshold=settings.benford_mad_threshold,
+            ml_probability=probability,
+            ml_confidence=confidence,
+        )
+        scores.append(score)
+        scored_features.append(features)
+        scored_wallets.append(account)
+        scored_pairs.append(pair_key)
+
+    elapsed = time.monotonic() - t0
+
+    if scored_features:
+        try:
+            record_scored_features(scored_features, scored_wallets, scored_pairs)
+        except Exception:
+            logger.exception("Failed to record scored features in streaming flush")
+
+    save_scores(scores)
+
+    # Persist cursor for resumption after restart.
+    cursor_path = Path(settings.cursor_path)
+    cursor_path.parent.mkdir(parents=True, exist_ok=True)
+    cursor_path.write_text(cursor)
+
+    logger.info(
+        "Flush: %d trades, %d accounts scored, %.2fs elapsed",
+        len(buffer),
+        len(scores),
+        elapsed,
+    )
 
 
 if __name__ == "__main__":
