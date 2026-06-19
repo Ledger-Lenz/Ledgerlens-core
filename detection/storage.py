@@ -150,6 +150,36 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_circular_routes_tx_hash ON circular_path_routes (transaction_hash);
         """,
     ),
+    (
+        5,
+        "add drift_reports and retrain_runs tables for model governance",
+        """
+        CREATE TABLE IF NOT EXISTS drift_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            triggered_at TEXT NOT NULL,
+            drift_detected INTEGER NOT NULL,
+            psi_report_json TEXT NOT NULL,
+            psi_threshold REAL NOT NULL,
+            min_drifted_features INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_drift_reports_triggered_at ON drift_reports (triggered_at);
+
+        CREATE TABLE IF NOT EXISTS retrain_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            triggered_at TEXT NOT NULL,
+            drift_report_id INTEGER REFERENCES drift_reports(id),
+            model_name TEXT NOT NULL,
+            old_version TEXT,
+            new_version TEXT,
+            old_auc_roc REAL,
+            new_auc_roc REAL,
+            promoted INTEGER NOT NULL,
+            forced INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_retrain_runs_triggered_at ON retrain_runs (triggered_at);
+        CREATE INDEX IF NOT EXISTS idx_retrain_runs_model_name ON retrain_runs (model_name);
+        """,
+    ),
 ]
 
 
@@ -594,6 +624,141 @@ def get_shap_values(
     if row is None or row[0] is None:
         return None
     return json.loads(row[0])
+
+
+def save_drift_report(
+    drift_detected: bool,
+    psi_report: dict,
+    psi_threshold: float,
+    min_drifted_features: int,
+    db_path: str | None = None,
+) -> int:
+    """Persist a drift report; returns its row id (used as retrain_runs.drift_report_id)."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO drift_reports
+                (triggered_at, drift_detected, psi_report_json, psi_threshold, min_drifted_features)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                int(drift_detected),
+                json.dumps(psi_report),
+                psi_threshold,
+                min_drifted_features,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def _row_to_drift_report(row: tuple) -> dict:
+    return {
+        "id": row[0],
+        "triggered_at": row[1],
+        "drift_detected": bool(row[2]),
+        "psi_report": json.loads(row[3]),
+        "psi_threshold": row[4],
+        "min_drifted_features": row[5],
+    }
+
+
+def get_drift_reports(limit: int = 50, db_path: str | None = None) -> list[dict]:
+    """Most recent drift reports first."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, triggered_at, drift_detected, psi_report_json, psi_threshold, min_drifted_features
+            FROM drift_reports
+            ORDER BY triggered_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_row_to_drift_report(row) for row in rows]
+
+
+def save_retrain_run(
+    drift_report_id: int | None,
+    model_name: str,
+    old_version: str | None,
+    new_version: str | None,
+    old_auc_roc: float | None,
+    new_auc_roc: float | None,
+    promoted: bool,
+    forced: bool,
+    db_path: str | None = None,
+) -> None:
+    """Persist a single model's retrain outcome for one retrain-check run."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO retrain_runs
+                (triggered_at, drift_report_id, model_name, old_version, new_version,
+                 old_auc_roc, new_auc_roc, promoted, forced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                drift_report_id,
+                model_name,
+                old_version,
+                new_version,
+                old_auc_roc,
+                new_auc_roc,
+                int(promoted),
+                int(forced),
+            ),
+        )
+        conn.commit()
+
+
+def _row_to_retrain_run(row: tuple) -> dict:
+    return {
+        "id": row[0],
+        "triggered_at": row[1],
+        "drift_report_id": row[2],
+        "model_name": row[3],
+        "old_version": row[4],
+        "new_version": row[5],
+        "old_auc_roc": row[6],
+        "new_auc_roc": row[7],
+        "promoted": bool(row[8]),
+        "forced": bool(row[9]),
+    }
+
+
+def get_retrain_runs(
+    limit: int = 50,
+    model_name: str | None = None,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Most recent retrain runs first, optionally filtered by ``model_name``."""
+    init_db(db_path)
+    where = ""
+    params: list = []
+    if model_name is not None:
+        where = "WHERE model_name = ?"
+        params.append(model_name)
+    params.append(limit)
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, triggered_at, drift_report_id, model_name, old_version, new_version,
+                   old_auc_roc, new_auc_roc, promoted, forced
+            FROM retrain_runs
+            {where}
+            ORDER BY triggered_at DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+    return [_row_to_retrain_run(row) for row in rows]
 
 
 def _asset_pair_symbol(asset: dict) -> str:

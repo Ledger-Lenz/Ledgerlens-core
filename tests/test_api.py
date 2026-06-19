@@ -50,10 +50,25 @@ def _score(
     )
 
 
-def test_health(client):
+def test_health(client, tmp_path, monkeypatch):
+    """Healthy path: DB reachable and all model stub files present → 200 all-ok."""
+    import config.settings as settings_module
+    from detection.model_inference import _MODEL_FILENAMES
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    for filename in _MODEL_FILENAMES.values():
+        (model_dir / filename).write_bytes(b"stub")
+
+    object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["db"] == "ok"
+    assert body["models"] == "ok"
+
 
 
 def test_list_scores_empty(client):
@@ -639,3 +654,179 @@ def test_explain_response_time_under_100ms(client_with_models):
 
     assert resp.status_code == 200
     assert elapsed_ms < 100, f"Response took {elapsed_ms:.1f} ms — expected < 100 ms"
+
+
+# CORS middleware
+
+
+@pytest.fixture
+def cors_client(monkeypatch):
+    """TestClient whose app is built with one allowed CORS origin."""
+    import config.settings as settings_module
+    import api.main as main_module
+    import importlib
+    from fastapi.testclient import TestClient
+
+    orig_cors = settings_module.settings.cors_allowed_origins
+    object.__setattr__(settings_module.settings, "cors_allowed_origins", ("https://allowed.example.com",))
+
+    # Reload api.main so the app receives the new CORS configuration
+    importlib.reload(main_module)
+
+    yield TestClient(main_module.app), settings_module
+
+    # Restore setting and reload api.main to return to normal
+    object.__setattr__(settings_module.settings, "cors_allowed_origins", orig_cors)
+    importlib.reload(main_module)
+
+
+def test_cors_preflight_allowed_origin(cors_client):
+    """OPTIONS from an allowed origin receives Access-Control-Allow-Origin."""
+    client, _ = cors_client
+    response = client.options(
+        "/health",
+        headers={
+            "Origin": "https://allowed.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert response.headers.get("access-control-allow-origin") == "https://allowed.example.com"
+
+
+def test_cors_preflight_disallowed_origin(cors_client):
+    """OPTIONS from a non-allowed origin does NOT receive Access-Control-Allow-Origin."""
+    client, _ = cors_client
+    response = client.options(
+        "/health",
+        headers={
+            "Origin": "https://evil.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_cors_get_allowed_origin(cors_client):
+    """GET from an allowed origin receives Access-Control-Allow-Origin."""
+    client, _ = cors_client
+    response = client.get("/health", headers={"Origin": "https://allowed.example.com"})
+    assert response.headers.get("access-control-allow-origin") == "https://allowed.example.com"
+
+
+def test_cors_get_disallowed_origin(cors_client):
+    """GET from a non-allowed origin does NOT receive Access-Control-Allow-Origin."""
+    client, _ = cors_client
+    response = client.get("/health", headers={"Origin": "https://evil.example.com"})
+    assert "access-control-allow-origin" not in response.headers
+
+# /health — degraded cases
+
+
+def test_health_ok_with_models(tmp_path):
+    """/health returns 200 when DB and all model files are present and non-empty."""
+    import config.settings as settings_module
+    from api.main import app
+    from fastapi.testclient import TestClient
+
+    db_path = str(tmp_path / "ledgerlens.db")
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    from detection.model_inference import _MODEL_FILENAMES
+
+    for filename in _MODEL_FILENAMES.values():
+        (model_dir / filename).write_bytes(b"dummy")
+
+    orig_db = settings_module.settings.db_path
+    orig_model = settings_module.settings.model_dir
+
+    try:
+        object.__setattr__(settings_module.settings, "db_path", db_path)
+        object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["db"] == "ok"
+        assert body["models"] == "ok"
+    finally:
+        object.__setattr__(settings_module.settings, "db_path", orig_db)
+        object.__setattr__(settings_module.settings, "model_dir", orig_model)
+
+
+def test_health_503_bad_db(tmp_path):
+    """/health returns 503 when the DB path is invalid/unwritable.
+    The response must not contain a raw filesystem path."""
+    import config.settings as settings_module
+    from api.main import app
+    from fastapi.testclient import TestClient
+
+    # Point to an unwritable path (a directory, not a file).
+    bad_db = str(tmp_path / "not_a_db_dir" / "sub" / "ledgerlens.db")
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    from detection.model_inference import _MODEL_FILENAMES
+
+    for filename in _MODEL_FILENAMES.values():
+        (model_dir / filename).write_bytes(b"dummy")
+
+    orig_db = settings_module.settings.db_path
+    orig_model = settings_module.settings.model_dir
+
+    try:
+        object.__setattr__(settings_module.settings, "db_path", bad_db)
+        object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["status"] == "degraded"
+        assert "error" in body["db"]
+        # Must not leak a raw filesystem path in the response body.
+        assert bad_db not in body["db"]
+    finally:
+        object.__setattr__(settings_module.settings, "db_path", orig_db)
+        object.__setattr__(settings_module.settings, "model_dir", orig_model)
+
+
+def test_health_503_missing_model(tmp_path):
+    """/health returns 503 when a model file is absent, naming the missing model."""
+    import config.settings as settings_module
+    from api.main import app
+    from fastapi.testclient import TestClient
+
+    db_path = str(tmp_path / "ledgerlens.db")
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    from detection.model_inference import _MODEL_FILENAMES
+
+    # Write all model files except one to trigger the missing-model path.
+    names = list(_MODEL_FILENAMES.keys())
+    filenames = list(_MODEL_FILENAMES.values())
+    for filename in filenames[1:]:
+        (model_dir / filename).write_bytes(b"dummy")
+
+    orig_db = settings_module.settings.db_path
+    orig_model = settings_module.settings.model_dir
+
+    try:
+        object.__setattr__(settings_module.settings, "db_path", db_path)
+        object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["status"] == "degraded"
+        assert "missing" in body["models"]
+        # The name of the missing model must appear in the response.
+        assert names[0] in body["models"]
+    finally:
+        object.__setattr__(settings_module.settings, "db_path", orig_db)
+        object.__setattr__(settings_module.settings, "model_dir", orig_model)
+

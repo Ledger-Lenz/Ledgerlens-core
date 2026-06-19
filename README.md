@@ -297,6 +297,51 @@ Exposes `/health`, `/scores`, `/scores/{wallet}`, `/alerts`, and
 `/assets/risk-ranking` over the locally stored `RiskScore` records — a
 stand-in for `ledgerlens-api` during local development.
 
+#### CORS configuration
+
+The local API defaults to **deny-all** CORS (no browser origins are allowed
+unless explicitly configured). Set `LEDGERLENS_CORS_ALLOWED_ORIGINS` in your
+`.env` to a comma-separated list of permitted origins:
+
+```bash
+# Allow the dashboard dev server
+LEDGERLENS_CORS_ALLOWED_ORIGINS=http://localhost:3000
+
+# Allow multiple origins (e.g. staging + production dashboard)
+LEDGERLENS_CORS_ALLOWED_ORIGINS=https://dashboard.ledgerlens.io,https://staging.ledgerlens.io
+```
+
+> **Security**: never set `LEDGERLENS_CORS_ALLOWED_ORIGINS=*`. The API rejects
+> a wildcard at startup with a `ValueError`. Combining `allow_origins=["*"]`
+> with `allow_credentials=True` would let any website read authenticated
+> responses — a well-known OWASP A05:2021 misconfiguration. The setting enforces
+> an explicit origin list to prevent this from ever reaching production.
+
+#### `/health` response contract
+
+`GET /health` performs two real checks on every call:
+
+| Component | Check | OK value |
+|---|---|---|
+| `db` | Executes `SELECT 1` via the existing SQLite connection | `"ok"` |
+| `models` | Each model `.joblib` file exists under `MODEL_DIR` and has size > 0 | `"ok"` |
+
+Returns **HTTP 200** when both pass:
+
+```json
+{"status": "ok", "db": "ok", "models": "ok"}
+```
+
+Returns **HTTP 503** when any check fails, naming the failing component:
+
+```json
+{"status": "degraded", "db": "error: database unreachable", "models": "ok"}
+{"status": "degraded", "db": "ok", "models": "missing: random_forest, xgboost"}
+```
+
+The response body never contains raw filesystem paths or exception text —
+errors are logged server-side at `ERROR` level via `logger.exception`.
+
 > The production API, dashboard, and Soroban contract live in their
 > respective repos (`ledgerlens-api`, `ledgerlens-dashboard`,
 > `ledgerlens-contracts`).
