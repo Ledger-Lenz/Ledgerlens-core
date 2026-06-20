@@ -9,6 +9,8 @@ account-metadata inputs are optional and come from
 `ingestion.operations_loader` / `ingestion.account_loader` respectively.
 """
 
+from __future__ import annotations
+
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
@@ -77,6 +79,15 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
 ]
 
+CROSS_CHAIN_FEATURE_NAMES = [
+    "has_evm_link",
+    "evm_round_trip_frequency",
+    "evm_benford_mad_30d",
+    "evm_counterparty_concentration",
+    "bridge_volume_ratio",
+    "cross_chain_time_lag_median_h",
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -96,6 +107,10 @@ try:
     _HAS_ADVERSARIAL = True
 except ImportError:  # pragma: no cover
     _HAS_ADVERSARIAL = False
+
+# Cross-chain features are appended last so existing model checkpoints remain
+# loadable — old models see 0.0 for these features during inference.
+FEATURE_NAMES = FEATURE_NAMES + CROSS_CHAIN_FEATURE_NAMES  # type: ignore[assignment]
 
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
@@ -481,6 +496,54 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     }
 
 
+def build_cross_chain_features(
+    wallet: str,
+    linker: "CrossChainLinker",
+    sdex_volume: float = 0.0,
+    evm_trades: list[dict] | None = None,
+) -> dict:
+    """Compute the six cross-chain features for ``wallet``.
+
+    ``linker`` is a :class:`detection.cross_chain_linker.CrossChainLinker`
+    instance.  ``sdex_volume`` is the total SDEX trade volume for the wallet
+    (used to compute ``bridge_volume_ratio``).  ``evm_trades`` is an optional
+    list of EVM trade dicts (same schema as ``CrossChainTrade.model_dump()``).
+    """
+    zero: dict = {name: 0.0 for name in CROSS_CHAIN_FEATURE_NAMES}
+
+    evm_wallets = linker.link_wallets(wallet)
+    if not evm_wallets:
+        return zero
+
+    pattern = linker.get_evm_trade_pattern(
+        evm_wallets, chain="ethereum", evm_trades=evm_trades or []
+    )
+
+    evm_volume = pattern.get("total_evm_volume", 0.0)
+    bridge_volume_ratio = evm_volume / sdex_volume if sdex_volume > 0 else 0.0
+
+    unique_cp = pattern.get("unique_counterparties", 0)
+    if unique_cp > 0 and evm_trades:
+        wallet_trades = [
+            t for t in (evm_trades or []) if t.get("wallet_address") in set(evm_wallets)
+        ]
+        from collections import Counter
+        cp_counts = Counter(t.get("counterparty", "") for t in wallet_trades if t.get("counterparty"))
+        total = sum(cp_counts.values())
+        hhi = sum((c / total) ** 2 for c in cp_counts.values()) if total > 0 else 0.0
+    else:
+        hhi = 0.0
+
+    return {
+        "has_evm_link": 1.0,
+        "evm_round_trip_frequency": float(pattern.get("round_trip_frequency", 0.0)),
+        "evm_benford_mad_30d": float(pattern.get("benford_mad", 0.0)),
+        "evm_counterparty_concentration": float(hhi),
+        "bridge_volume_ratio": float(bridge_volume_ratio),
+        "cross_chain_time_lag_median_h": 0.0,
+    }
+
+
 def build_feature_vector(
     trades: pd.DataFrame,
     account: str,
@@ -493,6 +556,8 @@ def build_feature_vector(
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
+    ring_membership: dict[str, dict] | None = None,
+    cross_chain_linker: "CrossChainLinker | None" = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -538,4 +603,11 @@ def build_feature_vector(
     features.update(path_payment_features(path_payments, account))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
+
+    if cross_chain_linker is not None:
+        sdex_volume = float(_account_trades(trades, account)["base_amount"].sum()) if not trades.empty else 0.0
+        features.update(build_cross_chain_features(account, cross_chain_linker, sdex_volume=sdex_volume))
+    else:
+        features.update({name: 0.0 for name in CROSS_CHAIN_FEATURE_NAMES})
+
     return features

@@ -31,12 +31,15 @@ from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.risk_score import RiskScore
 from detection.storage import (
+    get_bridge_transfer_history,
+    get_bridge_transfers,
     get_circular_routes,
     get_drift_reports,
     get_latest_scores,
     get_liquidity_pool_trades,
     get_pair_correlations,
     get_retrain_runs,
+    get_rings,
     get_shap_values,
 )
 from detection.webhook_queue import get_dead_letters
@@ -198,13 +201,57 @@ def explain_wallet_score(
     return cached
 
 
-@app.get("/scores/{wallet}", response_model=list[RiskScore])
-def wallet_scores(wallet: str) -> list[RiskScore]:
-    """Return the latest score for `wallet` on each asset pair."""
+@app.get("/scores/{wallet}")
+def wallet_scores(wallet: str) -> dict:
+    """Return the latest score for `wallet` on each asset pair.
+
+    When the wallet has known EVM counterparts (bridge transfer records in the
+    database), the response includes a ``"cross_chain_links"`` field listing
+    the linked EVM wallets and the chain they were last seen on.  EVM RPC
+    endpoint URLs are never exposed in this response.
+    """
     scores = get_latest_scores(wallet=wallet)
     if not scores:
         raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
-    return scores
+
+    transfers = get_bridge_transfers(stellar_wallet=wallet, since_days=90)
+    seen: dict[tuple, dict] = {}
+    for t in transfers:
+        key = (t.chain, t.evm_wallet)
+        if key not in seen or t.timestamp.isoformat() > seen[key]["last_bridge_at"]:
+            seen[key] = {
+                "chain": t.chain,
+                "evm_wallet": t.evm_wallet,
+                "last_bridge_at": t.timestamp.isoformat(),
+            }
+    cross_chain_links = list(seen.values())
+
+    return {
+        "scores": [s.model_dump() for s in scores],
+        "cross_chain_links": cross_chain_links,
+    }
+
+
+@app.get("/wallets/{wallet}/cross-chain")
+def wallet_cross_chain(wallet: str) -> list[dict]:
+    """Return the full bridge transfer history for ``wallet``.
+
+    ``amount_usd_estimate`` values are derived from on-chain oracle prices and
+    may be manipulated — treat them as estimates only.
+    """
+    history = get_bridge_transfer_history(stellar_wallet=wallet)
+    if not history:
+        raise HTTPException(status_code=404, detail=f"No bridge transfer history for wallet {wallet}")
+    return history
+
+
+@app.get("/rings")
+def list_rings(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict]:
+    """Return detected wash rings from the latest pipeline run."""
+    return get_rings(limit=limit, offset=offset)
 
 
 @app.get("/alerts", response_model=list[RiskScore])

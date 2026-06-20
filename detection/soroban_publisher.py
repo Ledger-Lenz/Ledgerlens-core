@@ -13,7 +13,7 @@ import time
 
 from stellar_sdk import Keypair, SorobanServer, TransactionBuilder
 from stellar_sdk import scval
-from stellar_sdk.operation import InvokeContractFunction
+from stellar_sdk.operation import InvokeHostFunction as InvokeContractFunction
 
 from detection.risk_score import RiskScore
 from detection.storage import save_submission
