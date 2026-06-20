@@ -539,3 +539,32 @@ def build_feature_vector(
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features
+
+
+# --- T-GNN features (appended after PATH_PAYMENT_FEATURE_NAMES so existing
+# model checkpoints trained without these stay loadable by index/order). ---
+GNN_FEATURE_NAMES = [
+    "gnn_wash_ring_probability",
+    "gnn_neighbor_avg_score",
+]
+
+FEATURE_NAMES = FEATURE_NAMES + GNN_FEATURE_NAMES
+
+
+def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None, **kwargs):
+    """Wraps the base feature vector builder, optionally appending GNN features.
+
+    Args:
+        use_gnn: If True, appends gnn_wash_ring_probability and
+            gnn_neighbor_avg_score (default 0.0 if not found in gnn_features).
+        gnn_features: Optional {wallet: {feature_name: value}} lookup.
+    """
+    vector = _build_feature_vector_base(*args, **kwargs)
+    if use_gnn:
+        wallet = kwargs.get("wallet") or (args[0] if args else None)
+        feats = (gnn_features or {}).get(wallet, {})
+        vector = list(vector) + [
+            float(feats.get("gnn_wash_ring_probability", 0.0)),
+            float(feats.get("gnn_neighbor_avg_score", 0.0)),
+        ]
+    return vector
