@@ -7,6 +7,7 @@ models are written to `settings.model_dir` for `model_inference` to load.
 
 import joblib
 import pandas as pd
+from detection.model_signing import sign_model_file
 from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -92,7 +93,6 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
     if adversarial_hardening:
         try:
             from detection.adversarial_attack import pgd_attack
-            import pandas as pd
 
             # collect adversarial examples that successfully flip model
             adv_rows = []
@@ -146,9 +146,11 @@ def save_models(results: dict, model_dir: str | None = None, training_dataset_pa
     model_dir = model_dir or settings.model_dir
     os.makedirs(model_dir, exist_ok=True)
 
+    signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
+        sign_model_file(path, signing_key)
 
     # Write training_metadata.json
     if training_dataset_path:

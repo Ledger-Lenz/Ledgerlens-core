@@ -1,14 +1,13 @@
-from cli import robustness_eval
+import os
+
+from typer.testing import CliRunner
+
+from cli import app, robustness_eval
 
 
 def test_cli_robustness_eval_runs():
     # run a short evaluation to ensure it exits without error
     robustness_eval(epsilon=0.05, steps=5, n_samples=10)
-import os
-
-from typer.testing import CliRunner
-
-from cli import app
 
 runner = CliRunner()
 
@@ -77,3 +76,73 @@ def test_reweight_dry_run_prints_table_does_not_write(tmp_path, monkeypatch):
     assert "lightgbm" in result.output
     weights_path = os.path.join(model_dir, "ensemble_weights.json")
     assert not os.path.exists(weights_path), "dry-run must not write ensemble_weights.json"
+
+
+class TestSignModelsCommand:
+    def _make_unsigned_model(self, path):
+        import joblib
+        from sklearn.ensemble import RandomForestClassifier
+
+        m = RandomForestClassifier(n_estimators=2, random_state=0).fit([[0], [1]], [0, 1])
+        joblib.dump(m, path)
+
+    def test_sign_models_backfills_unsigned_artifacts(self, tmp_path, monkeypatch):
+        import config.settings as settings_module
+
+        model_dir = str(tmp_path)
+        self._make_unsigned_model(os.path.join(model_dir, "random_forest.joblib"))
+        object.__setattr__(settings_module.settings, "model_dir", model_dir)
+
+        result = runner.invoke(app, ["sign-models", "--model-dir", model_dir])
+
+        assert result.exit_code == 0, result.output
+        assert os.path.exists(os.path.join(model_dir, "random_forest.joblib.sig"))
+        assert "Signed 1 file(s)" in result.output
+
+    def test_sign_models_is_idempotent(self, tmp_path, monkeypatch):
+        import config.settings as settings_module
+
+        model_dir = str(tmp_path)
+        self._make_unsigned_model(os.path.join(model_dir, "random_forest.joblib"))
+        object.__setattr__(settings_module.settings, "model_dir", model_dir)
+
+        runner.invoke(app, ["sign-models", "--model-dir", model_dir])
+        result = runner.invoke(app, ["sign-models", "--model-dir", model_dir])
+
+        assert result.exit_code == 0, result.output
+        assert "Signed 0 file(s)" in result.output
+        assert "skipped 1" in result.output
+
+    def test_sign_models_fails_without_key(self, tmp_path, monkeypatch):
+        import config.settings as settings_module
+
+        model_dir = str(tmp_path)
+        self._make_unsigned_model(os.path.join(model_dir, "random_forest.joblib"))
+        object.__setattr__(settings_module.settings, "model_dir", model_dir)
+        object.__setattr__(settings_module.settings, "model_signing_key", "")
+        monkeypatch.delenv("LEDGERLENS_MODEL_SIGNING_KEY", raising=False)
+
+        result = runner.invoke(app, ["sign-models", "--model-dir", model_dir])
+
+        assert result.exit_code != 0
+
+    def test_save_models_produces_signed_artifacts(self, tmp_path, monkeypatch):
+        """save_models signs every .joblib it writes."""
+        import config.settings as settings_module
+        from sklearn.ensemble import RandomForestClassifier
+        from detection.model_training import save_models
+
+        model_dir = str(tmp_path / "models")
+        object.__setattr__(settings_module.settings, "model_dir", model_dir)
+
+        dummy = RandomForestClassifier(n_estimators=2, random_state=0).fit([[0], [1]], [0, 1])
+        results = {
+            name: {"model": dummy, "auc_roc": 0.9, "pr_auc": 0.8, "f1": 0.85}
+            for name in ("random_forest", "xgboost", "lightgbm")
+        }
+
+        save_models(results, model_dir=model_dir)
+
+        assert os.path.exists(os.path.join(model_dir, "random_forest.joblib.sig"))
+        assert os.path.exists(os.path.join(model_dir, "xgboost.joblib.sig"))
+        assert os.path.exists(os.path.join(model_dir, "lightgbm.joblib.sig"))

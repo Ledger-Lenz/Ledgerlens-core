@@ -11,6 +11,7 @@ otherwise run as separate scripts/modules:
 """
 
 import logging
+import os
 
 import typer
 
@@ -442,6 +443,53 @@ def reweight(
 
     apply_weights(proposed, settings.model_dir)
     typer.echo("Wrote updated weights to ensemble_weights.json")
+
+
+@app.command("sign-models")
+def sign_models(
+    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+) -> None:
+    """Backfill HMAC-SHA256 signatures for every .joblib in model_dir.
+
+    Idempotent: re-signs files whose content changed, skips already-valid ones.
+    Run this once against trusted committed artifacts after setting
+    LEDGERLENS_MODEL_SIGNING_KEY. Required before loading models with
+    verification enabled.
+    """
+    import glob
+
+    from config.settings import settings
+    from detection.model_signing import ModelIntegrityError, sign_model_file, verify_model_file
+
+    target_dir = model_dir or settings.model_dir
+    signing_key = settings.model_signing_key.encode()
+
+    if not signing_key:
+        typer.echo("ERROR: LEDGERLENS_MODEL_SIGNING_KEY is not set.", err=True)
+        raise typer.Exit(1)
+
+    pattern = os.path.join(target_dir, "*.joblib")
+    paths = glob.glob(pattern)
+    if not paths:
+        typer.echo(f"No .joblib files found in {target_dir}")
+        return
+
+    signed = []
+    skipped = []
+    for path in sorted(paths):
+        try:
+            verify_model_file(path, signing_key)
+            skipped.append(path)
+        except ModelIntegrityError:
+            sign_model_file(path, signing_key)
+            signed.append(path)
+
+    for path in signed:
+        logger.info("Signed: %s", path)
+    for path in skipped:
+        logger.info("Already valid, skipped: %s", path)
+
+    typer.echo(f"Signed {len(signed)} file(s), skipped {len(skipped)} already-valid file(s).")
 
 
 @app.command("webhook-worker")

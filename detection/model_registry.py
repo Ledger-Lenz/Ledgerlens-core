@@ -6,11 +6,13 @@ A latest pointer tracks the currently-active model for inference.
 """
 
 import hashlib
-import joblib
 import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+
+from config.settings import settings
+from detection.model_signing import assert_within_model_dir, safe_joblib_load, sign_model_file
 
 logger = logging.getLogger("ledgerlens.model_registry")
 
@@ -53,7 +55,9 @@ def save_versioned_model(
     Path(model_dir).mkdir(parents=True, exist_ok=True)
 
     model_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
+    import joblib
     joblib.dump(model, model_path)
+    sign_model_file(model_path, settings.model_signing_key.encode())
     logger.info("Saved versioned model to %s", model_path)
 
     latest_path = os.path.join(model_dir, f"{name}_latest.txt")
@@ -92,7 +96,8 @@ def load_latest_model(
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Versioned model not found: {model_path}")
 
-    model = joblib.load(model_path)
+    assert_within_model_dir(model_path, model_dir)
+    model = safe_joblib_load(model_path, settings.model_signing_key.encode())
     logger.info("Loaded %s version %s from %s", name, version, model_path)
     return model
 

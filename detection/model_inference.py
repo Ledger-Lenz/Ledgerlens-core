@@ -5,11 +5,11 @@ import json
 import logging
 import os
 
-import joblib
 import numpy as np
 
 import config.settings as settings_module
 from detection.feature_engineering import FEATURE_NAMES
+from detection.model_signing import assert_within_model_dir, safe_joblib_load
 
 logger = logging.getLogger("ledgerlens.model_inference")
 
@@ -99,11 +99,13 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
 def load_models(model_dir: str | None = None) -> dict:
     """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
     model_dir = model_dir or settings_module.settings.model_dir
+    signing_key = settings_module.settings.model_signing_key.encode()
     models = {}
     for name, filename in _MODEL_FILENAMES.items():
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
-            models[name] = joblib.load(path)
+            assert_within_model_dir(path, model_dir)
+            models[name] = safe_joblib_load(path, signing_key)
     if not models:
         raise FileNotFoundError(f"No trained models found in {model_dir}. Run model_training first.")
     return models

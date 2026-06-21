@@ -13,6 +13,7 @@ from detection.model_registry import (
     rollback_model,
     save_versioned_model,
 )
+from detection.model_signing import ModelIntegrityError
 
 
 @pytest.fixture
@@ -264,3 +265,54 @@ class TestGetCurrentVersion:
 
         rollback_model("test_model", v1, model_dir)
         assert get_current_version("test_model", model_dir) == v1
+
+
+class TestSigningIntegration:
+    """save_versioned_model writes a signature; load_latest_model verifies it."""
+
+    def test_save_creates_sig_file(self, tmp_path, dummy_model):
+        model_dir = str(tmp_path)
+        save_versioned_model(dummy_model, "rf", "v001", model_dir)
+        sig = os.path.join(model_dir, "rf_vv001.joblib.sig")
+        assert os.path.exists(sig)
+
+    def test_load_round_trip_with_signing(self, tmp_path, dummy_model):
+        model_dir = str(tmp_path)
+        save_versioned_model(dummy_model, "rf", "v001", model_dir)
+        loaded = load_latest_model("rf", model_dir)
+        assert hasattr(loaded, "predict")
+
+    def test_load_raises_on_tampered_file(self, tmp_path, dummy_model):
+        model_dir = str(tmp_path)
+        save_versioned_model(dummy_model, "rf", "v001", model_dir)
+        path = os.path.join(model_dir, "rf_vv001.joblib")
+        with open(path, "r+b") as f:
+            f.seek(0)
+            b = f.read(1)
+            f.seek(0)
+            f.write(bytes([b[0] ^ 0xFF]))
+        with pytest.raises(ModelIntegrityError):
+            load_latest_model("rf", model_dir)
+
+    def test_load_raises_when_sig_missing(self, tmp_path, dummy_model):
+        model_dir = str(tmp_path)
+        save_versioned_model(dummy_model, "rf", "v001", model_dir)
+        os.remove(os.path.join(model_dir, "rf_vv001.joblib.sig"))
+        with pytest.raises(ModelIntegrityError):
+            load_latest_model("rf", model_dir)
+
+    def test_load_raises_on_missing_signing_key(self, tmp_path, dummy_model):
+        import config.settings as settings_module
+
+        model_dir = str(tmp_path)
+        save_versioned_model(dummy_model, "rf", "v001", model_dir)
+        object.__setattr__(settings_module.settings, "model_signing_key", "")
+        try:
+            with pytest.raises(ModelIntegrityError, match="LEDGERLENS_MODEL_SIGNING_KEY"):
+                load_latest_model("rf", model_dir)
+        finally:
+            object.__setattr__(
+                settings_module.settings,
+                "model_signing_key",
+                "test-signing-key-for-unit-tests-only",
+            )

@@ -94,33 +94,3 @@ def apply_weights(weights: dict[str, float], model_dir: str) -> None:
         weights["xgboost"],
         weights["lightgbm"],
     )
-
-
-
-def apply_weights(weights: dict[str, float], model_dir: str) -> None:
-    """Write *weights* to ``ensemble_weights.json`` inside *model_dir*.
-
-    Args:
-        weights: Output of :func:`compute_updated_weights`.
-        model_dir: Directory where model artefacts are stored.
-    """
-    import time
-
-    payload = {
-        "random_forest": weights["random_forest"],
-        "xgboost": weights["xgboost"],
-        "lightgbm": weights["lightgbm"],
-        "updated_at": time.time(),
-    }
-    os.makedirs(model_dir, exist_ok=True)
-    path = os.path.join(model_dir, _WEIGHTS_FILENAME)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as fh:
-        json.dump(payload, fh)
-    os.replace(tmp_path, path)  # atomic rename
-    logger.info(
-        "Wrote ensemble weights: rf=%.4f xgb=%.4f lgbm=%.4f",
-        weights["random_forest"],
-        weights["xgboost"],
-        weights["lightgbm"],
-    )

@@ -1,7 +1,6 @@
 import pandas as pd
 
 from detection.robustness_eval import compute_robustness_report
-from detection.adversarial_attack import fgsm_attack
 from tests.test_adversarial_attack import DummyModel
 from detection.feature_engineering import FEATURE_NAMES
 from detection.storage import get_latest_robustness_report

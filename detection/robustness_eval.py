@@ -15,26 +15,7 @@ from detection.dataset import build_training_dataset
 from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
 from ingestion.synthetic_data import generate_synthetic_dataset
 from detection.adversarial_attack import pgd_attack
-from detection.storage import init_db, _connect, save_scores
-from detection.storage import save_feature_vectors
-from detection.storage import init_db as _init_db  # keep name for backward compat
-from detection.storage import _connect as _get_conn
-from detection.storage import _connect as _storage_connect
-from detection.storage import save_feature_vectors as _save_feature_vectors
-from detection.storage import save_pair_correlations
-from detection.storage import get_latest_scores
 
-from detection.storage import save_retrain_run
-from detection.storage import save_feature_vectors
-from detection.storage import save_pair_correlations
-from detection.storage import save_scores
-from detection.storage import _connect
-from detection.model_registry import _compute_version_hash
-from detection.model_training import save_models
-from detection.model_inference import load_models
-from detection.model_training import train_ensemble
-from detection.model_registry import get_current_version
-from detection.model_inference import load_models as _load_models
 from detection.feature_engineering import FEATURE_NAMES
 from detection.counterfactual_constraints import FEATURE_CONSTRAINTS
 
@@ -180,7 +161,6 @@ def compute_robustness_report(models: dict, df, n_samples: int = 200, epsilon: f
     - MAP computed per true positive by binary-searching epsilon where PGD succeeds
     - Certified radius estimated via randomized smoothing (Monte Carlo)
     """
-    import random
     from detection.storage import save_robustness_report
 
     rng = np.random.RandomState(seed)

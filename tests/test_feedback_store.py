@@ -3,7 +3,6 @@
 import threading
 from datetime import datetime, timezone
 
-import pytest
 
 from detection.feedback_store import ScoringFeedback, get_recent_feedback, record_feedback
 

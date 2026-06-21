@@ -8,6 +8,9 @@ from sklearn.ensemble import RandomForestClassifier
 import config.settings as settings_module
 from detection.feature_engineering import FEATURE_NAMES
 from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
+from detection.model_signing import ModelIntegrityError, sign_model_file
+
+_TEST_KEY = b"test-signing-key-for-unit-tests-only"
 
 
 def _trained_classifier(weight: float):
@@ -17,11 +20,16 @@ def _trained_classifier(weight: float):
     return RandomForestClassifier(n_estimators=5, random_state=0).fit(X, y)
 
 
+def _dump_and_sign(path, model):
+    joblib.dump(model, path)
+    sign_model_file(str(path), _TEST_KEY)
+
+
 @pytest.fixture
 def model_dir(tmp_path):
-    joblib.dump(_trained_classifier(0.9), tmp_path / "random_forest.joblib")
-    joblib.dump(_trained_classifier(0.9), tmp_path / "xgboost.joblib")
-    joblib.dump(_trained_classifier(0.9), tmp_path / "lightgbm.joblib")
+    _dump_and_sign(tmp_path / "random_forest.joblib", _trained_classifier(0.9))
+    _dump_and_sign(tmp_path / "xgboost.joblib", _trained_classifier(0.9))
+    _dump_and_sign(tmp_path / "lightgbm.joblib", _trained_classifier(0.9))
     return str(tmp_path)
 
 
@@ -46,9 +54,40 @@ def test_score_feature_vector_returns_probability_and_confidence(model_dir):
 
 
 def test_load_models_with_partial_directory(tmp_path):
-    joblib.dump(_trained_classifier(0.9), tmp_path / "random_forest.joblib")
+    _dump_and_sign(tmp_path / "random_forest.joblib", _trained_classifier(0.9))
     models = load_models(str(tmp_path))
     assert set(models.keys()) == {"random_forest"}
+
+
+def test_load_models_raises_model_integrity_error_on_tampered_file(tmp_path):
+    path = tmp_path / "random_forest.joblib"
+    _dump_and_sign(path, _trained_classifier(0.9))
+    with open(str(path), "r+b") as f:
+        f.seek(0)
+        b = f.read(1)
+        f.seek(0)
+        f.write(bytes([b[0] ^ 0xFF]))
+    with pytest.raises(ModelIntegrityError):
+        load_models(str(tmp_path))
+
+
+def test_load_models_raises_model_integrity_error_on_missing_signature(tmp_path):
+    path = tmp_path / "random_forest.joblib"
+    joblib.dump(_trained_classifier(0.9), path)
+    with pytest.raises(ModelIntegrityError):
+        load_models(str(tmp_path))
+
+
+def test_load_models_raises_on_missing_signing_key(tmp_path):
+    path = tmp_path / "random_forest.joblib"
+    _dump_and_sign(path, _trained_classifier(0.9))
+    import config.settings as settings_module
+    object.__setattr__(settings_module.settings, "model_signing_key", "")
+    try:
+        with pytest.raises(ModelIntegrityError, match="LEDGERLENS_MODEL_SIGNING_KEY"):
+            load_models(str(tmp_path))
+    finally:
+        object.__setattr__(settings_module.settings, "model_signing_key", "test-signing-key-for-unit-tests-only")
 
 
 class FixedProbabilityModel:

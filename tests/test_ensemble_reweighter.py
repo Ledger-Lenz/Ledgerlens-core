@@ -2,7 +2,6 @@
 
 from datetime import datetime, timezone
 
-import pytest
 
 from detection.ensemble_reweighter import compute_updated_weights
 from detection.feedback_store import ScoringFeedback

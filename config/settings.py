@@ -43,6 +43,7 @@ class Settings:
         )
     )
     admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
+    model_signing_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_MODEL_SIGNING_KEY", ""))
 
     # Federated Learning
     federated_min_participants: int = field(

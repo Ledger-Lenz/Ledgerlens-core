@@ -1,8 +1,13 @@
+import base64
+import os
+from datetime import datetime, timedelta, timezone
+
+import pytest
 from fastapi.testclient import TestClient
-import importlib
 
 from api.main import app
-from detection.storage import get_latest_robustness_report
+from detection.risk_score import RiskScore
+from detection.storage import save_scores
 
 
 def test_robustness_endpoint_no_report(monkeypatch):
@@ -36,15 +41,6 @@ def test_robustness_endpoint_with_report(monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
     assert "model_version" in data
-import base64
-import os
-from datetime import datetime, timedelta, timezone
-
-import pytest
-from fastapi.testclient import TestClient
-
-from detection.risk_score import RiskScore
-from detection.storage import save_scores
 
 
 @pytest.fixture(autouse=True)
