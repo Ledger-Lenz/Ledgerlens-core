@@ -2,7 +2,6 @@
 
 import os
 
-import joblib
 import pytest
 from sklearn.ensemble import RandomForestClassifier
 

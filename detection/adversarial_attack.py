@@ -13,12 +13,10 @@ enforced per-feature; and feature vectors are validated against
 """
 from __future__ import annotations
 
-import copy
 import math
 from typing import Tuple
 
 import numpy as np
-from scipy.stats import norm
 
 from detection.feature_engineering import FEATURE_NAMES
 try:

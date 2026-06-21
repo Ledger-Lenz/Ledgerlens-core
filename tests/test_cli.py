@@ -1,14 +1,13 @@
-from cli import robustness_eval
+import os
+
+from typer.testing import CliRunner
+
+from cli import app, robustness_eval
 
 
 def test_cli_robustness_eval_runs():
     # run a short evaluation to ensure it exits without error
     robustness_eval(epsilon=0.05, steps=5, n_samples=10)
-import os
-
-from typer.testing import CliRunner
-
-from cli import app
 
 runner = CliRunner()
 

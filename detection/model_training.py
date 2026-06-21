@@ -93,7 +93,6 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
     if adversarial_hardening:
         try:
             from detection.adversarial_attack import pgd_attack
-            import pandas as pd
 
             # collect adversarial examples that successfully flip model
             adv_rows = []
