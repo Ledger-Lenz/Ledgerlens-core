@@ -26,6 +26,13 @@ class Settings:
     ensemble_weight_xgb: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_XGB", "0.50")))
     ensemble_weight_lgbm: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_LGBM", "0.25")))
 
+    # Points subtracted from the correlational score per unit of positive price
+    # discovery contribution (see detection.risk_score / detection.causal_engine).
+    # 0.0 leaves the score unchanged.
+    pdc_discount_weight: float = field(
+        default_factory=lambda: float(os.getenv("PDC_DISCOUNT_WEIGHT", "0.0"))
+    )
+
     model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
     db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
 

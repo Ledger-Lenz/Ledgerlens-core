@@ -35,3 +35,60 @@ def explain_score(model, feature_vector: dict) -> dict:
 def top_contributing_features(explanation: dict, n: int = 5) -> list[tuple[str, float]]:
     """Return the `n` features with the largest absolute SHAP contribution."""
     return sorted(explanation.items(), key=lambda kv: abs(kv[1]), reverse=True)[:n]
+
+
+# Causal (price-discovery-contribution) features, mapped to the canonical name
+# used in human-readable explanations.
+PDC_FEATURES = ("pdc_5m", "pdc_1h", "price_discovery_contribution")
+
+
+def pdc_annotation(feature: str, value: float) -> dict:
+    """Build a human-readable causal annotation for a single PDC feature.
+
+    SHAP attributes *correlation*; PDC attributes *causal* responsibility for
+    price discovery. A positive PDC reduces risk (market-making behaviour), a
+    negative PDC increases it (price suppression consistent with wash trading).
+    """
+    if value > 0.0:
+        direction = "reduces_risk"
+        interpretation = "wallet consistently improves mid-price — consistent with market making"
+    elif value < 0.0:
+        direction = "increases_risk"
+        interpretation = "wallet suppresses price discovery — consistent with wash trading"
+    else:
+        direction = "neutral"
+        interpretation = "wallet has no measurable causal effect on price discovery"
+
+    return {
+        "feature": feature,
+        "value": float(value),
+        "direction": direction,
+        "interpretation": interpretation,
+    }
+
+
+def annotate_causal_features(feature_vector: dict) -> list[dict]:
+    """Return causal PDC annotations for whichever PDC features are present.
+
+    Lets the API/dashboard show *why* a high-frequency wallet was (or was not)
+    discounted, alongside the correlational SHAP values from `explain_score`.
+    """
+    return [
+        pdc_annotation(name, feature_vector[name])
+        for name in PDC_FEATURES
+        if name in feature_vector
+    ]
+
+
+def explain_score_with_causal(model, feature_vector: dict) -> dict:
+    """SHAP explanation plus causal PDC annotations.
+
+    Returns ``{"shap": {feature: shap_value}, "causal": [annotation, ...]}`` so
+    consumers get both the correlational attribution and the causal
+    interpretation in one call. `explain_score` is left unchanged for callers
+    that only need raw SHAP values.
+    """
+    return {
+        "shap": explain_score(model, feature_vector),
+        "causal": annotate_causal_features(feature_vector),
+    }

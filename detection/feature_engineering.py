@@ -13,6 +13,7 @@ import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import compute_benford_metrics
+from detection.causal_engine import estimate_pdc
 from detection.path_payment_engine import detect_atomic_circular_routes
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
 
@@ -77,6 +78,11 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
 ]
 
+CAUSAL_FEATURE_NAMES = [
+    "pdc_5m",  # price discovery contribution (ATE) over 5-minute windows
+    "pdc_1h",  # price discovery contribution (ATE) over 1-hour windows
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -85,6 +91,7 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
+    + CAUSAL_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -481,6 +488,30 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     }
 
 
+def causal_features(
+    trades: pd.DataFrame,
+    account: str,
+    prices: pd.DataFrame | None = None,
+    pair: str | None = None,
+) -> dict:
+    """Compute the price-discovery-contribution (PDC) features for `account`.
+
+    PDC is the doubly-robust treatment effect of the wallet's trades on the
+    subsequent mid-price (see `detection.causal_engine.estimate_pdc`): positive
+    for market makers, near-zero/negative for wash traders. Requires a `prices`
+    time series (`timestamp` + `mid_price`/`price`); omitting it yields `0.0`
+    for both features, so existing callers are unaffected.
+    """
+    zero = {name: 0.0 for name in CAUSAL_FEATURE_NAMES}
+    if prices is None or getattr(prices, "empty", True) or trades.empty:
+        return zero
+
+    return {
+        "pdc_5m": float(estimate_pdc(trades, prices, account, pair, window_minutes=5)),
+        "pdc_1h": float(estimate_pdc(trades, prices, account, pair, window_minutes=60)),
+    }
+
+
 def build_feature_vector(
     trades: pd.DataFrame,
     account: str,
@@ -494,6 +525,8 @@ def build_feature_vector(
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
     ring_membership: dict[str, dict] | None = None,
+    prices: pd.DataFrame | None = None,
+    pair: str | None = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -513,6 +546,10 @@ def build_feature_vector(
     `liquidity_pools`, `pool_deposits`, and `path_payments` are optional;
     omitting them yields `0.0` for the AMM/path-payment features that depend
     on them.
+
+    `prices` (a `timestamp` + `mid_price`/`price` series for the pair) and
+    `pair` drive the causal PDC features; omitting `prices` yields `0.0` for
+    `pdc_5m`/`pdc_1h`.
     """
     order_book_events = order_book_events if order_book_events is not None else pd.DataFrame(columns=["account", "event_type"])
     account_metadata = account_metadata or {}
@@ -537,6 +574,7 @@ def build_feature_vector(
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))
+    features.update(causal_features(trades, account, prices, pair))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features

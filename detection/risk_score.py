@@ -30,11 +30,24 @@ class RiskScore(BaseModel):
         benford_mad_threshold: float,
         ml_probability: float,
         ml_confidence: float,
+        pdc_score: float = 0.0,
+        pdc_discount_weight: float = 0.0,
     ) -> "RiskScore":
         """Combine Benford metrics and an ML probability into a single score.
 
         `score` is a 0-100 blend weighted toward the ML probability, with
         the Benford signal acting as a corroborating flag.
+
+        `pdc_score` is the wallet's price-discovery contribution from
+        `detection.causal_engine.estimate_pdc`. A positive PDC is causal
+        evidence of market making, so it *discounts* the correlational score:
+
+            causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight
+            score = max(0.0, raw_score - causal_adjustment)
+
+        The discount is applied before the final 0-100 clamp. With the default
+        `pdc_discount_weight = 0.0` the score is unchanged, so existing callers
+        and tests are unaffected.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
@@ -42,7 +55,9 @@ class RiskScore(BaseModel):
         benford_component = min(benford_mad / benford_mad_threshold, 1.0) * 100 if benford_mad_threshold else 0.0
         ml_component = ml_probability * 100
 
-        score = round(0.3 * benford_component + 0.7 * ml_component)
+        raw_score = 0.3 * benford_component + 0.7 * ml_component
+        causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight
+        score = round(max(0.0, raw_score - causal_adjustment))
         score = max(0, min(100, score))
 
         return cls(
