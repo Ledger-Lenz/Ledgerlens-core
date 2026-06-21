@@ -125,5 +125,4 @@ def cast_proposal_vote(proposal_id: str, voter_key_hash: str, vote: str) -> Gove
             conn.commit()
             return GovernanceProposal(proposal_id=row[1], proposal_type=row[2], proposed_value=row[3], proposed_by_key_hash=row[3], votes_for=votes_for, votes_against=votes_against, status="expired", created_at=datetime.fromisoformat(row[7]), expires_at=expires_at)
 
-        return GovernanceProposal(proposal_id=row[1], proposal_type=row[2], proposed_value=row[3], proposed_by_key_hash=row[3], votes_for=votes_for, votes_against=votes_against, status="open", created_at=datetime.fromisoformat(row[7]), expires_at=datetime.fromisoformat(row[8]))
-*** End Patch
+        return GovernanceProposal(proposal_id=row[1], proposal_type=row[2], proposed_value=row[3], proposed_by_key_hash=row[3], votes_for=votes_for, votes_against=votes_against, status="open", created_at=datetime.fromisoformat(row[7]), expires_at=datetime.fromisoformat(row[8]))

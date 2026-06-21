@@ -303,4 +303,3 @@ def get_dispute(dispute_id: str) -> ScoreDispute | None:
             resolved_at=datetime.fromisoformat(row[10]) if row[10] else None,
             resolution=row[11],
         )
-*** End Patch

@@ -357,7 +357,7 @@ def robustness_eval(
         models = {k: v["model"] for k, v in results.items()}
 
     report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
-    typer.echo(report.json(indent=2))
+    typer.echo(report.model_dump_json(indent=2))
 
 
 @app.command("serve")

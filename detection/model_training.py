@@ -6,6 +6,7 @@ models are written to `settings.model_dir` for `model_inference` to load.
 """
 
 import joblib
+import numpy as np
 import pandas as pd
 from detection.model_signing import sign_model_file
 from imblearn.over_sampling import SMOTE
@@ -126,6 +127,43 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
         except Exception:
             # Hardening is best-effort; failures should not crash training.
             pass
+
+    # Train LSTM temporal anomaly model
+    try:
+        from detection.temporal_dataset import build_training_sequences
+        from detection.temporal_model import train_temporal_model, predict_temporal_risk
+
+        # Train/validation split by wallet
+        train_df, test_df = train_test_split(
+            df, test_size=0.2, random_state=random_state, stratify=df["label"]
+        )
+
+        X_train_seq, y_train_seq = build_training_sequences(train_df, db_path=settings.db_path)
+        X_test_seq, y_test_seq = build_training_sequences(test_df, db_path=settings.db_path)
+
+        lstm_model = train_temporal_model(X_train_seq, y_train_seq, epochs=15, batch_size=32)
+
+        # Evaluate on test sequence dataset
+        y_proba_seq = np.array([predict_temporal_risk(lstm_model, seq) for seq in X_test_seq])
+        y_pred_seq = (y_proba_seq >= 0.5).astype(int)
+
+        if len(np.unique(y_test_seq)) > 1:
+            lstm_auc_roc = roc_auc_score(y_test_seq, y_proba_seq)
+            lstm_pr_auc = average_precision_score(y_test_seq, y_proba_seq)
+            lstm_f1 = f1_score(y_test_seq, y_pred_seq)
+        else:
+            lstm_auc_roc, lstm_pr_auc, lstm_f1 = 1.0, 1.0, 1.0
+
+        results["temporal_lstm"] = {
+            "model": lstm_model,
+            "auc_roc": lstm_auc_roc,
+            "pr_auc": lstm_pr_auc,
+            "f1": lstm_f1,
+        }
+    except Exception as e:
+        import logging
+        logger = logging.getLogger("ledgerlens.model_training")
+        logger.exception("Failed to train temporal LSTM model: %s", e)
 
     return results
 

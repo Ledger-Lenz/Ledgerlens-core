@@ -54,3 +54,23 @@ class RiskScore(BaseModel):
             confidence=round(ml_confidence * 100),
             timestamp=datetime.now(timezone.utc),
         )
+
+
+def temporal_risk_adjustment(
+    snapshot_score: int,
+    temporal_score: float | None,
+    history_days: int,
+    temporal_weight: float = 0.3,
+) -> int:
+    """Blend temporal risk probability (0-1) and snapshot score (0-100).
+
+    When a wallet has < 7 days of history, or temporal_score is None,
+    fall back to snapshot-only mode.
+    """
+    if history_days < 7 or temporal_score is None:
+        return snapshot_score
+
+    snapshot_weight = 1.0 - temporal_weight
+    final_score = snapshot_weight * snapshot_score + temporal_weight * (temporal_score * 100.0)
+    return max(0, min(100, round(final_score)))
+

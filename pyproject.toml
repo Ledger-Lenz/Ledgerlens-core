@@ -14,6 +14,11 @@ asyncio_mode = "auto"
 markers = [
     "benchmark: performance benchmarks (excluded from standard CI; run with -m benchmark)",
 ]
+filterwarnings = [
+    "ignore::UserWarning:sklearn.utils.parallel",
+    "ignore:.*sklearn.utils.parallel.*:UserWarning",
+    "ignore:`sklearn.utils.parallel.delayed`.*:UserWarning",
+]
 
 [tool.ruff]
 line-length = 100

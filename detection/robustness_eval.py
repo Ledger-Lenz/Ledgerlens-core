@@ -42,7 +42,9 @@ def _score_models(models: dict, df) -> dict[str, float]:
         return {"auc_roc": float("nan"), "f1": float("nan")}
 
     auc_rocs, f1s = [], []
-    for model in models.values():
+    for name, model in models.items():
+        if name == "temporal_lstm":
+            continue
         y_proba = model.predict_proba(X)[:, 1]
         y_pred = model.predict(X)
         auc_rocs.append(roc_auc_score(y, y_proba))
@@ -149,7 +151,9 @@ def _ensemble_probas(models: dict, df) -> np.ndarray:
     """Return mean ensemble probability (positive class) for each row in df."""
     X = df[FEATURE_NAMES].fillna(0.0)
     probs = []
-    for m in models.values():
+    for name, m in models.items():
+        if name == "temporal_lstm":
+            continue
         probs.append(m.predict_proba(X)[:, 1])
     return np.mean(np.vstack(probs), axis=0)
 
@@ -212,7 +216,7 @@ def compute_robustness_report(models: dict, df, n_samples: int = 200, epsilon: f
     certs = []
     for i in tp_indices:
         vec = row_to_vec(i)
-        count_pos = 0
+        noisy_list = []
         for _ in range(n_samples):
             noisy = {f: float(vec[f] + rng.normal(scale=sigma)) for f in FEATURE_NAMES}
             # enforce bounds
@@ -220,16 +224,11 @@ def compute_robustness_report(models: dict, df, n_samples: int = 200, epsilon: f
                 c = FEATURE_CONSTRAINTS.get(f, {})
                 noisy[f] = max(c.get("min", -math.inf), noisy[f])
                 noisy[f] = min(c.get("max", math.inf), noisy[f])
-            p = _ensemble_probas(models, build_training_dataset.__self__ if False else df.iloc[[i]])[0] if False else _ensemble_probas(models, df.iloc[[i]])[0]
-            # simpler: evaluate on noisy single-row
-            import pandas as pd
-            noisy_df = pd.DataFrame([noisy])[FEATURE_NAMES].fillna(0.0)
-            probs_noisy = []
-            for m in models.values():
-                probs_noisy.append(m.predict_proba(noisy_df)[:, 1][0])
-            p_noisy = float(np.mean(probs_noisy))
-            if p_noisy >= 0.5:
-                count_pos += 1
+            noisy_list.append(noisy)
+        import pandas as pd
+        noisy_df = pd.DataFrame(noisy_list)[FEATURE_NAMES].fillna(0.0)
+        probs_noisy = _ensemble_probas(models, noisy_df)
+        count_pos = int(np.sum(probs_noisy >= 0.5))
         p_hat = count_pos / n_samples
         if p_hat <= 0.5:
             certs.append(0.0)

@@ -38,7 +38,9 @@ def _ensemble_proba(models: dict, vec: dict) -> float:
 
     X = pd.DataFrame([vec])[FEATURE_NAMES].fillna(0.0)
     probs = []
-    for m in models.values():
+    for name, m in models.items():
+        if name == "temporal_lstm":
+            continue
         try:
             probs.append(float(m.predict_proba(X)[:, 1][0]))
         except Exception:

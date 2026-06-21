@@ -64,8 +64,8 @@ async def _lifespan(application: FastAPI):
         from detection.model_inference import load_models
         _models = load_models(settings.model_dir)
         logger.info("Loaded %d model(s) from %s", len(_models), settings.model_dir)
-    except FileNotFoundError:
-        logger.warning("No trained models found in %s — /explain will return 503", settings.model_dir)
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
     yield
 

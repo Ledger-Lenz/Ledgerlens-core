@@ -1,6 +1,9 @@
 """Real-time risk scoring: load trained models and score a feature vector."""
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import logging
 import os
@@ -22,6 +25,7 @@ _MODEL_FILENAMES = {
     "random_forest": "random_forest.joblib",
     "xgboost": "xgboost.joblib",
     "lightgbm": "lightgbm.joblib",
+    "temporal_lstm": "temporal_lstm.joblib",
 }
 
 
@@ -55,11 +59,13 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
 
     try:
         with open(path, "r") as fh:
-            fcntl.flock(fh, fcntl.LOCK_SH)
+            if fcntl is not None:
+                fcntl.flock(fh, fcntl.LOCK_SH)
             try:
                 data = json.load(fh)
             finally:
-                fcntl.flock(fh, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("ensemble_weights.json unreadable: %s — falling back to settings", exc)
         return None
@@ -145,6 +151,8 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
 
     probabilities = {}
     for name, model in models.items():
+        if name == "temporal_lstm":
+            continue
         if hasattr(model, "feature_names_in_"):
             ordered = X[:, [FEATURE_NAMES.index(f) for f in model.feature_names_in_]]
         else:
@@ -183,6 +191,8 @@ def score_feature_matrix(
 
     model_probs: dict[str, np.ndarray] = {}
     for name, model in models.items():
+        if name == "temporal_lstm":
+            continue
         if hasattr(model, "feature_names_in_"):
             col_idx = [FEATURE_NAMES.index(f) for f in model.feature_names_in_]
             ordered = X[:, col_idx]

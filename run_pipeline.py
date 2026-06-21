@@ -52,6 +52,30 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.pipeline")
 
 
+def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict) -> None:
+    temporal_model = models.get("temporal_lstm")
+    if temporal_model is None:
+        return
+
+    from detection.temporal_dataset import build_score_sequences, get_daily_history
+    from detection.temporal_model import predict_temporal_risk
+    from detection.risk_score import temporal_risk_adjustment
+
+    daily_history = get_daily_history(settings.db_path, account)
+    history_days = len(daily_history)
+
+    if history_days >= 7:
+        seqs = build_score_sequences(settings.db_path, account)
+        if len(seqs) > 0:
+            temporal_prob = predict_temporal_risk(temporal_model, seqs[-1])
+            score.score = temporal_risk_adjustment(
+                snapshot_score=score.score,
+                temporal_score=temporal_prob,
+                history_days=history_days,
+                temporal_weight=settings.temporal_weight,
+            )
+
+
 def run(
     asset_pairs: list[tuple[str | None, str | None]] | None = None,
     multi_pair: bool = False,
@@ -164,6 +188,7 @@ def run(
                 ml_probability=probability,
                 ml_confidence=confidence,
             )
+            adjust_score_with_temporal(account, pair_key, score, models)
             scores.append(score)
             scored_features.append(features)
             scored_wallets.append(account)
@@ -339,6 +364,7 @@ async def async_run(
                     ml_probability=probability,
                     ml_confidence=confidence,
                 )
+                adjust_score_with_temporal(account, pair_key, score, models)
                 scores.append(score)
                 scored_features.append(features)
                 scored_wallets.append(account)
@@ -459,6 +485,7 @@ def _flush_streaming_buffer(
             ml_probability=probability,
             ml_confidence=confidence,
         )
+        adjust_score_with_temporal(account, pair_key, score, models)
         scores.append(score)
         scored_features.append(features)
         scored_wallets.append(account)

@@ -260,7 +260,25 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_governance_proposals_proposal_id ON governance_proposals (proposal_id);
         """,
     ),
+    (
+        8,
+        "add wash_rings table",
+        """
+        CREATE TABLE IF NOT EXISTS wash_rings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            accounts_json TEXT NOT NULL,
+            total_volume REAL NOT NULL,
+            cycle_volume REAL NOT NULL,
+            avg_trade_count REAL NOT NULL,
+            timing_tightness REAL NOT NULL,
+            truncated INTEGER NOT NULL,
+            detected_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wash_rings_detected_at ON wash_rings (detected_at);
+        """,
+    ),
 ]
+
 
 
 @contextmanager
