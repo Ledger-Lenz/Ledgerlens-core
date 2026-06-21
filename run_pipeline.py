@@ -33,6 +33,7 @@ from detection.storage import (
     save_liquidity_pool_trades,
     save_pair_correlations,
     save_path_payments,
+    save_rings,
     save_scores,
 )
 from detection.shap_explainer import explain_score, top_contributing_features
@@ -72,6 +73,7 @@ def run(
     ]
     models = load_models()
     scores: list[RiskScore] = []
+    all_rings: list[dict] = []
     scored_features: list[dict] = []
     scored_wallets: list[str] = []
     scored_pairs: list[str] = []
@@ -119,7 +121,7 @@ def run(
         graph = build_transaction_graph(trades)
         rings = find_wash_rings(graph)
         all_rings.extend(rings)
-        ring_membership = build_ring_membership_index(rings, trades=trades)
+        _ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
         account_metadata = load_account_metadata(list(accounts))

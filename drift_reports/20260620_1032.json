@@ -1,0 +1,15 @@
+{
+  "timestamp": "20260620_1032",
+  "drift_detected": true,
+  "psi_report": {
+    "feature_a": 0.25,
+    "feature_b": 0.22,
+    "feature_c": 0.21
+  },
+  "promoted": true,
+  "new_model_metrics": {
+    "random_forest": 0.9,
+    "xgboost": 0.9,
+    "lightgbm": 0.9
+  }
+}

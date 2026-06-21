@@ -493,6 +493,7 @@ def build_feature_vector(
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
+    ring_membership: dict[str, dict] | None = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 

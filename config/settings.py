@@ -47,8 +47,31 @@ class Settings:
     )
     admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
 
-    # runtime config cache (module-level TTL implemented below)
-    _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
+    # Federated Learning
+    federated_min_participants: int = field(
+        default_factory=lambda: int(os.getenv("FEDERATED_MIN_PARTICIPANTS", "3"))
+    )
+    federated_dp_epsilon: float = field(
+        default_factory=lambda: float(os.getenv("FEDERATED_DP_EPSILON", "1.0"))
+    )
+    federated_dp_delta: float = field(
+        default_factory=lambda: float(os.getenv("FEDERATED_DP_DELTA", "1e-5"))
+    )
+    federated_dp_max_epsilon: float = field(
+        default_factory=lambda: float(os.getenv("FEDERATED_DP_MAX_EPSILON", "10.0"))
+    )
+    gradient_clip_threshold: float = field(
+        default_factory=lambda: float(os.getenv("GRADIENT_CLIP_THRESHOLD", "10.0"))
+    )
+    gradient_outlier_threshold: float = field(
+        default_factory=lambda: float(os.getenv("GRADIENT_OUTLIER_THRESHOLD", "0.1"))
+    )
+    federated_server_host: str = field(
+        default_factory=lambda: os.getenv("FEDERATED_SERVER_HOST", "127.0.0.1")
+    )
+    federated_server_port: int = field(
+        default_factory=lambda: int(os.getenv("FEDERATED_SERVER_PORT", "8001"))
+    )
 
     def __post_init__(self) -> None:
         weights = (

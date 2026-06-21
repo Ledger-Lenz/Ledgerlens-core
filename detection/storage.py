@@ -1050,6 +1050,69 @@ def get_circular_routes(
     ]
 
 
+def save_rings(rings: list[dict], db_path: str | None = None) -> None:
+    """Persist `find_wash_rings` output from the latest pipeline run."""
+    if not rings:
+        return
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO wash_rings
+                (accounts_json, total_volume, cycle_volume, avg_trade_count,
+                 timing_tightness, truncated, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    json.dumps(r["accounts"]),
+                    r["total_volume"],
+                    r["cycle_volume"],
+                    r.get("avg_trade_count", 0.0),
+                    r.get("timing_tightness", 0.0),
+                    int(r.get("truncated", False)),
+                    ts,
+                )
+                for r in rings
+            ],
+        )
+        conn.commit()
+
+
+def get_rings(
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return detected wash-trading rings, most recent first, paginated."""
+    init_db(db_path)
+    query = (
+        "SELECT accounts_json, total_volume, cycle_volume, avg_trade_count, "
+        "timing_tightness, truncated, detected_at FROM wash_rings ORDER BY detected_at DESC"
+    )
+    params: list = []
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "accounts": json.loads(row[0]),
+            "total_volume": row[1],
+            "cycle_volume": row[2],
+            "avg_trade_count": row[3],
+            "timing_tightness": row[4],
+            "truncated": bool(row[5]),
+            "detected_at": row[6],
+        }
+        for row in rows
+    ]
+
+
 if __name__ == "__main__":
     init_db()
     print(f"Initialized risk score database at {settings.db_path}")

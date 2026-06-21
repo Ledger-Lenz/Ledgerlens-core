@@ -1,5 +1,8 @@
 """Real-time risk scoring: load trained models and score a feature vector."""
 
+import fcntl
+import json
+import logging
 import os
 
 import joblib
@@ -8,11 +11,89 @@ import numpy as np
 import config.settings as settings_module
 from detection.feature_engineering import FEATURE_NAMES
 
+logger = logging.getLogger("ledgerlens.model_inference")
+
+_WEIGHTS_FILENAME = "ensemble_weights.json"
+_REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
+_weights_mtime: float | None = None
+_runtime_weights: dict[str, float] | None = None
+
 _MODEL_FILENAMES = {
     "random_forest": "random_forest.joblib",
     "xgboost": "xgboost.joblib",
     "lightgbm": "lightgbm.joblib",
 }
+
+
+def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
+    """Load ensemble weights from ``ensemble_weights.json`` if valid.
+
+    Validates that:
+    - The file exists and is parseable JSON.
+    - Exactly the three model keys are present and all weights are non-negative.
+    - Weights sum to within 1e-4 of 1.0.
+
+    Returns the weight dict on success, or ``None`` (with a WARNING log) on
+    any validation failure so callers can fall back to static settings values.
+
+    Thread safety: uses ``fcntl.flock`` for a shared (read) lock so concurrent
+    writer processes (CLI reweight command) cannot produce a torn read.
+    """
+    global _weights_mtime, _runtime_weights
+
+    path = os.path.join(model_dir, _WEIGHTS_FILENAME)
+    if not os.path.exists(path):
+        return None
+
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+
+    if mtime == _weights_mtime and _runtime_weights is not None:
+        return _runtime_weights
+
+    try:
+        with open(path, "r") as fh:
+            fcntl.flock(fh, fcntl.LOCK_SH)
+            try:
+                data = json.load(fh)
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("ensemble_weights.json unreadable: %s — falling back to settings", exc)
+        return None
+
+    model_keys = {k: data[k] for k in _REQUIRED_KEYS if k in data}
+    if set(model_keys) != _REQUIRED_KEYS:
+        logger.warning(
+            "ensemble_weights.json has unexpected keys %s — falling back to settings",
+            set(data.keys()) - {"updated_at"},
+        )
+        return None
+
+    weights: dict[str, float] = {}
+    for k, v in model_keys.items():
+        try:
+            w = float(v)
+        except (TypeError, ValueError):
+            logger.warning("ensemble_weights.json: non-numeric weight for %s — falling back", k)
+            return None
+        if w < 0:
+            logger.warning("ensemble_weights.json: negative weight for %s — falling back", k)
+            return None
+        weights[k] = w
+
+    if abs(sum(weights.values()) - 1.0) > 1e-4:
+        logger.warning(
+            "ensemble_weights.json weights sum to %.6f (not 1.0) — falling back to settings",
+            sum(weights.values()),
+        )
+        return None
+
+    _weights_mtime = mtime
+    _runtime_weights = weights
+    return weights
 
 
 def load_models(model_dir: str | None = None) -> dict:
@@ -28,12 +109,26 @@ def load_models(model_dir: str | None = None) -> dict:
     return models
 
 
-def _get_ensemble_weights() -> dict[str, float]:
-    settings = settings_module.settings
+def _get_ensemble_weights(model_dir: str | None = None) -> dict[str, float]:
+    """Return ensemble weights, preferring runtime cache over static settings.
+
+    If `settings` does not define `model_dir` (tests may monkeypatch a
+    SimpleNamespace without it), fall back to static settings and skip
+    attempting to load runtime weights.
+    """
+    actual_model_dir = model_dir if model_dir is not None else getattr(
+        settings_module.settings, "model_dir", None
+    )
+    runtime = load_runtime_weights(actual_model_dir) if actual_model_dir else None
+    if runtime is not None:
+        logger.debug("Using runtime ensemble weights from ensemble_weights.json")
+        return runtime
+    logger.debug("Using static ensemble weights from settings")
+    s = settings_module.settings
     return {
-        "random_forest": settings.ensemble_weight_rf,
-        "xgboost": settings.ensemble_weight_xgb,
-        "lightgbm": settings.ensemble_weight_lgbm,
+        "random_forest": s.ensemble_weight_rf,
+        "xgboost": s.ensemble_weight_xgb,
+        "lightgbm": s.ensemble_weight_lgbm,
     }
 
 

@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from api.auth import require_admin_key
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
+from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
 from detection.storage import (
     get_circular_routes,
@@ -37,6 +38,7 @@ from detection.storage import (
     get_liquidity_pool_trades,
     get_pair_correlations,
     get_retrain_runs,
+    get_rings,
     get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
@@ -262,6 +264,12 @@ def asset_risk_ranking() -> list[dict]:
     return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
 
 
+@app.get("/rings")
+def list_rings() -> list[dict]:
+    """Return detected wash-trading rings from the latest pipeline run."""
+    return get_rings()
+
+
 @app.get("/correlations")
 def list_correlations() -> list[dict]:
     """Return the most recent set of correlated asset pairs from the pipeline.
@@ -297,6 +305,79 @@ def circular_path_payments(
 
 
 # ---------------------------------------------------------------------------
+# Feedback ingestion — admin-key gated
+# ---------------------------------------------------------------------------
+
+
+class FeedbackRequest(BaseModel):
+    wallet: str
+    asset_pair: str
+    ground_truth: int  # 1 = confirmed wash, 0 = confirmed clean
+    scored_at: str     # ISO-8601 datetime of the scoring event
+
+
+@app.post("/feedback", dependencies=[Depends(require_admin_key)])
+def submit_feedback(body: FeedbackRequest) -> dict:
+    """Record ground-truth feedback for a previously scored wallet/asset_pair.
+
+    Looks up the stored per-model predictions from the ``risk_scores`` table
+    for the matching ``wallet``, ``asset_pair``, and ``scored_at`` timestamp,
+    then writes one :class:`~detection.feedback_store.ScoringFeedback` row per
+    model (3 rows total).
+
+    Returns ``{"recorded": 3}`` on success or 404 if no matching score is found.
+    """
+    from datetime import datetime, timezone
+
+    from detection.storage import _connect, init_db
+
+    try:
+        scored_at_dt = datetime.fromisoformat(body.scored_at)
+        if scored_at_dt.tzinfo is None:
+            scored_at_dt = scored_at_dt.replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid scored_at: {exc}")
+
+    # Ensure schema exists before querying
+    init_db()
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT score, shap_json FROM risk_scores "
+            "WHERE wallet = ? AND asset_pair = ? AND timestamp = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (body.wallet, body.asset_pair, scored_at_dt.isoformat()),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No score found for wallet={body.wallet} asset_pair={body.asset_pair} scored_at={body.scored_at}",
+        )
+
+    # We use the blended score / 100 as a proxy probability for each model
+    # when per-model probabilities are not stored separately.
+    blended_prob = row[0] / 100.0
+    confirmed_at = datetime.now(timezone.utc)
+    count = 0
+    for model_name in ("random_forest", "xgboost", "lightgbm"):
+        record_feedback(
+            ScoringFeedback(
+                wallet=body.wallet,
+                asset_pair=body.asset_pair,
+                model_name=model_name,
+                predicted_probability=blended_prob,
+                ground_truth=body.ground_truth,
+                scored_at=scored_at_dt,
+                confirmed_at=confirmed_at,
+            )
+        )
+        count += 1
+
+    return {"recorded": count}
+
+
+# ---------------------------------------------------------------------------
 # Model observability — drift reports and retrain runs (admin-key gated)
 # ---------------------------------------------------------------------------
 
@@ -325,6 +406,15 @@ def retrain_runs(
 ) -> list[dict]:
     """Return the most recent per-model retrain outcomes recorded by `cli.py retrain-check`."""
     return get_retrain_runs(limit=limit, model_name=model_name)
+
+
+@app.get("/admin/federated/audit-log", dependencies=[Depends(require_admin_key)])
+def federated_audit_log(
+    limit: int = Query(default=50, ge=1, le=1000),
+) -> list[dict]:
+    """Return the most recent federated-round audit records (participant IDs are SHA-256 hashed)."""
+    from detection.federated.audit import get_audit_records
+    return get_audit_records(limit=limit)
 
 
 # ---------------------------------------------------------------------------

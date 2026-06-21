@@ -44,7 +44,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from detection.risk_score import RiskScore
-from detection.storage import save_rings, save_scores
+from detection.storage import save_scores
 
 
 @pytest.fixture(autouse=True)
