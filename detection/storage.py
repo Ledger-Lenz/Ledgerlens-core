@@ -18,12 +18,26 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from enum import Enum
 
 import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
 from ingestion.data_models import PathPayment
+
+
+class AlertType(str, Enum):
+    """Taxonomy of manipulation alerts surfaced via the `/alerts` API.
+
+    Add new alert categories here; the value is the string stored in the
+    `alerts.alert_type` column and accepted by the `/alerts?alert_type=` query.
+    """
+
+    WASH_TRADING = "WASH_TRADING"
+    CIRCULAR_ROUTE = "CIRCULAR_ROUTE"
+    POOL_MANIPULATION = "POOL_MANIPULATION"
+    SANDWICH_ATTACK = "SANDWICH_ATTACK"
 
 
 class SchemaMigrationError(RuntimeError):
@@ -258,6 +272,24 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             expires_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_governance_proposals_proposal_id ON governance_proposals (proposal_id);
+        """,
+    ),
+    (
+        8,
+        "add alerts table for the manipulation alert taxonomy (incl. SANDWICH_ATTACK)",
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_type TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT,
+            pool_id TEXT,
+            severity INTEGER NOT NULL DEFAULT 0,
+            detail_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alerts_alert_type ON alerts (alert_type);
+        CREATE INDEX IF NOT EXISTS idx_alerts_wallet ON alerts (wallet);
         """,
     ),
 ]
@@ -1108,6 +1140,117 @@ def get_rings(
             "timing_tightness": row[4],
             "truncated": bool(row[5]),
             "detected_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
+    """Persist manipulation alerts to the `alerts` table.
+
+    Each dict must contain `alert_type` (an `AlertType` value or its string) and
+    `wallet`. Optional keys: `asset_pair`, `pool_id`, `severity` (0-100, default
+    0), and `detail` (any JSON-serialisable payload, stored as `detail_json`).
+    """
+    if not alerts:
+        return
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO alerts
+                (alert_type, wallet, asset_pair, pool_id, severity, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(getattr(a["alert_type"], "value", a["alert_type"])),
+                    a["wallet"],
+                    a.get("asset_pair"),
+                    a.get("pool_id"),
+                    int(a.get("severity", 0)),
+                    json.dumps(a["detail"]) if a.get("detail") is not None else None,
+                    a.get("created_at", ts),
+                )
+                for a in alerts
+            ],
+        )
+        conn.commit()
+
+
+def sandwich_candidates_to_alerts(candidates: list, asset_pair: str | None = None) -> list[dict]:
+    """Map `detection.sandwich_engine.SandwichCandidate` objects to alert dicts.
+
+    Severity scales with the inflicted slippage (capped at 100). The full
+    candidate is preserved in `detail` for downstream inspection.
+    """
+    alerts: list[dict] = []
+    for c in candidates:
+        alerts.append(
+            {
+                "alert_type": AlertType.SANDWICH_ATTACK,
+                "wallet": c.attacker,
+                "asset_pair": asset_pair,
+                "pool_id": c.pool_id,
+                "severity": int(min(abs(c.slippage_inflicted) * 100, 100)),
+                "detail": {
+                    "attacker": c.attacker,
+                    "victim": c.victim,
+                    "pool_id": c.pool_id,
+                    "buy_op_idx": c.buy_op_idx,
+                    "victim_op_idx": c.victim_op_idx,
+                    "sell_op_idx": c.sell_op_idx,
+                    "profit_xlm": c.profit_xlm,
+                    "ledger_sequence": c.ledger_sequence,
+                    "slippage_inflicted": c.slippage_inflicted,
+                },
+            }
+        )
+    return alerts
+
+
+def get_alerts(
+    alert_type: str | None = None,
+    wallet: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return stored alerts, most recent first, optionally filtered and paginated."""
+    init_db(db_path)
+    conditions: list[str] = []
+    params: list = []
+    if alert_type is not None:
+        conditions.append("alert_type = ?")
+        params.append(str(getattr(alert_type, "value", alert_type)))
+    if wallet is not None:
+        conditions.append("wallet = ?")
+        params.append(wallet)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    query = f"""
+        SELECT alert_type, wallet, asset_pair, pool_id, severity, detail_json, created_at
+        FROM alerts
+        {where}
+        ORDER BY created_at DESC, id DESC
+    """
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "alert_type": row[0],
+            "wallet": row[1],
+            "asset_pair": row[2],
+            "pool_id": row[3],
+            "severity": row[4],
+            "detail": json.loads(row[5]) if row[5] is not None else None,
+            "created_at": row[6],
         }
         for row in rows
     ]

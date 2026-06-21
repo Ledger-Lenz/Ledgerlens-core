@@ -32,6 +32,7 @@ from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
 from detection.storage import (
+    get_alerts,
     get_circular_routes,
     get_drift_reports,
     get_latest_scores,
@@ -238,12 +239,26 @@ def wallet_scores(wallet: str) -> list[RiskScore]:
     return scores
 
 
-@app.get("/alerts", response_model=list[RiskScore])
+@app.get("/alerts")
 def alerts(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-) -> list[RiskScore]:
-    """Return scores at or above `settings.risk_score_threshold`."""
+    alert_type: str | None = Query(
+        default=None,
+        description="Filter typed manipulation alerts (e.g. SANDWICH_ATTACK). "
+        "When omitted, returns risk scores at or above the threshold.",
+    ),
+):
+    """Return manipulation alerts.
+
+    Without `alert_type`, returns `RiskScore` records at or above
+    `settings.risk_score_threshold` (legacy behaviour). With `alert_type`,
+    returns stored typed alerts (see `detection.storage.AlertType`), such as
+    `SANDWICH_ATTACK`, most recent first.
+    """
+    if alert_type is not None:
+        return get_alerts(alert_type=alert_type, limit=limit, offset=offset)
+
     scores = get_latest_scores(limit=limit, offset=offset)
     return [s for s in scores if s.score >= settings.risk_score_threshold]
 

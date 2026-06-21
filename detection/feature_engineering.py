@@ -14,6 +14,7 @@ import pandas as pd
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import compute_benford_metrics
 from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.sandwich_engine import detect_sandwich_candidates
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
 
 ROLLING_WINDOWS = {
@@ -77,6 +78,11 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
 ]
 
+SANDWICH_FEATURE_NAMES = [
+    "sandwich_ratio",  # fraction of an account's pool trades that are attacker legs of a sandwich
+    "sandwich_profit_xlm_30d",  # XLM the account extracted as a sandwich attacker over the last 30d
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -85,6 +91,7 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
+    + SANDWICH_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -481,6 +488,48 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     }
 
 
+def sandwich_features(
+    trades: pd.DataFrame,
+    account: str,
+    as_of: pd.Timestamp,
+    min_profit_xlm: float = 10.0,
+) -> dict:
+    """Compute wallet-level sandwich-aggressor features for `account`.
+
+    `sandwich_ratio` is the share of `account`'s pool trades that are attacker
+    legs (buy + sell) of a detected sandwich. `sandwich_profit_xlm_30d` is the
+    XLM profit `account` extracted as the attacker across sandwiches whose
+    opening buy falls in the 30 days ending at `as_of`.
+    """
+    zero = {name: 0.0 for name in SANDWICH_FEATURE_NAMES}
+    if trades.empty or "trade_type" not in trades.columns or "price" not in trades.columns:
+        return zero
+
+    pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+    if pool_trades.empty:
+        return zero
+
+    window = _window_slice(pool_trades, as_of, ROLLING_WINDOWS["30d"])
+    if window.empty:
+        return zero
+
+    candidates = detect_sandwich_candidates(window, min_profit_xlm=min_profit_xlm)
+    own = [c for c in candidates if c.attacker == account]
+    if not own:
+        return zero
+
+    account_pool_trades = pool_trades[pool_trades["base_account"] == account]
+    denom = len(account_pool_trades)
+    # each sandwich contributes two attacker legs (buy + sell)
+    ratio = min(2 * len(own) / denom, 1.0) if denom > 0 else 0.0
+    profit = sum(c.profit_xlm for c in own)
+
+    return {
+        "sandwich_ratio": float(ratio),
+        "sandwich_profit_xlm_30d": float(profit),
+    }
+
+
 def build_feature_vector(
     trades: pd.DataFrame,
     account: str,
@@ -537,6 +586,7 @@ def build_feature_vector(
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))
+    features.update(sandwich_features(trades, account, as_of))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features
