@@ -115,7 +115,7 @@ def test_list_scores_and_filter_by_min_score(client, monkeypatch):
     from api.main import app  # noqa: F401
     import detection.storage as storage_module
 
-    save_scores([_score("GABC", "XLM/USDC", 80), _score("GXYZ", "XLM/USDC", 20)], storage_module.settings.db_path)
+    save_scores([_score("G" + "A" * 55, "XLM/USDC", 80), _score("G" + "B" * 55, "XLM/USDC", 20)], storage_module.settings.db_path)
 
     response = client.get("/scores")
     assert response.status_code == 200
@@ -125,7 +125,7 @@ def test_list_scores_and_filter_by_min_score(client, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
-    assert body[0]["wallet"] == "GABC"
+    assert body[0]["wallet"] == "G" + "A" * 55
 
 
 def test_list_scores_filters_by_benford_flag(client):
@@ -133,8 +133,8 @@ def test_list_scores_filters_by_benford_flag(client):
 
     save_scores(
         [
-            _score("GBENFORD", "XLM/USDC", 60, benford_flag=True, ml_flag=False),
-            _score("GCLEAN", "XLM/USDC", 95, benford_flag=False, ml_flag=True),
+            _score("G" + "B" * 55, "XLM/USDC", 60, benford_flag=True, ml_flag=False),
+            _score("G" + "C" * 55, "XLM/USDC", 95, benford_flag=False, ml_flag=True),
         ],
         storage_module.settings.db_path,
     )
@@ -142,7 +142,7 @@ def test_list_scores_filters_by_benford_flag(client):
     response = client.get("/scores?benford_flag=true")
     assert response.status_code == 200
     body = response.json()
-    assert [item["wallet"] for item in body] == ["GBENFORD"]
+    assert [item["wallet"] for item in body] == ["G" + "B" * 55]
 
 
 def test_list_scores_filters_by_ml_flag_false(client):
@@ -150,8 +150,8 @@ def test_list_scores_filters_by_ml_flag_false(client):
 
     save_scores(
         [
-            _score("GML", "XLM/USDC", 95, benford_flag=False, ml_flag=True),
-            _score("GNO_ML", "XLM/USDC", 60, benford_flag=True, ml_flag=False),
+            _score("G" + "M" * 55, "XLM/USDC", 95, benford_flag=False, ml_flag=True),
+            _score("G" + "N" * 55, "XLM/USDC", 60, benford_flag=True, ml_flag=False),
         ],
         storage_module.settings.db_path,
     )
@@ -159,7 +159,7 @@ def test_list_scores_filters_by_ml_flag_false(client):
     response = client.get("/scores?ml_flag=false")
     assert response.status_code == 200
     body = response.json()
-    assert [item["wallet"] for item in body] == ["GNO_ML"]
+    assert [item["wallet"] for item in body] == ["G" + "N" * 55]
 
 
 def test_list_scores_combines_flag_filters_and_min_score(client):
@@ -167,9 +167,9 @@ def test_list_scores_combines_flag_filters_and_min_score(client):
 
     save_scores(
         [
-            _score("GMATCH", "XLM/USDC", 80, benford_flag=True, ml_flag=False),
-            _score("GLOW", "XLM/USDC", 40, benford_flag=True, ml_flag=False),
-            _score("GWRONG_FLAG", "XLM/USDC", 95, benford_flag=True, ml_flag=True),
+            _score("G" + "M" * 55, "XLM/USDC", 80, benford_flag=True, ml_flag=False),
+            _score("G" + "L" * 55, "XLM/USDC", 40, benford_flag=True, ml_flag=False),
+            _score("G" + "W" * 55, "XLM/USDC", 95, benford_flag=True, ml_flag=True),
         ],
         storage_module.settings.db_path,
     )
@@ -177,7 +177,7 @@ def test_list_scores_combines_flag_filters_and_min_score(client):
     response = client.get("/scores?min_score=50&benford_flag=true&ml_flag=false")
     assert response.status_code == 200
     body = response.json()
-    assert [item["wallet"] for item in body] == ["GMATCH"]
+    assert [item["wallet"] for item in body] == ["G" + "M" * 55]
 
 
 def test_list_scores_sorts_by_confidence(client):
@@ -185,8 +185,8 @@ def test_list_scores_sorts_by_confidence(client):
 
     save_scores(
         [
-            _score("GLOW_CONF", "XLM/USDC", 95, confidence=20),
-            _score("GHIGH_CONF", "XLM/USDC", 80, confidence=99),
+            _score("G" + "L" * 55, "XLM/USDC", 95, confidence=20),
+            _score("G" + "H" * 55, "XLM/USDC", 80, confidence=99),
         ],
         storage_module.settings.db_path,
     )
@@ -194,7 +194,7 @@ def test_list_scores_sorts_by_confidence(client):
     response = client.get("/scores?sort_by=confidence")
     assert response.status_code == 200
     body = response.json()
-    assert [item["wallet"] for item in body] == ["GHIGH_CONF", "GLOW_CONF"]
+    assert [item["wallet"] for item in body] == ["G" + "H" * 55, "G" + "L" * 55]
 
 
 def test_list_scores_sorts_by_timestamp(client):
@@ -203,8 +203,8 @@ def test_list_scores_sorts_by_timestamp(client):
     now = datetime.now(timezone.utc)
     save_scores(
         [
-            _score("GOLDER", "XLM/USDC", 95, timestamp=now - timedelta(minutes=10)),
-            _score("GNEWER", "XLM/USDC", 80, timestamp=now),
+            _score("G" + "O" * 55, "XLM/USDC", 95, timestamp=now - timedelta(minutes=10)),
+            _score("G" + "N" * 55, "XLM/USDC", 80, timestamp=now),
         ],
         storage_module.settings.db_path,
     )
@@ -212,7 +212,7 @@ def test_list_scores_sorts_by_timestamp(client):
     response = client.get("/scores?sort_by=timestamp")
     assert response.status_code == 200
     body = response.json()
-    assert [item["wallet"] for item in body] == ["GNEWER", "GOLDER"]
+    assert [item["wallet"] for item in body] == ["G" + "N" * 55, "G" + "O" * 55]
 
 
 def test_list_scores_rejects_invalid_sort_by(client):
@@ -221,20 +221,62 @@ def test_list_scores_rejects_invalid_sort_by(client):
 
 
 def test_wallet_scores_not_found(client):
-    response = client.get("/scores/GABC")
+    response = client.get("/scores/G" + "A" * 55)
     assert response.status_code == 404
 
 
 def test_wallet_scores_found(client):
     import detection.storage as storage_module
 
-    save_scores([_score("GABC", "XLM/USDC", 80)], storage_module.settings.db_path)
+    save_scores([_score("G" + "A" * 55, "XLM/USDC", 80)], storage_module.settings.db_path)
 
-    response = client.get("/scores/GABC")
+    response = client.get("/scores/G" + "A" * 55)
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
-    assert body[0]["wallet"] == "GABC"
+    assert body[0]["wallet"] == "G" + "A" * 55
+
+
+def test_wallet_scores_validates_format(client):
+    valid_address = "G" + "A" * 55
+    response = client.get(f"/scores/{valid_address}")
+    assert response.status_code in (200, 404)
+
+
+def test_wallet_scores_rejects_too_short(client):
+    response = client.get("/scores/G" + "A" * 54)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Stellar wallet address format."
+
+
+def test_wallet_scores_rejects_too_long(client):
+    response = client.get("/scores/G" + "A" * 56)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Stellar wallet address format."
+
+
+def test_wallet_scores_rejects_non_g_start(client):
+    response = client.get("/scores/" + "A" * 56)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Stellar wallet address format."
+
+
+def test_wallet_scores_rejects_lowercase(client):
+    response = client.get("/scores/G" + "a" * 55)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Stellar wallet address format."
+
+
+def test_wallet_scores_rejects_invalid_character(client):
+    address = "G" + "A" * 27 + "0" + "A" * 27
+    response = client.get(f"/scores/{address}")
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Stellar wallet address format."
+
+
+def test_wallet_scores_rejects_empty_string(client):
+    response = client.get("/scores/%20")
+    assert response.status_code == 400
 
 
 def test_alerts_filters_by_threshold(client):
@@ -243,20 +285,20 @@ def test_alerts_filters_by_threshold(client):
 
     object.__setattr__(settings_module.settings, "risk_score_threshold", 70)
 
-    save_scores([_score("GABC", "XLM/USDC", 80), _score("GXYZ", "XLM/USDC", 20)], storage_module.settings.db_path)
+    save_scores([_score("G" + "A" * 55, "XLM/USDC", 80), _score("G" + "B" * 55, "XLM/USDC", 20)], storage_module.settings.db_path)
 
     response = client.get("/alerts")
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
-    assert body[0]["wallet"] == "GABC"
+    assert body[0]["wallet"] == "G" + "A" * 55
 
 
 def test_asset_risk_ranking(client):
     import detection.storage as storage_module
 
     save_scores(
-        [_score("GABC", "XLM/USDC", 80), _score("GXYZ", "XLM/USDC", 40), _score("GDEF", "BTC/USDC", 10)],
+        [_score("G" + "A" * 55, "XLM/USDC", 80), _score("G" + "B" * 55, "XLM/USDC", 40), _score("G" + "D" * 55, "BTC/USDC", 10)],
         storage_module.settings.db_path,
     )
 
@@ -342,14 +384,14 @@ def test_create_webhook_with_filters(client):
             "url": "https://example.com/webhook",
             "secret": "whsec_test",
             "min_score": 80,
-            "wallet_filter": "GABC,GDEF",
+            "wallet_filter": "G" + "A" * 55 + ",G" + "D" * 55,
             "asset_pair_filter": "XLM/USDC",
         },
     )
     assert response.status_code == 201
     body = client.get("/webhooks").json()
     assert len(body) == 1
-    assert body[0]["wallet_filter"] == "GABC,GDEF"
+    assert body[0]["wallet_filter"] == "G" + "A" * 55 + ",G" + "D" * 55
     assert body[0]["asset_pair_filter"] == "XLM/USDC"
     assert body[0]["min_score"] == 80
 
@@ -359,9 +401,9 @@ def test_list_scores_accepts_limit_offset(client):
 
     save_scores(
         [
-            _score("W1", "XLM/USDC", 10),
-            _score("W2", "XLM/USDC", 20),
-            _score("W3", "XLM/USDC", 30),
+            _score("G" + "W1" + "A" * 52, "XLM/USDC", 10),
+            _score("G" + "W2" + "A" * 52, "XLM/USDC", 20),
+            _score("G" + "W3" + "A" * 52, "XLM/USDC", 30),
         ],
         storage_module.settings.db_path,
     )
@@ -370,7 +412,7 @@ def test_list_scores_accepts_limit_offset(client):
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 2
-    assert [row["wallet"] for row in body] == ["W2", "W1"]
+    assert [row["wallet"] for row in body] == ["G" + "W2" + "A" * 52, "G" + "W1" + "A" * 52]
 
 
 def test_alerts_accepts_limit_offset(client):
@@ -381,9 +423,9 @@ def test_alerts_accepts_limit_offset(client):
 
     save_scores(
         [
-            _score("W1", "XLM/USDC", 10),
-            _score("W2", "XLM/USDC", 20),
-            _score("W3", "XLM/USDC", 30),
+            _score("G" + "W1" + "A" * 52, "XLM/USDC", 10),
+            _score("G" + "W2" + "A" * 52, "XLM/USDC", 20),
+            _score("G" + "W3" + "A" * 52, "XLM/USDC", 30),
         ],
         storage_module.settings.db_path,
     )
@@ -392,7 +434,7 @@ def test_alerts_accepts_limit_offset(client):
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 2
-    assert [row["wallet"] for row in body] == ["W3", "W2"]
+    assert [row["wallet"] for row in body] == ["G" + "W3" + "A" * 52, "G" + "W2" + "A" * 52]
 
 
 def test_limit_offset_out_of_range_returns_422(client):
@@ -471,6 +513,8 @@ def test_correlations_returns_only_latest_run(client, monkeypatch):
 
 
 def test_rings_empty(client):
+    import detection.storage as storage_module
+    storage_module.init_db()
     resp = client.get("/rings")
     assert resp.status_code == 200
     assert resp.json() == []
@@ -478,7 +522,7 @@ def test_rings_empty(client):
 
 def test_rings_returns_stored_data(client):
     import detection.storage as storage_module
-
+    storage_module.init_db()
     storage_module.save_rings(
         [
             {

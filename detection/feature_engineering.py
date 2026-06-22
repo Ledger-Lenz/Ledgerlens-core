@@ -15,6 +15,7 @@ from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import compute_benford_metrics
 from detection.causal_engine import estimate_pdc
 from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.sandwich_engine import detect_sandwich_candidates
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
 
 ROLLING_WINDOWS = {
@@ -78,9 +79,9 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
 ]
 
-CAUSAL_FEATURE_NAMES = [
-    "pdc_5m",  # price discovery contribution (ATE) over 5-minute windows
-    "pdc_1h",  # price discovery contribution (ATE) over 1-hour windows
+SANDWICH_FEATURE_NAMES = [
+    "sandwich_ratio",  # fraction of an account's pool trades that are attacker legs of a sandwich
+    "sandwich_profit_xlm_30d",  # XLM the account extracted as a sandwich attacker over the last 30d
 ]
 
 FEATURE_NAMES = (
@@ -91,7 +92,7 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
-    + CAUSAL_FEATURE_NAMES
+    + SANDWICH_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -488,27 +489,45 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     }
 
 
-def causal_features(
+def sandwich_features(
     trades: pd.DataFrame,
     account: str,
-    prices: pd.DataFrame | None = None,
-    pair: str | None = None,
+    as_of: pd.Timestamp,
+    min_profit_xlm: float = 10.0,
 ) -> dict:
-    """Compute the price-discovery-contribution (PDC) features for `account`.
+    """Compute wallet-level sandwich-aggressor features for `account`.
 
-    PDC is the doubly-robust treatment effect of the wallet's trades on the
-    subsequent mid-price (see `detection.causal_engine.estimate_pdc`): positive
-    for market makers, near-zero/negative for wash traders. Requires a `prices`
-    time series (`timestamp` + `mid_price`/`price`); omitting it yields `0.0`
-    for both features, so existing callers are unaffected.
+    `sandwich_ratio` is the share of `account`'s pool trades that are attacker
+    legs (buy + sell) of a detected sandwich. `sandwich_profit_xlm_30d` is the
+    XLM profit `account` extracted as the attacker across sandwiches whose
+    opening buy falls in the 30 days ending at `as_of`.
     """
-    zero = {name: 0.0 for name in CAUSAL_FEATURE_NAMES}
-    if prices is None or getattr(prices, "empty", True) or trades.empty:
+    zero = {name: 0.0 for name in SANDWICH_FEATURE_NAMES}
+    if trades.empty or "trade_type" not in trades.columns or "price" not in trades.columns:
         return zero
 
+    pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+    if pool_trades.empty:
+        return zero
+
+    window = _window_slice(pool_trades, as_of, ROLLING_WINDOWS["30d"])
+    if window.empty:
+        return zero
+
+    candidates = detect_sandwich_candidates(window, min_profit_xlm=min_profit_xlm)
+    own = [c for c in candidates if c.attacker == account]
+    if not own:
+        return zero
+
+    account_pool_trades = pool_trades[pool_trades["base_account"] == account]
+    denom = len(account_pool_trades)
+    # each sandwich contributes two attacker legs (buy + sell)
+    ratio = min(2 * len(own) / denom, 1.0) if denom > 0 else 0.0
+    profit = sum(c.profit_xlm for c in own)
+
     return {
-        "pdc_5m": float(estimate_pdc(trades, prices, account, pair, window_minutes=5)),
-        "pdc_1h": float(estimate_pdc(trades, prices, account, pair, window_minutes=60)),
+        "sandwich_ratio": float(ratio),
+        "sandwich_profit_xlm_30d": float(profit),
     }
 
 
@@ -574,7 +593,36 @@ def build_feature_vector(
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))
-    features.update(causal_features(trades, account, prices, pair))
+    features.update(sandwich_features(trades, account, as_of))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features
+
+
+# --- T-GNN features (appended after PATH_PAYMENT_FEATURE_NAMES so existing
+# model checkpoints trained without these stay loadable by index/order). ---
+GNN_FEATURE_NAMES = [
+    "gnn_wash_ring_probability",
+    "gnn_neighbor_avg_score",
+]
+
+FEATURE_NAMES = FEATURE_NAMES + GNN_FEATURE_NAMES
+
+
+def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None, **kwargs):
+    """Wraps the base feature vector builder, optionally appending GNN features.
+
+    Args:
+        use_gnn: If True, appends gnn_wash_ring_probability and
+            gnn_neighbor_avg_score (default 0.0 if not found in gnn_features).
+        gnn_features: Optional {wallet: {feature_name: value}} lookup.
+    """
+    vector = _build_feature_vector_base(*args, **kwargs)
+    if use_gnn:
+        wallet = kwargs.get("wallet") or (args[0] if args else None)
+        feats = (gnn_features or {}).get(wallet, {})
+        vector = list(vector) + [
+            float(feats.get("gnn_wash_ring_probability", 0.0)),
+            float(feats.get("gnn_neighbor_avg_score", 0.0)),
+        ]
+    return vector

@@ -30,34 +30,32 @@ class RiskScore(BaseModel):
         benford_mad_threshold: float,
         ml_probability: float,
         ml_confidence: float,
-        pdc_score: float = 0.0,
-        pdc_discount_weight: float = 0.0,
+        sandwich_signal: float = 0.0,
+        sandwich_weight: float = 0.0,
     ) -> "RiskScore":
         """Combine Benford metrics and an ML probability into a single score.
 
         `score` is a 0-100 blend weighted toward the ML probability, with
         the Benford signal acting as a corroborating flag.
 
-        `pdc_score` is the wallet's price-discovery contribution from
-        `detection.causal_engine.estimate_pdc`. A positive PDC is causal
-        evidence of market making, so it *discounts* the correlational score:
-
-            causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight
-            score = max(0.0, raw_score - causal_adjustment)
-
-        The discount is applied before the final 0-100 clamp. With the default
-        `pdc_discount_weight = 0.0` the score is unchanged, so existing callers
-        and tests are unaffected.
+        `sandwich_signal` (0-1) is an optional price-manipulation signal from
+        `detection.sandwich_engine` (e.g. a normalised sandwich frequency or
+        profit). It contributes a `sandwich_weight` fraction of the composite
+        score; the Benford/ML blend supplies the remaining `1 - sandwich_weight`.
+        With the default `sandwich_weight = 0.0` the score is identical to the
+        legacy Benford/ML blend.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
 
         benford_component = min(benford_mad / benford_mad_threshold, 1.0) * 100 if benford_mad_threshold else 0.0
         ml_component = ml_probability * 100
+        base_component = 0.3 * benford_component + 0.7 * ml_component
 
-        raw_score = 0.3 * benford_component + 0.7 * ml_component
-        causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight
-        score = round(max(0.0, raw_score - causal_adjustment))
+        sandwich_weight = max(0.0, min(1.0, sandwich_weight))
+        sandwich_component = max(0.0, min(1.0, sandwich_signal)) * 100
+
+        score = round((1.0 - sandwich_weight) * base_component + sandwich_weight * sandwich_component)
         score = max(0, min(100, score))
 
         return cls(

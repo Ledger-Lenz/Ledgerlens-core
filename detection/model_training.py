@@ -223,3 +223,41 @@ if __name__ == "__main__":
 
     save_models(results)
     logger.info("Saved models to %s", settings.model_dir)
+
+
+from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG
+from ingestion.graph_builder import TemporalGraphBuilder
+import os
+
+
+def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", **kwargs):
+    """Wraps the base ensemble trainer, optionally pre-training a T-GNN.
+
+    Args:
+        use_gnn: If True, trains a T-GNN on the training graph, appends its
+            two output features to the feature matrix before SMOTE, and
+            saves the checkpoint as gnn_model.pt in model_dir.
+    """
+    gnn_features_by_wallet = {}
+
+    if use_gnn:
+        if not _HAS_PYG:
+            raise RuntimeError(
+                "use_gnn=True requires torch + torch_geometric installed."
+            )
+        builder = TemporalGraphBuilder()
+        trades = _trades_from_training_df(df)
+        snapshots = builder.build_snapshots(trades, lookback_days=30)
+
+        import torch
+        model = TGATWashRingDetector()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        gnn_features_by_wallet = _run_gnn_training_loop(model, optimizer, snapshots)
+
+        os.makedirs(model_dir, exist_ok=True)
+        save_gnn_checkpoint(model, os.path.join(model_dir, "gnn_model.pt"))
+
+    return _train_ensemble_base(
+        df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
+        model_dir=model_dir, **kwargs
+    )
