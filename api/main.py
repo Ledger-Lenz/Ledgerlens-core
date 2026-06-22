@@ -17,6 +17,7 @@ Run with:
 import json
 import logging
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -48,6 +49,21 @@ from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
 logger = logging.getLogger("ledgerlens.api")
+
+_STELLAR_ADDRESS_PATTERN = re.compile(r"^G[A-Z2-7]{55}$")
+
+
+def validate_stellar_address(wallet: str) -> None:
+    """Validate that `wallet` is a valid Stellar account ID.
+
+    Stellar account IDs are exactly 56 characters long, start with 'G', and contain
+    only base32 characters (A-Z and 2-7).
+
+    Raises:
+        HTTPException: 400 with generic message if validation fails.
+    """
+    if not _STELLAR_ADDRESS_PATTERN.match(wallet):
+        raise HTTPException(status_code=400, detail="Invalid Stellar wallet address format.")
 
 # ---------------------------------------------------------------------------
 # Model loading — done once at startup so request handlers stay fast.
@@ -203,6 +219,9 @@ def explain_wallet_score(
 ) -> list[dict]:
     """Return the top-5 SHAP feature contributions for ``wallet`` on ``asset_pair``.
 
+    The wallet parameter must be a valid Stellar account ID (56 characters, starting
+    with 'G', containing only base32 characters A-Z and 2-7).
+
     Response schema: list of ``{"feature": str, "shap_value": float}`` ordered
     by absolute SHAP contribution descending.
 
@@ -213,6 +232,7 @@ def explain_wallet_score(
     if not _models:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
+    validate_stellar_address(wallet)
     cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
     if cached is None:
         raise HTTPException(
@@ -224,7 +244,12 @@ def explain_wallet_score(
 
 @app.get("/scores/{wallet}", response_model=list[RiskScore])
 def wallet_scores(wallet: str) -> list[RiskScore]:
-    """Return the latest score for `wallet` on each asset pair."""
+    """Return the latest score for `wallet` on each asset pair.
+
+    The wallet parameter must be a valid Stellar account ID (56 characters, starting
+    with 'G', containing only base32 characters A-Z and 2-7).
+    """
+    validate_stellar_address(wallet)
     scores = get_latest_scores(wallet=wallet)
     if not scores:
         raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
