@@ -139,6 +139,7 @@ def run(
     trades_by_pair: dict[str, pd.DataFrame] = {}
     correlated_pairs: list[tuple[str, str, float]] = []
     cross_pair_wallets_map: dict[str, list[str]] = {}
+    all_rings: list[dict] = []
 
     if multi_pair:
         for base_asset, counter_asset in asset_pairs:
@@ -210,6 +211,7 @@ def run(
                 correlated_pairs=correlated_pairs if multi_pair else None,
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
                 path_payments=path_payments,
+                ring_membership=ring_membership,
             )
             probability, confidence = score_feature_vector(models, features)
 

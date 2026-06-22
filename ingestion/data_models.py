@@ -95,3 +95,17 @@ class OrderBookEvent(BaseModel):
     amount: float
     price: float
     event_type: str  # "created" | "updated" | "cancelled"
+
+
+class BridgeTransfer(BaseModel):
+    """A cross-chain bridge transfer linking a Stellar wallet to an EVM wallet."""
+
+    chain: str
+    direction: str  # "stellar_to_evm" | "evm_to_stellar"
+    evm_wallet: str  # EIP-55 checksummed
+    stellar_wallet: str  # G... format
+    amount_usd: float | None = None
+    token: str
+    tx_hash_evm: str
+    tx_hash_stellar: str | None = None
+    timestamp: datetime

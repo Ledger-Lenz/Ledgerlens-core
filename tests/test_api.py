@@ -240,8 +240,10 @@ def test_wallet_scores_found(client):
     response = client.get("/scores/G" + "A" * 55)
     assert response.status_code == 200
     body = response.json()
-    assert len(body) == 1
-    assert body[0]["wallet"] == "G" + "A" * 55
+    assert "scores" in body
+    assert len(body["scores"]) == 1
+    assert body["scores"][0]["wallet"] == "G" + "A" * 55
+    assert "cross_chain_links" in body
 
 
 def test_wallet_scores_validates_format(client):
@@ -284,6 +286,42 @@ def test_wallet_scores_rejects_invalid_character(client):
 def test_wallet_scores_rejects_empty_string(client):
     response = client.get("/scores/%20")
     assert response.status_code == 400
+
+
+def test_wallet_scores_cross_chain_links_present_when_bridge_data_exists(client):
+    """GET /scores/{wallet} includes cross_chain_links when bridge transfers exist."""
+    import detection.storage as storage_module
+    from datetime import datetime, timezone
+    from ingestion.data_models import BridgeTransfer
+    from detection.storage import save_bridge_transfer
+
+    db = storage_module.settings.db_path
+    stellar_wallet = "G" + "C" * 55
+    evm_wallet = "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+
+    save_scores([_score(stellar_wallet, "XLM/USDC", 75)], db)
+    save_bridge_transfer(BridgeTransfer(
+        chain="ethereum",
+        direction="evm_to_stellar",
+        evm_wallet=evm_wallet,
+        stellar_wallet=stellar_wallet,
+        amount_usd=500.0,
+        token="USDC",
+        tx_hash_evm="0x" + "aa" * 32,
+        tx_hash_stellar=None,
+        timestamp=datetime.now(timezone.utc),
+    ), db_path=db)
+
+    response = client.get(f"/scores/{stellar_wallet}")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert "cross_chain_links" in body
+    links = body["cross_chain_links"]
+    assert len(links) == 1
+    assert links[0]["chain"] == "ethereum"
+    assert links[0]["evm_wallet"] == evm_wallet
+    assert "last_bridge_at" in links[0]
 
 
 def test_alerts_filters_by_threshold(client):

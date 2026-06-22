@@ -24,7 +24,7 @@ import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from ingestion.data_models import PathPayment
+from ingestion.data_models import BridgeTransfer, PathPayment
 
 
 class AlertType(str, Enum):
@@ -287,6 +287,47 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_feature_states_key ON wallet_feature_states (wallet, asset_pair);
         CREATE INDEX IF NOT EXISTS idx_wallet_feature_states_updated ON wallet_feature_states (last_updated);
+        """,
+    ),
+    (
+        9,
+        "add wash_rings table for wash trading ring detection",
+        """
+        CREATE TABLE IF NOT EXISTS wash_rings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            accounts_json TEXT NOT NULL,
+            total_volume REAL NOT NULL,
+            cycle_volume REAL NOT NULL,
+            avg_trade_count REAL NOT NULL,
+            timing_tightness REAL NOT NULL,
+            truncated INTEGER NOT NULL,
+            detected_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wash_rings_detected_at ON wash_rings (detected_at);
+        """,
+    ),
+    (
+        10,
+        "add bridge_transfers table for cross-chain wallet linking",
+        """
+        CREATE TABLE IF NOT EXISTS bridge_transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            evm_wallet TEXT NOT NULL,
+            stellar_wallet TEXT NOT NULL,
+            amount_usd REAL,
+            token TEXT NOT NULL,
+            tx_hash_evm TEXT NOT NULL,
+            tx_hash_stellar TEXT,
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bridge_transfers_stellar_wallet
+            ON bridge_transfers (stellar_wallet);
+        CREATE INDEX IF NOT EXISTS idx_bridge_transfers_evm_wallet
+            ON bridge_transfers (evm_wallet);
+        CREATE INDEX IF NOT EXISTS idx_bridge_transfers_timestamp
+            ON bridge_transfers (timestamp);
         """,
     ),
 ]
@@ -1096,12 +1137,12 @@ def save_rings(rings: list[dict], db_path: str | None = None) -> None:
             """,
             [
                 (
-                    json.dumps(r["accounts"]),
-                    r["total_volume"],
-                    r["cycle_volume"],
-                    r.get("avg_trade_count", 0.0),
-                    r.get("timing_tightness", 0.0),
-                    int(r.get("truncated", False)),
+                    json.dumps(r.get("accounts", [])),
+                    float(r.get("total_volume", 0.0)),
+                    float(r.get("cycle_volume", 0.0)),
+                    float(r.get("avg_trade_count", 0.0)),
+                    float(r.get("timing_tightness", 0.0)),
+                    int(bool(r.get("truncated", False))),
                     ts,
                 )
                 for r in rings
@@ -1145,7 +1186,7 @@ def get_rings(
 
 def save_feature_state(state, db_path: str | None = None) -> None:
     """Persist a WalletFeatureState to cold storage (SQLite).
-    
+
     Args:
         state: WalletFeatureState instance to persist.
         db_path: Optional database path; uses settings.db_path if not provided.
@@ -1166,7 +1207,7 @@ def save_feature_state(state, db_path: str | None = None) -> None:
 
 def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
     """Retrieve a WalletFeatureState from cold storage.
-    
+
     Returns None if not found.
     """
     init_db(db_path)
@@ -1175,17 +1216,17 @@ def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
             "SELECT state_json FROM wallet_feature_states WHERE wallet = ? AND asset_pair = ?",
             (wallet, asset_pair),
         ).fetchone()
-    
+
     if row is None:
         return None
-    
+
     from detection.feature_store import WalletFeatureState
     return WalletFeatureState.model_validate_json_compat(row[0])
 
 
 def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | None = None) -> int:
     """Load most recently updated feature states from cold storage and write to Redis.
-    
+
     Returns the count of states promoted.
     """
     init_db(db_path)
@@ -1198,7 +1239,7 @@ def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | Non
             """,
             (batch_size,),
         ).fetchall()
-    
+
     count = 0
     from detection.feature_store import WalletFeatureState
     for row in rows:
@@ -1208,8 +1249,148 @@ def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | Non
             count += 1
         except Exception as e:
             logger.error(f"Error promoting feature state: {e}")
-    
+
     return count
+
+
+def save_bridge_transfer(transfer: BridgeTransfer, db_path: str | None = None) -> None:
+    """Persist a single bridge transfer record."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO bridge_transfers
+                (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                 tx_hash_evm, tx_hash_stellar, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer.chain,
+                transfer.direction,
+                transfer.evm_wallet,
+                transfer.stellar_wallet,
+                transfer.amount_usd,
+                transfer.token,
+                transfer.tx_hash_evm,
+                transfer.tx_hash_stellar,
+                transfer.timestamp.isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None = None) -> None:
+    """Persist a batch of bridge transfer records."""
+    if not transfers:
+        return
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO bridge_transfers
+                (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                 tx_hash_evm, tx_hash_stellar, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    t.chain,
+                    t.direction,
+                    t.evm_wallet,
+                    t.stellar_wallet,
+                    t.amount_usd,
+                    t.token,
+                    t.tx_hash_evm,
+                    t.tx_hash_stellar,
+                    t.timestamp.isoformat(),
+                )
+                for t in transfers
+            ],
+        )
+        conn.commit()
+
+
+def get_bridge_transfers(
+    stellar_wallet: str | None = None,
+    evm_wallet: str | None = None,
+    since_days: int = 90,
+    db_path: str | None = None,
+) -> list[BridgeTransfer]:
+    """Return bridge transfers filtered by wallet and recency."""
+    init_db(db_path)
+    from datetime import timedelta
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+    conditions = ["timestamp >= ?"]
+    params: list = [cutoff]
+    if stellar_wallet is not None:
+        conditions.append("stellar_wallet = ?")
+        params.append(stellar_wallet)
+    if evm_wallet is not None:
+        conditions.append("evm_wallet = ?")
+        params.append(evm_wallet)
+
+    where = " AND ".join(conditions)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                   tx_hash_evm, tx_hash_stellar, timestamp
+            FROM bridge_transfers
+            WHERE {where}
+            ORDER BY timestamp DESC
+            """,
+            tuple(params),
+        ).fetchall()
+
+    return [
+        BridgeTransfer(
+            chain=row[0],
+            direction=row[1],
+            evm_wallet=row[2],
+            stellar_wallet=row[3],
+            amount_usd=row[4],
+            token=row[5],
+            tx_hash_evm=row[6],
+            tx_hash_stellar=row[7],
+            timestamp=datetime.fromisoformat(row[8]),
+        )
+        for row in rows
+    ]
+
+
+def get_bridge_transfer_history(
+    stellar_wallet: str,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the full bridge transfer history for a Stellar wallet as dicts."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                   tx_hash_evm, tx_hash_stellar, timestamp
+            FROM bridge_transfers
+            WHERE stellar_wallet = ?
+            ORDER BY timestamp DESC
+            """,
+            (stellar_wallet,),
+        ).fetchall()
+
+    return [
+        {
+            "chain": row[0],
+            "direction": row[1],
+            "evm_wallet": row[2],
+            "stellar_wallet": row[3],
+            "amount_usd_estimate": row[4],
+            "token": row[5],
+            "tx_hash_evm": row[6],
+            "tx_hash_stellar": row[7],
+            "timestamp": row[8],
+        }
+        for row in rows
+    ]
 
 
 if __name__ == "__main__":
