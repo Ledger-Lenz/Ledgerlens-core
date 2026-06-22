@@ -260,6 +260,21 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_governance_proposals_proposal_id ON governance_proposals (proposal_id);
         """,
     ),
+    (
+        8,
+        "add wallet_feature_states table for streaming feature store",
+        """
+        CREATE TABLE IF NOT EXISTS wallet_feature_states (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            last_updated TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_feature_states_key ON wallet_feature_states (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_wallet_feature_states_updated ON wallet_feature_states (last_updated);
+        """,
+    ),
 ]
 
 
@@ -1111,6 +1126,75 @@ def get_rings(
         }
         for row in rows
     ]
+
+
+def save_feature_state(state, db_path: str | None = None) -> None:
+    """Persist a WalletFeatureState to cold storage (SQLite).
+    
+    Args:
+        state: WalletFeatureState instance to persist.
+        db_path: Optional database path; uses settings.db_path if not provided.
+    """
+    init_db(db_path)
+    state_json = state.model_dump_json_compat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO wallet_feature_states
+                (wallet, asset_pair, state_json, last_updated)
+            VALUES (?, ?, ?, ?)
+            """,
+            (state.wallet, state.asset_pair, state_json, state.last_updated.isoformat()),
+        )
+        conn.commit()
+
+
+def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
+    """Retrieve a WalletFeatureState from cold storage.
+    
+    Returns None if not found.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT state_json FROM wallet_feature_states WHERE wallet = ? AND asset_pair = ?",
+            (wallet, asset_pair),
+        ).fetchone()
+    
+    if row is None:
+        return None
+    
+    from detection.feature_store import WalletFeatureState
+    return WalletFeatureState.model_validate_json_compat(row[0])
+
+
+def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | None = None) -> int:
+    """Load most recently updated feature states from cold storage and write to Redis.
+    
+    Returns the count of states promoted.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT state_json FROM wallet_feature_states
+            ORDER BY last_updated DESC
+            LIMIT ?
+            """,
+            (batch_size,),
+        ).fetchall()
+    
+    count = 0
+    from detection.feature_store import WalletFeatureState
+    for row in rows:
+        try:
+            state = WalletFeatureState.model_validate_json_compat(row[0])
+            feature_store.set_state(state)
+            count += 1
+        except Exception as e:
+            logger.error(f"Error promoting feature state: {e}")
+    
+    return count
 
 
 if __name__ == "__main__":
