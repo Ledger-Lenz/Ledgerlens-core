@@ -1,12 +1,11 @@
-import os
 import sqlite3
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import pytest
 
 from config.settings import settings
 from detection import storage
-from detection.dispute_store import submit_dispute, cast_vote, get_dispute
+from detection.dispute_store import submit_dispute, cast_vote
 
 
 def _use_tmp_db(tmp_path):
@@ -37,7 +36,7 @@ def test_second_dispute_within_7_days_raises(tmp_path):
     conn.commit()
     conn.close()
 
-    d1 = submit_dispute("GXYZ", "XLM/USDC", None)
+    submit_dispute("GXYZ", "XLM/USDC", None)
     with pytest.raises(ValueError):
         submit_dispute("GXYZ", "XLM/USDC", None)
 
@@ -75,7 +74,7 @@ def test_quorum_triggers_resolution(tmp_path):
     d = submit_dispute("GHIJ", "XLM/USDC", None)
     # cast approve votes from three members
     cast_vote(d.dispute_id, "a" * 64, "approve")
-    res = cast_vote(d.dispute_id, "b" * 64, "approve")
+    cast_vote(d.dispute_id, "b" * 64, "approve")
     # after third vote it should be resolved (supermajority)
     res2 = cast_vote(d.dispute_id, "c" * 64, "approve")
     assert res2.status == "approved"

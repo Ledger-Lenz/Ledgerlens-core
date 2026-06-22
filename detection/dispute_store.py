@@ -3,18 +3,16 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import List
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from detection.storage import init_db, _connect, save_submission
+from detection.storage import init_db, _connect
 from detection.soroban_publisher import SorobanPublisher, SorobanCircuitOpenError
 
 
@@ -159,7 +157,7 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
         conn.commit()
 
         # Check quorum
-        member_count = conn.execute("SELECT COUNT(*) FROM committee_members").fetchone()[0]
+        member_count = conn.execute("SELECT COUNT(*) FROM committee_members").fetchone()[0]  # noqa: F841
         quorum = getattr(settings, "COMMITTEE_QUORUM", 3)
         if len(votes) >= quorum:
             approves = sum(1 for v in votes if v.get("vote") == "approve")

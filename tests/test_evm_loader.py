@@ -1,8 +1,7 @@
 """Tests for ingestion/evm_loader.py."""
 
-import json
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 import pytest
 import responses as responses_lib

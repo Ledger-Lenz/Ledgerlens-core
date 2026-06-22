@@ -10,7 +10,6 @@ from detection.feature_store import (
     _get_first_significant_digit,
     _hash_counterparty,
     RING_BUFFER_CAPS,
-    RING_BUFFER_WINDOWS_US,
 )
 from ingestion.data_models import Trade, Asset, TradeType
 

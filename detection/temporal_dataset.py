@@ -6,7 +6,7 @@ and compute pairwise score correlations for wallet clusters.
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import numpy as np
 import pandas as pd
 

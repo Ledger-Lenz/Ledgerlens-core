@@ -46,7 +46,6 @@ from detection.storage import (
     get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
-import sqlite3
 from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
