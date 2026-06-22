@@ -22,6 +22,7 @@ class RiskScore(BaseModel):
     benford_flag: bool
     ml_flag: bool
     confidence: int = Field(ge=0, le=100)
+    disputed: bool = False
     timestamp: datetime
 
     # Conformal prediction uncertainty fields (optional, v2+)
@@ -55,6 +56,8 @@ class RiskScore(BaseModel):
         score_upper: float | None = None,
         prediction_set: list[int] | None = None,
         coverage_guarantee: float | None = None,
+        sandwich_signal: float = 0.0,
+        sandwich_weight: float = 0.0,
     ) -> "RiskScore":
         """Combine Benford metrics and an ML probability into a single score.
 
@@ -64,14 +67,25 @@ class RiskScore(BaseModel):
         Optional uncertainty fields (``score_lower``, ``score_upper``,
         ``prediction_set``, ``coverage_guarantee``) are passed through to
         the returned ``RiskScore`` when provided.
+
+        `sandwich_signal` (0-1) is an optional price-manipulation signal from
+        `detection.sandwich_engine` (e.g. a normalised sandwich frequency or
+        profit). It contributes a `sandwich_weight` fraction of the composite
+        score; the Benford/ML blend supplies the remaining `1 - sandwich_weight`.
+        With the default `sandwich_weight = 0.0` the score is identical to the
+        legacy Benford/ML blend.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
 
         benford_component = min(benford_mad / benford_mad_threshold, 1.0) * 100 if benford_mad_threshold else 0.0
         ml_component = ml_probability * 100
+        base_component = 0.3 * benford_component + 0.7 * ml_component
 
-        score = round(0.3 * benford_component + 0.7 * ml_component)
+        sandwich_weight = max(0.0, min(1.0, sandwich_weight))
+        sandwich_component = max(0.0, min(1.0, sandwich_signal)) * 100
+
+        score = round((1.0 - sandwich_weight) * base_component + sandwich_weight * sandwich_component)
         score = max(0, min(100, score))
 
         return cls(
@@ -87,3 +101,23 @@ class RiskScore(BaseModel):
             prediction_set=prediction_set,
             coverage_guarantee=coverage_guarantee,
         )
+
+
+def temporal_risk_adjustment(
+    snapshot_score: int,
+    temporal_score: float | None,
+    history_days: int,
+    temporal_weight: float = 0.3,
+) -> int:
+    """Blend temporal risk probability (0-1) and snapshot score (0-100).
+
+    When a wallet has < 7 days of history, or temporal_score is None,
+    fall back to snapshot-only mode.
+    """
+    if history_days < 7 or temporal_score is None:
+        return snapshot_score
+
+    snapshot_weight = 1.0 - temporal_weight
+    final_score = snapshot_weight * snapshot_score + temporal_weight * (temporal_score * 100.0)
+    return max(0, min(100, round(final_score)))
+

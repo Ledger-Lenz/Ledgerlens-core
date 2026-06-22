@@ -13,7 +13,6 @@ import time
 
 from stellar_sdk import Keypair, SorobanServer, TransactionBuilder
 from stellar_sdk import scval
-from stellar_sdk.operation import InvokeContractFunction
 
 from detection.risk_score import RiskScore
 from detection.storage import save_submission
@@ -212,24 +211,22 @@ class SorobanPublisher:
         try:
             source_account = server.load_account(self._keypair.public_key)
 
-            op = InvokeContractFunction(
-                contract_id=self._contract_id,
-                function_name="submit_score",
-                parameters=[
-                    scval.to_address(score.wallet),
-                    scval.to_symbol(score.asset_pair),
-                    scval.to_uint32(max(0, min(100, score.score))),
-                    scval.to_uint64(int(score.timestamp.timestamp())),
-                ],
-            )
-
             tx = (
                 TransactionBuilder(
                     source_account=source_account,
                     network_passphrase=self._network_passphrase,
                     base_fee=100,
                 )
-                .add_operation(op)
+                .append_invoke_contract_function_op(
+                    contract_id=self._contract_id,
+                    function_name="submit_score",
+                    parameters=[
+                        scval.to_address(score.wallet),
+                        scval.to_symbol(score.asset_pair),
+                        scval.to_uint32(max(0, min(100, score.score))),
+                        scval.to_uint64(int(score.timestamp.timestamp())),
+                    ],
+                )
                 .build()
             )
 

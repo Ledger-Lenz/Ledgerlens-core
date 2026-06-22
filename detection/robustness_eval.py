@@ -4,12 +4,32 @@ Measures model performance degradation under each evasion strategy by
 generating adversarial datasets and scoring them with pre-trained models.
 """
 
+import json
+import math
 import numpy as np
+from pydantic import BaseModel
+from scipy.stats import norm
 from sklearn.metrics import f1_score, roc_auc_score
 
 from detection.dataset import build_training_dataset
 from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
 from ingestion.synthetic_data import generate_synthetic_dataset
+from detection.adversarial_attack import pgd_attack
+
+from detection.feature_engineering import FEATURE_NAMES
+from detection.counterfactual_constraints import FEATURE_CONSTRAINTS
+
+
+class RobustnessReport(BaseModel):
+    model_version: str
+    asr: dict
+    mean_map: float
+    p95_map: float
+    certified_radius: float
+    n_samples: int
+    epsilon: float
+
+
 
 
 def _score_models(models: dict, df) -> dict[str, float]:
@@ -22,7 +42,9 @@ def _score_models(models: dict, df) -> dict[str, float]:
         return {"auc_roc": float("nan"), "f1": float("nan")}
 
     auc_rocs, f1s = [], []
-    for model in models.values():
+    for name, model in models.items():
+        if name == "temporal_lstm":
+            continue
         y_proba = model.predict_proba(X)[:, 1]
         y_pred = model.predict(X)
         auc_rocs.append(roc_auc_score(y, y_proba))
@@ -123,3 +145,130 @@ def evaluate_robustness(
     }
 
     return results
+
+
+def _ensemble_probas(models: dict, df) -> np.ndarray:
+    """Return mean ensemble probability (positive class) for each row in df."""
+    X = df[FEATURE_NAMES].fillna(0.0)
+    probs = []
+    for name, m in models.items():
+        if name == "temporal_lstm":
+            continue
+        probs.append(m.predict_proba(X)[:, 1])
+    return np.mean(np.vstack(probs), axis=0)
+
+
+def compute_robustness_report(models: dict, df, n_samples: int = 200, epsilon: float = 0.1, steps: int = 10, seed: int = 42) -> RobustnessReport:
+    """Compute ASR, MAP, and certified radius on the provided dataset.
+
+    - ASR computed at epsilons 0.05, 0.10, 0.20 (fraction of true positives flipped)
+    - MAP computed per true positive by binary-searching epsilon where PGD succeeds
+    - Certified radius estimated via randomized smoothing (Monte Carlo)
+    """
+    from detection.storage import save_robustness_report
+
+    rng = np.random.RandomState(seed)
+    probs = _ensemble_probas(models, df)
+    labels = df["label"].values
+    # True positives as those labeled 1 and predicted positive at 0.5
+    tp_mask = (labels == 1) & (probs >= 0.5)
+    tp_indices = np.where(tp_mask)[0]
+
+    asr_eps = [0.05, 0.10, 0.20]
+    asr: dict = {}
+
+    # small helper to get feature vector as dict for a row
+    def row_to_vec(i):
+        return {f: float(df.iloc[i][f]) for f in FEATURE_NAMES}
+
+    for e in asr_eps:
+        flipped = 0
+        for i in tp_indices:
+            vec = row_to_vec(i)
+            _, p = pgd_attack(vec, models, epsilon=e, alpha=e / max(1, steps), steps=steps)
+            if p < 0.5:
+                flipped += 1
+        asr["{:.2f}".format(e)] = float(flipped / len(tp_indices)) if len(tp_indices) else 0.0
+
+    # MAP: minimal epsilon per TP via binary search on [0, max_eps]
+    maps = []
+    max_eps = 1.0
+    for i in tp_indices:
+        lo = 0.0
+        hi = max_eps
+        found = False
+        for _ in range(10):
+            mid = (lo + hi) / 2.0
+            vec = row_to_vec(i)
+            _, p = pgd_attack(vec, models, epsilon=mid, alpha=mid / max(1, steps), steps=steps)
+            if p < 0.5:
+                found = True
+                hi = mid
+            else:
+                lo = mid
+        if found:
+            maps.append(hi)
+    mean_map = float(np.mean(maps)) if maps else 0.0
+    p95_map = float(np.percentile(maps, 95)) if maps else 0.0
+
+    # Certified radius (Monte Carlo smoothing)
+    sigma = 0.25
+    certs = []
+    for i in tp_indices:
+        vec = row_to_vec(i)
+        noisy_list = []
+        for _ in range(n_samples):
+            noisy = {f: float(vec[f] + rng.normal(scale=sigma)) for f in FEATURE_NAMES}
+            # enforce bounds
+            for f in FEATURE_NAMES:
+                c = FEATURE_CONSTRAINTS.get(f, {})
+                noisy[f] = max(c.get("min", -math.inf), noisy[f])
+                noisy[f] = min(c.get("max", math.inf), noisy[f])
+            noisy_list.append(noisy)
+        import pandas as pd
+        noisy_df = pd.DataFrame(noisy_list)[FEATURE_NAMES].fillna(0.0)
+        probs_noisy = _ensemble_probas(models, noisy_df)
+        count_pos = int(np.sum(probs_noisy >= 0.5))
+        p_hat = count_pos / n_samples
+        if p_hat <= 0.5:
+            certs.append(0.0)
+        else:
+            # approximate lower bound (probabilistic)
+            try:
+                r = sigma * norm.ppf(p_hat)
+                certs.append(max(0.0, float(r)))
+            except Exception:
+                certs.append(0.0)
+    certified_radius = float(np.mean(certs)) if certs else 0.0
+
+    # Model version: read metadata file if exists
+    import os
+    from config.settings import settings
+    meta_path = os.path.join(settings.model_dir, "training_metadata.json")
+    model_version = "unknown"
+    try:
+        with open(meta_path, "r") as f:
+            j = json.load(f)
+            model_version = j.get("version", "unknown")
+    except Exception:
+        model_version = "unknown"
+
+    report = RobustnessReport(
+        model_version=model_version,
+        asr=asr,
+        mean_map=mean_map,
+        p95_map=p95_map,
+        certified_radius=certified_radius,
+        n_samples=n_samples,
+        epsilon=epsilon,
+    )
+
+    # persist
+    try:
+        from detection.storage import save_robustness_report
+        save_robustness_report(report.dict())
+    except Exception:
+        # best-effort persist; failures should not crash reporting
+        pass
+
+    return report

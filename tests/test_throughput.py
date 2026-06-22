@@ -54,14 +54,18 @@ def _make_mock_client(latency: float = 0.10, max_concurrency: int = 20) -> Async
     return client
 
 
-def _save_temp_models(tmp_path):
+def _save_temp_models(tmp_path, signing_key: bytes | None = None):
     X = [[0] * len(FEATURE_NAMES), [1] * len(FEATURE_NAMES)]
     y = [0, 1]
     model = RandomForestClassifier(n_estimators=3, random_state=0).fit(X, y)
     models_path = tmp_path / "models"
     models_path.mkdir()
     for name in ("random_forest", "xgboost", "lightgbm"):
-        joblib.dump(model, models_path / f"{name}.joblib")
+        path = models_path / f"{name}.joblib"
+        joblib.dump(model, path)
+        if signing_key:
+            from detection.model_signing import sign_model_file
+            sign_model_file(str(path), signing_key)
     return str(models_path)
 
 
@@ -117,7 +121,7 @@ async def test_async_run_throughput_500_wallets(tmp_path, monkeypatch):
         n_normal_accounts=450, n_wash_rings=10, ring_size=5, seed=42
     )
 
-    models_path = _save_temp_models(tmp_path)
+    models_path = _save_temp_models(tmp_path, settings_module.settings.model_signing_key.encode())
     monkeypatch.setattr(
         settings_module,
         "settings",

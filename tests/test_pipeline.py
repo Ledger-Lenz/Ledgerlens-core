@@ -49,6 +49,9 @@ def _make_trade(
 
 @pytest.fixture
 def model_dir(tmp_path, monkeypatch):
+    from detection.model_signing import sign_model_file
+    import config.settings as settings_module
+
     X = [[0] * len(FEATURE_NAMES), [1] * len(FEATURE_NAMES)]
     y = [0, 1]
     model = RandomForestClassifier(n_estimators=5, random_state=0).fit(X, y)
@@ -56,9 +59,9 @@ def model_dir(tmp_path, monkeypatch):
     model_path = tmp_path / "models"
     model_path.mkdir()
     for name in ("random_forest", "xgboost", "lightgbm"):
-        joblib.dump(model, model_path / f"{name}.joblib")
-
-    import config.settings as settings_module
+        path = model_path / f"{name}.joblib"
+        joblib.dump(model, path)
+        sign_model_file(str(path), settings_module.settings.model_signing_key.encode())
 
     object.__setattr__(settings_module.settings, "model_dir", str(model_path))
     object.__setattr__(settings_module.settings, "db_path", str(tmp_path / "ledgerlens.db"))

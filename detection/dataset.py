@@ -11,6 +11,7 @@ ready for `detection.model_training.train_ensemble`.
 import pandas as pd
 
 from detection.feature_engineering import FEATURE_NAMES, build_feature_vector
+from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 
 
 def build_training_dataset(
@@ -29,6 +30,9 @@ def build_training_dataset(
 
     as_of = as_of or pd.Timestamp(trades["ledger_close_time"].max())
     account_metadata = account_metadata or {}
+    graph = build_transaction_graph(trades)
+    rings = find_wash_rings(graph)
+    ring_membership = build_ring_membership_index(rings, trades=trades)
 
     rows = []
     for account, label in labels.items():
@@ -43,6 +47,7 @@ def build_training_dataset(
             as_of,
             order_book_events=account_events,
             account_metadata=account_metadata,
+            ring_membership=ring_membership,
         )
         features["wallet"] = account
         features["label"] = label

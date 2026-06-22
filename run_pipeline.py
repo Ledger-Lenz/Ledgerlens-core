@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
+from typing import Optional
 import pandas as pd
 
 from config.settings import settings
@@ -23,6 +24,8 @@ from detection.cross_pair_engine import (
 )
 from detection.drift_monitor import record_scored_features
 from detection.feature_engineering import build_feature_vector
+from detection.feature_store import FeatureStore
+from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_calibration, load_models, score_feature_matrix, score_feature_vector, score_with_uncertainty
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.risk_score import RiskScore
@@ -32,7 +35,9 @@ from detection.storage import (
     save_liquidity_pool_trades,
     save_pair_correlations,
     save_path_payments,
+    save_rings,
     save_scores,
+    promote_cold_to_hot,
 )
 from detection.shap_explainer import explain_score, top_contributing_features
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
@@ -48,6 +53,59 @@ from ingestion.path_payment_loader import async_load_path_payments, load_path_pa
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.pipeline")
+
+# Global feature store instance
+_feature_store: Optional[FeatureStore] = None
+_last_cold_flush_time = 0.0
+
+
+def _get_feature_store() -> FeatureStore:
+    """Lazy initialization of global feature store."""
+    global _feature_store
+    if _feature_store is None:
+        _feature_store = FeatureStore()
+    return _feature_store
+
+
+def _maybe_flush_feature_store_to_cold() -> None:
+    """Periodically flush hot feature states to cold storage (SQLite)."""
+    global _last_cold_flush_time
+    now = time.time()
+    flush_interval = settings.feature_store_flush_interval_seconds
+    
+    if now - _last_cold_flush_time >= flush_interval:
+        try:
+            fs = _get_feature_store()
+            count = promote_cold_to_hot(fs)
+            if count > 0:
+                logger.debug(f"Promoted {count} feature states from cold to hot storage")
+            _last_cold_flush_time = now
+        except Exception as e:
+            logger.warning(f"Failed to flush feature store to cold storage: {e}")
+
+
+def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict) -> None:
+    temporal_model = models.get("temporal_lstm")
+    if temporal_model is None:
+        return
+
+    from detection.temporal_dataset import build_score_sequences, get_daily_history
+    from detection.temporal_model import predict_temporal_risk
+    from detection.risk_score import temporal_risk_adjustment
+
+    daily_history = get_daily_history(settings.db_path, account)
+    history_days = len(daily_history)
+
+    if history_days >= 7:
+        seqs = build_score_sequences(settings.db_path, account)
+        if len(seqs) > 0:
+            temporal_prob = predict_temporal_risk(temporal_model, seqs[-1])
+            score.score = temporal_risk_adjustment(
+                snapshot_score=score.score,
+                temporal_score=temporal_prob,
+                history_days=history_days,
+                temporal_weight=settings.temporal_weight,
+            )
 
 
 def run(
@@ -77,6 +135,7 @@ def run(
     models = load_models()
     calibrators = load_calibration() if use_uncertainty else {}
     scores: list[RiskScore] = []
+    all_rings: list[dict] = []
     scored_features: list[dict] = []
     scored_wallets: list[str] = []
     scored_pairs: list[str] = []
@@ -85,6 +144,7 @@ def run(
     trades_by_pair: dict[str, pd.DataFrame] = {}
     correlated_pairs: list[tuple[str, str, float]] = []
     cross_pair_wallets_map: dict[str, list[str]] = {}
+    all_rings: list[dict] = []
 
     if multi_pair:
         for base_asset, counter_asset in asset_pairs:
@@ -121,6 +181,10 @@ def run(
             continue
 
         as_of = pd.Timestamp(trades["ledger_close_time"].max())
+        graph = build_transaction_graph(trades)
+        rings = find_wash_rings(graph)
+        all_rings.extend(rings)
+        _ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
         account_metadata = load_account_metadata(list(accounts))
@@ -152,6 +216,7 @@ def run(
                 correlated_pairs=correlated_pairs if multi_pair else None,
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
                 path_payments=path_payments,
+                ring_membership=_ring_membership,
             )
             if calibrators:
                 uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
@@ -168,6 +233,8 @@ def run(
                     score_upper=uncertainty["score_upper"],
                     prediction_set=uncertainty.get("prediction_set"),
                     coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                    sandwich_signal=features.get("pdc_5m", 0.0),
+                    sandwich_weight=settings.pdc_discount_weight,
                 )
             else:
                 probability, confidence = score_feature_vector(models, features)
@@ -178,7 +245,10 @@ def run(
                     benford_mad_threshold=settings.benford_mad_threshold,
                     ml_probability=probability,
                     ml_confidence=confidence,
+                    sandwich_signal=features.get("pdc_5m", 0.0),
+                    sandwich_weight=settings.pdc_discount_weight,
                 )
+            adjust_score_with_temporal(account, pair_key, score, models)
             scores.append(score)
             scored_features.append(features)
             scored_wallets.append(account)
@@ -194,6 +264,7 @@ def run(
             logger.exception("Failed to record scored features for drift detection")
 
     save_scores(scores)
+    save_rings(all_rings)
 
     # Persist feature vectors and compute+cache SHAP values using XGBoost model.
     if scored_features:
@@ -295,6 +366,7 @@ async def async_run(
     models = load_models()
     calibrators = load_calibration() if use_uncertainty else {}
     scores: list[RiskScore] = []
+    all_rings: list[dict] = []
 
     scored_features: list[dict] = []
     scored_wallets: list[str] = []
@@ -367,6 +439,8 @@ async def async_run(
                         score_upper=uncertainty["score_upper"],
                         prediction_set=uncertainty.get("prediction_set"),
                         coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                        sandwich_signal=features.get("pdc_5m", 0.0),
+                        sandwich_weight=settings.pdc_discount_weight,
                     )
                 else:
                     score = RiskScore.combine(
@@ -376,7 +450,10 @@ async def async_run(
                         benford_mad_threshold=settings.benford_mad_threshold,
                         ml_probability=probability,
                         ml_confidence=confidence,
+                        sandwich_signal=features.get("pdc_5m", 0.0),
+                        sandwich_weight=settings.pdc_discount_weight,
                     )
+                adjust_score_with_temporal(account, pair_key, score, models)
                 scores.append(score)
                 scored_features.append(features)
                 scored_wallets.append(account)
@@ -392,6 +469,7 @@ async def async_run(
             logger.exception("Failed to record scored features for drift detection")
 
     save_scores(scores)
+    save_rings(all_rings)
     _enqueue_webhook_alerts(scores)
     _submit_on_chain(scores)
 
@@ -494,8 +572,6 @@ def _flush_streaming_buffer(
         if calibrators:
             uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
             probability = uncertainty["score"] / 100.0
-            confidence = 1.0  # Use ensemble confidence separately
-            # Re-compute confidence via score_feature_vector for consistency
             _, confidence = score_feature_vector(models, features)
             score = RiskScore.combine(
                 wallet=account,
@@ -508,6 +584,8 @@ def _flush_streaming_buffer(
                 score_upper=uncertainty["score_upper"],
                 prediction_set=uncertainty.get("prediction_set"),
                 coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                sandwich_signal=features.get("pdc_5m", 0.0),
+                sandwich_weight=settings.pdc_discount_weight,
             )
         else:
             probability, confidence = score_feature_vector(models, features)
@@ -518,7 +596,10 @@ def _flush_streaming_buffer(
                 benford_mad_threshold=settings.benford_mad_threshold,
                 ml_probability=probability,
                 ml_confidence=confidence,
+                sandwich_signal=features.get("pdc_5m", 0.0),
+                sandwich_weight=settings.pdc_discount_weight,
             )
+        adjust_score_with_temporal(account, pair_key, score, models)
         scores.append(score)
         scored_features.append(features)
         scored_wallets.append(account)

@@ -62,3 +62,25 @@ def test_all_zero_ensemble_weights_raise(monkeypatch):
 
     with pytest.raises(ValueError, match="At least one ensemble weight must be positive"):
         settings_module.Settings()
+
+
+def test_cors_wildcard_origin_raises(monkeypatch):
+    monkeypatch.setenv("LEDGERLENS_CORS_ALLOWED_ORIGINS", "*")
+
+    with pytest.raises(ValueError, match="must not contain '\\*'"):
+        settings_module.Settings()
+
+
+def test_cors_wildcard_in_list_raises(monkeypatch):
+    monkeypatch.setenv("LEDGERLENS_CORS_ALLOWED_ORIGINS", "https://ok.example.com,*")
+
+    with pytest.raises(ValueError, match="must not contain '\\*'"):
+        settings_module.Settings()
+
+
+def test_cors_default_is_empty_tuple(monkeypatch):
+    monkeypatch.delenv("LEDGERLENS_CORS_ALLOWED_ORIGINS", raising=False)
+
+    settings = settings_module.Settings()
+
+    assert settings.cors_allowed_origins == ()

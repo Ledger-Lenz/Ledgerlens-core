@@ -9,11 +9,15 @@ account-metadata inputs are optional and come from
 `ingestion.operations_loader` / `ingestion.account_loader` respectively.
 """
 
+from __future__ import annotations
+
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import compute_benford_metrics
+from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.sandwich_engine import detect_sandwich_candidates
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
 
 ROLLING_WINDOWS = {
@@ -51,6 +55,10 @@ WALLET_GRAPH_FEATURE_NAMES = [
     "funding_source_similarity_score",
     "network_centrality",
     "account_age_days",
+    "wash_ring_membership",
+    "wash_ring_size",
+    "cycle_volume_ratio",
+    "timing_tightness_score",
 ]
 
 CROSS_PAIR_FEATURE_NAMES = [
@@ -73,6 +81,20 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
 ]
 
+SANDWICH_FEATURE_NAMES = [
+    "sandwich_ratio",  # fraction of an account's pool trades that are attacker legs of a sandwich
+    "sandwich_profit_xlm_30d",  # XLM the account extracted as a sandwich attacker over the last 30d
+]
+
+CROSS_CHAIN_FEATURE_NAMES = [
+    "has_evm_link",
+    "evm_round_trip_frequency",
+    "evm_benford_mad_30d",
+    "evm_counterparty_concentration",
+    "bridge_volume_ratio",
+    "cross_chain_time_lag_median_h",
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -81,6 +103,7 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
+    + SANDWICH_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -92,6 +115,10 @@ try:
     _HAS_ADVERSARIAL = True
 except ImportError:  # pragma: no cover
     _HAS_ADVERSARIAL = False
+
+# Cross-chain features are appended last so existing model checkpoints remain
+# loadable — old models see 0.0 for these features during inference.
+FEATURE_NAMES = FEATURE_NAMES + CROSS_CHAIN_FEATURE_NAMES  # type: ignore[assignment]
 
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
@@ -293,6 +320,29 @@ def account_age_days(account: str, as_of: pd.Timestamp, account_metadata: dict[s
     return float((as_of - pd.Timestamp(created_at)).total_seconds() / 86400)
 
 
+def graph_ring_features(account: str, ring_membership: dict[str, dict] | None) -> dict:
+    """Compute graph-structural wash-ring features for `account`."""
+    zero = {
+        "wash_ring_membership": 0.0,
+        "wash_ring_size": 0.0,
+        "cycle_volume_ratio": 0.0,
+        "timing_tightness_score": 0.0,
+    }
+    if not ring_membership:
+        return zero
+
+    metadata = ring_membership.get(account)
+    if metadata is None:
+        return zero
+
+    return {
+        "wash_ring_membership": 1.0,
+        "wash_ring_size": float(metadata.get("wash_ring_size", metadata.get("ring_size", 0.0))),
+        "cycle_volume_ratio": float(metadata.get("cycle_volume_ratio", 0.0)),
+        "timing_tightness_score": float(metadata.get("timing_tightness_score", 0.0)),
+    }
+
+
 def cross_pair_features(
     account: str,
     trades_by_pair: dict[str, pd.DataFrame] | None,
@@ -454,7 +504,97 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     }
 
 
-def build_feature_vector(
+def sandwich_features(
+    trades: pd.DataFrame,
+    account: str,
+    as_of: pd.Timestamp,
+    min_profit_xlm: float = 10.0,
+) -> dict:
+    """Compute wallet-level sandwich-aggressor features for `account`.
+
+    `sandwich_ratio` is the share of `account`'s pool trades that are attacker
+    legs (buy + sell) of a detected sandwich. `sandwich_profit_xlm_30d` is the
+    XLM profit `account` extracted as the attacker across sandwiches whose
+    opening buy falls in the 30 days ending at `as_of`.
+    """
+    zero = {name: 0.0 for name in SANDWICH_FEATURE_NAMES}
+    if trades.empty or "trade_type" not in trades.columns or "price" not in trades.columns:
+        return zero
+
+    pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+    if pool_trades.empty:
+        return zero
+
+    window = _window_slice(pool_trades, as_of, ROLLING_WINDOWS["30d"])
+    if window.empty:
+        return zero
+
+    candidates = detect_sandwich_candidates(window, min_profit_xlm=min_profit_xlm)
+    own = [c for c in candidates if c.attacker == account]
+    if not own:
+        return zero
+
+    account_pool_trades = pool_trades[pool_trades["base_account"] == account]
+    denom = len(account_pool_trades)
+    # each sandwich contributes two attacker legs (buy + sell)
+    ratio = min(2 * len(own) / denom, 1.0) if denom > 0 else 0.0
+    profit = sum(c.profit_xlm for c in own)
+
+    return {
+        "sandwich_ratio": float(ratio),
+        "sandwich_profit_xlm_30d": float(profit),
+    }
+
+
+def build_cross_chain_features(
+    wallet: str,
+    linker: "CrossChainLinker",  # noqa: F821
+    sdex_volume: float = 0.0,
+    evm_trades: list[dict] | None = None,
+) -> dict:
+    """Compute the six cross-chain features for ``wallet``.
+
+    ``linker`` is a :class:`detection.cross_chain_linker.CrossChainLinker`
+    instance.  ``sdex_volume`` is the total SDEX trade volume for the wallet
+    (used to compute ``bridge_volume_ratio``).  ``evm_trades`` is an optional
+    list of EVM trade dicts (same schema as ``CrossChainTrade.model_dump()``).
+    """
+    zero: dict = {name: 0.0 for name in CROSS_CHAIN_FEATURE_NAMES}
+
+    evm_wallets = linker.link_wallets(wallet)
+    if not evm_wallets:
+        return zero
+
+    pattern = linker.get_evm_trade_pattern(
+        evm_wallets, chain="ethereum", evm_trades=evm_trades or []
+    )
+
+    evm_volume = pattern.get("total_evm_volume", 0.0)
+    bridge_volume_ratio = evm_volume / sdex_volume if sdex_volume > 0 else 0.0
+
+    unique_cp = pattern.get("unique_counterparties", 0)
+    if unique_cp > 0 and evm_trades:
+        wallet_trades = [
+            t for t in (evm_trades or []) if t.get("wallet_address") in set(evm_wallets)
+        ]
+        from collections import Counter
+        cp_counts = Counter(t.get("counterparty", "") for t in wallet_trades if t.get("counterparty"))
+        total = sum(cp_counts.values())
+        hhi = sum((c / total) ** 2 for c in cp_counts.values()) if total > 0 else 0.0
+    else:
+        hhi = 0.0
+
+    return {
+        "has_evm_link": 1.0,
+        "evm_round_trip_frequency": float(pattern.get("round_trip_frequency", 0.0)),
+        "evm_benford_mad_30d": float(pattern.get("benford_mad", 0.0)),
+        "evm_counterparty_concentration": float(hhi),
+        "bridge_volume_ratio": float(bridge_volume_ratio),
+        "cross_chain_time_lag_median_h": 0.0,
+    }
+
+
+def _build_feature_vector_base(
     trades: pd.DataFrame,
     account: str,
     as_of: pd.Timestamp,
@@ -466,6 +606,10 @@ def build_feature_vector(
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
+    ring_membership: dict[str, dict] | None = None,
+    prices: pd.DataFrame | None = None,
+    pair: str | None = None,
+    cross_chain_linker: "CrossChainLinker | None" = None,  # noqa: F821
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -485,6 +629,10 @@ def build_feature_vector(
     `liquidity_pools`, `pool_deposits`, and `path_payments` are optional;
     omitting them yields `0.0` for the AMM/path-payment features that depend
     on them.
+
+    `prices` (a `timestamp` + `mid_price`/`price` series for the pair) and
+    `pair` drive the causal PDC features; omitting `prices` yields `0.0` for
+    `pdc_5m`/`pdc_1h`.
     """
     order_book_events = order_book_events if order_book_events is not None else pd.DataFrame(columns=["account", "event_type"])
     account_metadata = account_metadata or {}
@@ -505,9 +653,47 @@ def build_feature_vector(
             "account_age_days": account_age_days(account, as_of, account_metadata),
         }
     )
+    features.update(graph_ring_features(account, ring_membership))
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))
+    features.update(sandwich_features(trades, account, as_of))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
+
+    if cross_chain_linker is not None:
+        sdex_volume = float(_account_trades(trades, account)["base_amount"].sum()) if not trades.empty else 0.0
+        features.update(build_cross_chain_features(account, cross_chain_linker, sdex_volume=sdex_volume))
+    else:
+        features.update({name: 0.0 for name in CROSS_CHAIN_FEATURE_NAMES})
+
     return features
+
+
+# --- T-GNN features (appended after PATH_PAYMENT_FEATURE_NAMES so existing
+# model checkpoints trained without these stay loadable by index/order). ---
+GNN_FEATURE_NAMES = [
+    "gnn_wash_ring_probability",
+    "gnn_neighbor_avg_score",
+]
+
+FEATURE_NAMES = FEATURE_NAMES + GNN_FEATURE_NAMES
+
+
+def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None, **kwargs):
+    """Wraps the base feature vector builder, optionally appending GNN features.
+
+    Args:
+        use_gnn: If True, appends gnn_wash_ring_probability and
+            gnn_neighbor_avg_score (default 0.0 if not found in gnn_features).
+        gnn_features: Optional {wallet: {feature_name: value}} lookup.
+    """
+    vector = _build_feature_vector_base(*args, **kwargs)
+    if use_gnn:
+        wallet = kwargs.get("wallet") or (args[0] if args else None)
+        feats = (gnn_features or {}).get(wallet, {})
+        vector = list(vector) + [
+            float(feats.get("gnn_wash_ring_probability", 0.0)),
+            float(feats.get("gnn_neighbor_avg_score", 0.0)),
+        ]
+    return vector
