@@ -23,7 +23,7 @@ from detection.cross_pair_engine import (
 )
 from detection.drift_monitor import record_scored_features
 from detection.feature_engineering import build_feature_vector
-from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
+from detection.model_inference import load_calibration, load_models, score_feature_matrix, score_feature_vector, score_with_uncertainty
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.risk_score import RiskScore
 from detection.storage import (
@@ -54,6 +54,7 @@ def run(
     asset_pairs: list[tuple[str | None, str | None]] | None = None,
     multi_pair: bool = False,
     no_submit: bool = False,
+    use_uncertainty: bool = True,
 ) -> list[RiskScore]:
     """Run one scoring pass over the given asset pairs and return the resulting scores.
 
@@ -65,11 +66,16 @@ def run(
     cross-asset correlation analysis is performed once across all pairs.
     The resulting cross-pair features are included in each account's
     feature vector.
+
+    When ``use_uncertainty=True`` (default), loads calibration artifacts
+    and includes conformal prediction intervals in the returned scores.
+    Falls back silently if no calibration artifacts are found.
     """
     asset_pairs = asset_pairs or [
         (None, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
     ]
     models = load_models()
+    calibrators = load_calibration() if use_uncertainty else {}
     scores: list[RiskScore] = []
     scored_features: list[dict] = []
     scored_wallets: list[str] = []
@@ -147,16 +153,32 @@ def run(
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
                 path_payments=path_payments,
             )
-            probability, confidence = score_feature_vector(models, features)
-
-            score = RiskScore.combine(
-                wallet=account,
-                asset_pair=pair_key,
-                benford_mad=features.get("benford_mad_24h", 0.0),
-                benford_mad_threshold=settings.benford_mad_threshold,
-                ml_probability=probability,
-                ml_confidence=confidence,
-            )
+            if calibrators:
+                uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
+                probability = uncertainty["score"] / 100.0
+                _, confidence = score_feature_vector(models, features)
+                score = RiskScore.combine(
+                    wallet=account,
+                    asset_pair=pair_key,
+                    benford_mad=features.get("benford_mad_24h", 0.0),
+                    benford_mad_threshold=settings.benford_mad_threshold,
+                    ml_probability=probability,
+                    ml_confidence=confidence,
+                    score_lower=uncertainty["score_lower"],
+                    score_upper=uncertainty["score_upper"],
+                    prediction_set=uncertainty.get("prediction_set"),
+                    coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                )
+            else:
+                probability, confidence = score_feature_vector(models, features)
+                score = RiskScore.combine(
+                    wallet=account,
+                    asset_pair=pair_key,
+                    benford_mad=features.get("benford_mad_24h", 0.0),
+                    benford_mad_threshold=settings.benford_mad_threshold,
+                    ml_probability=probability,
+                    ml_confidence=confidence,
+                )
             scores.append(score)
             scored_features.append(features)
             scored_wallets.append(account)
@@ -212,8 +234,11 @@ def _enqueue_webhook_alerts(scores: list[RiskScore]) -> None:
         init_r()
         init_q()
         for score in scores:
+            payload = score.model_dump()
+            payload["score_lower"] = score.score_lower
+            payload["score_upper"] = score.score_upper
             for sub in get_matching_subscribers(score):
-                enqueue(sub.subscriber_id, score.model_dump())
+                enqueue(sub.subscriber_id, payload)
     except Exception:
         logger.exception("Failed to enqueue webhook alerts")
 
@@ -252,17 +277,23 @@ def _submit_on_chain(scores: list[RiskScore], no_submit: bool = False) -> None:
 async def async_run(
     asset_pairs: list[tuple[str | None, str | None]] | None = None,
     max_concurrency: int = 20,
+    use_uncertainty: bool = True,
 ) -> list[RiskScore]:
     """Async version of `run()` using concurrent I/O and batched ML inference.
 
     Fetches all account metadata concurrently (bounded by `max_concurrency`)
     and scores all accounts in a single batched `predict_proba` call per model.
     Produces identical scores to synchronous `run()` for the same input data.
+
+    When ``use_uncertainty=True`` (default), loads calibration artifacts
+    and includes conformal prediction intervals in the returned scores.
+    Falls back silently if no calibration artifacts are found.
     """
     asset_pairs = asset_pairs or [
         (None, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
     ]
     models = load_models()
+    calibrators = load_calibration() if use_uncertainty else {}
     scores: list[RiskScore] = []
 
     scored_features: list[dict] = []
@@ -322,14 +353,30 @@ async def async_run(
             for account, features, (probability, confidence) in zip(
                 accounts, feature_vectors, batch_results
             ):
-                score = RiskScore.combine(
-                    wallet=account,
-                    asset_pair=pair_key,
-                    benford_mad=features.get("benford_mad_24h", 0.0),
-                    benford_mad_threshold=settings.benford_mad_threshold,
-                    ml_probability=probability,
-                    ml_confidence=confidence,
-                )
+                if calibrators:
+                    uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
+                    prob = uncertainty["score"] / 100.0
+                    score = RiskScore.combine(
+                        wallet=account,
+                        asset_pair=pair_key,
+                        benford_mad=features.get("benford_mad_24h", 0.0),
+                        benford_mad_threshold=settings.benford_mad_threshold,
+                        ml_probability=prob,
+                        ml_confidence=confidence,
+                        score_lower=uncertainty["score_lower"],
+                        score_upper=uncertainty["score_upper"],
+                        prediction_set=uncertainty.get("prediction_set"),
+                        coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                    )
+                else:
+                    score = RiskScore.combine(
+                        wallet=account,
+                        asset_pair=pair_key,
+                        benford_mad=features.get("benford_mad_24h", 0.0),
+                        benford_mad_threshold=settings.benford_mad_threshold,
+                        ml_probability=probability,
+                        ml_confidence=confidence,
+                    )
                 scores.append(score)
                 scored_features.append(features)
                 scored_wallets.append(account)
@@ -377,6 +424,9 @@ def run_streaming(
         "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
     )
     models = load_models()
+    calibrators = load_calibration()
+    if calibrators:
+        logger.info("Loaded calibration artifacts for %d models", len(calibrators))
     pair_key = f"{asset_pair[0] or 'XLM'}/{asset_pair[1] or 'XLM'}"
 
     # Read cursor from file so we resume where we left off.
@@ -398,13 +448,13 @@ def run_streaming(
 
             now = _now()
             if len(buffer) >= batch_size or (now - last_flush_time) >= flush_interval_seconds:
-                _flush_streaming_buffer(buffer, models, pair_key, asset_pair, last_cursor)
+                _flush_streaming_buffer(buffer, models, pair_key, asset_pair, last_cursor, calibrators)
                 buffer.clear()
                 last_flush_time = now
     except KeyboardInterrupt:
         logger.info("Stream interrupted, flushing remaining %d trades", len(buffer))
         if buffer:
-            _flush_streaming_buffer(buffer, models, pair_key, asset_pair, last_cursor)
+            _flush_streaming_buffer(buffer, models, pair_key, asset_pair, last_cursor, calibrators)
         raise
 
 
@@ -414,6 +464,7 @@ def _flush_streaming_buffer(
     pair_key: str,
     asset_pair: tuple[str | None, str | None],
     cursor: str,
+    calibrators: dict | None = None,
 ) -> None:
     """Score all accounts in *buffer* and persist results + cursor."""
     if not buffer:
@@ -439,16 +490,35 @@ def _flush_streaming_buffer(
             as_of,
             account_metadata=account_metadata,
         )
-        probability, confidence = score_feature_vector(models, features)
 
-        score = RiskScore.combine(
-            wallet=account,
-            asset_pair=pair_key,
-            benford_mad=features.get("benford_mad_24h", 0.0),
-            benford_mad_threshold=settings.benford_mad_threshold,
-            ml_probability=probability,
-            ml_confidence=confidence,
-        )
+        if calibrators:
+            uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
+            probability = uncertainty["score"] / 100.0
+            confidence = 1.0  # Use ensemble confidence separately
+            # Re-compute confidence via score_feature_vector for consistency
+            _, confidence = score_feature_vector(models, features)
+            score = RiskScore.combine(
+                wallet=account,
+                asset_pair=pair_key,
+                benford_mad=features.get("benford_mad_24h", 0.0),
+                benford_mad_threshold=settings.benford_mad_threshold,
+                ml_probability=probability,
+                ml_confidence=confidence,
+                score_lower=uncertainty["score_lower"],
+                score_upper=uncertainty["score_upper"],
+                prediction_set=uncertainty.get("prediction_set"),
+                coverage_guarantee=uncertainty.get("coverage_guarantee"),
+            )
+        else:
+            probability, confidence = score_feature_vector(models, features)
+            score = RiskScore.combine(
+                wallet=account,
+                asset_pair=pair_key,
+                benford_mad=features.get("benford_mad_24h", 0.0),
+                benford_mad_threshold=settings.benford_mad_threshold,
+                ml_probability=probability,
+                ml_confidence=confidence,
+            )
         scores.append(score)
         scored_features.append(features)
         scored_wallets.append(account)

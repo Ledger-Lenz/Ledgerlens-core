@@ -4,6 +4,10 @@ This mirrors the on-chain `RiskScore` struct defined in the
 ledgerlens-contracts repo (`ledgerlens-score/src/lib.rs`). Keep the two in
 sync — see README.md's "LedgerLens Organization" section for the cross-repo
 data contract.
+
+Starting from v2, the schema includes optional uncertainty fields
+(``score_lower``, ``score_upper``, ``prediction_set``, ``coverage_guarantee``)
+populated by ``ConformalCalibrator`` during inference.
 """
 
 from datetime import datetime, timezone
@@ -20,6 +24,24 @@ class RiskScore(BaseModel):
     confidence: int = Field(ge=0, le=100)
     timestamp: datetime
 
+    # Conformal prediction uncertainty fields (optional, v2+)
+    score_lower: float | None = Field(
+        default=None, ge=0.0, le=100.0,
+        description="Lower bound of 90 % conformal prediction interval",
+    )
+    score_upper: float | None = Field(
+        default=None, ge=0.0, le=100.0,
+        description="Upper bound of 90 % conformal prediction interval",
+    )
+    prediction_set: list[int] | None = Field(
+        default=None,
+        description="Class indices in the conformal prediction set",
+    )
+    coverage_guarantee: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Target coverage level (1 - alpha) of the prediction set",
+    )
+
     @classmethod
     def combine(
         cls,
@@ -29,11 +51,19 @@ class RiskScore(BaseModel):
         benford_mad_threshold: float,
         ml_probability: float,
         ml_confidence: float,
+        score_lower: float | None = None,
+        score_upper: float | None = None,
+        prediction_set: list[int] | None = None,
+        coverage_guarantee: float | None = None,
     ) -> "RiskScore":
         """Combine Benford metrics and an ML probability into a single score.
 
         `score` is a 0-100 blend weighted toward the ML probability, with
         the Benford signal acting as a corroborating flag.
+
+        Optional uncertainty fields (``score_lower``, ``score_upper``,
+        ``prediction_set``, ``coverage_guarantee``) are passed through to
+        the returned ``RiskScore`` when provided.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
@@ -52,4 +82,8 @@ class RiskScore(BaseModel):
             ml_flag=ml_flag,
             confidence=round(ml_confidence * 100),
             timestamp=datetime.now(timezone.utc),
+            score_lower=score_lower,
+            score_upper=score_upper,
+            prediction_set=prediction_set,
+            coverage_guarantee=coverage_guarantee,
         )

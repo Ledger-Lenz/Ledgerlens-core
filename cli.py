@@ -54,6 +54,7 @@ def train(
     n_wash_rings: int = typer.Option(10, help="Number of wash-trading rings"),
     ring_size: int = typer.Option(3, help="Accounts per wash ring"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
 ) -> None:
     """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
     import os
@@ -74,11 +75,16 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
-    results = train_ensemble(df)
+    results = train_ensemble(df, calibrate=calibrate)
     for name, result in results.items():
+        if name == "_calib":
+            continue
         logger.info("%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
     save_models(results, training_dataset_path=training_dataset_path)
+    if calibrate and "_calib" in results:
+        coverage = results["_calib"].get("coverage_avg", 0.0)
+        logger.info("Conformal calibration complete (avg coverage=%.4f)", coverage)
     logger.info("Saved models to %s", settings.model_dir)
 
 
@@ -155,16 +161,19 @@ def retrain_check(
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     new_results = train_ensemble(df)
-    for name, result in new_results.items():
+    model_names = [k for k in new_results if k != "_calib"]
+    for name in model_names:
+        result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
     # Compare new models with previous models
     previous_metrics = metadata.get("model_metrics", {})
     promoted = False
-    old_versions = {model_name: get_current_version(model_name, settings.model_dir) for model_name in new_results}
+    old_versions = {model_name: get_current_version(model_name, settings.model_dir) for model_name in model_names}
     auc_by_model: dict[str, tuple[float, float]] = {}
 
-    for model_name, new_result in new_results.items():
+    for model_name in model_names:
+        new_result = new_results[model_name]
         old_auc = previous_metrics.get(model_name, {}).get("auc_roc", 0.0)
         new_auc = new_result.get("auc_roc", 0.0)
         auc_by_model[model_name] = (old_auc, new_auc)
@@ -198,7 +207,7 @@ def retrain_check(
             if old_version:
                 rollback_model(model_name, old_version, settings.model_dir)
 
-    for model_name in new_results:
+    for model_name in model_names:
         old_auc, new_auc = auc_by_model[model_name]
         save_retrain_run(
             drift_report_id=drift_report_id,
@@ -277,7 +286,7 @@ def eval_robustness(
         n_normal_accounts=n_normal_accounts, n_wash_rings=n_wash_rings, ring_size=ring_size, seed=seed
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
-    baseline_results = train_ensemble(df, adversarial_augment=False)
+    baseline_results = train_ensemble(df, adversarial_augment=False, calibrate=False)
     baseline_models = {k: v["model"] for k, v in baseline_results.items()}
 
     logger.info("Evaluating robustness of baseline model…")
@@ -285,7 +294,7 @@ def eval_robustness(
 
     # Train an adversarially-augmented model
     logger.info("Training adversarially-augmented model…")
-    adv_results = train_ensemble(df, adversarial_augment=adversarial_augment)
+    adv_results = train_ensemble(df, adversarial_augment=adversarial_augment, calibrate=False)
     adv_models = {k: v["model"] for k, v in adv_results.items()}
 
     logger.info("Evaluating robustness of augmented model…")
