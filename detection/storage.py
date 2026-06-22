@@ -18,12 +18,26 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from enum import Enum
 
 import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
 from ingestion.data_models import PathPayment
+
+
+class AlertType(str, Enum):
+    """Taxonomy of manipulation alerts surfaced via the `/alerts` API.
+
+    Add new alert categories here; the value is the string stored in the
+    `alerts.alert_type` column and accepted by the `/alerts?alert_type=` query.
+    """
+
+    WASH_TRADING = "WASH_TRADING"
+    CIRCULAR_ROUTE = "CIRCULAR_ROUTE"
+    POOL_MANIPULATION = "POOL_MANIPULATION"
+    SANDWICH_ATTACK = "SANDWICH_ATTACK"
 
 
 class SchemaMigrationError(RuntimeError):

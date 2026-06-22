@@ -26,6 +26,13 @@ class Settings:
     ensemble_weight_xgb: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_XGB", "0.50")))
     ensemble_weight_lgbm: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_LGBM", "0.25")))
 
+    # Fraction of the composite risk score driven by the sandwich-attack signal
+    # (see detection.risk_score.RiskScore.combine). 0.0 preserves the legacy
+    # benford/ML-only blend.
+    sandwich_score_weight: float = field(
+        default_factory=lambda: float(os.getenv("SANDWICH_SCORE_WEIGHT", "0.0"))
+    )
+
     model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
     db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
 

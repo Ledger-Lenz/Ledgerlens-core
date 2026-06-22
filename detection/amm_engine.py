@@ -9,6 +9,7 @@ functions operate on `Trade` rows with `trade_type=LIQUIDITY_POOL` (see
 
 import pandas as pd
 
+from detection.sandwich_engine import detect_sandwich_candidates
 from ingestion.data_models import LiquidityPool, TradeType
 
 
@@ -54,6 +55,58 @@ def pool_round_trip_ratio(
                 break
 
     return round_trips / n
+
+
+def pool_sandwich_count(
+    trades: pd.DataFrame,
+    pool_id: str,
+    min_profit_xlm: float = 10.0,
+    max_ledger_gap: int = 2,
+) -> int:
+    """Number of sandwich-attack candidates detected against `pool_id`.
+
+    Operates on the same `Trade`-shaped DataFrame as `pool_round_trip_ratio`
+    (rows with `trade_type == LIQUIDITY_POOL`). Returns 0 when the pool has no
+    trades or the schema lacks the price/direction columns the detector needs.
+    """
+    if trades.empty or "liquidity_pool_id" not in trades.columns:
+        return 0
+
+    pool_trades = trades.loc[trades["liquidity_pool_id"] == pool_id]
+    if pool_trades.empty:
+        return 0
+
+    return len(
+        detect_sandwich_candidates(
+            pool_trades,
+            min_profit_xlm=min_profit_xlm,
+            max_ledger_gap=max_ledger_gap,
+        )
+    )
+
+
+def pool_sandwich_frequency(
+    trades: pd.DataFrame,
+    pool_id: str,
+    min_profit_xlm: float = 10.0,
+    max_ledger_gap: int = 2,
+) -> float:
+    """Fraction of `pool_id`'s trades that participate in a detected sandwich.
+
+    Each candidate consumes three trade legs (buy, victim, sell); the ratio is
+    `3 * candidate_count / pool_trade_count`, clamped to 1.0. A pool-level
+    proxy for how heavily a pool is being sandwiched.
+    """
+    if trades.empty or "liquidity_pool_id" not in trades.columns:
+        return 0.0
+
+    pool_trades = trades.loc[trades["liquidity_pool_id"] == pool_id]
+    n = len(pool_trades)
+    if n == 0:
+        return 0.0
+
+    count = pool_sandwich_count(trades, pool_id, min_profit_xlm, max_ledger_gap)
+    return float(min(3 * count / n, 1.0))
 
 
 def pool_share_concentration(pool: LiquidityPool, deposits: pd.DataFrame) -> float:
