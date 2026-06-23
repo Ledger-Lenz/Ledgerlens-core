@@ -80,6 +80,35 @@ def record_feedback(feedback: ScoringFeedback, db_path: str | None = None) -> No
         conn.commit()
 
 
+def get_recent_confirmed_labels(
+    since: datetime,
+    db_path: str | None = None,
+) -> list[ScoringFeedback]:
+    """Return feedback records with confirmed_at >= `since`."""
+    cutoff = since.isoformat()
+    with _connect(db_path) as conn:
+        _init(conn)
+        rows = conn.execute(
+            "SELECT wallet, asset_pair, model_name, predicted_probability, "
+            "ground_truth, scored_at, confirmed_at "
+            "FROM scoring_feedback WHERE confirmed_at >= ? "
+            "ORDER BY confirmed_at",
+            (cutoff,),
+        ).fetchall()
+    return [
+        ScoringFeedback(
+            wallet=r[0],
+            asset_pair=r[1],
+            model_name=r[2],
+            predicted_probability=r[3],
+            ground_truth=r[4],
+            scored_at=datetime.fromisoformat(r[5]),
+            confirmed_at=datetime.fromisoformat(r[6]),
+        )
+        for r in rows
+    ]
+
+
 def get_recent_feedback(
     days_back: int = 7,
     model_name: str | None = None,

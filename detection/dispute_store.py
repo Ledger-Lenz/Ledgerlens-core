@@ -281,6 +281,41 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
         )
 
 
+def get_resolved_disputes(
+    since: datetime,
+    db_path: str | None = None,
+) -> list[ScoreDispute]:
+    """Return disputes resolved at or after `since`."""
+    cutoff = since.isoformat()
+    path = db_path or settings.db_path
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        rows = conn.execute(
+            "SELECT dispute_id, wallet, asset_pair, disputed_score, soroban_tx_hash, "
+            "evidence_url, submitted_at, status, committee_votes_json, resolved_at, resolution "
+            "FROM score_disputes WHERE resolved_at >= ? ORDER BY resolved_at",
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        ScoreDispute(
+            dispute_id=r[0],
+            wallet=r[1],
+            asset_pair=r[2],
+            disputed_score=r[3],
+            soroban_tx_hash=r[4],
+            evidence_url=r[5],
+            submitted_at=datetime.fromisoformat(r[6]),
+            status=r[7],
+            committee_votes=json.loads(r[8]),
+            resolved_at=datetime.fromisoformat(r[9]) if r[9] else None,
+            resolution=r[10],
+        )
+        for r in rows
+    ]
+
+
 def get_dispute(dispute_id: str) -> ScoreDispute | None:
     init_db()
     with _connect() as conn:

@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -574,6 +575,40 @@ def federated_audit_log(
     """Return the most recent federated-round audit records (participant IDs are SHA-256 hashed)."""
     from detection.federated.audit import get_audit_records
     return get_audit_records(limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Model weights
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/v1/model/weights")
+def model_weights() -> JSONResponse:
+    """Return current ensemble classifier weights from the adaptive reweighter."""
+    from detection.adaptive_reweighter import (
+        ThompsonSamplingReweighter,
+        _CLASSIFIER_NAMES,
+        get_global_reweighter,
+        load_state,
+    )
+
+    rw = get_global_reweighter() or load_state()
+    if rw is None:
+        rw = ThompsonSamplingReweighter(n_classifiers=len(_CLASSIFIER_NAMES))
+
+    weights = rw.current_weights()
+    return JSONResponse({
+        "classifiers": [
+            {
+                "name": name,
+                "alpha": float(rw.alphas[i]),
+                "beta": float(rw.betas[i]),
+                "weight": weights[name],
+            }
+            for i, name in enumerate(_CLASSIFIER_NAMES)
+        ],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 # ---------------------------------------------------------------------------
