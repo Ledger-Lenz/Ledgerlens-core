@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS federated_audit_log (
     timestamp           TEXT NOT NULL,
     excluded_participants_json TEXT NOT NULL DEFAULT '[]',
     record_json         TEXT NOT NULL,
-    signature           BLOB NOT NULL
+    signature           BLOB NOT NULL,
+    dp_delta            REAL NOT NULL DEFAULT 0.0,
+    noise_multiplier    REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS federated_state (
@@ -39,6 +41,11 @@ CREATE TABLE IF NOT EXISTS federated_state (
     value TEXT NOT NULL
 );
 """
+
+_MIGRATIONS = [
+    ("dp_delta", "REAL NOT NULL DEFAULT 0.0"),
+    ("noise_multiplier", "REAL NOT NULL DEFAULT 0.0"),
+]
 
 
 @contextmanager
@@ -49,6 +56,12 @@ def _connect(db_path: str | None = None) -> Generator[sqlite3.Connection, None, 
     try:
         conn.executescript(_SCHEMA)
         conn.commit()
+        for col, definition in _MIGRATIONS:
+            try:
+                conn.execute(f"ALTER TABLE federated_audit_log ADD COLUMN {col} {definition}")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
         yield conn
     finally:
         conn.close()
@@ -66,6 +79,8 @@ def build_record(
     dp_epsilon_consumed: float,
     cumulative_epsilon: float,
     excluded_participant_ids: list[str] | None = None,
+    dp_delta: float = 0.0,
+    noise_multiplier: float = 0.0,
 ) -> dict:
     """Build an unsigned audit record dict (all participant IDs are hashed)."""
     return {
@@ -75,6 +90,8 @@ def build_record(
         "aggregated_update_norm": aggregated_update_norm,
         "dp_epsilon_consumed": dp_epsilon_consumed,
         "cumulative_epsilon": cumulative_epsilon,
+        "dp_delta": dp_delta,
+        "noise_multiplier": noise_multiplier,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -109,8 +126,9 @@ def save_audit_record(
             INSERT OR REPLACE INTO federated_audit_log
                 (round_id, participants_json, aggregated_update_norm,
                  dp_epsilon_consumed, cumulative_epsilon, timestamp,
-                 excluded_participants_json, record_json, signature)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 excluded_participants_json, record_json, signature,
+                 dp_delta, noise_multiplier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["round_id"],
@@ -122,6 +140,8 @@ def save_audit_record(
                 json.dumps(record.get("excluded_participants", [])),
                 json.dumps(record, sort_keys=True),
                 signature,
+                record.get("dp_delta", 0.0),
+                record.get("noise_multiplier", 0.0),
             ),
         )
         conn.commit()
@@ -155,3 +175,10 @@ def get_cumulative_epsilon(db_path: str | None = None) -> float:
             "SELECT cumulative_epsilon FROM federated_audit_log ORDER BY timestamp DESC LIMIT 1"
         ).fetchone()
     return float(row["cumulative_epsilon"]) if row else 0.0
+
+
+def get_round_count(db_path: str | None = None) -> int:
+    """Return the total number of completed federated rounds persisted in the audit log."""
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM federated_audit_log").fetchone()
+    return int(row["n"]) if row else 0

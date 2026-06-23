@@ -53,10 +53,14 @@ from cryptography.exceptions import InvalidSignature
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from dp_accounting import dp_event as _dp_event
+from dp_accounting.rdp import rdp_privacy_accountant as _rdp_pa
+
 from config.settings import settings
 from detection.federated.audit import (
     build_record,
     get_cumulative_epsilon,
+    get_round_count,
     save_audit_record,
     sign_record,
 )
@@ -98,6 +102,8 @@ class FederatedAggregationServer:
         dp_max_epsilon: float | None = None,
         db_path: str | None = None,
         server_private_key: Ed25519PrivateKey | None = None,
+        noise_multiplier: float | None = None,
+        target_delta: float | None = None,
     ) -> None:
         self.min_participants = min_participants if min_participants is not None else settings.federated_min_participants
         self.gradient_clip_threshold = gradient_clip_threshold if gradient_clip_threshold is not None else settings.gradient_clip_threshold
@@ -106,6 +112,13 @@ class FederatedAggregationServer:
         self.dp_delta = dp_delta if dp_delta is not None else settings.federated_dp_delta
         self.dp_max_epsilon = dp_max_epsilon if dp_max_epsilon is not None else settings.federated_dp_max_epsilon
         self.db_path = db_path
+        # noise_multiplier > 0 enables the RDP accounting path (σ = clip_norm × nm).
+        # 0.0 keeps the legacy linear ε-accumulation for backward compatibility.
+        self.noise_multiplier = (
+            noise_multiplier if noise_multiplier is not None
+            else settings.federated_noise_multiplier
+        )
+        self.target_delta = target_delta if target_delta is not None else self.dp_delta
 
         self._lock = threading.Lock()
         self._participants: dict[str, _Participant] = {}
@@ -113,8 +126,20 @@ class FederatedAggregationServer:
         self._global_soft_labels: np.ndarray | None = None
         self._previous_mean_delta: np.ndarray | None = None
         self._current_round_id: str = str(uuid.uuid4())
-        self._round_number: int = 0
+        self._round_number: int = get_round_count(db_path)
         self._cumulative_epsilon: float = get_cumulative_epsilon(db_path)
+
+        # Reconstruct RDP accountant state from the persisted round count so that
+        # ε projections remain accurate across server restarts.
+        if self.noise_multiplier > 0.0 and self._round_number > 0:
+            acc = _rdp_pa.RdpAccountant()
+            acc.compose(
+                _dp_event.SelfComposedDpEvent(
+                    _dp_event.GaussianDpEvent(noise_multiplier=self.noise_multiplier),
+                    count=self._round_number,
+                )
+            )
+            self._cumulative_epsilon = acc.get_epsilon(target_delta=self.target_delta)
 
         if server_private_key is None:
             server_private_key = Ed25519PrivateKey.generate()
@@ -152,6 +177,23 @@ class FederatedAggregationServer:
         return self._public_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
 
     # ------------------------------------------------------------------
+    # RDP budget helpers
+    # ------------------------------------------------------------------
+
+    def _epsilon_at_round(self, n: int) -> float:
+        """Return RDP-computed ε after `n` rounds of the Gaussian mechanism."""
+        if n <= 0:
+            return 0.0
+        acc = _rdp_pa.RdpAccountant()
+        acc.compose(
+            _dp_event.SelfComposedDpEvent(
+                _dp_event.GaussianDpEvent(noise_multiplier=self.noise_multiplier),
+                count=n,
+            )
+        )
+        return acc.get_epsilon(target_delta=self.target_delta)
+
+    # ------------------------------------------------------------------
     # Update submission
     # ------------------------------------------------------------------
 
@@ -172,7 +214,15 @@ class FederatedAggregationServer:
             if participant_id not in self._participants:
                 raise ValueError(f"Unknown participant: {participant_id}")
 
-            if self._cumulative_epsilon >= self.dp_max_epsilon:
+            if self.noise_multiplier > 0.0:
+                projected_epsilon = self._epsilon_at_round(self._round_number + 1)
+                if projected_epsilon > self.dp_max_epsilon:
+                    raise RuntimeError(
+                        f"Privacy budget exhausted: projected ε={projected_epsilon:.4f} "
+                        f"after next round would exceed max ε={self.dp_max_epsilon:.4f}. "
+                        "Operator acknowledgement required."
+                    )
+            elif self._cumulative_epsilon >= self.dp_max_epsilon:
                 raise RuntimeError(
                     f"Privacy budget exhausted: cumulative ε={self._cumulative_epsilon:.4f} "
                     f">= max ε={self.dp_max_epsilon:.4f}. Operator acknowledgement required."
@@ -297,8 +347,12 @@ class FederatedAggregationServer:
             weight = u.n_samples / n_total
             agg += weight * u.noisy_soft_labels
 
-        # Server-side DP noise (defence-in-depth)
-        sigma = self._gaussian_sigma(self.gradient_clip_threshold)
+        # Server-side DP noise (defence-in-depth).
+        # When noise_multiplier > 0, use σ = clip_norm × nm; else use (ε,δ) formula.
+        if self.noise_multiplier > 0.0:
+            sigma = self.gradient_clip_threshold * self.noise_multiplier
+        else:
+            sigma = self._gaussian_sigma(self.gradient_clip_threshold)
         server_noise = np.random.normal(0.0, sigma, agg.shape)
         agg = np.clip(agg + server_noise, 0.0, 1.0)
 
@@ -313,7 +367,17 @@ class FederatedAggregationServer:
             self._previous_mean_delta = mean_delta
 
         self._global_soft_labels = agg
-        self._cumulative_epsilon += self.dp_epsilon
+        self._round_number += 1
+
+        # Update cumulative ε via RDP accountant (tight bound) or legacy linear sum.
+        if self.noise_multiplier > 0.0:
+            self._cumulative_epsilon = self._epsilon_at_round(self._round_number)
+            dp_epsilon_consumed = self._cumulative_epsilon - (
+                self._epsilon_at_round(self._round_number - 1)
+            )
+        else:
+            self._cumulative_epsilon += self.dp_epsilon
+            dp_epsilon_consumed = self.dp_epsilon
 
         # Audit record
         accepted_ids = [u.participant_id for u in valid_updates]
@@ -322,9 +386,11 @@ class FederatedAggregationServer:
             round_id=self._current_round_id,
             participant_ids=accepted_ids,
             aggregated_update_norm=agg_norm,
-            dp_epsilon_consumed=self.dp_epsilon,
+            dp_epsilon_consumed=dp_epsilon_consumed,
             cumulative_epsilon=self._cumulative_epsilon,
             excluded_participant_ids=excluded_ids,
+            dp_delta=self.target_delta,
+            noise_multiplier=self.noise_multiplier,
         )
         sig = sign_record(record, self._private_key)
         save_audit_record(record, sig, self.db_path)
@@ -338,11 +404,20 @@ class FederatedAggregationServer:
         )
 
         # Advance round
-        self._round_number += 1
         self._current_round_id = str(uuid.uuid4())
         self._pending_updates = {}
 
-        if self._cumulative_epsilon >= self.dp_max_epsilon:
+        if self.noise_multiplier > 0.0:
+            next_projected = self._epsilon_at_round(self._round_number + 1)
+            if next_projected > self.dp_max_epsilon:
+                logger.warning(
+                    "Privacy budget will be exhausted after round %d: "
+                    "next projected ε=%.4f > max ε=%.4f",
+                    self._round_number,
+                    next_projected,
+                    self.dp_max_epsilon,
+                )
+        elif self._cumulative_epsilon >= self.dp_max_epsilon:
             logger.warning(
                 "Privacy budget exhausted after round %d: cumulative ε=%.4f",
                 self._round_number,

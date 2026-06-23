@@ -97,6 +97,12 @@ class Settings:
     gradient_outlier_threshold: float = field(
         default_factory=lambda: float(os.getenv("GRADIENT_OUTLIER_THRESHOLD", "0.1"))
     )
+    # RDP noise multiplier (σ = clip_norm × noise_multiplier).
+    # 0.0 disables RDP accounting and falls back to legacy linear ε tracking.
+    # Production default: set FEDERATED_NOISE_MULTIPLIER=1.1 in .env.
+    federated_noise_multiplier: float = field(
+        default_factory=lambda: float(os.getenv("FEDERATED_NOISE_MULTIPLIER", "0.0"))
+    )
     federated_server_host: str = field(
         default_factory=lambda: os.getenv("FEDERATED_SERVER_HOST", "127.0.0.1")
     )

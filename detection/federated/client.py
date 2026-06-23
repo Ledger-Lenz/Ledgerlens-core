@@ -96,6 +96,7 @@ class FederatedClient:
         dp_epsilon: float | None = None,
         dp_delta: float | None = None,
         gradient_clip_threshold: float | None = None,
+        noise_multiplier: float | None = None,
     ) -> None:
         self.operator_id = operator_id
         self._private_key = private_key or Ed25519PrivateKey.generate()
@@ -105,6 +106,12 @@ class FederatedClient:
             gradient_clip_threshold
             if gradient_clip_threshold is not None
             else settings.gradient_clip_threshold
+        )
+        # When noise_multiplier > 0 use σ = clip_norm × nm directly (RDP path).
+        # When 0 or unset, fall back to the (ε, δ)-parametrised Gaussian formula.
+        self.noise_multiplier = (
+            noise_multiplier if noise_multiplier is not None
+            else settings.federated_noise_multiplier
         )
         self._models: dict = {}
         self._prev_xgb_booster = None
@@ -169,7 +176,10 @@ class FederatedClient:
 
     def inject_dp_noise(self, delta: np.ndarray) -> np.ndarray:
         """Add Gaussian DP noise to `delta` (client-side privacy guarantee)."""
-        sigma = _gaussian_sigma(self.gradient_clip_threshold, self.dp_epsilon, self.dp_delta)
+        if self.noise_multiplier > 0.0:
+            sigma = self.gradient_clip_threshold * self.noise_multiplier
+        else:
+            sigma = _gaussian_sigma(self.gradient_clip_threshold, self.dp_epsilon, self.dp_delta)
         noise = np.random.normal(0.0, sigma, delta.shape)
         return delta + noise
 
