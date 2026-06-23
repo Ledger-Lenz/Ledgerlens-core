@@ -6,7 +6,7 @@ of the linked EVM wallets.
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from detection.benford_engine import compute_benford_metrics
 from detection.storage import get_bridge_transfers

@@ -15,7 +15,7 @@ import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import compute_benford_metrics
-from detection.causal_engine import estimate_pdc
+from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
@@ -95,6 +95,17 @@ CROSS_CHAIN_FEATURE_NAMES = [
     "cross_chain_time_lag_median_h",
 ]
 
+CAUSAL_FEATURE_NAMES = [
+    "pdc_5m",
+    "pdc_1h",
+]
+
+MULTIVARIATE_BENFORD_FEATURE_NAMES = [
+    "benford_copula_pval",
+    "cross_pair_sync_ratio",
+    "digit_entropy_delta",
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -104,6 +115,8 @@ FEATURE_NAMES = (
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
     + SANDWICH_FEATURE_NAMES
+    + CAUSAL_FEATURE_NAMES
+    + MULTIVARIATE_BENFORD_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -546,9 +559,58 @@ def sandwich_features(
     }
 
 
+def causal_features(
+    trades: pd.DataFrame,
+    account: str,
+    prices: pd.DataFrame | None = None,
+    pair: str | None = None,
+) -> dict:
+    zero = {name: 0.0 for name in CAUSAL_FEATURE_NAMES}
+    if prices is None or getattr(prices, "empty", True) or trades.empty:
+        return zero
+
+    return {
+        "pdc_5m": float(estimate_pdc(trades, prices, account, pair, window_minutes=5)),
+        "pdc_1h": float(estimate_pdc(trades, prices, account, pair, window_minutes=60)),
+    }
+
+
+def multivariate_benford_features(
+    account: str,
+    trades_by_pair: dict[str, pd.DataFrame] | None,
+) -> dict:
+    default = {
+        "benford_copula_pval": 1.0,
+        "cross_pair_sync_ratio": 0.0,
+        "digit_entropy_delta": 0.0,
+    }
+    if not trades_by_pair:
+        return default
+
+    frames = []
+    active_pairs = []
+    for pair, df in trades_by_pair.items():
+        if df is not None and not df.empty:
+            frames.append(df)
+            active_pairs.append(pair)
+    if len(frames) < 2:
+        return default
+
+    from detection.benford_engine import multivariate_benford_score
+
+    all_trades = pd.concat(frames, ignore_index=True)
+    wallet_pairs = [(account, p) for p in active_pairs]
+    result = multivariate_benford_score(all_trades, wallet_pairs)
+    return {
+        "benford_copula_pval": result["copula_pval"],
+        "cross_pair_sync_ratio": result["sync_ratio"],
+        "digit_entropy_delta": result["digit_entropy_delta"],
+    }
+
+
 def build_cross_chain_features(
     wallet: str,
-    linker: "CrossChainLinker",
+    linker: "CrossChainLinker",  # noqa: F821
     sdex_volume: float = 0.0,
     evm_trades: list[dict] | None = None,
 ) -> dict:
@@ -609,7 +671,7 @@ def _build_feature_vector_base(
     ring_membership: dict[str, dict] | None = None,
     prices: pd.DataFrame | None = None,
     pair: str | None = None,
-    cross_chain_linker: "CrossChainLinker | None" = None,
+    cross_chain_linker: "CrossChainLinker | None" = None,  # noqa: F821
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -657,6 +719,8 @@ def _build_feature_vector_base(
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))
+    features.update(causal_features(trades, account, prices, pair))
+    features.update(multivariate_benford_features(account, trades_by_pair))
     features.update(sandwich_features(trades, account, as_of))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))

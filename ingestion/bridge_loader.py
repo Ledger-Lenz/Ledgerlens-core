@@ -147,7 +147,7 @@ class BridgeTransferLoader:
                     f"TokensSent data too short ({len(data_hex)} chars): {data_hex!r}"
                 )
             recipient_bytes = bytes.fromhex(data_hex[0:64])
-            amount_raw = int.from_bytes(bytes.fromhex(data_hex[64:128]), "big")
+            amount_raw = int.from_bytes(bytes.fromhex(data_hex[64:128]), "big")  # noqa: F841
         except (KeyError, IndexError) as exc:
             raise ValueError(
                 f"Failed to parse TokensSent event — missing field {exc}: {log!r}"

@@ -6,15 +6,15 @@ vs the original build_feature_vector() full-recompute path.
 
 import time
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from detection.feature_store import (
     WalletFeatureState,
     update_feature_state,
     derive_feature_vector,
 )
-from detection.feature_engineering import build_feature_vector, ROLLING_WINDOWS
-from ingestion.data_models import Trade, Asset, TradeType
+from detection.feature_engineering import build_feature_vector
+from ingestion.data_models import Trade
 from ingestion.synthetic_data import generate_synthetic_trades
 
 

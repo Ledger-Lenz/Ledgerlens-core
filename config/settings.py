@@ -76,6 +76,9 @@ class Settings:
         )
     )
     admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
+    # Separate key scope gating the regulatory `/compliance/` endpoints so that
+    # SAR / Travel-Rule exports are never reachable with the admin key alone.
+    compliance_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_COMPLIANCE_API_KEY", ""))
     model_signing_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_MODEL_SIGNING_KEY", ""))
 
     # Federated Learning
@@ -141,6 +144,8 @@ class Settings:
         self._validate_evm_pool_addresses()
 
     def _validate_evm_pool_addresses(self) -> None:
+        if not self.evm_pool_addresses:
+            return
         from web3 import Web3
 
         for addr in self.evm_pool_addresses:

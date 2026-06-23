@@ -1,26 +1,21 @@
 """Tests for the LSTM temporal anomaly detection model, sequence builder, and registry integration."""
 
-import json
 import os
-import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 
-from config.settings import settings
-from detection.model_registry import get_current_version, load_latest_model, save_versioned_model
-from detection.risk_score import temporal_risk_adjustment
-from detection.temporal_dataset import (
-    build_score_sequences,
+torch = pytest.importorskip("torch")
+
+from detection.model_registry import get_current_version, load_latest_model, save_versioned_model  # noqa: E402
+from detection.risk_score import temporal_risk_adjustment  # noqa: E402
+from detection.temporal_dataset import (  # noqa: E402
     cluster_score_correlation,
     generate_synthetic_sequence,
-    get_daily_history,
-    get_wallet_cluster,
 )
-from detection.temporal_model import (
+from detection.temporal_model import (  # noqa: E402
     TemporalAnomalyLSTM,
     predict_temporal_risk,
     train_temporal_model,

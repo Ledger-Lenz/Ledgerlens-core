@@ -813,12 +813,19 @@ ledgerlens-data  ──(labelled datasets)──▶  ledgerlens-core
 class RiskScore:
     wallet: str
     asset_pair: str
-    score: int        # 0-100
+    score: int            # 0-100
     benford_flag: bool
     ml_flag: bool
-    confidence: int    # 0-100
+    confidence: int        # 0-100
     timestamp: datetime
+    # Uncertainty fields (optional, v2+)
+    score_lower: float | None       # Lower bound of 90 % conformal prediction interval
+    score_upper: float | None       # Upper bound of 90 % conformal prediction interval
+    prediction_set: list[int] | None  # Class indices in the conformal set (0=clean, 1=wash)
+    coverage_guarantee: float | None  # Target coverage level (typically 0.90)
 ```
+
+The uncertainty fields are populated by `ConformalCalibrator` when conformal prediction calibration artifacts are available. See `docs/uncertainty_quantification.md` for a plain-language explanation.
 
 If you change a field name, type, or range here, update the Rust struct in `ledgerlens-contracts` and the Pydantic response models in `ledgerlens-api` in the same change set (or open a tracked follow-up in each repo).
 

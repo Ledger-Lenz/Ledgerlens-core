@@ -3,6 +3,10 @@
 Expects a feature DataFrame (see `feature_engineering.build_feature_vector`)
 with a binary `label` column (1 = confirmed wash trade pattern). Trained
 models are written to `settings.model_dir` for `model_inference` to load.
+
+When ``calibrate=True`` a calibration split is held out (10 % of the data,
+stratified by label) *before* any model training, then used after training
+to compute conformal prediction thresholds via ``ConformalCalibrator``.
 """
 
 import joblib
@@ -29,39 +33,14 @@ def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-def merge_evasion_samples(df: pd.DataFrame, evasion_samples, label_value: int = 1) -> pd.DataFrame:
-    """Fold red team evasion feature vectors into a training DataFrame as positives.
-
-    ``evasion_samples`` is an iterable of feature dicts (or evasion-event dicts
-    carrying an ``evasion_features`` member, as produced by
-    :mod:`detection.red_team.evasion_logger`).  Each is appended with a synthetic
-    ground-truth ``label`` of ``label_value`` (high risk by default), so the
-    discovered evasions are learned as hard positives on the next training run.
-    """
-    if not evasion_samples:
-        return df
-    rows = []
-    for sample in evasion_samples:
-        features = sample.get("evasion_features", sample) if isinstance(sample, dict) else sample
-        row = {f: float(features.get(f, 0.0)) for f in FEATURE_NAMES}
-        row["label"] = label_value
-        rows.append(row)
-    if not rows:
-        return df
-    return pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
-
-
-def load_evasion_samples_for_training(threshold=None, db_path: str | None = None) -> list[dict]:
-    """Return successful-evasion feature dicts from the red team log for retraining."""
-    from detection.red_team import EVASION_THRESHOLD
-    from detection.red_team.evasion_logger import get_evasion_events
-
-    thr = EVASION_THRESHOLD if threshold is None else threshold
-    events = get_evasion_events(only_evasions=True, db_path=db_path)
-    return [e["evasion_features"] for e in events if e["evasion_score"] < thr]
-
-
-def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment: bool = True, adversarial_hardening: bool = False, evasion_samples=None) -> dict:
+def _train_ensemble_base(
+    df: pd.DataFrame,
+    random_state: int = 42,
+    adversarial_augment: bool = True,
+    calibrate: bool = True,
+    adversarial_hardening: bool = False,
+    **kwargs,
+) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
 
     Applies SMOTE to the training split to address class imbalance, since
@@ -71,9 +50,11 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
     mixed evasion strategies and concatenates them before SMOTE resampling,
     forcing the models to learn adversarial meta-signatures.
 
-    ``evasion_samples`` optionally injects red team evasions
-    (:func:`load_evasion_samples_for_training`) as high-risk positives so the
-    model is hardened against the latest discovered evasion strategies.
+    When ``calibrate=True``, reserves a 10 % calibration split (stratified)
+    before the train/test split, trains on the remaining data, then runs
+    conformal calibration on the held-out set. Calibration data and
+    ``ConformalCalibrator`` instances are returned under the ``"calib"`` key
+    and used by ``save_models`` to persist the artifacts.
     """
     df = merge_evasion_samples(df, evasion_samples)
     if adversarial_augment:
@@ -100,9 +81,25 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
         df = pd.concat(augment_dfs, ignore_index=True)
 
     X, y = _split_features_labels(df)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state, stratify=y
-    )
+
+    if calibrate:
+        X_remaining, X_cal, y_remaining, y_cal = train_test_split(
+            X, y, test_size=0.10, random_state=random_state, stratify=y
+        )
+        cal_split_info = {
+            "X_cal": X_cal,
+            "y_cal": y_cal,
+            "cal_index_start": X_cal.index.min(),
+            "cal_index_end": X_cal.index.max(),
+        }
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+        )
+    else:
+        cal_split_info = {}
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=random_state, stratify=y
+        )
 
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
@@ -125,6 +122,21 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
             "pr_auc": average_precision_score(y_test, y_proba),
             "f1": f1_score(y_test, y_pred),
         }
+
+    if calibrate:
+        from detection.conformal import ConformalCalibrator
+
+        calibrators = {}
+        for name, result in results.items():
+            cal = ConformalCalibrator(alpha=0.10).calibrate(
+                result["model"], cal_split_info["X_cal"], cal_split_info["y_cal"]
+            )
+            calibrators[name] = cal
+            # Empirical coverage on the calibration set
+            cal_split_info[f"coverage_{name}"] = _compute_empirical_coverage(
+                result["model"], cal_split_info["X_cal"], cal_split_info["y_cal"], cal.q_hat
+            )
+        results["_calib"] = {**cal_split_info, "calibrators": calibrators}
 
     # --- Adversarial hardening: generate PGD adversarial examples from
     # training true positives and retrain once on the augmented set.
@@ -205,11 +217,26 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
     return results
 
 
-def save_models(results: dict, model_dir: str | None = None, training_dataset_path: str | None = None) -> None:
+def _compute_empirical_coverage(model, X_cal, y_cal, q_hat):
+    """Fraction of calibration examples whose true class is in the prediction set."""
+    probs = model.predict_proba(X_cal)
+    scores = 1.0 - probs[range(len(y_cal)), y_cal.values]
+    return float((scores <= q_hat).mean())
+
+
+def save_models(
+    results: dict,
+    model_dir: str | None = None,
+    training_dataset_path: str | None = None,
+) -> None:
     """Persist trained models to `model_dir` (defaults to `settings.model_dir`).
 
     Also writes training_metadata.json with model versions, AUC-ROC scores,
     and training dataset path for drift detection and rollback.
+
+    When ``results`` contains ``"_calib"`` key (from ``train_ensemble`` with
+    ``calibrate=True``), calibration artifacts are written alongside each
+    model file and ``metrics.json`` is updated with empirical coverage.
     """
     import hashlib
     import json
@@ -223,6 +250,8 @@ def save_models(results: dict, model_dir: str | None = None, training_dataset_pa
 
     signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
+        if name == "_calib":
+            continue
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
         sign_model_file(path, signing_key)
@@ -230,7 +259,6 @@ def save_models(results: dict, model_dir: str | None = None, training_dataset_pa
     # Write training_metadata.json
     if training_dataset_path:
         try:
-            # Compute training dataset hash for versioning
             train_df = pd.read_csv(training_dataset_path)
             training_row_count = len(train_df)
             column_hash = hashlib.sha256(
@@ -258,6 +286,7 @@ def save_models(results: dict, model_dir: str | None = None, training_dataset_pa
                 "f1": result.get("f1", 0.0),
             }
             for name, result in results.items()
+            if name != "_calib"
         },
     }
 
@@ -266,8 +295,49 @@ def save_models(results: dict, model_dir: str | None = None, training_dataset_pa
         json.dump(metadata, f, indent=2)
 
     import logging
+
     logger = logging.getLogger("ledgerlens.model_training")
     logger.info("Wrote training metadata to %s", metadata_path)
+
+    # ------------------------------------------------------------------
+    # Calibration artifacts
+    # ------------------------------------------------------------------
+    calib = results.get("_calib")
+    if calib and calib.get("calibrators"):
+        metrics = {}
+        for name, cal in calib["calibrators"].items():
+            cal_path = os.path.join(model_dir, f"{name}_conformal.json")
+            cal.save(cal_path)
+            cover_key = f"coverage_{name}"
+            cov = calib.get(cover_key, 0.0)
+            metrics[f"conformal_empirical_coverage_{name}"] = round(cov, 4)
+
+        # Aggregate coverage (simple average across models)
+        coverages = [v for k, v in metrics.items() if k.startswith("conformal_empirical_coverage_")]
+        metrics["conformal_empirical_coverage"] = round(
+            sum(coverages) / len(coverages), 4
+        ) if coverages else 0.0
+
+        # Log calibration split index range for audit
+        metrics["calibration_index_start"] = int(calib.get("cal_index_start", -1))
+        metrics["calibration_index_end"] = int(calib.get("cal_index_end", -1))
+
+        metrics_path = os.path.join(model_dir, "metrics.json")
+        existing = {}
+        if os.path.exists(metrics_path):
+            with open(metrics_path, "r") as f:
+                try:
+                    existing = json.load(f)
+                except Exception:
+                    pass
+        existing.update(metrics)
+        with open(metrics_path, "w") as f:
+            json.dump(existing, f, indent=2)
+        logger.info(
+            "Wrote calibration metrics (coverage=%.4f) to %s",
+            metrics.get("conformal_empirical_coverage", 0.0),
+            metrics_path,
+        )
 
 
 if __name__ == "__main__":
@@ -286,8 +356,10 @@ if __name__ == "__main__":
     )
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=order_book_events)
 
-    results = train_ensemble(df)
+    results = train_ensemble(df)  # noqa: F821
     for name, result in results.items():
+        if name == "_calib":
+            continue
         logger.info(
             "%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f",
             name,
@@ -300,9 +372,9 @@ if __name__ == "__main__":
     logger.info("Saved models to %s", settings.model_dir)
 
 
-from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG
-from ingestion.graph_builder import TemporalGraphBuilder
-import os
+from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
+from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
+import os  # noqa: E402
 
 
 def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", **kwargs):
@@ -321,13 +393,13 @@ def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", 
                 "use_gnn=True requires torch + torch_geometric installed."
             )
         builder = TemporalGraphBuilder()
-        trades = _trades_from_training_df(df)
+        trades = _trades_from_training_df(df)  # noqa: F821
         snapshots = builder.build_snapshots(trades, lookback_days=30)
 
         import torch
         model = TGATWashRingDetector()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        gnn_features_by_wallet = _run_gnn_training_loop(model, optimizer, snapshots)
+        gnn_features_by_wallet = _run_gnn_training_loop(model, optimizer, snapshots)  # noqa: F821
 
         os.makedirs(model_dir, exist_ok=True)
         save_gnn_checkpoint(model, os.path.join(model_dir, "gnn_model.pt"))

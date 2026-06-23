@@ -129,7 +129,7 @@ class EVMTradeLoader:
                 logger.debug("Rate-limited by RPC endpoint; retrying in %ss", wait)
                 time.sleep(wait)
                 last_exc = requests.HTTPError(
-                    f"429 Too Many Requests from RPC endpoint", response=response
+                    "429 Too Many Requests from RPC endpoint", response=response
                 )
                 continue
 

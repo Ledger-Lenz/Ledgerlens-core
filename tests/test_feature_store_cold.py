@@ -2,7 +2,6 @@
 
 import pytest
 from datetime import datetime, timezone
-from pathlib import Path
 
 from detection.feature_store import FeatureStore, WalletFeatureState
 from detection.storage import save_feature_state, get_feature_state, promote_cold_to_hot
@@ -93,7 +92,7 @@ def test_promote_cold_to_hot_batch_limit(sample_state, tmp_path):
     # Save multiple states
     for i in range(10):
         state = sample_state.model_copy(
-            update={"wallet": f"GA{i:03d}", "asset_pair": f"USDC/XLM"}
+            update={"wallet": f"GA{i:03d}", "asset_pair": "USDC/XLM"}
         )
         save_feature_state(state, db_path=db_path)
     

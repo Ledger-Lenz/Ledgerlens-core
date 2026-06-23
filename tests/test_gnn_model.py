@@ -4,7 +4,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch_geometric")
 
-from detection.gnn_model import (
+from detection.gnn_model import (  # noqa: E402
     TGATWashRingDetector, safe_load_gnn_checkpoint, save_gnn_checkpoint, NODE_FEATURE_DIM,
 )
 

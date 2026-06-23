@@ -1,11 +1,9 @@
 """Tests for ingestion/bridge_loader.py."""
 
-import os
 from datetime import datetime, timezone
 
 import pytest
 import responses as responses_lib
-from web3 import Web3
 
 from ingestion.bridge_loader import (
     ALLBRIDGE_TOKENS_SENT_TOPIC,

@@ -24,10 +24,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from api.auth import require_admin_key
+from api.auth import require_admin_key, require_compliance_key
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -46,7 +46,6 @@ from detection.storage import (
     get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
-import sqlite3
 from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
@@ -656,4 +655,74 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return p.dict()
+
+
+# ------------------------------------------------------------------
+# Regulatory compliance export layer
+#
+# These endpoints emit FATF Travel-Rule / SAR evidence and are gated behind the
+# dedicated `compliance:read` scope (see api.auth.require_compliance_key). They
+# are excluded from the public OpenAPI schema (include_in_schema=False) so they
+# never surface on the unauthenticated /docs page.
+# ------------------------------------------------------------------
+
+
+class SARPackageRequest(BaseModel):
+    wallet: str
+    start_date: str
+    end_date: str
+
+
+@app.get(
+    "/compliance/ivms/{wallet}",
+    dependencies=[Depends(require_compliance_key)],
+    include_in_schema=False,
+)
+def compliance_ivms(wallet: str) -> dict:
+    """Return the IVMS 101 risk-augmentation block for ``wallet``."""
+    from dataclasses import asdict
+
+    from detection.compliance_exporter import build_ivms_risk_field
+
+    validate_stellar_address(wallet)
+    return asdict(build_ivms_risk_field(wallet))
+
+
+@app.post(
+    "/compliance/sar-package",
+    dependencies=[Depends(require_compliance_key)],
+    include_in_schema=False,
+)
+def compliance_sar_package(body: SARPackageRequest) -> FileResponse:
+    """Generate a SAR evidence ZIP for a wallet and return it as a download."""
+    import tempfile
+
+    from detection.compliance_exporter import generate_sar_package
+
+    validate_stellar_address(body.wallet)
+    output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
+    zip_path = generate_sar_package(
+        wallet=body.wallet,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        output_dir=output_dir,
+    )
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=os.path.basename(zip_path),
+    )
+
+
+@app.get(
+    "/compliance/audit-trail/{wallet}",
+    dependencies=[Depends(require_compliance_key)],
+    include_in_schema=False,
+)
+def compliance_audit_trail(wallet: str) -> list[dict]:
+    """Return the full timestamped audit log for ``wallet`` (for legal hold)."""
+    from detection.compliance_exporter import get_audit_trail
+
+    validate_stellar_address(wallet)
+    return get_audit_trail(wallet)
 

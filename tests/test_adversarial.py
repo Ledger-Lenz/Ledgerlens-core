@@ -176,7 +176,7 @@ def test_evaluate_robustness_returns_expected_keys():
         n_normal_accounts=30, n_wash_rings=8, ring_size=3, seed=99
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
-    results = train_ensemble(df, adversarial_augment=False)
+    results = train_ensemble(df, adversarial_augment=False, calibrate=False)
     models = {k: v["model"] for k, v in results.items()}
 
     robustness = evaluate_robustness(models, n_trials=1, seed=99)

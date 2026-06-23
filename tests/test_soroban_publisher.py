@@ -14,8 +14,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ── Mock stellar_sdk before importing the module under test ─────────────
-import sys
-from unittest.mock import MagicMock
 
 sys.modules.pop("detection.soroban_publisher", None)
 sys.modules.pop("stellar_sdk", None)

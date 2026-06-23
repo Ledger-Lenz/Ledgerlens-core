@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List
 
 from pydantic import BaseModel
 
-from config.settings import settings, load_runtime_config
 from detection.storage import init_db, _connect
 
 
