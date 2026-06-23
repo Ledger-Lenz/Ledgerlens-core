@@ -28,6 +28,9 @@ requests>=2.31.0
 # Webhook / security
 cryptography>=42.0.0
 
+# Zero-knowledge proofs (BN254 elliptic curve)
+py_ecc>=7.0.0
+
 # Local API + CLI
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0

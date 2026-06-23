@@ -1,0 +1,20 @@
+[package]
+name = "ledgerlens-zk-verifier"
+version = "0.1.0"
+edition = "2021"
+description = "Soroban contract that verifies zero-knowledge threshold proofs for LedgerLens risk scores"
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "21.0.0"
+soroban-sdk-derive = "21.0.0"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+lto = true
