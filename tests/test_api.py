@@ -109,6 +109,35 @@ def test_health(client, tmp_path, monkeypatch):
     assert body["status"] == "ok"
     assert body["db"] == "ok"
     assert body["models"] == "ok"
+    assert body["circuits"] == {"horizon": "closed", "feature_store_redis": "closed"}
+
+
+def test_health_open_circuit_is_degraded_not_failed(client, tmp_path, monkeypatch):
+    """An OPEN circuit breaker should mark /health "degraded" while still
+    returning 200 -- the service is serving in reduced-functionality mode,
+    not failed (DB/model failures are what return 503)."""
+    import config.settings as settings_module
+    import ingestion.horizon_streamer as horizon_streamer
+    from detection.model_inference import _MODEL_FILENAMES
+    from utils.circuit_breaker import CircuitBreaker
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    for filename in _MODEL_FILENAMES.values():
+        (model_dir / filename).write_bytes(b"stub")
+    object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
+    # monkeypatch swaps in a throwaway breaker and restores the real one at
+    # teardown, so this never leaks an OPEN circuit into other tests.
+    open_circuit = CircuitBreaker(name="horizon", failure_threshold=1, recovery_timeout=60)
+    open_circuit.record_failure()
+    monkeypatch.setattr(horizon_streamer, "horizon_circuit", open_circuit)
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["circuits"]["horizon"] == "open"
 
 
 

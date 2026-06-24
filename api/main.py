@@ -129,22 +129,49 @@ class VoteBody(BaseModel):
     vote: str
 
 
+_health_feature_store = None
+
+
+def _get_health_feature_store():
+    """Lazily-created `FeatureStore` used only to read the Redis circuit
+    breaker's state for `/health`. Note this reflects the breaker as seen
+    from *this* process; if the ingestion worker runs as a separate
+    process, its `horizon`/`feature_store_redis` circuit state isn't
+    directly observable here -- this still accurately reports Redis
+    reachability from the API process's own perspective.
+    """
+    global _health_feature_store
+    if _health_feature_store is None:
+        from detection.feature_store import FeatureStore
+
+        _health_feature_store = FeatureStore()
+    return _health_feature_store
+
+
 @app.get("/health")
 def health() -> JSONResponse:
-    """Returns 200 when healthy, 503 when any component check fails.
+    """Returns 200 when healthy, 503 when any hard-failure component check fails.
 
     Checks:
     - DB connectivity: executes SELECT 1 via the existing _connect helper.
     - Model files: each expected .joblib file exists and is non-empty.
+    - Circuit breakers: Horizon ingestion and the Redis feature store each
+      have a breaker (see `utils.circuit_breaker`). An OPEN/HALF_OPEN
+      circuit marks the response "degraded" but keeps returning 200 (the
+      service is still serving traffic in a reduced-functionality state,
+      not failed) — only DB/model failures return 503.
 
     The response body names every component but never leaks local filesystem
     paths — errors are logged server-side at ERROR level.
     """
     from detection.model_inference import _MODEL_FILENAMES
     from detection.storage import _connect
+    from ingestion.horizon_streamer import horizon_circuit
+    from utils.circuit_breaker import CircuitState
 
-    status: dict[str, str] = {}
+    status: dict[str, object] = {}
     healthy = True
+    degraded = False
 
     # --- DB check ---
     try:
@@ -168,8 +195,26 @@ def health() -> JSONResponse:
     else:
         status["models"] = "ok"
 
-    status["status"] = "ok" if healthy else "degraded"
-    http_status = 200 if healthy else 503
+    # --- Circuit breakers (open/half-open => degraded, not failed) ---
+    try:
+        feature_store_circuit_state = _get_health_feature_store().circuit_state
+    except Exception as exc:
+        logger.error("Health check: feature store circuit lookup failed: %s", exc)
+        feature_store_circuit_state = CircuitState.OPEN.value
+    circuits = {
+        "horizon": horizon_circuit.state.value,
+        "feature_store_redis": feature_store_circuit_state,
+    }
+    status["circuits"] = circuits
+    if any(state != CircuitState.CLOSED.value for state in circuits.values()):
+        degraded = True
+
+    if healthy:
+        status["status"] = "degraded" if degraded else "ok"
+        http_status = 200
+    else:
+        status["status"] = "degraded"
+        http_status = 503
     return JSONResponse(content=status, status_code=http_status)
 
 
