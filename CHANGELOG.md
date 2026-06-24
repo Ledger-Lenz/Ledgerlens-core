@@ -5,6 +5,10 @@ All notable changes to `ledgerlens-core` are documented in this file.
 ## Unreleased
 
 ### Added
+- Compliance audit report generator (`detection/compliance_report.py`) producing
+  self-contained HTML/PDF reports with SHAP attributions, Benford analysis,
+  trade timeline, and model provenance.
+- `cli.py report generate --wallet G... --date YYYY-MM-DD` command.
 - Synthetic SDEX trade generator (`ingestion/synthetic_data.py`) with
   labelled wash-trading rings for local training and testing.
 - Labelled training dataset builder (`detection/dataset.py`).

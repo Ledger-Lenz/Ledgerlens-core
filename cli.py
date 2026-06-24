@@ -644,5 +644,24 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+report_app = typer.Typer(help="Compliance report commands")
+app.add_typer(report_app, name="report")
+
+
+@report_app.command("generate")
+def report_generate(
+    wallet: str = typer.Option(..., "--wallet", help="Stellar wallet address (G...)"),
+    date: str = typer.Option(..., "--date", help="Scoring date (YYYY-MM-DD)"),
+    output: str = typer.Option("report.html", "--output", help="Output file path (.html or .pdf)"),
+) -> None:
+    """Generate a compliance audit report for a wallet on a given date."""
+    from detection.compliance_report import ComplianceReportGenerator
+
+    fmt = "pdf" if output.endswith(".pdf") else "html"
+    generator = ComplianceReportGenerator()
+    path = generator.generate(wallet=wallet, date=date, output_path=output, fmt=fmt)
+    typer.echo(f"Report written to {path}")
+
+
 if __name__ == "__main__":
     app()
