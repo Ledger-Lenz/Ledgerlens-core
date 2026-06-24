@@ -5,6 +5,9 @@ All notable changes to `ledgerlens-core` are documented in this file.
 ## Unreleased
 
 ### Added
+- Token-bucket rate limiter (`ingestion/rate_limiter.py`) with sync/async acquire,
+  backpressure controller, and adaptive rate reduction on HTTP 429 responses.
+- `GET /stream/rate-limiter` admin endpoint exposing current rate state.
 - Synthetic SDEX trade generator (`ingestion/synthetic_data.py`) with
   labelled wash-trading rings for local training and testing.
 - Labelled training dataset builder (`detection/dataset.py`).

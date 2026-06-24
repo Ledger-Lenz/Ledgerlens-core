@@ -835,3 +835,37 @@ def compliance_audit_trail(wallet: str) -> list[dict]:
     validate_stellar_address(wallet)
     return get_audit_trail(wallet)
 
+
+# ---------------------------------------------------------------------------
+# Rate limiter status (admin-gated)
+# ---------------------------------------------------------------------------
+
+_horizon_streamer = None
+
+
+def set_horizon_streamer(streamer) -> None:
+    """Register the active HorizonStreamer instance for status reporting."""
+    global _horizon_streamer
+    _horizon_streamer = streamer
+
+
+class RateLimiterStatus(BaseModel):
+    configured_rate: float
+    current_rate: float
+    bucket_level: float
+    backpressure_active: bool
+    queue_size: int
+    last_429_at: float | None
+
+
+@app.get(
+    "/stream/rate-limiter",
+    response_model=RateLimiterStatus,
+    dependencies=[Depends(require_admin_key)],
+)
+def rate_limiter_status() -> RateLimiterStatus:
+    """Return current rate limiter state for the Horizon SSE streamer."""
+    if _horizon_streamer is None:
+        raise HTTPException(status_code=503, detail="No active streamer instance")
+    return RateLimiterStatus(**_horizon_streamer.rate_limiter_status())
+
