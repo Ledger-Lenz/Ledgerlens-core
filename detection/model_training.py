@@ -9,6 +9,8 @@ stratified by label) *before* any model training, then used after training
 to compute conformal prediction thresholds via ``ConformalCalibrator``.
 """
 
+import logging
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -21,16 +23,24 @@ from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
 from config.settings import settings
+from detection.dataset import data_leakage_audit, temporal_train_val_split
 from detection.feature_engineering import FEATURE_NAMES
 
+_logger = logging.getLogger("ledgerlens.model_training")
 
-def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """Split `df` into `(X, y)`, ordering feature columns by `FEATURE_NAMES`
-    so training and inference (`model_inference.score_feature_vector`) never drift.
+
+def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, np.ndarray]:
+    """Split ``df`` into ``(X, y, timestamps)``.
+
+    Feature columns are ordered by ``FEATURE_NAMES`` so training and
+    inference never drift.  The ``timestamp`` column is **not** included
+    in ``X`` — it is returned separately for temporal splitting.
     """
+    assert "timestamp" not in FEATURE_NAMES, "timestamp must not be a model feature"
     X = df[FEATURE_NAMES].fillna(0.0)
     y = df["label"]
-    return X, y
+    timestamps = df["timestamp"].values.astype(float) if "timestamp" in df.columns else np.zeros(len(df))
+    return X, y, timestamps
 
 
 def _train_ensemble_base(
@@ -80,27 +90,87 @@ def _train_ensemble_base(
             )
         df = pd.concat(augment_dfs, ignore_index=True)
 
-    X, y = _split_features_labels(df)
+    X, y, timestamps = _split_features_labels(df)
+
+    # --- Split order: temporal split → oversample (train only) → fit → evaluate ---
+    # Temporal splitting prevents future data from leaking into training.
+    # SMOTE/ADASYN is applied ONLY to the training portion after the split
+    # to avoid synthetic samples influencing validation metrics.
+
+    has_timestamps = timestamps.max() > 0
 
     if calibrate:
-        X_remaining, X_cal, y_remaining, y_cal = train_test_split(
-            X, y, test_size=0.10, random_state=random_state, stratify=y
-        )
+        if has_timestamps:
+            X_remaining, X_cal, y_remaining, y_cal = temporal_train_val_split(
+                X.values, y.values, timestamps,
+                val_ratio=0.10,
+                gap_days=settings.temporal_split_gap_days,
+                max_window_days=settings.temporal_split_max_window_days,
+            )
+            X_remaining = pd.DataFrame(X_remaining, columns=FEATURE_NAMES)
+            X_cal = pd.DataFrame(X_cal, columns=FEATURE_NAMES)
+            y_remaining = pd.Series(y_remaining, name="label")
+            y_cal = pd.Series(y_cal, name="label")
+        else:
+            _logger.warning("No timestamps available; falling back to random split")
+            X_remaining, X_cal, y_remaining, y_cal = train_test_split(
+                X, y, test_size=0.10, random_state=random_state, stratify=y
+            )
         cal_split_info = {
             "X_cal": X_cal,
             "y_cal": y_cal,
-            "cal_index_start": X_cal.index.min(),
-            "cal_index_end": X_cal.index.max(),
+            "cal_index_start": int(X_cal.index.min()) if hasattr(X_cal, "index") and len(X_cal) > 0 else -1,
+            "cal_index_end": int(X_cal.index.max()) if hasattr(X_cal, "index") and len(X_cal) > 0 else -1,
         }
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
-        )
+
+        if has_timestamps:
+            remaining_ts = timestamps[np.argsort(timestamps)][:len(X_remaining)]
+            X_train, X_test, y_train, y_test = temporal_train_val_split(
+                X_remaining.values if hasattr(X_remaining, "values") else X_remaining,
+                y_remaining.values if hasattr(y_remaining, "values") else y_remaining,
+                remaining_ts,
+                val_ratio=settings.temporal_split_val_ratio,
+                gap_days=settings.temporal_split_gap_days,
+                max_window_days=settings.temporal_split_max_window_days,
+            )
+            X_train = pd.DataFrame(X_train, columns=FEATURE_NAMES)
+            X_test = pd.DataFrame(X_test, columns=FEATURE_NAMES)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+            )
     else:
         cal_split_info = {}
+        if has_timestamps:
+            X_train, X_test, y_train, y_test = temporal_train_val_split(
+                X.values, y.values, timestamps,
+                val_ratio=settings.temporal_split_val_ratio,
+                gap_days=settings.temporal_split_gap_days,
+                max_window_days=settings.temporal_split_max_window_days,
+            )
+            X_train = pd.DataFrame(X_train, columns=FEATURE_NAMES)
+            X_test = pd.DataFrame(X_test, columns=FEATURE_NAMES)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            _logger.warning("No timestamps available; falling back to random split")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=random_state, stratify=y
+            )
+
+    if len(X_train) == 0 or len(X_test) == 0:
+        _logger.warning(
+            "Temporal split produced empty train or val set (train=%d, val=%d); "
+            "falling back to random split",
+            len(X_train), len(X_test),
+        )
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=random_state, stratify=y
         )
 
+    # SMOTE applied AFTER temporal split, on training data only
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
 
@@ -279,6 +349,11 @@ def save_models(
         "training_dataset_path": training_dataset_path or "",
         "training_row_count": training_row_count,
         "column_hash": column_hash,
+        "temporal_split": {
+            "val_ratio": settings.temporal_split_val_ratio,
+            "gap_days": settings.temporal_split_gap_days,
+            "max_window_days": settings.temporal_split_max_window_days,
+        },
         "model_metrics": {
             name: {
                 "auc_roc": result.get("auc_roc", 0.0),

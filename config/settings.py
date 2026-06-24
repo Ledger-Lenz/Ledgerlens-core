@@ -32,6 +32,20 @@ class Settings:
     temporal_weight: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_WEIGHT", "0.3")))
     _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
 
+    # Temporal train/val split configuration
+    temporal_split_val_ratio: float = field(
+        default_factory=lambda: float(os.getenv("TEMPORAL_SPLIT_VAL_RATIO", "0.20"))
+    )
+    temporal_split_gap_days: float = field(
+        default_factory=lambda: float(os.getenv("TEMPORAL_SPLIT_GAP_DAYS", "7.0"))
+    )
+    temporal_split_max_window_days: float = field(
+        default_factory=lambda: float(os.getenv("TEMPORAL_SPLIT_MAX_WINDOW_DAYS", "30.0"))
+    )
+    walk_forward_n_splits: int = field(
+        default_factory=lambda: int(os.getenv("WALK_FORWARD_N_SPLITS", "5"))
+    )
+
     # Fraction of the composite risk score driven by the sandwich-attack signal
     # (see detection.risk_score.RiskScore.combine). 0.0 preserves the legacy
     # benford/ML-only blend.
