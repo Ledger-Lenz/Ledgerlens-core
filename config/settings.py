@@ -30,6 +30,10 @@ class Settings:
     ensemble_weight_xgb: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_XGB", "0.50")))
     ensemble_weight_lgbm: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_LGBM", "0.25")))
     temporal_weight: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_WEIGHT", "0.3")))
+    # Sequence model settings
+    temporal_model_type: str = field(default_factory=lambda: os.getenv("TEMPORAL_MODEL_TYPE", "lstm"))
+    temporal_max_seq_len: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_MAX_SEQ_LEN", "200")))
+    temporal_lstm_hidden_dim: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_LSTM_HIDDEN_DIM", "64")))
     _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
 
     # Fraction of the composite risk score driven by the sandwich-attack signal

@@ -36,6 +36,7 @@ At a high level, it does three things:
 
 - **Benford's Law Anomaly Engine**: Chi-square, per-digit Z-score, and MAD analysis of transaction amounts across rolling time windows (1h, 4h, 24h, 7d, 30d)
 - **Ensemble ML Scoring**: Random Forest, XGBoost, and LightGBM classifiers trained on labelled wash-trade patterns with SHAP interpretability
+- **Temporal Sequence Model**: LSTM or Transformer encoder that processes a wallet's ordered trade history (up to 200 trades) as a sequence, detecting temporal patterns invisible to aggregate features — regular inter-trade intervals, alternating buy/sell sequences, and burst-pause cycles; fused with the tabular ensemble score via a learned weight `w_seq` (see [docs/temporal_model.md](docs/temporal_model.md))
 - **LedgerLens Risk Score (0–100)**: Continuously updated composite score per wallet and per trading pair
 - **Cross-Chain Detection**: Links Stellar wallets to EVM counterparts (Ethereum, Base, Polygon) via Allbridge bridge events; detects round-trip wash-trade patterns across chains using six dedicated features (see [docs/cross_chain_detection.md](docs/cross_chain_detection.md))
 - **On-Chain Risk Registry**: Soroban smart contract exposes risk scores so AMMs, lending protocols, and aggregators can gate suspicious activity natively
