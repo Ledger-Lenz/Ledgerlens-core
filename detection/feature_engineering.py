@@ -78,6 +78,8 @@ AMM_FEATURE_NAMES = [
     "pool_trade_ratio",  # fraction of an account's volume that is pool, not orderbook
     "pool_round_trip_ratio",
     "pool_share_concentration",
+    "amm_tenure_ratio",            # fraction of AMM sessions with short tenure (< 4h)
+    "amm_volume_concentration",    # max volume-to-liquidity ratio across sessions, normalized
 ]
 
 PATH_PAYMENT_FEATURE_NAMES = [
@@ -504,6 +506,8 @@ def amm_features(
         "pool_trade_ratio": pool_trade_ratio,
         "pool_round_trip_ratio": avg_round_trip,
         "pool_share_concentration": avg_concentration,
+        "amm_tenure_ratio": 0.0,
+        "amm_volume_concentration": 0.0,
     }
 
 

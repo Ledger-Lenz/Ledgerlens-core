@@ -442,6 +442,35 @@ def pool_risk(pool_id: str) -> dict:
     return {"pool_id": pool_id, **risk}
 
 
+@app.get("/amm-anomalies")
+def list_amm_anomalies(
+    min_score: float = Query(0.5, ge=0.0, le=1.0),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
+    """Return AMM wash-trading anomalies ordered by anomaly_score DESC."""
+    from detection.amm_engine import AMMEngine
+
+    engine = AMMEngine()
+    anomalies = engine.get_anomalies(min_score=min_score)
+    anomalies.sort(key=lambda a: a.anomaly_score, reverse=True)
+    page = anomalies[offset : offset + limit]
+    return [
+        {
+            "wallet": a.wallet,
+            "pool_id": a.pool_id,
+            "session_start": a.session_start.isoformat(),
+            "tenure_seconds": a.tenure_seconds,
+            "volume_to_liquidity_ratio": a.volume_to_liquidity_ratio,
+            "deposit_withdraw_symmetry": a.deposit_withdraw_symmetry,
+            "counterparty_concentration": a.counterparty_concentration,
+            "anomaly_score": a.anomaly_score,
+            "detected_at": a.detected_at.isoformat(),
+        }
+        for a in page
+    ]
+
+
 @app.get("/path-payments/circular")
 def circular_path_payments(
     limit: int = Query(default=100, ge=1, le=1000),
