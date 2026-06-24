@@ -56,6 +56,9 @@ def train(
     ring_size: int = typer.Option(3, help="Accounts per wash ring"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
+    optimize: bool = typer.Option(False, "--optimize", help="Run Optuna hyperparameter optimization before training"),
+    n_trials: int = typer.Option(100, "--n-trials", help="Number of Optuna trials per model (max 1000)"),
+    timeout: int = typer.Option(1800, "--timeout", help="Optuna wall-clock timeout in seconds per model (max 86400)"),
 ) -> None:
     """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
     import os
@@ -75,6 +78,23 @@ def train(
     training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
+
+    if optimize:
+        from detection.model_training import optimize_hyperparameters, _split_features_labels, _save_best_hyperparams
+
+        logger.info("Running Optuna optimization (%d trials, %ds timeout per model)…", n_trials, timeout)
+        X, y, timestamps = _split_features_labels(df)
+        all_best: dict = {}
+        n_trials_completed: dict = {}
+        best_auc_pr: dict = {}
+        for model_name in ("random_forest", "xgboost", "lightgbm"):
+            best = optimize_hyperparameters(
+                model_name, X.values, y.values,
+                n_trials=n_trials, timeout_seconds=timeout, random_state=seed,
+            )
+            all_best[model_name] = best
+            logger.info("%s best params: %s", model_name, best)
+        _save_best_hyperparams(all_best, n_trials_completed, best_auc_pr)
 
     results = train_ensemble(df, calibrate=calibrate)
     for name, result in results.items():

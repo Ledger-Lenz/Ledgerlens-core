@@ -17,6 +17,8 @@ venv/
 data/
 models/*.pkl
 models/*.joblib
+models/optuna_studies/
+models/best_hyperparams.json
 
 # Local RiskScore store
 *.db

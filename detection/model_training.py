@@ -7,9 +7,18 @@ models are written to `settings.model_dir` for `model_inference` to load.
 When ``calibrate=True`` a calibration split is held out (10 % of the data,
 stratified by label) *before* any model training, then used after training
 to compute conformal prediction thresholds via ``ConformalCalibrator``.
+
+Hyperparameter optimization (``--optimize`` CLI flag) uses Optuna's TPE
+sampler with temporal CV to find near-optimal configurations.  Best
+parameters are persisted to ``models/best_hyperparams.json``.
 """
 
+import hashlib
+import json
 import logging
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict
 
 import joblib
 import numpy as np
@@ -19,7 +28,7 @@ from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit, train_test_split
 from xgboost import XGBClassifier
 
 from config.settings import settings
@@ -27,6 +36,147 @@ from detection.dataset import data_leakage_audit, temporal_train_val_split
 from detection.feature_engineering import FEATURE_NAMES
 
 _logger = logging.getLogger("ledgerlens.model_training")
+
+
+# ---------------------------------------------------------------------------
+# Optuna hyperparameter optimization
+# ---------------------------------------------------------------------------
+
+def _suggest_params(trial, model_name: str) -> dict:
+    """Suggest hyperparameters for a given model type using an Optuna trial."""
+    if model_name == "random_forest":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
+            "max_depth": trial.suggest_categorical("max_depth", [None, 5, 10, 15, 20]),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+            "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.3, 0.5]),
+            "class_weight": trial.suggest_categorical("class_weight", ["balanced", "balanced_subsample", None]),
+            "bootstrap": trial.suggest_categorical("bootstrap", [True, False]),
+        }
+    elif model_name == "xgboost":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 600, step=50),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "scale_pos_weight": trial.suggest_float("scale_pos_weight", 1.0, 50.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "eval_metric": "logloss",
+        }
+    elif model_name == "lightgbm":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+            "max_depth": trial.suggest_int("max_depth", -1, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "is_unbalance": trial.suggest_categorical("is_unbalance", [True, False]),
+            "verbose": -1,
+        }
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+
+def _build_model(model_name: str, params: dict, random_state: int = 42):
+    """Instantiate a model with the given hyperparameters."""
+    if model_name == "random_forest":
+        return RandomForestClassifier(**params, random_state=random_state, n_jobs=-1)
+    elif model_name == "xgboost":
+        return XGBClassifier(**params, random_state=random_state)
+    elif model_name == "lightgbm":
+        return LGBMClassifier(**params, random_state=random_state)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+
+def optimize_hyperparameters(
+    model_name: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    n_trials: int = 100,
+    timeout_seconds: int = 1800,
+    random_state: int = 42,
+) -> Dict[str, Any]:
+    """Run Bayesian hyperparameter optimization with Optuna's TPE sampler.
+
+    Uses ``TimeSeriesSplit`` with a purge gap for cross-validation to
+    prevent data leakage during hyperparameter search.
+    """
+    import optuna
+
+    if n_trials > 1000:
+        raise ValueError("n_trials must be <= 1000")
+    if timeout_seconds > 86400:
+        raise ValueError("timeout_seconds must be <= 86400")
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    version_hash = hashlib.sha256(
+        f"{model_name}_{len(X_train)}_{random_state}".encode()
+    ).hexdigest()[:12]
+
+    study_dir = os.path.join(settings.model_dir, "optuna_studies")
+    os.makedirs(study_dir, exist_ok=True)
+    storage = f"sqlite:///{study_dir}/{model_name}.db"
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=random_state, n_startup_trials=10),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2),
+        storage=storage,
+        study_name=f"{model_name}_{version_hash}",
+        load_if_exists=True,
+    )
+
+    def objective(trial):
+        params = _suggest_params(trial, model_name)
+        model = _build_model(model_name, params, random_state)
+        tscv = TimeSeriesSplit(n_splits=3, gap=100)
+        aucs = []
+        for step, (train_idx, val_idx) in enumerate(tscv.split(X_train)):
+            model.fit(X_train[train_idx], y_train[train_idx])
+            proba = model.predict_proba(X_train[val_idx])[:, 1]
+            aucs.append(average_precision_score(y_train[val_idx], proba))
+            trial.report(np.mean(aucs), step=step)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+        return np.mean(aucs)
+
+    study.optimize(objective, n_trials=n_trials, timeout=timeout_seconds, n_jobs=-1)
+
+    if study.best_trial is None:
+        _logger.warning("All Optuna trials pruned for %s; using default params", model_name)
+        return {}
+
+    best = study.best_params
+    _logger.info(
+        "%s optimization complete: best AUC-PR=%.4f after %d trials",
+        model_name, study.best_value, len(study.trials),
+    )
+    return best
+
+
+def _save_best_hyperparams(all_best: dict, n_trials_completed: dict, best_auc_pr: dict) -> None:
+    """Persist best hyperparameters to ``models/best_hyperparams.json``."""
+    output = {
+        **all_best,
+        "optimization_date": datetime.now(timezone.utc).isoformat(),
+        "n_trials_completed": n_trials_completed,
+        "best_auc_pr": best_auc_pr,
+    }
+    path = os.path.join(settings.model_dir, "best_hyperparams.json")
+    os.makedirs(settings.model_dir, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(output, f, indent=2)
+    _logger.info("Saved best hyperparams to %s", path)
 
 
 def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, np.ndarray]:
