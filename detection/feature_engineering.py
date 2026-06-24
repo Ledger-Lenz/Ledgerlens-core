@@ -13,10 +13,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import compute_benford_metrics
+from detection.benford_engine import compute_benford_metrics, compute_ks_statistic, compute_kuiper_statistic, first_digit
 from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
@@ -40,6 +41,17 @@ BENFORD_FEATURE_NAMES = [
     f"benford_{metric}_{window}"
     for window in ROLLING_WINDOWS
     for metric in ("chi_square", "mad", "max_zscore")
+]
+
+KS_KUIPER_FEATURE_NAMES = [
+    f"{metric}_{window}"
+    for window in ROLLING_WINDOWS
+    for metric in ("ks_stat", "ks_pval", "kuiper_stat", "kuiper_pval")
+]
+
+BENFORD_COMBINED_FLAG_NAMES = [
+    f"benford_combined_flag_{window}"
+    for window in ROLLING_WINDOWS
 ]
 
 TRADE_PATTERN_FEATURE_NAMES = [
@@ -120,6 +132,8 @@ MULTIVARIATE_BENFORD_FEATURE_NAMES = [
 
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
+    + KS_KUIPER_FEATURE_NAMES
+    + BENFORD_COMBINED_FLAG_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
     + VOLUME_TIMING_FEATURE_NAMES
     + WALLET_GRAPH_FEATURE_NAMES
@@ -174,14 +188,36 @@ def _asset_symbol(asset: dict) -> str:
 
 
 def benford_features(trades: pd.DataFrame, as_of: pd.Timestamp) -> dict:
-    """Chi-square, MAD, and max Z-score for `base_amount` across each rolling window."""
-    features = {}
+    """Chi-square, MAD, max Z-score, KS, Kuiper, and combined flag across each rolling window."""
+    features: dict = {}
     for label, window in ROLLING_WINDOWS.items():
         subset = _window_slice(trades, as_of, window)
-        metrics = compute_benford_metrics(subset["base_amount"].tolist())
+        amounts = subset["base_amount"].tolist()
+        metrics = compute_benford_metrics(amounts)
         features[f"benford_chi_square_{label}"] = metrics["chi_square"]
         features[f"benford_mad_{label}"] = metrics["mad"]
         features[f"benford_max_zscore_{label}"] = max(metrics["z_scores"].values(), default=0.0)
+
+        digits = [first_digit(a) for a in amounts]
+        digits = [d for d in digits if d is not None]
+        digit_counts = np.zeros(9)
+        for d in digits:
+            digit_counts[d - 1] += 1
+
+        ks = compute_ks_statistic(digit_counts)
+        features[f"ks_stat_{label}"] = ks["ks_stat"] if not np.isnan(ks["ks_stat"]) else 0.0
+        features[f"ks_pval_{label}"] = ks["ks_pval"] if not np.isnan(ks["ks_pval"]) else 1.0
+
+        kuiper = compute_kuiper_statistic(digit_counts)
+        features[f"kuiper_stat_{label}"] = kuiper["kuiper_stat"] if not np.isnan(kuiper["kuiper_stat"]) else 0.0
+        features[f"kuiper_pval_{label}"] = kuiper["kuiper_pval"] if not np.isnan(kuiper["kuiper_pval"]) else 1.0
+
+        chi2_flag = metrics["chi_square"] > 15.507
+        ks_flag = ks["ks_flag"]
+        kuiper_flag = kuiper["kuiper_flag"]
+        flags_true = sum([chi2_flag, ks_flag, kuiper_flag])
+        features[f"benford_combined_flag_{label}"] = 1.0 if flags_true >= 2 else 0.0
+
     return features
 
 

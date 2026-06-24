@@ -120,6 +120,84 @@ def is_anomalous(metrics: dict, mad_threshold: float = 0.015) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Kolmogorov-Smirnov and Kuiper tests for small-sample Benford conformity
+# ---------------------------------------------------------------------------
+
+# Benford CDF: F(d) = sum_{k=1}^{d} log10(1 + 1/k) for d = 1..9
+_BENFORD_CDF = np.cumsum([BENFORD_EXPECTED[d] for d in DIGITS])
+
+
+def compute_ks_statistic(digit_counts: np.ndarray) -> dict:
+    """One-sample KS test against the Benford CDF.
+
+    ``digit_counts`` must be a length-9 array of non-negative integer
+    counts for digits 1–9.  Valid for N >= 5; returns NaN for N < 5.
+
+    Returns ``{"ks_stat": float, "ks_pval": float, "ks_flag": bool}``.
+    """
+    digit_counts = np.asarray(digit_counts, dtype=float)
+    if len(digit_counts) != 9 or (digit_counts < 0).any():
+        return {"ks_stat": float("nan"), "ks_pval": float("nan"), "ks_flag": False}
+
+    n = digit_counts.sum()
+    if n < 5:
+        return {"ks_stat": float("nan"), "ks_pval": float("nan"), "ks_flag": False}
+
+    observed_cdf = np.cumsum(digit_counts) / n
+    d_stat = float(np.max(np.abs(observed_cdf - _BENFORD_CDF)))
+    d_crit = 1.358 / math.sqrt(n)
+    flag = d_stat > d_crit
+    # Approximate p-value via Kolmogorov distribution
+    lam = (math.sqrt(n) + 0.12 + 0.11 / math.sqrt(n)) * d_stat
+    p_value = max(0.0, min(1.0, 2.0 * sum(
+        ((-1) ** (k - 1)) * math.exp(-2.0 * k * k * lam * lam)
+        for k in range(1, 101)
+    )))
+    return {"ks_stat": d_stat, "ks_pval": p_value, "ks_flag": flag}
+
+
+def _kuiper_pvalue(v: float, n: int) -> float:
+    """Kuiper V-statistic p-value via series expansion (Press et al.)."""
+    lam = v * (math.sqrt(n) + 0.155 + 0.24 / math.sqrt(n))
+    if lam < 0.01:
+        return 1.0
+    p = 0.0
+    for j in range(1, 101):
+        term = (4.0 * j * j * lam * lam - 1.0) * math.exp(-2.0 * j * j * lam * lam)
+        if abs(term) < 1e-300:
+            break
+        p += term
+    return max(0.0, min(1.0, 2.0 * p))
+
+
+def compute_kuiper_statistic(digit_counts: np.ndarray) -> dict:
+    """Kuiper V-test against the Benford CDF.
+
+    Rotation-invariant variant of KS, more sensitive to tail deviations
+    (digits 1 and 9) where wash-trading bots using round lots tend to
+    deviate.  Valid for N >= 5; returns NaN for N < 5.
+
+    Returns ``{"kuiper_stat": float, "kuiper_pval": float, "kuiper_flag": bool}``.
+    """
+    digit_counts = np.asarray(digit_counts, dtype=float)
+    if len(digit_counts) != 9 or (digit_counts < 0).any():
+        return {"kuiper_stat": float("nan"), "kuiper_pval": float("nan"), "kuiper_flag": False}
+
+    n = digit_counts.sum()
+    if n < 5:
+        return {"kuiper_stat": float("nan"), "kuiper_pval": float("nan"), "kuiper_flag": False}
+
+    observed_cdf = np.cumsum(digit_counts) / n
+    diff = observed_cdf - _BENFORD_CDF
+    d_plus = float(np.max(diff))
+    d_minus = float(np.max(-diff))
+    v_stat = d_plus + d_minus
+    p_value = _kuiper_pvalue(v_stat, int(n))
+    flag = p_value < 0.05
+    return {"kuiper_stat": v_stat, "kuiper_pval": p_value, "kuiper_flag": flag}
+
+
+# ---------------------------------------------------------------------------
 # Multivariate (cross-pair) Benford analysis
 #
 # A syndicate that splits wash volume evenly across N pairs keeps each pair's
