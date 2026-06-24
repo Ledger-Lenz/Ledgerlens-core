@@ -5,6 +5,8 @@ All notable changes to `ledgerlens-core` are documented in this file.
 ## Unreleased
 
 ### Added
+- Shell auto-completion for Bash, Zsh, and Fish via `cli.py completion --shell`.
+- CLI reference documentation in `docs/cli_reference.md`.
 - Synthetic SDEX trade generator (`ingestion/synthetic_data.py`) with
   labelled wash-trading rings for local training and testing.
 - Labelled training dataset builder (`detection/dataset.py`).

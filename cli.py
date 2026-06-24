@@ -644,5 +644,86 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+@app.command("completion")
+def completion(
+    shell: str = typer.Option(..., "--shell", help="Shell type: bash, zsh, or fish"),
+) -> None:
+    """Print shell completion script for the given shell.
+
+    Install with:
+        eval "$(python -m cli completion --shell bash)"
+        eval "$(python -m cli completion --shell zsh)"
+        python -m cli completion --shell fish | source
+    """
+    shell = shell.lower().strip()
+    if shell not in ("bash", "zsh", "fish"):
+        typer.echo(f"Unsupported shell: {shell}. Choose from: bash, zsh, fish", err=True)
+        raise typer.Exit(1)
+
+    import subprocess
+    import sys
+
+    prog_name = "ledgerlens"
+
+    if shell == "bash":
+        script = f"""\
+_ledgerlens_completion() {{
+    local IFS=$'\\n'
+    COMPREPLY=( $(compgen -W "$(python -m cli --help 2>/dev/null | grep -oP '^  \\K[a-z][a-z-]+')" -- "${{COMP_WORDS[COMP_CWORD]}}") )
+}}
+complete -o default -F _ledgerlens_completion {prog_name}
+complete -o default -F _ledgerlens_completion "python -m cli"
+"""
+    elif shell == "zsh":
+        script = f"""\
+#compdef {prog_name}
+_ledgerlens() {{
+    local -a commands
+    commands=(
+        'generate-data:Generate a synthetic trade dataset'
+        'train:Train the ensemble on synthetic data'
+        'score:Run the detection pipeline'
+        'serve:Serve the local API'
+        'stream:Stream trades from Horizon SSE'
+        'retrain-check:Check for drift and retrain'
+        'db-migrate:Apply pending schema migrations'
+        'reweight:Update ensemble weights from feedback'
+        'sign-models:Sign model artifacts with HMAC'
+        'webhook-worker:Run the webhook delivery worker'
+        'eval-robustness:Evaluate robustness under evasion'
+        'robustness-eval:Run PGD attacks on test split'
+        'completion:Print shell completion script'
+        'federated:Federated learning commands'
+    )
+    _describe 'command' commands
+}}
+compdef _ledgerlens {prog_name}
+compdef _ledgerlens "python -m cli"
+"""
+    else:
+        script = f"""\
+complete -c {prog_name} -n "__fish_use_subcommand" -a "generate-data" -d "Generate a synthetic trade dataset"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "train" -d "Train the ensemble on synthetic data"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "score" -d "Run the detection pipeline"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "serve" -d "Serve the local API"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "stream" -d "Stream trades from Horizon SSE"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "retrain-check" -d "Check for drift and retrain"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "db-migrate" -d "Apply pending schema migrations"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "reweight" -d "Update ensemble weights"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "sign-models" -d "Sign model artifacts"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "webhook-worker" -d "Run webhook delivery worker"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "eval-robustness" -d "Evaluate robustness"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "robustness-eval" -d "Run PGD attacks"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "completion" -d "Print shell completion script"
+complete -c {prog_name} -n "__fish_use_subcommand" -a "federated" -d "Federated learning commands"
+complete -c {prog_name} -n "__fish_seen_subcommand_from completion" -l shell -a "bash zsh fish" -d "Shell type"
+complete -c {prog_name} -n "__fish_seen_subcommand_from serve" -l host -d "Host to bind to"
+complete -c {prog_name} -n "__fish_seen_subcommand_from serve" -l port -d "Port to bind to"
+complete -c {prog_name} -n "__fish_seen_subcommand_from score" -l output -d "Output format"
+"""
+
+    typer.echo(script, nl=False)
+
+
 if __name__ == "__main__":
     app()
