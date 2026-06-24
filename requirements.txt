@@ -1,6 +1,7 @@
 # Core
 python-dotenv>=1.0.0
 pydantic>=2.6.0
+pydantic-settings>=2.2.0
 
 # Data / numerics
 pandas>=2.2.0,<3.0

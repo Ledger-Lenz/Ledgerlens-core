@@ -644,5 +644,36 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+config_app = typer.Typer(help="Configuration commands")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("validate")
+def config_validate() -> None:
+    """Load and validate configuration, printing all settings (secrets masked)."""
+    import pydantic
+
+    _SECRETS = {
+        "ledgerlens_service_secret_key",
+        "ledgerlens_admin_api_key",
+        "ledgerlens_compliance_api_key",
+        "ledgerlens_model_signing_key",
+        "ledgerlens_webhook_encryption_key",
+    }
+
+    try:
+        from config.settings import Settings
+        s = Settings()
+    except (pydantic.ValidationError, Exception) as exc:
+        typer.echo(f"❌ Configuration invalid:\n{exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo("✅ Configuration is valid\n")
+    for name in Settings.model_fields:
+        raw = getattr(s, name)
+        value = "***" if name in _SECRETS and raw else raw
+        typer.echo(f"  {name}={value}")
+
+
 if __name__ == "__main__":
     app()

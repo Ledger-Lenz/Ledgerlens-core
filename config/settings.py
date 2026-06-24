@@ -1,192 +1,256 @@
-"""Central configuration loaded from environment variables (.env)."""
+"""Central configuration loaded from environment variables (.env).
 
-import os
-from dataclasses import dataclass, field
+At import time, pydantic-settings validates every field. A missing required
+field or type/range violation aborts startup immediately with a human-readable
+error listing every problem at once.
+"""
+
 import time
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-def _parse_evm_pool_addresses(raw: str) -> tuple[str, ...]:
-    return tuple(a.strip() for a in raw.split(",") if a.strip())
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-@dataclass(frozen=True)
-class Settings:
-    horizon_url: str = field(default_factory=lambda: os.getenv("HORIZON_URL", "https://horizon.stellar.org"))
-    horizon_stream_url: str = field(default_factory=lambda: os.getenv("HORIZON_STREAM_URL", "https://horizon.stellar.org"))
-    network: str = field(default_factory=lambda: os.getenv("NETWORK", "testnet"))
+def _split_csv(raw: str) -> tuple[str, ...]:
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
 
-    poll_interval_seconds: int = field(default_factory=lambda: int(os.getenv("POLL_INTERVAL_SECONDS", "5")))
-    trade_history_lookback_days: int = field(default_factory=lambda: int(os.getenv("TRADE_HISTORY_LOOKBACK_DAYS", "30")))
 
-    benford_mad_threshold: float = field(default_factory=lambda: float(os.getenv("BENFORD_MAD_THRESHOLD", "0.015")))
-    _default_risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
-    COMMITTEE_QUORUM: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_QUORUM", "3")))
-    COMMITTEE_VOTE_DEADLINE_DAYS: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_VOTE_DEADLINE_DAYS", "14")))
-    ensemble_weight_rf: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_RF", "0.25")))
-    ensemble_weight_xgb: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_XGB", "0.50")))
-    ensemble_weight_lgbm: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_LGBM", "0.25")))
-    temporal_weight: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_WEIGHT", "0.3")))
-    _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
-
-    # Fraction of the composite risk score driven by the sandwich-attack signal
-    # (see detection.risk_score.RiskScore.combine). 0.0 preserves the legacy
-    # benford/ML-only blend.
-    sandwich_score_weight: float = field(
-        default_factory=lambda: float(os.getenv("SANDWICH_SCORE_WEIGHT", "0.0"))
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+        populate_by_name=True,
     )
 
-    # Fraction of the composite risk score driven by the multivariate (cross-pair)
-    # Benford copula dependence signal (see detection.risk_score.RiskScore.combine).
-    # 0.0 preserves the legacy Benford/ML-only blend.
-    benford_copula_weight: float = field(
-        default_factory=lambda: float(os.getenv("BENFORD_COPULA_WEIGHT", "0.0"))
-    )
+    # ── Horizon ───────────────────────────────────────────────────────────────
+    horizon_url: str = "https://horizon.stellar.org"
+    horizon_stream_url: str = "https://horizon.stellar.org"
+    network: str = "testnet"
 
-    # Points subtracted per unit of positive price-discovery-contribution (PDC)
-    # (see detection.risk_score.RiskScore.combine). 0.0 preserves the legacy
-    # Benford/ML-only blend; negative PDC never increases the score.
-    pdc_discount_weight: float = field(
-        default_factory=lambda: float(os.getenv("PDC_DISCOUNT_WEIGHT", "0.0"))
-    )
+    # ── Polling ───────────────────────────────────────────────────────────────
+    poll_interval_seconds: int = 5
+    trade_history_lookback_days: int = 30
+    cursor_path: str = "./horizon_cursor.txt"
 
-    model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
-    db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
+    # ── Feature Store ─────────────────────────────────────────────────────────
+    redis_url: str = "redis://localhost:6379/0"
+    feature_store_ttl_hours: int = 48
+    feature_store_flush_interval_seconds: int = 300
 
-    # Feature Store (Redis hot layer + SQLite cold layer)
-    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    feature_store_ttl_hours: int = field(default_factory=lambda: int(os.getenv("FEATURE_STORE_TTL_HOURS", "48")))
-    feature_store_flush_interval_seconds: int = (
-        field(default_factory=lambda: int(os.getenv("FEATURE_STORE_FLUSH_INTERVAL_SECONDS", "300")))
-    )
+    # ── Detection ─────────────────────────────────────────────────────────────
+    benford_mad_threshold: float = 0.015
+    risk_score_threshold: int = 70
+    committee_quorum: int = 3
+    committee_vote_deadline_days: int = 14
 
-    # Streaming
-    cursor_path: str = field(default_factory=lambda: os.getenv("CURSOR_PATH", "./horizon_cursor.txt"))
+    # ── Ensemble weights ──────────────────────────────────────────────────────
+    ensemble_weight_rf: float = 0.25
+    ensemble_weight_xgb: float = 0.50
+    ensemble_weight_lgbm: float = 0.25
 
-    ledgerlens_api_url: str = field(default_factory=lambda: os.getenv("LEDGERLENS_API_URL", "http://localhost:8000"))
-    score_contract_id: str = field(default_factory=lambda: os.getenv("LEDGERLENS_SCORE_CONTRACT_ID", ""))
-    service_secret_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_SERVICE_SECRET_KEY", ""))
+    # ── Score blending ────────────────────────────────────────────────────────
+    temporal_weight: float = 0.3
+    sandwich_score_weight: float = 0.0
+    benford_copula_weight: float = 0.0
+    pdc_discount_weight: float = 0.0
 
-    soroban_rpc_url: str = field(default_factory=lambda: os.getenv("SOROBAN_RPC_URL", "https://soroban-testnet.stellar.org"))
-    network_passphrase: str = field(default_factory=lambda: os.getenv("NETWORK_PASSPHRASE", "Test SDF Network ; September 2015"))
-    soroban_circuit_breaker_threshold: int = field(default_factory=lambda: int(os.getenv("SOROBAN_CIRCUIT_BREAKER_THRESHOLD", "5")))
-    soroban_circuit_reset_seconds: int = field(default_factory=lambda: int(os.getenv("SOROBAN_CIRCUIT_RESET_SECONDS", "300")))
+    # ── Storage ───────────────────────────────────────────────────────────────
+    model_dir: str = "./models"
+    ledgerlens_db_path: str = "./ledgerlens.db"
 
-    cors_allowed_origins: tuple[str, ...] = field(
-        default_factory=lambda: tuple(
-            o.strip()
-            for o in os.getenv("LEDGERLENS_CORS_ALLOWED_ORIGINS", "").split(",")
-            if o.strip()
-        )
-    )
-    admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
-    # Separate key scope gating the regulatory `/compliance/` endpoints so that
-    # SAR / Travel-Rule exports are never reachable with the admin key alone.
-    compliance_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_COMPLIANCE_API_KEY", ""))
-    model_signing_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_MODEL_SIGNING_KEY", ""))
+    # ── Downstream services ───────────────────────────────────────────────────
+    ledgerlens_api_url: str = "http://localhost:8000"
+    ledgerlens_score_contract_id: str = ""
+    ledgerlens_service_secret_key: str = ""
 
-    # Federated Learning
-    federated_min_participants: int = field(
-        default_factory=lambda: int(os.getenv("FEDERATED_MIN_PARTICIPANTS", "3"))
-    )
-    federated_dp_epsilon: float = field(
-        default_factory=lambda: float(os.getenv("FEDERATED_DP_EPSILON", "1.0"))
-    )
-    federated_dp_delta: float = field(
-        default_factory=lambda: float(os.getenv("FEDERATED_DP_DELTA", "1e-5"))
-    )
-    federated_dp_max_epsilon: float = field(
-        default_factory=lambda: float(os.getenv("FEDERATED_DP_MAX_EPSILON", "10.0"))
-    )
-    gradient_clip_threshold: float = field(
-        default_factory=lambda: float(os.getenv("GRADIENT_CLIP_THRESHOLD", "10.0"))
-    )
-    gradient_outlier_threshold: float = field(
-        default_factory=lambda: float(os.getenv("GRADIENT_OUTLIER_THRESHOLD", "0.1"))
-    )
-    # RDP noise multiplier (σ = clip_norm × noise_multiplier).
-    # 0.0 disables RDP accounting and falls back to legacy linear ε tracking.
-    # Production default: set FEDERATED_NOISE_MULTIPLIER=1.1 in .env.
-    federated_noise_multiplier: float = field(
-        default_factory=lambda: float(os.getenv("FEDERATED_NOISE_MULTIPLIER", "0.0"))
-    )
-    federated_server_host: str = field(
-        default_factory=lambda: os.getenv("FEDERATED_SERVER_HOST", "127.0.0.1")
-    )
-    federated_server_port: int = field(
-        default_factory=lambda: int(os.getenv("FEDERATED_SERVER_PORT", "8001"))
-    )
+    # ── Soroban ───────────────────────────────────────────────────────────────
+    soroban_rpc_url: str = "https://soroban-testnet.stellar.org"
+    network_passphrase: str = "Test SDF Network ; September 2015"
+    soroban_circuit_breaker_threshold: int = 5
+    soroban_circuit_reset_seconds: int = 300
 
-    # EVM cross-chain detection
-    evm_rpc_ethereum: str = field(
-        default_factory=lambda: os.getenv("EVM_RPC_ETHEREUM", "https://eth.llamarpc.com")
-    )
-    evm_rpc_base: str = field(
-        default_factory=lambda: os.getenv("EVM_RPC_BASE", "https://mainnet.base.org")
-    )
-    evm_rpc_polygon: str = field(
-        default_factory=lambda: os.getenv("EVM_RPC_POLYGON", "https://polygon-rpc.com")
-    )
-    evm_lookback_blocks: int = field(
-        default_factory=lambda: int(os.getenv("EVM_LOOKBACK_BLOCKS", "5760"))
-    )
-    evm_pool_addresses: tuple[str, ...] = field(
-        default_factory=lambda: _parse_evm_pool_addresses(
-            os.getenv("EVM_POOL_ADDRESSES", "")
-        )
-    )
+    # ── API / security ────────────────────────────────────────────────────────
+    ledgerlens_cors_allowed_origins: str = ""
+    ledgerlens_admin_api_key: str = ""
+    ledgerlens_compliance_api_key: str = ""
+    ledgerlens_model_signing_key: str = ""
+    ledgerlens_webhook_encryption_key: str = ""
 
-    def __post_init__(self) -> None:
-        weights = (
-            self.ensemble_weight_rf,
-            self.ensemble_weight_xgb,
-            self.ensemble_weight_lgbm,
-        )
-        if any(weight < 0 for weight in weights):
+    # ── Federated learning ────────────────────────────────────────────────────
+    federated_min_participants: int = 3
+    federated_dp_epsilon: float = 1.0
+    federated_dp_delta: float = 1e-5
+    federated_dp_max_epsilon: float = 10.0
+    gradient_clip_threshold: float = 10.0
+    gradient_outlier_threshold: float = 0.1
+    federated_noise_multiplier: float = 0.0
+    federated_server_host: str = "127.0.0.1"
+    federated_server_port: int = 8001
+
+    # ── EVM cross-chain ───────────────────────────────────────────────────────
+    evm_rpc_ethereum: str = "https://eth.llamarpc.com"
+    evm_rpc_base: str = "https://mainnet.base.org"
+    evm_rpc_polygon: str = "https://polygon-rpc.com"
+    evm_lookback_blocks: int = 5760
+    # Store as raw string; parsed tuple exposed via .evm_pool_addresses property
+    evm_pool_addresses: str = ""
+
+    # ── Runtime config cache TTL ──────────────────────────────────────────────
+    runtime_config_ttl_seconds: int = 60
+
+    # ── Validators ────────────────────────────────────────────────────────────
+
+    @field_validator("poll_interval_seconds", "trade_history_lookback_days",
+                     "feature_store_ttl_hours", "feature_store_flush_interval_seconds",
+                     "soroban_circuit_reset_seconds", "evm_lookback_blocks",
+                     "committee_quorum", "committee_vote_deadline_days",
+                     "federated_min_participants", mode="before")
+    @classmethod
+    def must_be_positive(cls, v: object) -> object:
+        if int(v) <= 0:
+            raise ValueError("must be a positive integer")
+        return v
+
+    @field_validator("federated_server_port", mode="before")
+    @classmethod
+    def valid_port(cls, v: object) -> object:
+        port = int(v)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"port {port} is out of range 1-65535")
+        return v
+
+    @field_validator("risk_score_threshold", mode="before")
+    @classmethod
+    def valid_score_threshold(cls, v: object) -> object:
+        val = int(v)
+        if not (0 <= val <= 100):
+            raise ValueError(f"RISK_SCORE_THRESHOLD {val} must be 0-100")
+        return v
+
+    @field_validator("soroban_circuit_breaker_threshold", mode="before")
+    @classmethod
+    def valid_circuit_threshold(cls, v: object) -> object:
+        if int(v) < 1:
+            raise ValueError("SOROBAN_CIRCUIT_BREAKER_THRESHOLD must be >= 1")
+        return v
+
+    @field_validator("benford_mad_threshold", "temporal_weight",
+                     "sandwich_score_weight", "benford_copula_weight",
+                     "pdc_discount_weight", mode="before")
+    @classmethod
+    def non_negative_float(cls, v: object) -> object:
+        if float(v) < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    @field_validator("ensemble_weight_rf", "ensemble_weight_xgb", "ensemble_weight_lgbm",
+                     mode="before")
+    @classmethod
+    def non_negative_weight(cls, v: object) -> object:
+        if float(v) < 0:
             raise ValueError("Ensemble weights must be non-negative")
-        if all(weight == 0 for weight in weights):
+        return v
+
+    @field_validator("horizon_url", "horizon_stream_url", "soroban_rpc_url",
+                     "ledgerlens_api_url", "redis_url",
+                     "evm_rpc_ethereum", "evm_rpc_base", "evm_rpc_polygon",
+                     mode="before")
+    @classmethod
+    def valid_url(cls, v: object) -> object:
+        s = str(v).strip()
+        if not s:
+            raise ValueError("must be a non-empty URL")
+        if not (s.startswith("http://") or s.startswith("https://")
+                or s.startswith("redis://") or s.startswith("rediss://")):
+            raise ValueError(f"{s!r} is not a valid URL (expected http/https/redis scheme)")
+        return s
+
+    @field_validator("network", mode="before")
+    @classmethod
+    def valid_network(cls, v: object) -> object:
+        val = str(v).strip().lower()
+        if val not in ("testnet", "mainnet"):
+            raise ValueError(f"NETWORK must be 'testnet' or 'mainnet', got {v!r}")
+        return val
+
+    @model_validator(mode="after")
+    def ensemble_weights_not_all_zero(self) -> "Settings":
+        if self.ensemble_weight_rf == 0 and self.ensemble_weight_xgb == 0 and self.ensemble_weight_lgbm == 0:
             raise ValueError("At least one ensemble weight must be positive")
-        if "*" in self.cors_allowed_origins:
+        return self
+
+    @model_validator(mode="after")
+    def no_wildcard_cors(self) -> "Settings":
+        if "*" in _split_csv(self.ledgerlens_cors_allowed_origins):
             raise ValueError(
                 "LEDGERLENS_CORS_ALLOWED_ORIGINS must not contain '*'. "
                 "Specify an explicit origin list instead."
             )
-        self._validate_evm_pool_addresses()
+        return self
 
-    def _validate_evm_pool_addresses(self) -> None:
-        if not self.evm_pool_addresses:
-            return
+    @model_validator(mode="after")
+    def valid_evm_pool_addresses(self) -> "Settings":
+        addrs = _split_csv(self.evm_pool_addresses)
+        if not addrs:
+            return self
         from web3 import Web3
-
-        for addr in self.evm_pool_addresses:
-            if not isinstance(addr, str) or len(addr) != 42 or not addr.startswith("0x"):
-                raise ValueError(
-                    f"EVM_POOL_ADDRESSES contains a malformed address: {addr!r}. "
-                    "Addresses must be 42-character hex strings starting with '0x'."
-                )
+        for addr in addrs:
+            if len(addr) != 42 or not addr.startswith("0x"):
+                raise ValueError(f"EVM_POOL_ADDRESSES malformed address: {addr!r}")
             if not Web3.is_checksum_address(addr):
-                raise ValueError(
-                    f"EVM_POOL_ADDRESSES contains a non-checksummed address: {addr!r}. "
-                    "Use EIP-55 checksum format (e.g. '0xAb5801a7D398...')."
-                )
+                raise ValueError(f"EVM_POOL_ADDRESSES non-checksummed address: {addr!r}")
+        return self
+
+    # ── Backward-compat properties ────────────────────────────────────────────
+
+    @property
+    def db_path(self) -> str:
+        return self.ledgerlens_db_path
+
+    @property
+    def score_contract_id(self) -> str:
+        return self.ledgerlens_score_contract_id
+
+    @property
+    def service_secret_key(self) -> str:
+        return self.ledgerlens_service_secret_key
+
+    @property
+    def cors_allowed_origins(self) -> tuple[str, ...]:
+        return _split_csv(self.ledgerlens_cors_allowed_origins)
+
+    @property
+    def admin_api_key(self) -> str:
+        return self.ledgerlens_admin_api_key
+
+    @property
+    def compliance_api_key(self) -> str:
+        return self.ledgerlens_compliance_api_key
+
+    @property
+    def model_signing_key(self) -> str:
+        return self.ledgerlens_model_signing_key
+
+    @property
+    def _default_risk_score_threshold(self) -> int:
+        return self.risk_score_threshold
+
+    @property
+    def _runtime_cache_ttl_seconds(self) -> int:
+        return self.runtime_config_ttl_seconds
 
 
 settings = Settings()
 
 
-# Runtime config cache
+# ── Runtime config cache ──────────────────────────────────────────────────────
 _runtime_cache: dict = {"ts": 0, "config": {}}
 
 
 def load_runtime_config() -> dict:
-    """Load runtime overrides from the `runtime_config` table with a TTL cache.
-
-    Returns a dict of key->value strings. Cache TTL is configurable via
-    `RUNTIME_CONFIG_TTL_SECONDS` environment variable (default 60).
-    """
+    """Load runtime overrides from the `runtime_config` table with a TTL cache."""
     now = time.time()
     ttl = settings._runtime_cache_ttl_seconds
     if _runtime_cache.get("ts", 0) + ttl > now and _runtime_cache.get("config"):
@@ -211,22 +275,7 @@ def load_runtime_config() -> dict:
 
 def get_runtime_risk_score_threshold() -> int:
     cfg = load_runtime_config()
-    if "risk_score_threshold" in cfg:
-        try:
-            return int(cfg["risk_score_threshold"])
-        except Exception:
-            return settings._default_risk_score_threshold
-    return settings._default_risk_score_threshold
-
-
-# Expose risk_score_threshold property for compatibility
-@property
-def runtime_risk_score_threshold(self) -> int:  # type: ignore
-    return get_runtime_risk_score_threshold()
-
-@runtime_risk_score_threshold.setter
-def runtime_risk_score_threshold(self, value: int) -> None:
-    object.__setattr__(self, "_default_risk_score_threshold", value)
-
-# Monkeypatch onto Settings instance for attribute access
-setattr(Settings, "risk_score_threshold", runtime_risk_score_threshold)
+    try:
+        return int(cfg["risk_score_threshold"])
+    except (KeyError, ValueError):
+        return settings._default_risk_score_threshold
