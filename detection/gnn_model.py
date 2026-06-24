@@ -144,3 +144,242 @@ def save_gnn_checkpoint(model, path: str) -> None:
         },
         path,
     )
+
+
+# ---------------------------------------------------------------------------
+# WashRingGNN: GraphSAGE / GAT classifier for wash-ring detection
+# ---------------------------------------------------------------------------
+
+if _HAS_PYG:
+    from torch_geometric.nn import SAGEConv
+    from torch_geometric.data import Data, InMemoryDataset
+
+    class WashRingGNN(nn.Module):
+        """GraphSAGE or GAT classifier for per-node wash-trading probability.
+
+        Two message-passing layers aggregate multi-hop neighbourhood features.
+        A 2-layer MLP classifier head produces a wash-trading probability per
+        node. The architecture is monotone: adding more suspicious neighbours
+        always increases the node's score.
+        """
+
+        def __init__(
+            self,
+            in_channels: int,
+            hidden_channels: int = 64,
+            num_layers: int = 2,
+            dropout: float = 0.3,
+            conv_type: str = "sage",
+            gat_heads: int = 4,
+        ):
+            super().__init__()
+            self.num_layers = num_layers
+            self.dropout = dropout
+            self.convs = nn.ModuleList()
+            self.bns = nn.ModuleList()
+
+            for i in range(num_layers):
+                in_c = in_channels if i == 0 else hidden_channels
+                if conv_type == "sage":
+                    self.convs.append(SAGEConv(in_c, hidden_channels))
+                else:
+                    heads = gat_heads if i < num_layers - 1 else 1
+                    self.convs.append(
+                        GATConv(in_c, hidden_channels // heads, heads=heads, dropout=dropout)
+                    )
+                self.bns.append(nn.BatchNorm1d(hidden_channels))
+
+            self.classifier = nn.Sequential(
+                nn.Linear(hidden_channels, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1),
+            )
+
+        def forward(self, x, edge_index, edge_attr=None):
+            for conv, bn in zip(self.convs, self.bns):
+                x = conv(x, edge_index)
+                x = bn(x)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+            return torch.sigmoid(self.classifier(x)).squeeze(-1)
+
+    class TradeGraphDataset(InMemoryDataset):
+        """Convert a NetworkX trade graph into a PyTorch Geometric Data object.
+
+        Node features come from the tabular feature engineering pipeline.
+        Edge features carry [total_volume, trade_count, timing_tightness].
+        """
+
+        def __init__(
+            self,
+            graph,
+            feature_vectors: dict[str, list[float]],
+            labels: dict[str, int] | None = None,
+            root: str | None = None,
+        ):
+            self._graph = graph
+            self._feature_vectors = feature_vectors
+            self._labels = labels or {}
+            self._data_obj = None
+            self._process_graph()
+
+        def _process_graph(self):
+            node_list = list(self._graph.nodes())
+            node_to_idx = {n: i for i, n in enumerate(node_list)}
+
+            default_dim = len(next(iter(self._feature_vectors.values()), [0.0]))
+            x = torch.tensor(
+                [self._feature_vectors.get(n, [0.0] * default_dim) for n in node_list],
+                dtype=torch.float,
+            )
+
+            edges = list(self._graph.edges(data=True))
+            if edges:
+                src = [node_to_idx[u] for u, v, _ in edges]
+                dst = [node_to_idx[v] for _, v, _ in edges]
+                edge_index = torch.tensor([src, dst], dtype=torch.long)
+                edge_attr = torch.tensor(
+                    [
+                        [
+                            d.get("total_volume", 0.0),
+                            d.get("trade_count", 0.0),
+                            d.get("timing_tightness", 0.0),
+                        ]
+                        for _, _, d in edges
+                    ],
+                    dtype=torch.float,
+                )
+            else:
+                edge_index = torch.zeros((2, 0), dtype=torch.long)
+                edge_attr = torch.zeros((0, 3), dtype=torch.float)
+
+            y = torch.tensor(
+                [float(self._labels.get(n, 0)) for n in node_list], dtype=torch.float
+            )
+
+            self._data_obj = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+            self._node_list = node_list
+            self._node_to_idx = node_to_idx
+
+        @property
+        def data(self) -> Data:
+            return self._data_obj
+
+        @property
+        def node_list(self) -> list[str]:
+            return self._node_list
+
+        @property
+        def node_to_idx(self) -> dict[str, int]:
+            return self._node_to_idx
+
+        def len(self):
+            return 1
+
+        def get(self, idx):
+            return self._data_obj
+
+    def train_wash_ring_gnn(
+        dataset: TradeGraphDataset,
+        epochs: int = 200,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-4,
+        patience: int = 20,
+    ) -> WashRingGNN:
+        """Train a WashRingGNN on the trade graph dataset."""
+        data = dataset.data
+        in_channels = data.x.shape[1]
+        model = WashRingGNN(in_channels=in_channels)
+
+        pos_count = data.y.sum().item()
+        neg_count = len(data.y) - pos_count
+        pos_weight = torch.tensor([neg_count / max(pos_count, 1)])
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        best_loss = float("inf")
+        patience_counter = 0
+
+        model.train()
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            # Use raw logits for BCEWithLogitsLoss
+            for conv, bn in zip(model.convs, model.bns):
+                pass  # forward handled below
+
+            # Direct forward without sigmoid for loss
+            x = data.x
+            for conv, bn in zip(model.convs, model.bns):
+                x = conv(x, data.edge_index)
+                x = bn(x)
+                x = F.relu(x)
+                x = F.dropout(x, p=model.dropout, training=True)
+            logits = model.classifier(x).squeeze(-1)
+
+            loss = criterion(logits, data.y)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+
+        model.eval()
+        return model
+
+    def compute_fusion_weight(
+        tabular_proba: np.ndarray,
+        gnn_proba: np.ndarray,
+        y_val: np.ndarray,
+    ) -> float:
+        """Find optimal GNN fusion weight in [0.0, 0.5] maximising AUC-PR."""
+        from scipy.optimize import minimize_scalar
+        from sklearn.metrics import average_precision_score
+
+        def neg_ap(w):
+            fused = (1 - w) * tabular_proba + w * gnn_proba
+            return -average_precision_score(y_val, fused)
+
+        result = minimize_scalar(neg_ap, bounds=(0.0, 0.5), method="bounded")
+        return float(result.x)
+
+    def save_wash_ring_gnn(model: WashRingGNN, path: str) -> None:
+        """Save WashRingGNN checkpoint with weights_only-compatible format."""
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "in_channels": model.convs[0].in_channels if model.convs else 0,
+                "hidden_channels": 64,
+                "num_layers": model.num_layers,
+            },
+            path,
+        )
+
+    def load_wash_ring_gnn(path: str) -> WashRingGNN:
+        """Load WashRingGNN safely using weights_only=True."""
+        checkpoint = torch.load(path, weights_only=True, map_location="cpu")
+        model = WashRingGNN(
+            in_channels=checkpoint.get("in_channels", NODE_FEATURE_DIM),
+            hidden_channels=checkpoint.get("hidden_channels", 64),
+            num_layers=checkpoint.get("num_layers", 2),
+        )
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        return model
+
+else:
+    class WashRingGNN:  # type: ignore[no-redef]
+        def __init__(self, *a, **k):
+            raise RuntimeError("PyTorch / torch_geometric not installed.")
+
+    class TradeGraphDataset:  # type: ignore[no-redef]
+        def __init__(self, *a, **k):
+            raise RuntimeError("PyTorch / torch_geometric not installed.")

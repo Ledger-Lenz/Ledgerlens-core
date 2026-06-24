@@ -326,10 +326,16 @@ from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
 
 _MODEL_FILENAMES = dict(globals().get("_MODEL_FILENAMES", {}))
 _MODEL_FILENAMES["gnn"] = "gnn_model.pt"
+_MODEL_FILENAMES["wash_ring_gnn"] = "wash_ring_gnn.pt"
+
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "wash_ring_gnn"})
+
+# Default GNN fusion weight (overridden by training_metadata.json if available)
+_DEFAULT_W_GNN: float = 0.2
 
 
 def load_models(model_dir: str, *args, **kwargs) -> dict:
-    """Wraps the base model loader, also loading gnn_model.pt if present."""
+    """Wraps the base model loader, also loading GNN checkpoints if present."""
     models = _load_models_base(model_dir, *args, **kwargs)
 
     gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
@@ -339,7 +345,31 @@ def load_models(model_dir: str, *args, **kwargs) -> dict:
         except RuntimeError as e:
             logger.error("GNN checkpoint failed validation: %s", e)
             raise
+
+    # WashRingGNN (GraphSAGE/GAT classifier)
+    wrg_path = os.path.join(model_dir, _MODEL_FILENAMES["wash_ring_gnn"])
+    if os.path.exists(wrg_path) and _HAS_PYG:
+        try:
+            from detection.gnn_model import load_wash_ring_gnn
+            models["wash_ring_gnn"] = load_wash_ring_gnn(wrg_path)
+            logger.info("Loaded WashRingGNN from %s", wrg_path)
+        except Exception as e:
+            logger.warning("WashRingGNN checkpoint failed: %s — using tabular ensemble only", e)
+    else:
+        logger.info("GNN model not available; using tabular ensemble only")
+
     return models
+
+
+def fuse_gnn_score(
+    tabular_prob: float,
+    gnn_prob: float | None,
+    w_gnn: float = _DEFAULT_W_GNN,
+) -> float:
+    """Fuse tabular ensemble probability with GNN probability."""
+    if gnn_prob is None:
+        return tabular_prob
+    return (1 - w_gnn) * tabular_prob + w_gnn * gnn_prob
 
 
 def score_feature_matrix(batch, models: dict, *args, **kwargs):

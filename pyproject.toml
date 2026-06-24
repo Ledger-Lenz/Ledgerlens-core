@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Benford's Law + ensemble ML wash-trading detection engine for the Stellar DEX"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+gnn = ["torch>=2.0.0", "torch_geometric>=2.5.0"]
+
 [project.scripts]
 ledgerlens = "cli:app"
 
