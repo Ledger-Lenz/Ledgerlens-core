@@ -170,6 +170,16 @@ def _kuiper_pvalue(v: float, n: int) -> float:
     return max(0.0, min(1.0, 2.0 * p))
 
 
+def _digit_counts_from_amounts(amounts: list[float]) -> np.ndarray:
+    """Extract a length-9 digit-count array from trade amounts."""
+    counts = np.zeros(9)
+    for a in amounts:
+        d = first_digit(a)
+        if d is not None:
+            counts[d - 1] += 1
+    return counts
+
+
 def compute_kuiper_statistic(digit_counts: np.ndarray) -> dict:
     """Kuiper V-test against the Benford CDF.
 
@@ -195,6 +205,121 @@ def compute_kuiper_statistic(digit_counts: np.ndarray) -> dict:
     p_value = _kuiper_pvalue(v_stat, int(n))
     flag = p_value < 0.05
     return {"kuiper_stat": v_stat, "kuiper_pval": p_value, "kuiper_flag": flag}
+
+
+# ---------------------------------------------------------------------------
+# Asset-pair stratified Benford analysis
+# ---------------------------------------------------------------------------
+
+import re
+
+_VALID_PAIR_RE = re.compile(r"^[A-Za-z0-9/.\-:]{1,30}$")
+
+
+def _normalize_asset_pair(base: str, counter: str) -> str:
+    """Canonical lexicographically-ordered pair string."""
+    pair = f"{base}/{counter}" if base <= counter else f"{counter}/{base}"
+    return pair
+
+
+def stratified_benford_analysis(
+    trades: "list | pd.DataFrame",
+    min_stratum_size: int = 30,
+) -> dict:
+    """Compute per-stratum Benford metrics grouped by asset pair.
+
+    Accepts a list of Trade objects (with ``.base_asset``, ``.counter_asset``,
+    ``base_amount`` attributes) or a DataFrame with ``base_asset``,
+    ``counter_asset``, and ``base_amount`` columns.
+
+    Returns ``{"strata": {pair: BenfordResult, ...}, "summary": {...},
+    "fallback_global": bool}``.
+    """
+    import pandas as pd
+
+    if isinstance(trades, pd.DataFrame):
+        df = trades
+    else:
+        df = pd.DataFrame([{
+            "base_asset": getattr(t, "base_asset", {}),
+            "counter_asset": getattr(t, "counter_asset", {}),
+            "base_amount": getattr(t, "base_amount", 0.0),
+        } for t in trades])
+
+    if df.empty:
+        return {"strata": {}, "summary": _empty_stratum_summary(), "fallback_global": True}
+
+    def _asset_label(asset) -> str:
+        if isinstance(asset, dict):
+            code = asset.get("code", "unknown")
+            issuer = asset.get("issuer")
+            return code if issuer is None else f"{code}:{issuer}"
+        return str(asset)
+
+    grouped: dict[str, list[float]] = {}
+    for _, row in df.iterrows():
+        base_label = _asset_label(row.get("base_asset", ""))
+        counter_label = _asset_label(row.get("counter_asset", ""))
+        pair = _normalize_asset_pair(base_label, counter_label)
+        if not _VALID_PAIR_RE.match(pair.replace("/", "")):
+            continue
+        grouped.setdefault(pair, []).append(float(row["base_amount"]))
+
+    strata: dict = {}
+    valid_strata: list[dict] = []
+
+    for pair, amounts in grouped.items():
+        n = sum(1 for a in amounts if first_digit(a) is not None)
+        if n < min_stratum_size:
+            strata[pair] = {"valid": False, "reason": "insufficient_sample", "sample_size": n}
+            continue
+        metrics = compute_benford_metrics(amounts)
+        metrics["valid"] = True
+        metrics["benford_flag"] = metrics["chi_square"] > 15.507
+        strata[pair] = metrics
+        valid_strata.append(metrics)
+
+    if not valid_strata:
+        all_amounts = []
+        for amounts in grouped.values():
+            all_amounts.extend(amounts)
+        global_metrics = compute_benford_metrics(all_amounts) if all_amounts else {}
+        return {
+            "strata": strata,
+            "summary": _stratum_summary(valid_strata),
+            "global_fallback_metrics": global_metrics,
+            "fallback_global": True,
+        }
+
+    return {
+        "strata": strata,
+        "summary": _stratum_summary(valid_strata),
+        "fallback_global": False,
+    }
+
+
+def _empty_stratum_summary() -> dict:
+    return {
+        "max_stratum_chi2": 0.0,
+        "max_stratum_MAD": 0.0,
+        "mean_stratum_MAD": 0.0,
+        "n_flagged_strata": 0,
+        "n_strata_above_0015": 0,
+    }
+
+
+def _stratum_summary(valid_strata: list[dict]) -> dict:
+    if not valid_strata:
+        return _empty_stratum_summary()
+    chi2s = [s["chi_square"] for s in valid_strata]
+    mads = [s["mad"] for s in valid_strata]
+    return {
+        "max_stratum_chi2": max(chi2s),
+        "max_stratum_MAD": max(mads),
+        "mean_stratum_MAD": sum(mads) / len(mads),
+        "n_flagged_strata": sum(1 for s in valid_strata if s.get("benford_flag")),
+        "n_strata_above_0015": sum(1 for m in mads if m > 0.015),
+    }
 
 
 # ---------------------------------------------------------------------------

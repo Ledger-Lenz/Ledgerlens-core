@@ -17,7 +17,13 @@ import numpy as np
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import compute_benford_metrics, compute_ks_statistic, compute_kuiper_statistic, first_digit
+from detection.benford_engine import (
+    compute_benford_metrics,
+    compute_ks_statistic,
+    compute_kuiper_statistic,
+    first_digit,
+    stratified_benford_analysis,
+)
 from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
@@ -52,6 +58,12 @@ KS_KUIPER_FEATURE_NAMES = [
 BENFORD_COMBINED_FLAG_NAMES = [
     f"benford_combined_flag_{window}"
     for window in ROLLING_WINDOWS
+]
+
+STRATUM_SUMMARY_FEATURE_NAMES = [
+    f"{metric}_{window}"
+    for window in ROLLING_WINDOWS
+    for metric in ("max_stratum_chi2", "max_stratum_MAD", "n_flagged_strata")
 ]
 
 TRADE_PATTERN_FEATURE_NAMES = [
@@ -134,6 +146,7 @@ FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + KS_KUIPER_FEATURE_NAMES
     + BENFORD_COMBINED_FLAG_NAMES
+    + STRATUM_SUMMARY_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
     + VOLUME_TIMING_FEATURE_NAMES
     + WALLET_GRAPH_FEATURE_NAMES
@@ -188,7 +201,7 @@ def _asset_symbol(asset: dict) -> str:
 
 
 def benford_features(trades: pd.DataFrame, as_of: pd.Timestamp) -> dict:
-    """Chi-square, MAD, max Z-score, KS, Kuiper, and combined flag across each rolling window."""
+    """Chi-square, MAD, max Z-score, KS, Kuiper, combined flag, and stratum summaries."""
     features: dict = {}
     for label, window in ROLLING_WINDOWS.items():
         subset = _window_slice(trades, as_of, window)
@@ -217,6 +230,12 @@ def benford_features(trades: pd.DataFrame, as_of: pd.Timestamp) -> dict:
         kuiper_flag = kuiper["kuiper_flag"]
         flags_true = sum([chi2_flag, ks_flag, kuiper_flag])
         features[f"benford_combined_flag_{label}"] = 1.0 if flags_true >= 2 else 0.0
+
+        strat = stratified_benford_analysis(subset)
+        summary = strat["summary"]
+        features[f"max_stratum_chi2_{label}"] = summary.get("max_stratum_chi2", 0.0)
+        features[f"max_stratum_MAD_{label}"] = summary.get("max_stratum_MAD", 0.0)
+        features[f"n_flagged_strata_{label}"] = float(summary.get("n_flagged_strata", 0))
 
     return features
 

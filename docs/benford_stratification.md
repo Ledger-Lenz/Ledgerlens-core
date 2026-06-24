@@ -46,3 +46,25 @@ have N < 30, the engine falls back to a global (unstratified) computation.
 
 These features surface the worst-case stratum signal without dilution from
 well-behaved pairs.
+
+### Asset-Pair Normalization
+
+Pairs are canonicalized with lexicographic ordering to avoid duplicates:
+`XLM/USDC` and `USDC/XLM` both resolve to `USDC/XLM`. Pair strings are
+validated against `[A-Za-z0-9/.\-:]` and capped at 30 characters.
+
+### Fallback Logic
+
+When **all** strata have N < 30:
+
+1. Global (unstratified) Benford metrics are computed as a fallback
+2. `fallback_global=True` is set on the result
+3. Stratum summary features default to 0.0
+
+### Implementation
+
+`stratified_benford_analysis()` in `detection/benford_engine.py` accepts
+either a list of `Trade` objects or a DataFrame.  It groups trades by
+canonical asset pair, filters strata below the minimum size, computes
+`compute_benford_metrics()` per valid stratum, and returns per-stratum
+results alongside the cross-stratum summary.
