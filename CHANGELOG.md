@@ -15,6 +15,11 @@ All notable changes to `ledgerlens-core` are documented in this file.
   loaded from `MODEL_SIGNING_PRIVATE_KEY` environment variable only.
 - Documentation: `docs/model_signing.md` covering threat model, key management,
   rotation procedure, and CI integration.
+- **Uniswap V3 adapter** (`ingestion/uniswap_adapter.py`): Ingests Swap events
+  from Uniswap V3 pools, filtered to wallets linked to Stellar via bridge graph.
+- **Curve adapter** (`ingestion/curve_adapter.py`): Ingests TokenExchange events
+  from Curve StableSwap pools for cross-chain wash-cycle detection.
+- Feature flags `INGEST_UNISWAP` and `INGEST_CURVE` for opt-in DEX ingestion.
 - Synthetic SDEX trade generator (`ingestion/synthetic_data.py`) with
   labelled wash-trading rings for local training and testing.
 - Labelled training dataset builder (`detection/dataset.py`).

@@ -127,6 +127,14 @@ class Settings:
     )
 
     # EVM cross-chain detection
+    # DEX swap ingestion feature flags
+    ingest_uniswap: bool = field(
+        default_factory=lambda: os.getenv("INGEST_UNISWAP", "false").lower() in ("true", "1", "yes")
+    )
+    ingest_curve: bool = field(
+        default_factory=lambda: os.getenv("INGEST_CURVE", "false").lower() in ("true", "1", "yes")
+    )
+
     evm_rpc_ethereum: str = field(
         default_factory=lambda: os.getenv("EVM_RPC_ETHEREUM", "https://eth.llamarpc.com")
     )
