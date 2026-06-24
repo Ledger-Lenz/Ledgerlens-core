@@ -1,0 +1,66 @@
+image:
+  repository: ledgerlens/core
+  tag: latest
+  pullPolicy: IfNotPresent
+
+api:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  service:
+    type: ClusterIP
+    port: 8000
+
+ingestionWorker:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+featureStore:
+  redis:
+    enabled: true
+    image: redis:7-alpine
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  host: ledgerlens.local
+  tls: []
+
+persistence:
+  enabled: true
+  size: 5Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+env:
+  HORIZON_URL: https://horizon.stellar.org
+  HORIZON_STREAM_URL: https://horizon.stellar.org
+  NETWORK: testnet
+  REDIS_URL: redis://{{ .Release.Name }}-redis:6379/0
+
+secretEnv: {}

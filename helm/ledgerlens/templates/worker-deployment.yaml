@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ledgerlens.fullname" . }}-worker
+  labels:
+    {{- include "ledgerlens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion-worker
+spec:
+  replicas: {{ .Values.ingestionWorker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ledgerlens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ingestion-worker
+  template:
+    metadata:
+      labels:
+        {{- include "ledgerlens.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ingestion-worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "cli", "stream"]
+          resources:
+            {{- toYaml .Values.ingestionWorker.resources | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "ledgerlens.fullname" . }}-config
+            {{- if .Values.secretEnv }}
+            - secretRef:
+                name: {{ include "ledgerlens.fullname" . }}-secret
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: /app/data
+            {{- end }}
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "ledgerlens.fullname" . }}-data
+        {{- end }}

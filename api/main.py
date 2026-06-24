@@ -181,6 +181,44 @@ def _model_file_ok(path: str) -> bool:
         return False
 
 
+@app.get("/health/ready")
+def health_ready() -> JSONResponse:
+    """Readiness probe: returns 200 only when the API can serve scoring requests."""
+    from detection.model_inference import _MODEL_FILENAMES
+    from detection.storage import _connect
+
+    ready = True
+    status: dict[str, str] = {}
+
+    try:
+        with _connect() as conn:
+            conn.execute("SELECT 1")
+        status["db"] = "ok"
+    except sqlite3.Error:
+        status["db"] = "not ready"
+        ready = False
+
+    missing = [
+        name
+        for name, filename in _MODEL_FILENAMES.items()
+        if not _model_file_ok(os.path.join(settings.model_dir, filename))
+    ]
+    if missing:
+        status["models"] = "not ready"
+        ready = False
+    else:
+        status["models"] = "ok"
+
+    if _models:
+        status["models_loaded"] = "ok"
+    else:
+        status["models_loaded"] = "not ready"
+        ready = False
+
+    status["ready"] = "true" if ready else "false"
+    return JSONResponse(content=status, status_code=200 if ready else 503)
+
+
 @app.get("/scores", response_model=list[RiskScore])
 def list_scores(
     min_score: int = 0,
