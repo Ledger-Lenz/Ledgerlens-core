@@ -1401,7 +1401,7 @@ def save_feature_state(state, db_path: str | None = None) -> None:
         db_path: Optional database path; uses settings.db_path if not provided.
     """
     init_db(db_path)
-    state_json = state.model_dump_json_compat()
+    state_json = state.model_dump_json()
     with _connect(db_path) as conn:
         conn.execute(
             """
@@ -1430,7 +1430,7 @@ def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
         return None
 
     from detection.feature_store import WalletFeatureState
-    return WalletFeatureState.model_validate_json_compat(row[0])
+    return WalletFeatureState.model_validate_json(row[0])
 
 
 def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | None = None) -> int:
@@ -1453,7 +1453,7 @@ def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | Non
     from detection.feature_store import WalletFeatureState
     for row in rows:
         try:
-            state = WalletFeatureState.model_validate_json_compat(row[0])
+            state = WalletFeatureState.model_validate_json(row[0])
             feature_store.set_state(state)
             count += 1
         except Exception as e:

@@ -97,12 +97,12 @@ def get_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
-class ConfigPatch(BaseModel):
+class RuntimeConfigPatch(BaseModel):
     updates: dict[str, str]
 
 
 @router.patch("/config", include_in_schema=False)
-def patch_config(body: ConfigPatch) -> dict:
+def patch_config(body: RuntimeConfigPatch) -> dict:
     """Persist config key/value updates to SQLite and invalidate the in-process cache."""
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(settings.db_path) as conn:

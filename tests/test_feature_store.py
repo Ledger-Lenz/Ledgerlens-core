@@ -252,8 +252,8 @@ def test_derive_feature_vector_volume_ratio(initial_state):
 
 def test_serialize_deserialize_state(initial_state):
     """Test JSON serialization/deserialization of WalletFeatureState."""
-    json_str = initial_state.model_dump_json_compat()
-    deserialized = WalletFeatureState.model_validate_json_compat(json_str)
+    json_str = initial_state.model_dump_json()
+    deserialized = WalletFeatureState.model_validate_json(json_str)
     
     assert deserialized.wallet == initial_state.wallet
     assert deserialized.asset_pair == initial_state.asset_pair
