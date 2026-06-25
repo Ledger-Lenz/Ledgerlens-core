@@ -33,6 +33,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
+from api.admin_router import router as admin_router
+from api.export_router import router as export_router
+from api.batch_router import router as batch_router
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -84,7 +87,7 @@ _models: dict = {}
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    """Load trained models at startup; release nothing at shutdown."""
+    """Load trained models at startup; close WebSocket connections at shutdown."""
     global _models
     try:
         from detection.model_inference import load_models
@@ -94,6 +97,8 @@ async def _lifespan(application: FastAPI):
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
     yield
+    from api.ws_router import manager as _ws_manager
+    await _ws_manager.close_all()
 
 
 app = FastAPI(
@@ -111,37 +116,16 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-# Sunset date for legacy (non-prefixed) paths: 90 days from initial deployment.
-_DEPRECATION_DATE = "Wed, 24 Sep 2026 00:00:00 GMT"
-_SUNSET_DATE = "Wed, 24 Sep 2026 00:00:00 GMT"
+from api.ws_router import router as _ws_router  # noqa: E402
+app.include_router(_ws_router)
 
-# Paths that are legacy aliases and should carry Deprecation headers.
-# These are the bare paths (without /v1 prefix).
-_LEGACY_PATH_PREFIXES = (
-    "/health", "/scores", "/wallets", "/alerts", "/assets",
-    "/rings", "/correlations", "/amm", "/path-payments",
-    "/feedback", "/admin", "/webhooks", "/disputes", "/governance", "/compliance",
-)
+app.include_router(admin_router)
 
 
-class DeprecationMiddleware(BaseHTTPMiddleware):
-    """Adds Deprecation and Sunset headers to legacy (non-/v1/) API paths."""
-
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        path = request.url.path
-        # Only tag paths that are legacy aliases (not already under /v1/)
-        if not path.startswith("/v1/") and any(path.startswith(p) for p in _LEGACY_PATH_PREFIXES):
-            response.headers["Deprecation"] = _DEPRECATION_DATE
-            response.headers["Sunset"] = _SUNSET_DATE
-            response.headers["Link"] = f'</v1{path}>; rel="successor-version"'
-        return response
+app.include_router(batch_router)
 
 
-app.add_middleware(DeprecationMiddleware)
-
-# All versioned routes are registered on this router and mounted at /v1.
-v1_router = APIRouter(prefix="/v1")
+app.include_router(export_router)
 
 
 class WebhookCreate(BaseModel):

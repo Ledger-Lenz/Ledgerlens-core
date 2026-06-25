@@ -1,4 +1,4 @@
-.PHONY: install test lint generate-data train serve
+.PHONY: install test lint mutation-test generate-data train serve
 
 install:
 	pip install -r requirements.txt
@@ -8,6 +8,11 @@ test:
 
 lint:
 	ruff check .
+
+mutation-test:
+	mutmut run --paths-to-mutate detection/benford_engine.py,detection/graph_engine.py,detection/model_inference.py
+	@echo "=== Mutation Results ==="
+	mutmut results --all
 
 generate-data:
 	python3 cli.py generate-data

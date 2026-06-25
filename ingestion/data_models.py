@@ -10,8 +10,9 @@ for the cross-repo data contract.
 
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 
 class Asset(BaseModel):
@@ -109,3 +110,30 @@ class BridgeTransfer(BaseModel):
     tx_hash_evm: str
     tx_hash_stellar: str | None = None
     timestamp: datetime
+
+    # Integrity verification fields (populated by BridgeEventVerifier)
+    canonical_hash: str | None = None
+    verification_status: str = "disabled"
+    verified_at: datetime | None = None
+
+    # Raw log fields used for receipt verification — stored as private attrs so
+    # they are excluded from serialisation and the DB schema.
+    _log_index: int = PrivateAttr(default=0)
+    _topics: list = PrivateAttr(default_factory=list)
+    _data: str = PrivateAttr(default="")
+    _block_hash: str = PrivateAttr(default="")
+
+    def model_post_init(self, __context: Any) -> None:
+        # Private attributes are set via keyword after normal init via __init__ below.
+        pass
+
+    def __init__(self, **data: Any) -> None:
+        log_index = data.pop("_log_index", 0)
+        topics = data.pop("_topics", [])
+        raw_data = data.pop("_data", "")
+        block_hash = data.pop("_block_hash", "")
+        super().__init__(**data)
+        self._log_index = log_index
+        self._topics = topics
+        self._data = raw_data
+        self._block_hash = block_hash
