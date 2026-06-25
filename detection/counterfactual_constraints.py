@@ -141,14 +141,16 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _decreasable("avg_path_hop_count"),
     _decreasable("path_cycle_volume_ratio"),
 
-    # --- Multi-hop path-payment cycle features (4) --------------------------
-    # All four rise with cyclic self-dealing routed across separate path
+    # --- Multi-hop path-payment cycle features (6) --------------------------
+    # All six rise with cyclic self-dealing routed across separate path
     # payments, so they are only ever lowerable (floored at 0.0 for the
     # no-cycle default).
     _decreasable("path_cycle_count_24h"),
     _decreasable("path_cycle_xlm_volume_24h"),
     _decreasable("max_cycle_length"),
     _decreasable("cycle_asset_diversity"),
+    _decreasable("path_cycle_count"),
+    _decreasable("path_cycle_recovery_ratio"),
 
     # --- Sandwich-attack features (2) ---------------------------------------
     _decreasable("sandwich_ratio"),
