@@ -3,6 +3,16 @@ name = "ledgerlens-core"
 version = "0.1.0"
 description = "Benford's Law + ensemble ML wash-trading detection engine for the Stellar DEX"
 requires-python = ">=3.10"
+authors = [
+    { name = "LedgerLens Contributors" },
+]
+license = { text = "MIT" }
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/Ledger-Lenz/Ledgerlens-core"
+Repository = "https://github.com/Ledger-Lenz/Ledgerlens-core.git"
+Changelog = "https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/CHANGELOG.md"
 
 [project.scripts]
 ledgerlens = "cli:app"
@@ -20,6 +30,32 @@ filterwarnings = [
     "ignore:`sklearn.utils.parallel.delayed`.*:UserWarning",
 ]
 
+[tool.mutmut]
+paths = ["detection/benford_engine.py", "detection/graph_engine.py", "detection/model_inference.py"]
+tests_dir = "tests"
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# E402: module-level import not at top (conditional imports in detection/)
+ignore = ["E402"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pre-existing issues in files not modified by #197-#200
+"detection/feature_engineering.py" = ["F811", "F821"]
+"detection/model_inference.py"     = ["F811", "F821"]
+"detection/model_training.py"      = ["F821"]
+"detection/oracle_node.py"         = ["F401"]
+"detection/red_team/evasion_logger.py" = ["F401"]
+"detection/soroban_publisher.py"   = ["F401"]
+"detection/storage.py"             = ["F811"]
+"detection/zk_prover.py"           = ["F401"]
+"detection/zk_verifier.py"         = ["F401"]
+"run_pipeline.py"                  = ["F821", "F841"]
+"tests/test_adaptive_reweighter.py" = ["F401"]
+"tests/test_feature_store_redis.py" = ["F401"]
+"tests/test_oracle_node.py"        = ["F401"]
+"tests/test_red_team_attacker.py"  = ["F401"]
+"tests/test_zk_commitment.py"      = ["F401"]

@@ -2,7 +2,23 @@
 
 All notable changes to `ledgerlens-core` are documented in this file.
 
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Releases are automated via [release-please](https://github.com/google-github-actions/release-please-action);
+merging a release PR (created by the `release-please` GitHub Action) tags the
+commit, generates this file, and publishes a tagged Docker image to GHCR.
+
 ## Unreleased
+
+### Added
+- **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
+- **#147** API endpoints `POST /scores/{wallet}/commit` and `POST /scores/verify-threshold` for ZK threshold proofs.
+- **#150** Full governance proposal engine (`detection/governance.py`): `GovernanceEngine` with `submit_proposal`, `cast_vote`, `tally_proposal`, `close_proposal`, `execute_proposal`, `close_expired`; `SettingsReloader` with compile-time allowlist and atomic `.env` write.
+- **#150** SQLite migration 13: `governance_proposals`, `governance_votes`, `governance_committee` tables.
+- **#150** Governance REST endpoints: `POST/GET /governance/proposals`, `GET /governance/proposals/{id}`, `POST /governance/proposals/{id}/vote`, `POST /governance/proposals/{id}/execute` (admin-key gated).
+- **#150** `cli.py governance-close-expired` command.
+- `docs/governance_protocol.md` updated to reflect full implemented lifecycle.
 
 ### Added
 - Synthetic SDEX trade generator (`ingestion/synthetic_data.py`) with
@@ -14,33 +30,10 @@ All notable changes to `ledgerlens-core` are documented in this file.
 - `ledgerlens` CLI (`cli.py`): `generate-data`, `train`, `score`, `serve`.
 - Retrying HTTP client for Horizon API calls (`ingestion/http_client.py`).
 - Dockerfile, docker-compose, and GitHub Actions CI workflow.
-- Kubernetes Helm chart (`helm/ledgerlens/`) with templates for API
-  Deployment, Ingestion Worker, HPA, Service, Ingress, ConfigMap, Secret,
-  PersistentVolumeClaim, and ServiceAccount. Liveness/readiness probes
-  on the API deployment (`GET /health` and `/health/ready`).
-  Documented in `docs/kubernetes_deployment.md`.
-- Token-bucket rate limiter (`ingestion/rate_limiter.py`) with sync/async
-  `acquire`, non-blocking `try_acquire`, and `set_rate`. Integrated into
-  `HorizonStreamer` as an async SSE consumer class.
-- `BackpressureController` that pauses SSE consumption when the downstream
-  queue exceeds a configurable high-watermark (default 1000) and resumes at
-  a low-watermark (default 500).
-- `AdaptiveRateController` that halves the current rate on HTTP 429 and
-  restores linearly over `RATE_RESTORE_SECONDS` (default 60).
-- `HORIZON_RATE_LIMIT`, `HORIZON_RATE_BUCKET_CAPACITY`,
-  `HORIZON_QUEUE_HIGH_WATERMARK`, `HORIZON_QUEUE_LOW_WATERMARK`,
-  `RATE_RESTORE_SECONDS` configuration variables in `config/settings.py`.
-- `GET /health/ready` readiness probe endpoint.
-- `GET /stream/rate-limiter` admin-gated endpoint returning current rate,
-  bucket level, backpressure state, and queue size.
-- `ComplianceReportGenerator` (`detection/compliance_report.py`) producing
-  self-contained HTML audit reports (and optional PDF via weasyprint) with
-  executive summary, top-5 SHAP features with plain-English descriptions,
-  Benford analysis, trade timeline, model version, and data provenance.
-- `cli.py report generate --wallet G... --date YYYY-MM-DD --output report.html`
-  subcommand for generating compliance audit reports.
-- `cli.py completion --shell {bash,zsh,fish}` subcommand printing shell
-  completion scripts. Documented in `docs/cli_reference.md`.
+- `ledgerlens --version` / `-V` flag that reports the current version from
+  `pyproject.toml`.
+- `release-please` GitHub Action workflow for automated semantic versioning,
+  changelog generation, and Docker image publishing to GHCR.
 
 ### Fixed
 - `detection/shap_explainer.py` updated for the current SHAP `TreeExplainer`

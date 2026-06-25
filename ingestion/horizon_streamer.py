@@ -3,37 +3,40 @@
 Streams the `/trades` endpoint and yields `Trade` objects as ledgers close.
 Downstream, `run_pipeline.py` feeds these into `detection.feature_engineering`.
 
-The module provides two interfaces:
-
-1. **Synchronous** (:func:`stream_trades`, :func:`stream_trades_with_cursor`) —
-   the original blocking iterator API, kept for backward compatibility.
-2. **Async** (:class:`HorizonStreamer`) — an asyncio-based class that integrates
-   token-bucket rate limiting, backpressure control, and adaptive rate reduction
-   on HTTP 429 responses.
+Connection attempts are gated by `horizon_circuit`: after
+`HORIZON_FAILURE_THRESHOLD` consecutive connection/stream failures, the
+breaker opens and `stream_trades_with_cursor` raises `CircuitOpenError`
+immediately instead of continuing to retry, so a sustained Horizon outage
+fails fast rather than exhausting connection attempts. Callers that want to
+keep polling across an outage should catch `CircuitOpenError` and retry
+after a delay -- the breaker will allow exactly one probe connection once
+`HORIZON_RECOVERY_TIMEOUT_SECONDS` has elapsed.
 """
 
-from __future__ import annotations
-
-import asyncio
-import json
 import logging
-from collections.abc import AsyncIterator, Iterator
-from typing import Optional
+import time
+from collections.abc import Iterator
 
 import httpx
 import sseclient
 
 from config.settings import settings
 from ingestion.data_models import Asset, Trade, TradeType
-from ingestion.rate_limiter import (
-    AdaptiveRateController,
-    BackpressureController,
-    TokenBucket,
+from utils.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
+
+logger = logging.getLogger(__name__)
+
+HORIZON_FAILURE_THRESHOLD = 5
+HORIZON_RECOVERY_TIMEOUT_SECONDS = 60.0
+# Delay between reconnect attempts while the circuit is still CLOSED, so a
+# string of immediate failures doesn't itself become a connection storm.
+_RECONNECT_BACKOFF_SECONDS = 1.0
+
+horizon_circuit = CircuitBreaker(
+    name="horizon",
+    failure_threshold=HORIZON_FAILURE_THRESHOLD,
+    recovery_timeout=HORIZON_RECOVERY_TIMEOUT_SECONDS,
 )
-
-logger = logging.getLogger("ledgerlens.horizon_streamer")
-
-HTTP429Error = httpx.HTTPStatusError
 
 
 def _parse_trade(record: dict) -> Trade:
@@ -91,17 +94,44 @@ def stream_trades_with_cursor(cursor: str = "now") -> Iterator[tuple[Trade, str]
 
     The second element is the SSE event ID (Horizon paging token) which can
     be persisted and passed back as ``cursor`` to resume from that point.
+
+    Reconnects automatically on a dropped connection while
+    `horizon_circuit` is CLOSED or HALF_OPEN. Once the circuit is OPEN
+    (`HORIZON_FAILURE_THRESHOLD` consecutive failures), raises
+    `CircuitOpenError` immediately instead of attempting another
+    connection.
     """
-    url = f"{settings.horizon_stream_url}/trades?cursor={cursor}"
     headers = {"Accept": "text/event-stream"}
 
-    client = sseclient.SSEClient(url, headers=headers)
-    for event in client:
-        if not event.data:
-            continue
-        record = _decode_event(event.data)
-        if record is not None:
-            yield _parse_trade(record), event.id or cursor
+    while True:
+        if not horizon_circuit.allow_request():
+            raise CircuitOpenError(horizon_circuit.name)
+
+        url = f"{settings.horizon_stream_url}/trades?cursor={cursor}"
+        try:
+            client = sseclient.SSEClient(url, headers=headers)
+            for event in client:
+                if not event.data:
+                    continue
+                record = _decode_event(event.data)
+                if record is not None:
+                    trade = _parse_trade(record)
+                    cursor = event.id or cursor
+                    horizon_circuit.record_success()
+                    yield trade, cursor
+            # The SSE stream ended without raising -- treat as a successful
+            # connection that simply closed, not a failure.
+            return
+        except Exception:
+            horizon_circuit.record_failure()
+            if horizon_circuit.state is CircuitState.OPEN:
+                raise CircuitOpenError(horizon_circuit.name)
+            logger.warning(
+                "horizon_streamer: connection failed, retrying in %.1fs (cursor=%s)",
+                _RECONNECT_BACKOFF_SECONDS,
+                cursor,
+            )
+            time.sleep(_RECONNECT_BACKOFF_SECONDS)
 
 
 def _decode_event(data: str) -> dict | None:

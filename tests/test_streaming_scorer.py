@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 from detection.feature_engineering import FEATURE_NAMES
 from detection.risk_score import RiskScore
 from ingestion.data_models import Asset, Trade
+from tests.factories import TradeFactory
 
 
 def _make_trade(
@@ -19,7 +20,7 @@ def _make_trade(
     idx: int = 0,
     ts: datetime | None = None,
 ) -> Trade:
-    return Trade(
+    return TradeFactory.trade(
         id=f"trade-{idx}",
         ledger_close_time=ts or datetime(2024, 1, 1, 12, 0, 0),
         base_account=base_account,

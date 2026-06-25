@@ -19,7 +19,7 @@ def test_robustness_endpoint_no_report():
     client = TestClient(app)
     try:
         # when no report exists, return 404
-        resp = client.get("/admin/robustness-report")
+        resp = client.get("/v1/admin/robustness-report")
         assert resp.status_code == 404 or resp.status_code == 200
     finally:
         app.dependency_overrides.clear()
@@ -42,7 +42,7 @@ def test_robustness_endpoint_with_report():
         df = make_df()
         compute_robustness_report(models, df, n_samples=10, epsilon=0.05, steps=3, seed=2)
 
-        resp = client.get("/admin/robustness-report")
+        resp = client.get("/v1/admin/robustness-report")
         assert resp.status_code == 200
         data = resp.json()
         assert "model_version" in data
@@ -103,17 +103,46 @@ def test_health(client, tmp_path, monkeypatch):
 
     object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
 
-    response = client.get("/health")
+    response = client.get("/v1/health")
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
     assert body["db"] == "ok"
     assert body["models"] == "ok"
+    assert body["circuits"] == {"horizon": "closed", "feature_store_redis": "closed"}
+
+
+def test_health_open_circuit_is_degraded_not_failed(client, tmp_path, monkeypatch):
+    """An OPEN circuit breaker should mark /health "degraded" while still
+    returning 200 -- the service is serving in reduced-functionality mode,
+    not failed (DB/model failures are what return 503)."""
+    import config.settings as settings_module
+    import ingestion.horizon_streamer as horizon_streamer
+    from detection.model_inference import _MODEL_FILENAMES
+    from utils.circuit_breaker import CircuitBreaker
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    for filename in _MODEL_FILENAMES.values():
+        (model_dir / filename).write_bytes(b"stub")
+    object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
+    # monkeypatch swaps in a throwaway breaker and restores the real one at
+    # teardown, so this never leaks an OPEN circuit into other tests.
+    open_circuit = CircuitBreaker(name="horizon", failure_threshold=1, recovery_timeout=60)
+    open_circuit.record_failure()
+    monkeypatch.setattr(horizon_streamer, "horizon_circuit", open_circuit)
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["circuits"]["horizon"] == "open"
 
 
 
 def test_list_scores_empty(client):
-    response = client.get("/scores")
+    response = client.get("/v1/scores")
     assert response.status_code == 200
     assert response.json() == []
 
@@ -124,11 +153,11 @@ def test_list_scores_and_filter_by_min_score(client, monkeypatch):
 
     save_scores([_score("G" + "A" * 55, "XLM/USDC", 80), _score("G" + "B" * 55, "XLM/USDC", 20)], storage_module.settings.db_path)
 
-    response = client.get("/scores")
+    response = client.get("/v1/scores")
     assert response.status_code == 200
     assert len(response.json()) == 2
 
-    response = client.get("/scores?min_score=50")
+    response = client.get("/v1/scores?min_score=50")
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
@@ -146,7 +175,7 @@ def test_list_scores_filters_by_benford_flag(client):
         storage_module.settings.db_path,
     )
 
-    response = client.get("/scores?benford_flag=true")
+    response = client.get("/v1/scores?benford_flag=true")
     assert response.status_code == 200
     body = response.json()
     assert [item["wallet"] for item in body] == ["G" + "B" * 55]
@@ -163,7 +192,7 @@ def test_list_scores_filters_by_ml_flag_false(client):
         storage_module.settings.db_path,
     )
 
-    response = client.get("/scores?ml_flag=false")
+    response = client.get("/v1/scores?ml_flag=false")
     assert response.status_code == 200
     body = response.json()
     assert [item["wallet"] for item in body] == ["G" + "N" * 55]
@@ -181,7 +210,7 @@ def test_list_scores_combines_flag_filters_and_min_score(client):
         storage_module.settings.db_path,
     )
 
-    response = client.get("/scores?min_score=50&benford_flag=true&ml_flag=false")
+    response = client.get("/v1/scores?min_score=50&benford_flag=true&ml_flag=false")
     assert response.status_code == 200
     body = response.json()
     assert [item["wallet"] for item in body] == ["G" + "M" * 55]
@@ -198,7 +227,7 @@ def test_list_scores_sorts_by_confidence(client):
         storage_module.settings.db_path,
     )
 
-    response = client.get("/scores?sort_by=confidence")
+    response = client.get("/v1/scores?sort_by=confidence")
     assert response.status_code == 200
     body = response.json()
     assert [item["wallet"] for item in body] == ["G" + "H" * 55, "G" + "L" * 55]
@@ -216,19 +245,19 @@ def test_list_scores_sorts_by_timestamp(client):
         storage_module.settings.db_path,
     )
 
-    response = client.get("/scores?sort_by=timestamp")
+    response = client.get("/v1/scores?sort_by=timestamp")
     assert response.status_code == 200
     body = response.json()
     assert [item["wallet"] for item in body] == ["G" + "N" * 55, "G" + "O" * 55]
 
 
 def test_list_scores_rejects_invalid_sort_by(client):
-    response = client.get("/scores?sort_by=invalid")
+    response = client.get("/v1/scores?sort_by=invalid")
     assert response.status_code == 422
 
 
 def test_wallet_scores_not_found(client):
-    response = client.get("/scores/G" + "A" * 55)
+    response = client.get("/v1/scores/G" + "A" * 55)
     assert response.status_code == 404
 
 
@@ -237,7 +266,7 @@ def test_wallet_scores_found(client):
 
     save_scores([_score("G" + "A" * 55, "XLM/USDC", 80)], storage_module.settings.db_path)
 
-    response = client.get("/scores/G" + "A" * 55)
+    response = client.get("/v1/scores/G" + "A" * 55)
     assert response.status_code == 200
     body = response.json()
     assert "scores" in body
@@ -248,43 +277,43 @@ def test_wallet_scores_found(client):
 
 def test_wallet_scores_validates_format(client):
     valid_address = "G" + "A" * 55
-    response = client.get(f"/scores/{valid_address}")
+    response = client.get(f"/v1/scores/{valid_address}")
     assert response.status_code in (200, 404)
 
 
 def test_wallet_scores_rejects_too_short(client):
-    response = client.get("/scores/G" + "A" * 54)
+    response = client.get("/v1/scores/G" + "A" * 54)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
 def test_wallet_scores_rejects_too_long(client):
-    response = client.get("/scores/G" + "A" * 56)
+    response = client.get("/v1/scores/G" + "A" * 56)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
 def test_wallet_scores_rejects_non_g_start(client):
-    response = client.get("/scores/" + "A" * 56)
+    response = client.get("/v1/scores/" + "A" * 56)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
 def test_wallet_scores_rejects_lowercase(client):
-    response = client.get("/scores/G" + "a" * 55)
+    response = client.get("/v1/scores/G" + "a" * 55)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
 def test_wallet_scores_rejects_invalid_character(client):
     address = "G" + "A" * 27 + "0" + "A" * 27
-    response = client.get(f"/scores/{address}")
+    response = client.get(f"/v1/scores/{address}")
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
 def test_wallet_scores_rejects_empty_string(client):
-    response = client.get("/scores/%20")
+    response = client.get("/v1/scores/%20")
     assert response.status_code == 400
 
 
@@ -312,7 +341,7 @@ def test_wallet_scores_cross_chain_links_present_when_bridge_data_exists(client)
         timestamp=datetime.now(timezone.utc),
     ), db_path=db)
 
-    response = client.get(f"/scores/{stellar_wallet}")
+    response = client.get(f"/v1/scores/{stellar_wallet}")
     assert response.status_code == 200
     body = response.json()
 
@@ -332,7 +361,7 @@ def test_alerts_filters_by_threshold(client):
 
     save_scores([_score("G" + "A" * 55, "XLM/USDC", 80), _score("G" + "B" * 55, "XLM/USDC", 20)], storage_module.settings.db_path)
 
-    response = client.get("/alerts")
+    response = client.get("/v1/alerts")
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
@@ -347,7 +376,7 @@ def test_asset_risk_ranking(client):
         storage_module.settings.db_path,
     )
 
-    response = client.get("/assets/risk-ranking")
+    response = client.get("/v1/assets/risk-ranking")
     assert response.status_code == 200
     body = response.json()
     assert body[0]["asset_pair"] == "XLM/USDC"
@@ -362,7 +391,7 @@ def test_asset_risk_ranking(client):
 
 def test_create_webhook(client):
     response = client.post(
-        "/webhooks",
+        "/v1/webhooks",
         json={"url": "https://example.com/webhook", "secret": "whsec_test", "min_score": 70},
     )
     assert response.status_code == 201
@@ -373,7 +402,7 @@ def test_create_webhook(client):
 
 def test_create_webhook_rejects_http(client):
     response = client.post(
-        "/webhooks",
+        "/v1/webhooks",
         json={"url": "http://evil.com/webhook", "secret": "whsec_test"},
     )
     assert response.status_code == 422
@@ -381,10 +410,10 @@ def test_create_webhook_rejects_http(client):
 
 def test_list_webhooks(client):
     client.post(
-        "/webhooks",
+        "/v1/webhooks",
         json={"url": "https://example.com/webhook", "secret": "whsec_test"},
     )
-    response = client.get("/webhooks")
+    response = client.get("/v1/webhooks")
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
@@ -394,37 +423,37 @@ def test_list_webhooks(client):
 
 
 def test_list_webhooks_empty(client):
-    response = client.get("/webhooks")
+    response = client.get("/v1/webhooks")
     assert response.status_code == 200
     assert response.json() == []
 
 
 def test_delete_webhook(client):
     resp = client.post(
-        "/webhooks",
+        "/v1/webhooks",
         json={"url": "https://example.com/webhook", "secret": "whsec_test"},
     )
     sid = resp.json()["subscriber_id"]
-    response = client.delete(f"/webhooks/{sid}")
+    response = client.delete(f"/v1/webhooks/{sid}")
     assert response.status_code == 200
     assert response.json() == {"status": "deactivated"}
-    assert len(client.get("/webhooks").json()) == 0
+    assert len(client.get("/v1/webhooks").json()) == 0
 
 
 def test_delete_webhook_not_found(client):
-    response = client.delete("/webhooks/nonexistent")
+    response = client.delete("/v1/webhooks/nonexistent")
     assert response.status_code == 404
 
 
 def test_dead_letters_endpoint(client):
-    response = client.get("/webhooks/dead-letters")
+    response = client.get("/v1/webhooks/dead-letters")
     assert response.status_code == 200
     assert response.json() == []
 
 
 def test_create_webhook_with_filters(client):
     response = client.post(
-        "/webhooks",
+        "/v1/webhooks",
         json={
             "url": "https://example.com/webhook",
             "secret": "whsec_test",
@@ -434,7 +463,7 @@ def test_create_webhook_with_filters(client):
         },
     )
     assert response.status_code == 201
-    body = client.get("/webhooks").json()
+    body = client.get("/v1/webhooks").json()
     assert len(body) == 1
     assert body[0]["wallet_filter"] == "G" + "A" * 55 + ",G" + "D" * 55
     assert body[0]["asset_pair_filter"] == "XLM/USDC"
@@ -453,7 +482,7 @@ def test_list_scores_accepts_limit_offset(client):
         storage_module.settings.db_path,
     )
 
-    resp = client.get("/scores?limit=2&offset=1")
+    resp = client.get("/v1/scores?limit=2&offset=1")
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 2
@@ -475,7 +504,7 @@ def test_alerts_accepts_limit_offset(client):
         storage_module.settings.db_path,
     )
 
-    resp = client.get("/alerts?limit=2&offset=0")
+    resp = client.get("/v1/alerts?limit=2&offset=0")
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 2
@@ -483,13 +512,13 @@ def test_alerts_accepts_limit_offset(client):
 
 
 def test_limit_offset_out_of_range_returns_422(client):
-    resp = client.get("/scores?limit=0&offset=0")
+    resp = client.get("/v1/scores?limit=0&offset=0")
     assert resp.status_code == 422
 
-    resp = client.get("/scores?limit=1001&offset=0")
+    resp = client.get("/v1/scores?limit=1001&offset=0")
     assert resp.status_code == 422
 
-    resp = client.get("/scores?limit=10&offset=-1")
+    resp = client.get("/v1/scores?limit=10&offset=-1")
     assert resp.status_code == 422
 
 
@@ -499,7 +528,7 @@ def test_limit_offset_out_of_range_returns_422(client):
 
 
 def test_correlations_empty(client):
-    resp = client.get("/correlations")
+    resp = client.get("/v1/correlations")
     assert resp.status_code == 200
     assert resp.json() == []
 
@@ -514,7 +543,7 @@ def test_correlations_returns_stored_data(client, monkeypatch):
         db_path=storage_module.settings.db_path,
     )
 
-    resp = client.get("/correlations")
+    resp = client.get("/v1/correlations")
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 1
@@ -545,7 +574,7 @@ def test_correlations_returns_only_latest_run(client, monkeypatch):
         db_path=db,
     )
 
-    resp = client.get("/correlations")
+    resp = client.get("/v1/correlations")
     body = resp.json()
     pairs = {(r["pair_a"], r["pair_b"]) for r in body}
     assert ("XLM/USDC", "XLM/yXLM") in pairs
@@ -560,7 +589,7 @@ def test_correlations_returns_only_latest_run(client, monkeypatch):
 def test_rings_empty(client):
     import detection.storage as storage_module
     storage_module.init_db()
-    resp = client.get("/rings")
+    resp = client.get("/v1/rings")
     assert resp.status_code == 200
     assert resp.json() == []
 
@@ -582,7 +611,7 @@ def test_rings_returns_stored_data(client):
         db_path=storage_module.settings.db_path,
     )
 
-    resp = client.get("/rings")
+    resp = client.get("/v1/rings")
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 1
@@ -591,3 +620,48 @@ def test_rings_returns_stored_data(client):
     assert row["total_volume"] == 300.0
     assert row["cycle_volume"] == 100.0
     assert row["detected_at"]
+
+
+# ---------------------------------------------------------------------------
+# API versioning — legacy redirect and deprecation header tests
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_path_redirects_to_v1(client):
+    """Bare /health redirects to /v1/health with 302."""
+    response = client.get("/health", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"].endswith("/v1/health")
+
+
+def test_legacy_path_has_deprecation_headers(client):
+    """/health redirect response carries Deprecation and Sunset headers."""
+    response = client.get("/health", follow_redirects=False)
+    assert "Deprecation" in response.headers
+    assert "Sunset" in response.headers
+    assert "Link" in response.headers
+    assert "/v1/health" in response.headers["Link"]
+
+
+def test_v1_path_has_no_deprecation_headers(client, tmp_path, monkeypatch):
+    """Direct /v1/health calls do NOT carry Deprecation headers."""
+    import config.settings as settings_module
+    from detection.model_inference import _MODEL_FILENAMES
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    for filename in _MODEL_FILENAMES.values():
+        (model_dir / filename).write_bytes(b"stub")
+    object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+
+    response = client.get("/v1/health")
+    assert response.status_code == 200
+    assert "Deprecation" not in response.headers
+
+
+def test_legacy_scores_redirects(client):
+    """/scores redirects to /v1/scores preserving query string."""
+    response = client.get("/scores?min_score=50", follow_redirects=False)
+    assert response.status_code == 302
+    assert "/v1/scores" in response.headers["location"]
+    assert "min_score=50" in response.headers["location"]

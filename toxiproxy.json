@@ -1,0 +1,20 @@
+[
+  {
+    "name": "horizon_proxy",
+    "listen": "0.0.0.0:18000",
+    "upstream": "horizon.stellar.org:443",
+    "enabled": true
+  },
+  {
+    "name": "horizon_partition",
+    "listen": "0.0.0.0:18001",
+    "upstream": "horizon.stellar.org:443",
+    "enabled": true
+  },
+  {
+    "name": "redis_proxy",
+    "listen": "0.0.0.0:16379",
+    "upstream": "redis:6379",
+    "enabled": true
+  }
+]

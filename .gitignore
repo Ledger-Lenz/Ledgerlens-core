@@ -24,3 +24,6 @@ models/*.joblib
 # Editors
 .vscode/
 .idea/
+
+# Project specific
+somzilla.md
