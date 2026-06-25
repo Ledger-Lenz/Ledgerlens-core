@@ -67,6 +67,10 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     *(_decreasable(f"benford_chi_square_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
     *(_decreasable(f"benford_mad_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
     *(_decreasable(f"benford_max_zscore_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+    # benford_window_expanded_* are observational flags set when the Benford
+    # analysis had to widen its look-back window due to sparse data. The wallet
+    # cannot undo past sparsity, so these flags are immutable.
+    *(_immutable(f"benford_window_expanded_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
 
     # --- Trade pattern features (4) -----------------------------------------
     # All four are [0, 1] ratios where a higher value is a hallmark of
