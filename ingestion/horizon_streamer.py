@@ -13,16 +13,29 @@ after a delay -- the breaker will allow exactly one probe connection once
 `HORIZON_RECOVERY_TIMEOUT_SECONDS` has elapsed.
 """
 
+import asyncio
+import json
 import logging
 import time
-from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from collections.abc import AsyncIterator, Iterator
+from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
 import sseclient
 
 from config.settings import settings
+from ingestion.checkpoint import (
+    CursorCheckpoint,
+    FlushPolicy,
+    resolve_checkpoint_path,
+    validate_cursor,
+)
 from ingestion.data_models import Asset, Trade, TradeType
+from ingestion.rate_limiter import (
+    AdaptiveRateController,
+    BackpressureController,
+    TokenBucket,
+)
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
 
 logger = logging.getLogger(__name__)
@@ -93,7 +106,10 @@ def stream_trades(cursor: str = "now") -> Iterator[Trade]:
         yield trade
 
 
-def stream_trades_with_cursor(cursor: str = "now") -> Iterator[tuple[Trade, str]]:
+def stream_trades_with_cursor(
+    cursor: str = "now",
+    checkpoint: CursorCheckpoint | None = None,
+) -> Iterator[tuple[Trade, str]]:
     """Yield ``(Trade, cursor)`` tuples as trades occur on the SDEX.
 
     The second element is the SSE event ID (Horizon paging token) which can
@@ -126,7 +142,19 @@ def stream_trades_with_cursor(cursor: str = "now") -> Iterator[tuple[Trade, str]
             # The SSE stream ended without raising -- treat as a successful
             # connection that simply closed, not a failure.
             return
-        except Exception:
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code in (404, 410) and cursor != "now":
+                logger.warning(
+                    "Horizon rejected cursor %s with HTTP %d; falling back to now",
+                    cursor,
+                    status_code,
+                )
+                if checkpoint is not None:
+                    checkpoint.delete()
+                cursor = "now"
+                continue
             horizon_circuit.record_failure()
             if horizon_circuit.state is CircuitState.OPEN:
                 raise CircuitOpenError(horizon_circuit.name)
@@ -180,20 +208,46 @@ class HorizonStreamer:
     def __init__(
         self,
         queue: asyncio.Queue,
-        cursor: str = "now",
+        cursor: str | None = None,
         rate_limit: Optional[float] = None,
         bucket_capacity: Optional[float] = None,
         high_watermark: Optional[int] = None,
         low_watermark: Optional[int] = None,
         restore_seconds: Optional[float] = None,
+        checkpoint: CursorCheckpoint | None = None,
+        flush_policy: FlushPolicy | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         rate_limit = rate_limit if rate_limit is not None else settings.horizon_rate_limit
         bucket_capacity = bucket_capacity if bucket_capacity is not None else settings.horizon_rate_bucket_capacity
         high_watermark = high_watermark if high_watermark is not None else settings.horizon_queue_high_watermark
         low_watermark = low_watermark if low_watermark is not None else settings.horizon_queue_low_watermark
         restore_seconds = restore_seconds if restore_seconds is not None else settings.rate_restore_seconds
+        if checkpoint is None:
+            checkpoint_path = resolve_checkpoint_path(
+                settings.cursor_checkpoint_path, settings.data_dir
+            )
+            checkpoint = CursorCheckpoint(checkpoint_path)
+        stored_cursor = checkpoint.load()
+        if cursor is not None:
+            self._cursor = validate_cursor(cursor)
+            logger.info("Starting fresh from cursor %s", self._cursor)
+        elif stored_cursor is not None:
+            self._cursor = stored_cursor
+            logger.info("Resuming from cursor %s", self._cursor)
+        else:
+            self._cursor = validate_cursor(settings.horizon_default_cursor)
+            logger.info("Starting fresh from cursor %s", self._cursor)
         self._queue = queue
-        self._cursor = cursor
+        self._checkpoint = checkpoint
+        self._flush_policy = flush_policy or FlushPolicy(
+            max_events=settings.cursor_flush_events,
+            max_seconds=settings.cursor_flush_seconds,
+        )
+        self._clock = clock
+        self._events_since_flush = 0
+        self._last_flush_time = clock()
+        self._last_ledger_sequence: int | None = None
         self._bucket = TokenBucket(rate=rate_limit, capacity=bucket_capacity)
         self._backpressure = BackpressureController(
             queue, high_watermark=high_watermark, low_watermark=low_watermark
@@ -225,6 +279,36 @@ class HorizonStreamer:
         self._client = client
         return client
 
+    def _record_processed_event(self, record: dict) -> None:
+        event_cursor = record.get("paging_token") or record.get("id")
+        if not isinstance(event_cursor, str):
+            logger.warning("Horizon event has no paging token; checkpoint not advanced")
+            return
+        try:
+            self._cursor = validate_cursor(event_cursor)
+        except ValueError as exc:
+            logger.warning("Ignoring event with malformed paging token: %s", exc)
+            return
+        ledger = record.get("ledger") or record.get("ledger_sequence")
+        try:
+            self._last_ledger_sequence = int(ledger) if ledger is not None else None
+        except (TypeError, ValueError):
+            self._last_ledger_sequence = None
+        self._events_since_flush += 1
+        now = self._clock()
+        if self._flush_policy.should_flush(
+            self._events_since_flush, self._last_flush_time, now
+        ):
+            self._checkpoint.save(self._cursor, self._last_ledger_sequence)
+            self._events_since_flush = 0
+            self._last_flush_time = now
+
+    def _flush_checkpoint(self) -> None:
+        if self._events_since_flush:
+            self._checkpoint.save(self._cursor, self._last_ledger_sequence)
+            self._events_since_flush = 0
+            self._last_flush_time = self._clock()
+
     async def stream_events(self) -> AsyncIterator[dict]:
         """Yield raw parsed SSE data dicts, handling reconnection and rate limiting."""
         while True:
@@ -240,6 +324,17 @@ class HorizonStreamer:
                             if record is not None:
                                 await self._bucket.async_acquire()
                                 yield record
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (404, 410) and self._cursor != "now":
+                    logger.warning(
+                        "Horizon rejected cursor %s with HTTP %d; falling back to now",
+                        self._cursor,
+                        exc.response.status_code,
+                    )
+                    self._checkpoint.delete()
+                    self._cursor = "now"
+                    continue
+                raise
             except httpx.TransportError:
                 logger.warning("SSE connection lost; reconnecting in 5s…")
                 await asyncio.sleep(5)
@@ -250,15 +345,19 @@ class HorizonStreamer:
         Handles HTTP 429 by delegating to :meth:`AdaptiveRateController.on_429`.
         """
         self._running = True
-        async for record in self.stream_events():
-            try:
-                trade = _parse_trade(record)
-            except (KeyError, ValueError, TypeError) as exc:
-                logger.warning("Failed to parse trade record: %s", exc)
-                continue
+        try:
+            async for record in self.stream_events():
+                try:
+                    trade = _parse_trade(record)
+                except (KeyError, ValueError, TypeError) as exc:
+                    logger.warning("Failed to parse trade record: %s", exc)
+                    continue
 
-            await self._backpressure.check_and_wait()
-            await self._queue.put(trade)
+                await self._backpressure.check_and_wait()
+                await self._queue.put(trade)
+                self._record_processed_event(record)
+        finally:
+            self._flush_checkpoint()
 
     async def run_with_cursor(self) -> AsyncIterator[tuple[Trade, str]]:
         """Yield ``(Trade, cursor)`` tuples with rate limiting and backpressure.
@@ -267,17 +366,21 @@ class HorizonStreamer:
         for resume capability.
         """
         self._running = True
-        async for record in self.stream_events():
-            try:
-                trade = _parse_trade(record)
-            except (KeyError, ValueError, TypeError) as exc:
-                logger.warning("Failed to parse trade record: %s", exc)
-                continue
+        try:
+            async for record in self.stream_events():
+                try:
+                    trade = _parse_trade(record)
+                except (KeyError, ValueError, TypeError) as exc:
+                    logger.warning("Failed to parse trade record: %s", exc)
+                    continue
 
-            await self._backpressure.check_and_wait()
-            await self._queue.put(trade)
-            event_cursor = record.get("id", self._cursor)
-            yield trade, event_cursor
+                await self._backpressure.check_and_wait()
+                await self._queue.put(trade)
+                self._record_processed_event(record)
+                event_cursor = self._cursor
+                yield trade, event_cursor
+        finally:
+            self._flush_checkpoint()
 
     def stop(self) -> None:
         """Signal the stream loop to stop."""

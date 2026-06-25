@@ -49,3 +49,7 @@ ledgerlens completion --shell fish | source
 - Subcommand names (e.g. `score`, `stream`, `report`, `completion`)
 - Common flags (e.g. `--output`, `--concurrency`, `--date`)
 - `--shell` enum values (`bash`, `zsh`, `fish`)
+
+`stream --reset-cursor` deletes the durable Horizon paging-token checkpoint
+before connecting. The checkpoint location is configured with
+`CURSOR_CHECKPOINT_PATH` and must be inside `DATA_DIR`.

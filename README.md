@@ -415,11 +415,17 @@ python cli.py score           # run the pipeline against live Horizon data
 python cli.py stream          # stream trades from Horizon SSE and score incrementally
                               #   --checkpoint-interval N  persist state every N trades (default: 100)
                               #   --score-delta N          min score change to emit alert (default: 5)
+                              #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
+
+The Horizon stream position is stored atomically in
+`CURSOR_CHECKPOINT_PATH` (default `./data/horizon_cursor.json`). The path must
+remain inside `DATA_DIR`. Use `--reset-cursor` when an intentional fresh start
+or replay is required.
 
 ## Continuous Retraining
 
