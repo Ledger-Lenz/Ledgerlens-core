@@ -24,6 +24,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,7 +44,7 @@ from detection.storage import (
     get_bridge_transfers,
     get_circular_routes,
     get_drift_reports,
-    get_feature_vector_for_wallet,
+    get_feature_vector,
     get_latest_scores,
     get_liquidity_pool_trades,
     get_pair_correlations,
@@ -281,7 +282,7 @@ def wallet_counterfactual(
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    feature_vector = get_feature_vector_for_wallet(wallet, asset_pair)
+    feature_vector = get_feature_vector(wallet, asset_pair)
     if feature_vector is None:
         raise HTTPException(
             status_code=404, detail=f"No cached feature vector for wallet {wallet} on {asset_pair}"
@@ -449,6 +450,19 @@ def circular_path_payments(
 ) -> list[dict]:
     """Return detected atomic circular path-payment routes, paginated."""
     return get_circular_routes(limit=limit, offset=offset)
+
+
+@app.get("/path-cycles")
+def list_path_cycles(
+    min_score: float = Query(0.6, ge=0.0, le=1.0),
+    wallet: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+) -> list[dict]:
+    """Return detected multi-hop path-payment wash-trade cycles."""
+    from detection.storage import get_hop_payment_cycles
+    if wallet is not None:
+        validate_stellar_address(wallet)
+    return get_hop_payment_cycles(min_score=min_score, wallet=wallet, limit=limit)
 
 
 # ---------------------------------------------------------------------------
