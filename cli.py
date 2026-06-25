@@ -416,11 +416,97 @@ def serve(
 def stream(
     batch_size: int = typer.Option(500, "--batch-size", help="Number of trades to accumulate before scoring"),
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
+    checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
+    score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
 ) -> None:
-    """Stream trades from Horizon SSE and score wallets in near-real-time."""
-    import run_pipeline
+    """Stream trades from Horizon SSE and score incrementally per wallet.
 
-    run_pipeline.run_streaming(batch_size=batch_size, flush_interval_seconds=flush_interval)
+    Maintains per-wallet rolling windows (1h/4h/24h), recomputes features on
+    each trade, and emits a RiskScore when the score changes by >= score_delta
+    points. Window state is checkpointed to SQLite every checkpoint_interval
+    trades. Graceful shutdown (SIGTERM/SIGINT) persists all in-memory state.
+    """
+    import signal
+    import threading
+
+    from config.settings import settings as cfg
+    from detection.feature_engineering import FeatureEngineering
+    from detection.model_inference import IncrementalScorer, ModelInference, load_models
+    from detection.rolling_window import RollingWindowState, RollingWindowStore
+    from detection.storage import init_db, save_scores
+    from detection.webhook_queue import enqueue
+    from detection.webhook_registry import get_matching_subscribers
+    from ingestion.horizon_streamer import stream_trades
+    import api.main as api_main
+
+    _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
+    _score_delta = score_delta if score_delta is not None else cfg.stream_score_delta_threshold
+
+    init_db()
+    checkpoint_store = RollingWindowStore()
+    window_state = RollingWindowState()
+    checkpoint_store.load_all(window_state)
+
+    try:
+        models = load_models(cfg.model_dir)
+    except FileNotFoundError:
+        logger.error("No trained models found in %s — run `python cli.py train` first", cfg.model_dir)
+        raise typer.Exit(1)
+
+    fe = FeatureEngineering()
+    scorer = IncrementalScorer(
+        window_state=window_state,
+        feature_engineering=fe,
+        model_inference=ModelInference(models),
+        score_delta_threshold=_score_delta,
+    )
+
+    stop_event = threading.Event()
+
+    def _shutdown(signum, frame):
+        logger.info("Shutdown signal received — checkpointing all window states…")
+        checkpoint_store.save_all(scorer.window_state)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    trades_since_checkpoint = 0
+
+    logger.info(
+        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d)",
+        _chk_interval,
+        _score_delta,
+    )
+
+    for trade in stream_trades():
+        if stop_event.is_set():
+            break
+
+        # Update stream status for /stream/status endpoint
+        api_main._stream_status_update(trade)
+        with api_main._stream_lock:
+            api_main._stream_active_wallets = scorer.window_state.active_wallets
+
+        result = scorer.score_on_trade(trade)
+        if result:
+            save_scores([result])
+            try:
+                subscribers = get_matching_subscribers(result)
+                for sub in subscribers:
+                    enqueue(sub.subscriber_id, result.model_dump(mode="json"))
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Webhook dispatch error: %s", exc)
+
+        trades_since_checkpoint += 1
+        if trades_since_checkpoint >= _chk_interval:
+            checkpoint_store.save_all(scorer.window_state)
+            trades_since_checkpoint = 0
+            logger.debug("Checkpointed %d wallet windows", scorer.window_state.active_wallets)
+
+    # Final checkpoint on clean exit
+    checkpoint_store.save_all(scorer.window_state)
+    logger.info("Stream stopped. Final checkpoint written.")
 
 
 @app.command("db-migrate")
