@@ -89,6 +89,56 @@ def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
+def merge_analyst_corrections(
+    synthetic_df: pd.DataFrame,
+    feedback_weight_multiplier: float = 5.0,
+    db_path: str | None = None,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Merge synthetic training data with analyst corrections.
+
+    Synthetic samples receive weight=1.0. Correction samples receive
+    weight = feedback_weight_multiplier * importance_weight.
+
+    Returns (merged_df, sample_weights).
+    """
+    from detection.feedback_store import AnalystFeedbackStore
+    from detection.storage import get_feature_vector
+
+    store = AnalystFeedbackStore(db_path=db_path)
+    corrections = store.get_weighted_corrections()
+
+    if not corrections:
+        weights = np.ones(len(synthetic_df))
+        return synthetic_df, weights
+
+    correction_rows = []
+    correction_weights = []
+    for wallet, label, weight in corrections:
+        try:
+            fv = get_feature_vector(wallet, db_path=db_path)
+            if not fv:
+                continue
+        except Exception:
+            continue
+
+        row = {fname: fv.get(fname, 0.0) for fname in FEATURE_NAMES}
+        row["label"] = label
+        correction_rows.append(row)
+        correction_weights.append(feedback_weight_multiplier * weight)
+
+    if not correction_rows:
+        return synthetic_df, np.ones(len(synthetic_df))
+
+    corrections_df = pd.DataFrame(correction_rows)
+    merged = pd.concat([synthetic_df, corrections_df], ignore_index=True)
+    weights = np.concatenate([
+        np.ones(len(synthetic_df)),
+        np.array(correction_weights),
+    ])
+
+    return merged, weights
+
+
 def _train_ensemble_base(
     df: pd.DataFrame,
     random_state: int = 42,
@@ -96,6 +146,7 @@ def _train_ensemble_base(
     calibrate: bool = True,
     adversarial_hardening: bool = False,
     imbalance_strategy: str = "smote",
+    sample_weights: np.ndarray | None = None,
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -157,11 +208,30 @@ def _train_ensemble_base(
             X, y, test_size=0.2, random_state=random_state, stratify=y
         )
 
+    # Propagate sample weights through train/test split
+    _train_weights = None
+    if sample_weights is not None:
+        if calibrate:
+            _, _, w_remaining, _ = train_test_split(
+                sample_weights, sample_weights, test_size=0.10, random_state=random_state, stratify=y
+            )
+            w_train, _ = train_test_split(
+                w_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+            )[:2] if len(w_remaining) > 0 else (w_remaining, np.array([]))
+        else:
+            w_train, _ = train_test_split(
+                sample_weights, test_size=0.2, random_state=random_state, stratify=y
+            )[:2]
+    else:
+        w_train = None
+
     oversampler = _get_oversampler(imbalance_strategy, random_state=random_state)
     if oversampler is not None:
         X_train_res, y_train_res = oversampler.fit_resample(X_train, y_train)
+        _train_weights = None  # SMOTE generates new samples; weights don't apply cleanly
     else:
         X_train_res, y_train_res = X_train, y_train
+        _train_weights = w_train
     _applied_imbalance_strategy = imbalance_strategy
 
     # Log hyperparameters
@@ -170,6 +240,7 @@ def _train_ensemble_base(
     mlflow.log_param("calibrate", calibrate)
     mlflow.log_param("adversarial_hardening", adversarial_hardening)
     mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
+    mlflow.log_param("has_sample_weights", sample_weights is not None)
 
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
@@ -183,7 +254,10 @@ def _train_ensemble_base(
 
     results = {}
     for name, model in models.items():
-        model.fit(X_train_res, y_train_res)
+        fit_kwargs = {}
+        if _train_weights is not None and len(_train_weights) == len(y_train_res):
+            fit_kwargs["sample_weight"] = _train_weights
+        model.fit(X_train_res, y_train_res, **fit_kwargs)
         y_proba = model.predict_proba(X_test)[:, 1]
         y_pred = model.predict(X_test)
 

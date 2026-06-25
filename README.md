@@ -634,6 +634,13 @@ The response returns a `subscriber_id` (UUID) used for management.
 | `DELETE` | `/webhooks/{subscriber_id}` | Deactivate a subscriber            |
 | `GET`    | `/webhooks/dead-letters`    | List permanently failed deliveries |
 
+### Analyst Feedback Endpoints
+
+| Method | Path                | Description                                         |
+| ------ | ------------------- | --------------------------------------------------- |
+| `POST` | `/v1/feedback`      | Submit analyst label correction (admin-key required) |
+| `GET`  | `/v1/feedback`      | Paginated correction history (admin-key required)    |
+
 ### Cross-Chain Link Endpoints
 
 | Method | Path                                          | Description                                                |

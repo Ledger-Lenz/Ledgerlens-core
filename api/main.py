@@ -67,6 +67,7 @@ from detection.storage import (
     get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
+from detection.feedback_store import AnalystFeedbackStore
 from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
@@ -375,6 +376,118 @@ def health_ready() -> JSONResponse:
             content={"status": "shutting_down"},
         )
     return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+# ---------------------------------------------------------------------------
+# Analyst feedback endpoints
+# ---------------------------------------------------------------------------
+
+class FeedbackSubmission(BaseModel):
+    wallet: str
+    asset_pair: str
+    analyst_label: int
+    confidence: float = 1.0
+
+
+class FeedbackRecordOut(BaseModel):
+    id: int
+    wallet: str
+    asset_pair: str
+    analyst_label: int
+    original_score: int
+    confidence: float
+    importance_weight: float
+    has_feature_vector: bool
+    created_at: str
+
+
+class PaginatedFeedback(BaseModel):
+    records: list[FeedbackRecordOut]
+    total: int
+    page: int
+    page_size: int
+
+
+_feedback_rate_buckets: dict[str, list[float]] = defaultdict(list)
+_FEEDBACK_RATE_LIMIT = 100
+_FEEDBACK_RATE_WINDOW = 3600.0
+
+
+def _check_feedback_rate_limit(client_ip: str) -> None:
+    now = time.monotonic()
+    bucket = _feedback_rate_buckets[client_ip]
+    _feedback_rate_buckets[client_ip] = [t for t in bucket if now - t < _FEEDBACK_RATE_WINDOW]
+    if len(_feedback_rate_buckets[client_ip]) >= _FEEDBACK_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded: 100 corrections per hour.")
+    _feedback_rate_buckets[client_ip].append(now)
+
+
+@v1_router.post("/feedback", status_code=201, response_model=FeedbackRecordOut,
+                dependencies=[Depends(require_admin_key)])
+def submit_analyst_feedback(payload: FeedbackSubmission, request: Request):
+    """Submit an analyst label correction. Admin-key required."""
+    _check_feedback_rate_limit(request.client.host if request.client else "unknown")
+
+    if not _STELLAR_ADDRESS_PATTERN.match(payload.wallet):
+        raise HTTPException(status_code=422, detail="Invalid Stellar wallet address format.")
+    if payload.analyst_label not in (0, 1):
+        raise HTTPException(status_code=422, detail="analyst_label must be 0 or 1.")
+    if not (0.0 <= payload.confidence <= 1.0):
+        raise HTTPException(status_code=422, detail="confidence must be in [0.0, 1.0].")
+
+    store = AnalystFeedbackStore(db_path=settings.db_path)
+
+    scores = get_latest_scores(wallet=payload.wallet, limit=1)
+    original_score = scores[0].score if scores else 0
+
+    record = store.add_correction(
+        wallet=payload.wallet,
+        asset_pair=payload.asset_pair,
+        analyst_label=payload.analyst_label,
+        original_score=original_score,
+        confidence=payload.confidence,
+    )
+    return FeedbackRecordOut(
+        id=record.id,
+        wallet=record.wallet,
+        asset_pair=record.asset_pair,
+        analyst_label=record.analyst_label,
+        original_score=record.original_score,
+        confidence=record.confidence,
+        importance_weight=record.importance_weight,
+        has_feature_vector=record.has_feature_vector,
+        created_at=record.created_at.isoformat(),
+    )
+
+
+@v1_router.get("/feedback", response_model=PaginatedFeedback,
+               dependencies=[Depends(require_admin_key)])
+def list_analyst_feedback(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    """Paginated correction history (most recent first). Admin-key required."""
+    store = AnalystFeedbackStore(db_path=settings.db_path)
+    records, total = store.get_corrections_paginated(page=page, page_size=page_size)
+    return PaginatedFeedback(
+        records=[
+            FeedbackRecordOut(
+                id=r.id,
+                wallet=r.wallet,
+                asset_pair=r.asset_pair,
+                analyst_label=r.analyst_label,
+                original_score=r.original_score,
+                confidence=r.confidence,
+                importance_weight=r.importance_weight,
+                has_feature_vector=r.has_feature_vector,
+                created_at=r.created_at.isoformat(),
+            )
+            for r in records
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @v1_router.get("/scores", response_model=list[RiskScore])
