@@ -326,20 +326,65 @@ from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
 
 _MODEL_FILENAMES = dict(globals().get("_MODEL_FILENAMES", {}))
 _MODEL_FILENAMES["gnn"] = "gnn_model.pt"
+_MODEL_FILENAMES["sequence_model"] = "temporal_model.pt"
+
+# Models excluded from the tabular ensemble probability vote.
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model"})
 
 
-def load_models(model_dir: str, *args, **kwargs) -> dict:
-    """Wraps the base model loader, also loading gnn_model.pt if present."""
-    models = _load_models_base(model_dir, *args, **kwargs)
+def load_models(model_dir: str | None = None, *args, **kwargs) -> dict:
+    """Wraps the base model loader, also loading gnn_model.pt and temporal_model.pt if present."""
+    actual_model_dir = model_dir or settings_module.settings.model_dir
+    models = _load_models_base(actual_model_dir, *args, **kwargs)
 
-    gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
+    gnn_path = os.path.join(actual_model_dir, _MODEL_FILENAMES["gnn"])
     if os.path.exists(gnn_path) and _HAS_PYG:
         try:
             models["gnn"] = safe_load_gnn_checkpoint(gnn_path)
         except RuntimeError as e:
             logger.error("GNN checkpoint failed validation: %s", e)
             raise
+
+    seq_path = os.path.join(actual_model_dir, _MODEL_FILENAMES["sequence_model"])
+    if os.path.exists(seq_path):
+        try:
+            from detection.temporal_model import load_sequence_model
+            s = settings_module.settings
+            seq_model = load_sequence_model(
+                actual_model_dir,
+                model_type=s.temporal_model_type,
+                lstm_hidden_dim=s.temporal_lstm_hidden_dim,
+                max_seq_len=s.temporal_max_seq_len,
+            )
+            if seq_model is not None:
+                models["sequence_model"] = seq_model
+        except Exception as exc:
+            logger.warning("Could not load temporal_model.pt: %s — skipping", exc)
+
     return models
+
+
+def fuse_sequence_score(
+    tabular_prob: float,
+    seq_prob: float,
+    w_seq: float,
+) -> float:
+    """Fuse tabular ensemble probability with sequence model probability.
+
+    Uses the same linear interpolation approach as GNN fusion.
+    ``w_seq`` is found by ``scipy.optimize.minimize_scalar`` on validation
+    AUC-PR; valid range is [0.0, 0.4].
+
+    Args:
+        tabular_prob: Ensemble tabular probability (0–1).
+        seq_prob:     WashTradeSequenceModel output probability (0–1).
+        w_seq:        Learned fusion weight in [0.0, 0.4].
+
+    Returns:
+        Blended probability in [0, 1].
+    """
+    w = max(0.0, min(0.4, w_seq))
+    return (1.0 - w) * tabular_prob + w * seq_prob
 
 
 def score_feature_matrix(batch, models: dict, *args, **kwargs):
