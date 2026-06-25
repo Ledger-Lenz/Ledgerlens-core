@@ -139,6 +139,16 @@ class Settings:
         )
     )
 
+    # Path payment decomposition
+    path_payment_loader_enabled: bool = field(
+        default_factory=lambda: os.getenv("PATH_PAYMENT_LOADER_ENABLED", "true").lower() != "false"
+    )
+    # When True, fetch per-operation effects for accurate hop amounts.
+    # Set False for approximate decomposition from operation data alone (lower API cost).
+    path_payment_fetch_effects: bool = field(
+        default_factory=lambda: os.getenv("PATH_PAYMENT_FETCH_EFFECTS", "true").lower() != "false"
+    )
+
     # Bridge event integrity verification
     # 1.0 = verify all events (recommended for production)
     # 0.0 = disabled (emits a WARNING on startup; cross-chain integrity not guaranteed)

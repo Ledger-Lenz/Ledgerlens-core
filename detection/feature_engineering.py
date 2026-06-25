@@ -84,6 +84,7 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "atomic_self_payment_ratio",  # fraction of an account's path payments where source==destination
     "avg_path_hop_count",
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
+    "path_payment_frequency",   # fraction of all trades that originated from path payments
 ]
 
 PATH_PAYMENT_CYCLE_FEATURE_NAMES = [
@@ -507,9 +508,15 @@ def amm_features(
     }
 
 
-def path_payment_features(path_payments: list[PathPayment] | None, account: str) -> dict:
-    """Compute the three path-payment features for `account`'s own payments
+def path_payment_features(path_payments: list[PathPayment] | None, account: str, trades: "pd.DataFrame | None" = None) -> dict:
+    """Compute the path-payment features for `account`'s own payments
     (`source_account == account`). Omitting `path_payments` yields `0.0`.
+
+    Args:
+        path_payments: List of PathPayment records for the account.
+        account: The wallet address being scored.
+        trades: Optional DataFrame of all trades for the account, used to
+            compute ``path_payment_frequency`` (fraction of trades from path payments).
     """
     zero = {name: 0.0 for name in PATH_PAYMENT_FEATURE_NAMES}
     if not path_payments:
@@ -526,10 +533,19 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     total_volume = sum(p.source_amount for p in own_payments)
     hop_counts = [len(p.path) + 1 for p in own_payments]
 
+    # path_payment_frequency: fraction of all trades that came from path payments
+    pp_frequency = 0.0
+    if trades is not None and len(trades) > 0:
+        pp_col = "path_payment_id"
+        if pp_col in trades.columns:
+            pp_count = trades[pp_col].notna().sum()
+            pp_frequency = float(pp_count / len(trades))
+
     return {
         "atomic_self_payment_ratio": float(self_payment_count / len(own_payments)),
         "avg_path_hop_count": float(sum(hop_counts) / len(hop_counts)),
         "path_cycle_volume_ratio": float(cycle_volume / total_volume) if total_volume > 0 else 0.0,
+        "path_payment_frequency": pp_frequency,
     }
 
 
@@ -796,7 +812,7 @@ def _build_feature_vector_base(
     features.update(graph_ring_features(account, ring_membership))
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
-    features.update(path_payment_features(path_payments, account))
+    features.update(path_payment_features(path_payments, account, trades))
     features.update(path_payment_cycle_features(path_payments, path_cycles, account))
     features.update(causal_features(trades, account, prices, pair))
     features.update(multivariate_benford_features(account, trades_by_pair))
