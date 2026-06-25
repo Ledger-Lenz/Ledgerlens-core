@@ -12,6 +12,7 @@ from detection.feature_engineering import FEATURE_NAMES
 from detection.storage import get_latest_scores
 from ingestion.data_models import Asset, Trade
 from ingestion.synthetic_data import generate_synthetic_dataset
+from tests.factories import TradeFactory
 
 
 # Ensure stellar_sdk is mockable for Soroban integration tests.
@@ -30,7 +31,7 @@ def _make_trade(
     idx: int = 0,
     ts: datetime | None = None,
 ) -> Trade:
-    return Trade(
+    return TradeFactory.trade(
         id=f"trade-{idx}",
         ledger_close_time=ts or datetime(2024, 1, 1, 12, 0, 0),
         base_account=base_account,

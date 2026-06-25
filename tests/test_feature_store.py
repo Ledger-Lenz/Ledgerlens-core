@@ -11,13 +11,14 @@ from detection.feature_store import (
     _hash_counterparty,
     RING_BUFFER_CAPS,
 )
-from ingestion.data_models import Trade, Asset, TradeType
+from ingestion.data_models import Asset, TradeType
+from tests.factories import TradeFactory
 
 
 @pytest.fixture
 def sample_trade():
     """Create a sample trade for testing."""
-    return Trade(
+    return TradeFactory.trade(
         id="trade_123",
         ledger_close_time=datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc),
         base_account="GA123",
@@ -117,7 +118,7 @@ def test_ring_buffer_overflow(initial_state):
     
     # Add trades (200 trades spanning 20 seconds, all within 1h window)
     for i in range(200):
-        trade = Trade(
+        trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(milliseconds=i * 100),
             base_account="GA123",
@@ -142,7 +143,7 @@ def test_prune_expired_entries(initial_state):
     base_time = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     
     # Add a trade at the beginning
-    trade1 = Trade(
+    trade1 = TradeFactory.trade(
         id="trade_1",
         ledger_close_time=base_time,
         base_account="GA123",
@@ -158,7 +159,7 @@ def test_prune_expired_entries(initial_state):
     assert len(state.trade_ring_1h) == 1
     
     # Add a trade 2 hours later
-    trade2 = Trade(
+    trade2 = TradeFactory.trade(
         id="trade_2",
         ledger_close_time=base_time + timedelta(hours=2),
         base_account="GA123",
@@ -193,7 +194,7 @@ def test_derive_feature_vector_benford(initial_state):
         digit = (i % 9) + 1  # digits 1-9
         amount = float(f"{digit}00.0")  # 100, 200, ..., 900
         
-        trade = Trade(
+        trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(seconds=i),
             base_account="GA123",
@@ -229,7 +230,7 @@ def test_derive_feature_vector_volume_ratio(initial_state):
     
     # Add 10 trades with 5 unique counterparties
     for i in range(10):
-        trade = Trade(
+        trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(seconds=i),
             base_account="GA123",
