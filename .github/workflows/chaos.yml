@@ -1,0 +1,52 @@
+name: Chaos Engineering
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly on Monday at 02:00 UTC
+    - cron: "0 2 * * 1"
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start chaos services (Toxiproxy + Redis + API)
+        run: docker compose --profile chaos up -d --wait
+        env:
+          LEDGERLENS_ADMIN_API_KEY: test-admin-key
+          LEDGERLENS_DB_PATH: /tmp/ledgerlens_chaos.db
+
+      - name: Wait for API to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && break
+            sleep 2
+          done
+
+      - name: Run chaos test suite
+        run: pytest tests/chaos/ -m chaos -v --tb=short --timeout=120
+        env:
+          LEDGERLENS_ADMIN_API_KEY: test-admin-key
+          LEDGERLENS_DB_PATH: /tmp/ledgerlens_chaos.db
+          REDIS_URL: redis://localhost:6379/0
+
+      - name: Collect docker logs on failure
+        if: failure()
+        run: docker compose --profile chaos logs
+
+      - name: Tear down chaos services
+        if: always()
+        run: docker compose --profile chaos down

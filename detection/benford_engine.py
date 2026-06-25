@@ -12,11 +12,15 @@ statistically impossible under independent trading. The multivariate helpers
 `multivariate_benford_score`) surface that coordination signal.
 """
 
+import logging
 import math
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 from scipy.stats import chi2, norm
+
+logger = logging.getLogger("ledgerlens.benford_engine")
 
 DIGITS = list(range(1, 10))
 
@@ -117,6 +121,151 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
 def is_anomalous(metrics: dict, mad_threshold: float = 0.015) -> bool:
     """Whether a `compute_benford_metrics` result exceeds the MAD threshold."""
     return metrics["mad"] > mad_threshold
+
+
+# ---------------------------------------------------------------------------
+# Adaptive window sizing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BenfordWindowResult:
+    """Result of an adaptive Benford window fit for a single target window.
+
+    Attributes
+    ----------
+    trades:
+        The trade amounts used for Benford analysis (sliced to the effective
+        window, possibly wider than the target).
+    effective_width:
+        The actual window duration used (a ``pd.Timedelta``); may be wider
+        than the target when the sample count was below ``min_sample_count``.
+    valid:
+        ``True`` when ``len(trades) >= min_sample_count`` so chi-square and
+        MAD statistics are statistically reliable.
+    expanded:
+        ``True`` when the window had to be widened beyond the target to meet
+        the minimum sample count.
+    merged:
+        ``True`` when two adjacent windows were merged because neither alone
+        reached the minimum sample count.
+    label:
+        The original target window label (e.g. ``"1h"``).
+    """
+
+    trades: list
+    effective_width: "pd.Timedelta"
+    valid: bool
+    expanded: bool
+    merged: bool
+    label: str
+
+
+class AdaptiveBenfordWindow:
+    """Adaptive rolling-window selector for Benford's Law analysis.
+
+    Ensures each window contains at least ``min_sample_count`` trades before
+    computing chi-square / MAD statistics. If the target window is too narrow,
+    the window is doubled up to ``max_window_days`` days. If even the maximum
+    window has too few trades, adjacent windows are merged.
+
+    Parameters
+    ----------
+    min_sample_count:
+        Minimum number of valid (positive, finite) trade amounts required for
+        statistically reliable Benford analysis. Default: 30.
+    max_window_days:
+        Maximum window width in days before falling back to merging. Default: 90.
+    """
+
+    def __init__(self, min_sample_count: int = 30, max_window_days: int = 90) -> None:
+        self.min_sample_count = min_sample_count
+        self.max_window_days = max_window_days
+
+    def _count_valid(self, amounts: list) -> int:
+        return sum(1 for a in amounts if first_digit(a) is not None)
+
+    def _slice_amounts(
+        self, trades: pd.DataFrame, as_of: pd.Timestamp, width: "pd.Timedelta"
+    ) -> list:
+        start = as_of - width
+        mask = (trades["ledger_close_time"] > start) & (trades["ledger_close_time"] <= as_of)
+        return trades.loc[mask, "base_amount"].tolist()
+
+    def fit(
+        self,
+        trades: pd.DataFrame,
+        target_window_label: str,
+        as_of: pd.Timestamp,
+        window_map: "dict[str, pd.Timedelta]",
+    ) -> BenfordWindowResult:
+        """Fit the adaptive window for ``target_window_label``.
+
+        Expands the window by doubling until either ``min_sample_count`` is
+        reached or ``max_window_days`` is exceeded. When neither single-window
+        expansion reaches the threshold, the *all-time* slice up to ``as_of``
+        is used and the result is marked ``merged=True``.
+
+        Parameters
+        ----------
+        trades:
+            DataFrame with ``ledger_close_time`` and ``base_amount`` columns.
+        target_window_label:
+            One of the keys in ``window_map`` (e.g. ``"1h"``).
+        as_of:
+            The reference timestamp (end of all windows).
+        window_map:
+            Mapping from window label to ``pd.Timedelta``; used to determine
+            the starting width.
+        """
+        max_width = pd.Timedelta(days=self.max_window_days)
+        target_width = window_map[target_window_label]
+
+        width = target_width
+        expanded = False
+        while True:
+            amounts = self._slice_amounts(trades, as_of, width)
+            if self._count_valid(amounts) >= self.min_sample_count:
+                if width > target_width:
+                    logger.warning(
+                        "Benford window '%s' expanded from %s to %s (sample count was below %d)",
+                        target_window_label, target_width, width, self.min_sample_count,
+                    )
+                    expanded = True
+                return BenfordWindowResult(
+                    trades=amounts,
+                    effective_width=width,
+                    valid=True,
+                    expanded=expanded,
+                    merged=False,
+                    label=target_window_label,
+                )
+            if width >= max_width:
+                break
+            width = min(width * 2, max_width)
+
+        # Neither expansion nor max_width was sufficient; use all available trades.
+        all_amounts = trades["base_amount"].tolist() if not trades.empty else []
+        valid = self._count_valid(all_amounts) >= self.min_sample_count
+        if not valid:
+            logger.warning(
+                "Benford window '%s': only %d valid trades available (min_sample_count=%d). "
+                "Statistics may be unreliable.",
+                target_window_label, self._count_valid(all_amounts), self.min_sample_count,
+            )
+        else:
+            logger.warning(
+                "Benford window '%s' merged to full trade history (%d trades) "
+                "because no single expansion reached %d samples.",
+                target_window_label, self._count_valid(all_amounts), self.min_sample_count,
+            )
+        return BenfordWindowResult(
+            trades=all_amounts,
+            effective_width=max_width,
+            valid=valid,
+            expanded=True,
+            merged=True,
+            label=target_window_label,
+        )
 
 
 # ---------------------------------------------------------------------------

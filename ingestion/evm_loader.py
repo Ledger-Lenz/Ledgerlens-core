@@ -4,6 +4,9 @@ Fetches Uniswap V2/V3 Swap events from configured pool addresses and
 parses them into CrossChainTrade records.  The token-bucket rate limiter
 caps outbound RPC calls at 10 req/s per chain to avoid accidental DoS
 against public endpoints.
+
+Per-network circuit breakers isolate failures: a Base outage does not
+affect Arbitrum ingestion and vice versa.
 """
 
 import logging
@@ -19,7 +22,15 @@ from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.evm_loader")
 
-SUPPORTED_CHAINS = ["ethereum", "base", "polygon"]
+SUPPORTED_CHAINS = ["ethereum", "base", "polygon", "arbitrum"]
+
+# Per-network default rate limits (req/s)
+_NETWORK_RATE_LIMITS: dict[str, float] = {
+    "ethereum": 10.0,
+    "base": 10.0,
+    "polygon": 10.0,
+    "arbitrum": 10.0,
+}
 
 # Uniswap V3: Swap(address indexed sender, address indexed recipient,
 #                  int256 amount0, int256 amount1, uint160 sqrtPriceX96,
@@ -71,6 +82,55 @@ class _TokenBucket:
             self._tokens = 0.0
 
 
+class _CircuitBreaker:
+    """Per-network circuit breaker.
+
+    After `threshold` consecutive failures the circuit opens and all calls
+    raise ``CircuitOpenError``.  The circuit auto-resets after `reset_seconds`.
+    """
+
+    class CircuitOpenError(Exception):
+        pass
+
+    def __init__(self, threshold: int = 5, reset_seconds: float = 300.0) -> None:
+        self._threshold = threshold
+        self._reset_seconds = reset_seconds
+        self._failures = 0
+        self._opened_at: float | None = None
+        self._lock = Lock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._opened_at is None:
+                return False
+            if time.monotonic() - self._opened_at >= self._reset_seconds:
+                # Auto-reset
+                self._failures = 0
+                self._opened_at = None
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._opened_at = None
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self._threshold:
+                self._opened_at = time.monotonic()
+
+    def check(self) -> None:
+        """Raise CircuitOpenError if the circuit is open."""
+        if self.is_open:
+            raise _CircuitBreaker.CircuitOpenError(
+                f"Circuit open after {self._failures} consecutive failures; "
+                f"resets in {self._reset_seconds}s"
+            )
+
+
 def _validate_evm_address(address: str) -> str:
     """Return the EIP-55 checksummed form of address, or raise ValueError."""
     if not isinstance(address, str) or len(address) != 42 or not address.startswith("0x"):
@@ -98,6 +158,7 @@ class EVMTradeLoader:
         rpc_url: str,
         pool_addresses: list[str] | None = None,
         _rate_limiter: _TokenBucket | None = None,
+        _circuit_breaker: _CircuitBreaker | None = None,
     ) -> None:
         if chain not in SUPPORTED_CHAINS:
             raise ValueError(
@@ -106,10 +167,13 @@ class EVMTradeLoader:
         self.chain = chain
         self._rpc_url = rpc_url
         self.pool_addresses = [_validate_evm_address(a) for a in (pool_addresses or [])]
-        self._rate_limiter = _rate_limiter or _TokenBucket(rate=10.0)
+        rate = _NETWORK_RATE_LIMITS.get(chain, 10.0)
+        self._rate_limiter = _rate_limiter or _TokenBucket(rate=rate)
+        self._circuit_breaker = _circuit_breaker or _CircuitBreaker()
 
     def _rpc_call(self, method: str, params: list, max_retries: int = 3) -> dict:
         """Issue a JSON-RPC call with exponential backoff on 429 / transport errors."""
+        self._circuit_breaker.check()
         payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
         last_exc: Exception | None = None
 
@@ -120,6 +184,7 @@ class EVMTradeLoader:
                 response = requests.post(self._rpc_url, json=payload, timeout=30)
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc
+                self._circuit_breaker.record_failure()
                 if attempt < max_retries:
                     time.sleep(2**attempt)
                 continue
@@ -137,13 +202,16 @@ class EVMTradeLoader:
                 response.raise_for_status()
             except requests.HTTPError as exc:
                 last_exc = exc
+                self._circuit_breaker.record_failure()
                 if attempt < max_retries:
                     time.sleep(2**attempt)
                 continue
 
             result = response.json()
             if "error" in result:
+                self._circuit_breaker.record_failure()
                 raise ValueError(f"JSON-RPC error from {method}: {result['error']}")
+            self._circuit_breaker.record_success()
             return result
 
         assert last_exc is not None
@@ -273,6 +341,8 @@ class EVMTradeLoader:
         """Fetch Swap events from all configured pool addresses.
 
         Paginates over the last `lookback_blocks` blocks (default from settings).
+        ABI mismatches between networks are handled gracefully: a warning is
+        logged, the event is skipped, and ingestion continues.
         """
         lookback_blocks = lookback_blocks if lookback_blocks is not None else settings.evm_lookback_blocks
         latest = self._get_latest_block()
@@ -292,11 +362,24 @@ class EVMTradeLoader:
                         block_num = int(log["blockNumber"], 16)
                         if block_num not in block_ts_cache:
                             block_ts_cache[block_num] = self._get_block_timestamp(block_num)
-                        trade = parser(log, pool_address, block_ts_cache[block_num])
-                        trades.append(trade)
+                        try:
+                            trade = parser(log, pool_address, block_ts_cache[block_num])
+                            trades.append(trade)
+                        except ValueError as exc:
+                            # ABI mismatch or malformed event — log and skip, do not crash
+                            logger.warning(
+                                "ABI mismatch or malformed event on %s pool %s tx %s: %s",
+                                self.chain,
+                                pool_address,
+                                log.get("transactionHash", "unknown"),
+                                exc,
+                            )
+                            continue
                     if logs:
                         break
                 except ValueError:
+                    raise
+                except _CircuitBreaker.CircuitOpenError:
                     raise
                 except Exception as exc:
                     logger.warning(

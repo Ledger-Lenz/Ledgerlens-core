@@ -12,12 +12,42 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import tomllib
+from pathlib import Path
 
 import typer
+
+try:
+    _version_file = Path(__file__).resolve().parent / "pyproject.toml"
+    with open(_version_file, "rb") as _vf:
+        __version__ = tomllib.load(_vf)["project"]["version"]
+except Exception:
+    __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"ledgerlens-core v{__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Show the version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """LedgerLens detection engine CLI."""
+    pass
 
 
 @app.command("generate-data")
@@ -56,6 +86,7 @@ def train(
     ring_size: int = typer.Option(3, help="Accounts per wash ring"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
+    experiment_name: str = typer.Option(None, "--experiment-name", help="MLflow experiment name for tracking"),
 ) -> None:
     """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
     import os
@@ -76,7 +107,7 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
-    results = train_ensemble(df, calibrate=calibrate)
+    results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
         if name == "_calib":
             continue
@@ -663,6 +694,37 @@ def federated_join(
                 logger.info("Round %d: distillation update applied", round_num + 1)
 
     logger.info("Federated participation complete (%d round(s))", rounds)
+
+
+config_app = typer.Typer(help="Configuration commands")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("validate")
+def config_validate() -> None:
+    """Load and validate configuration, printing all settings (secrets masked)."""
+    import pydantic
+
+    _SECRETS = {
+        "ledgerlens_service_secret_key",
+        "ledgerlens_admin_api_key",
+        "ledgerlens_compliance_api_key",
+        "ledgerlens_model_signing_key",
+        "ledgerlens_webhook_encryption_key",
+    }
+
+    try:
+        from config.settings import Settings
+        s = Settings()
+    except (pydantic.ValidationError, Exception) as exc:
+        typer.echo(f"❌ Configuration invalid:\n{exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo("✅ Configuration is valid\n")
+    for name in Settings.model_fields:
+        raw = getattr(s, name)
+        value = "***" if name in _SECRETS and raw else raw
+        typer.echo(f"  {name}={value}")
 
 
 if __name__ == "__main__":

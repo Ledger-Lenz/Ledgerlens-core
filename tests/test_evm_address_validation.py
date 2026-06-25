@@ -119,7 +119,7 @@ def test_settings_accepts_empty_pool_addresses(monkeypatch):
     monkeypatch.delenv("EVM_POOL_ADDRESSES", raising=False)
     from config.settings import Settings
     s = Settings()
-    assert s.evm_pool_addresses == ()
+    assert s.evm_pool_addresses == ""
 
 
 # ---------------------------------------------------------------------------
