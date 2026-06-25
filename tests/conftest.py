@@ -21,7 +21,7 @@ def patch_signing_key(monkeypatch):
     import config.settings as settings_module
 
     monkeypatch.setenv("LEDGERLENS_MODEL_SIGNING_KEY", TEST_SIGNING_KEY)
-    object.__setattr__(settings_module.settings, "model_signing_key", TEST_SIGNING_KEY)
+    object.__setattr__(settings_module.settings, "ledgerlens_model_signing_key", TEST_SIGNING_KEY)
 
 
 # Files that need the real stellar_sdk during test execution.

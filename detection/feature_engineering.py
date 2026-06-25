@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import compute_benford_metrics
+from detection.benford_engine import AdaptiveBenfordWindow, compute_benford_metrics
 from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
@@ -40,6 +40,12 @@ BENFORD_FEATURE_NAMES = [
     f"benford_{metric}_{window}"
     for window in ROLLING_WINDOWS
     for metric in ("chi_square", "mad", "max_zscore")
+]
+
+# Boolean flags indicating that the corresponding Benford window was
+# adaptively expanded or merged due to insufficient sample count.
+BENFORD_WINDOW_EXPANDED_FEATURE_NAMES = [
+    f"benford_window_expanded_{window}" for window in ROLLING_WINDOWS
 ]
 
 TRADE_PATTERN_FEATURE_NAMES = [
@@ -129,6 +135,7 @@ FEATURE_NAMES = (
     + SANDWICH_FEATURE_NAMES
     + CAUSAL_FEATURE_NAMES
     + MULTIVARIATE_BENFORD_FEATURE_NAMES
+    + BENFORD_WINDOW_EXPANDED_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -173,12 +180,29 @@ def _asset_symbol(asset: dict) -> str:
     return code if issuer is None else f"{code}:{issuer}"
 
 
-def benford_features(trades: pd.DataFrame, as_of: pd.Timestamp) -> dict:
-    """Chi-square, MAD, and max Z-score for `base_amount` across each rolling window."""
+def benford_features(
+    trades: pd.DataFrame,
+    as_of: pd.Timestamp,
+    adaptive_window: AdaptiveBenfordWindow | None = None,
+) -> dict:
+    """Chi-square, MAD, and max Z-score for `base_amount` across each rolling window.
+
+    When ``adaptive_window`` is provided the window is expanded (or merged) as
+    needed to reach the configured minimum sample count, and a boolean
+    ``benford_window_expanded_{label}`` flag is set for each window that was
+    widened beyond the nominal target.
+    """
     features = {}
     for label, window in ROLLING_WINDOWS.items():
-        subset = _window_slice(trades, as_of, window)
-        metrics = compute_benford_metrics(subset["base_amount"].tolist())
+        if adaptive_window is not None:
+            result = adaptive_window.fit(trades, label, as_of, ROLLING_WINDOWS)
+            amounts = result.trades
+            features[f"benford_window_expanded_{label}"] = float(result.expanded or result.merged)
+        else:
+            subset = _window_slice(trades, as_of, window)
+            amounts = subset["base_amount"].tolist()
+            features[f"benford_window_expanded_{label}"] = 0.0
+        metrics = compute_benford_metrics(amounts)
         features[f"benford_chi_square_{label}"] = metrics["chi_square"]
         features[f"benford_mad_{label}"] = metrics["mad"]
         features[f"benford_max_zscore_{label}"] = max(metrics["z_scores"].values(), default=0.0)
@@ -750,6 +774,7 @@ def _build_feature_vector_base(
     prices: pd.DataFrame | None = None,
     pair: str | None = None,
     cross_chain_linker: "CrossChainLinker | None" = None,  # noqa: F821
+    adaptive_benford_window: AdaptiveBenfordWindow | None = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -777,7 +802,7 @@ def _build_feature_vector_base(
     order_book_events = order_book_events if order_book_events is not None else pd.DataFrame(columns=["account", "event_type"])
     account_metadata = account_metadata or {}
 
-    features = benford_features(trades, as_of)
+    features = benford_features(trades, as_of, adaptive_window=adaptive_benford_window)
     features.update(
         {
             "counterparty_concentration_ratio": counterparty_concentration_ratio(trades, account),
@@ -835,6 +860,10 @@ def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None
         use_gnn: If True, appends gnn_wash_ring_probability and
             gnn_neighbor_avg_score (default 0.0 if not found in gnn_features).
         gnn_features: Optional {wallet: {feature_name: value}} lookup.
+        adaptive_benford_window: Optional AdaptiveBenfordWindow instance. When
+            provided, Benford windows are expanded as needed to meet the
+            minimum sample count; ``benford_window_expanded_{label}`` flags are
+            set accordingly.
     """
     vector = _build_feature_vector_base(*args, **kwargs)
     if use_gnn:
