@@ -18,6 +18,7 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 - **Uniswap V3 adapter** (`ingestion/uniswap_adapter.py`): ingests `Swap` events from Uniswap V3 pools for EVM wallets linked to Stellar accounts, extending the cross-chain detection graph. Feature-flagged via `INGEST_UNISWAP=true`.
 - **Curve adapter** (`ingestion/curve_adapter.py`): ingests `TokenExchange` events from Curve pools for linked EVM wallets. Feature-flagged via `INGEST_CURVE=true`.
 - **Shadow model scoring** (`detection/shadow_scoring.py`): runs a candidate model in parallel with production on every scoring request, logging score divergence to Prometheus histogram and SQLite `shadow_scores` table. `GET /admin/shadow/report` returns mean divergence, p95, and high-divergence wallets. Activated via `SHADOW_MODEL_VERSION` env var.
+- **E2E test suite** (`tests/e2e/`): end-to-end tests covering ingest→score→retrieve, alert flow, and federated training rounds. Run with `make test-e2e`. Completes in < 5 minutes.
 
 ### Added
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
