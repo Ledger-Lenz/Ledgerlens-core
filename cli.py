@@ -644,5 +644,36 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+@app.command("report")
+def generate_report(
+    wallet: str = typer.Argument(..., help="Stellar wallet address (G...)"),
+    date: str = typer.Option(..., "--date", "-d", help="Report date (YYYY-MM-DD)"),
+    output: str = typer.Option("./report.html", "--output", "-o", help="Output HTML file path"),
+    pdf: bool = typer.Option(False, "--pdf", help="Also generate a PDF (requires weasyprint)"),
+) -> None:
+    """Generate a compliance audit report for a wallet on a given date.
+
+    Produces a self-contained HTML report with risk score, SHAP attributions,
+    Benford analysis, trade timeline, model version, and data provenance.
+    The report is read-only and idempotent.
+    """
+    from detection.compliance_report import ComplianceReportGenerator
+
+    generator = ComplianceReportGenerator(
+        wallet=wallet,
+        date=date,
+        output_path=output,
+    )
+    result_path = generator.generate()
+    typer.echo(f"Report written to {result_path}")
+
+    if pdf:
+        pdf_path = generator.generate_pdf()
+        if pdf_path:
+            typer.echo(f"PDF written to {pdf_path}")
+        else:
+            typer.echo("PDF generation skipped (weasyprint not installed)", err=True)
+
+
 if __name__ == "__main__":
     app()
