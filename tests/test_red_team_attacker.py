@@ -8,7 +8,6 @@ import threading
 import numpy as np
 import pytest
 
-from detection.red_team import EVASION_THRESHOLD
 from detection.red_team.attacker import GeneticAttacker, evaluate_score
 from detection.red_team.evasion_logger import (
     MODEL_EVASION_EVENT,

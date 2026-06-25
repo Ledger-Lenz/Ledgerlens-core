@@ -14,7 +14,7 @@ statistically impossible under independent trading. The multivariate helpers
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,100 @@ from scipy.stats import chi2, norm
 logger = logging.getLogger("ledgerlens.benford_engine")
 
 DIGITS = list(range(1, 10))
+
+
+def _parse_benford_windows(default: list[int]) -> list[int]:
+    raw = os.getenv("BENFORD_WINDOWS", "")
+    if not raw:
+        return default
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        return default
+
+
+@dataclass
+class BenfordStats:
+    chi_square: float
+    mad: float
+    z_scores: list[float]  # length-9, index 0 = digit 1
+    n: int
+
+
+class BenfordStreamCounter:
+    """O(1) incremental Benford digit-frequency counter over configurable sliding windows.
+
+    Each window uses a circular buffer of leading digits (``deque(maxlen=window)``).
+    When a new digit enters a full window, the oldest digit is automatically evicted
+    and the per-digit tally is updated in O(1).  ``window_stats()`` iterates over
+    the 9-element tally in O(9) = O(1).
+
+    Circular buffer rollover: Python's ``collections.deque(maxlen=N)`` handles the
+    ring automatically — appending to a full deque evicts the leftmost element and
+    returns it via the ``appendleft``/``append`` mechanics, but we need the evicted
+    value to decrement the tally.  We store the raw deque and maintain a parallel
+    ``counts`` array; on each ``update`` we read ``buf[0]`` before appending when
+    the buffer is already full, then decrement that evicted digit.
+    """
+
+    BENFORD_EXPECTED = [math.log10(1 + 1 / d) for d in range(1, 10)]
+
+    def __init__(self, windows: list[int] | None = None) -> None:
+        self._windows: list[int] = _parse_benford_windows(windows or [100, 500, 1000])
+        # per-window: circular buffer of raw digits (1-9), digit count array
+        self._bufs: list[deque] = [deque(maxlen=w) for w in self._windows]
+        self._counts: list[list[int]] = [[0] * 9 for _ in self._windows]
+        # pre-built list of (buf, counts, maxlen) to avoid attribute lookups in update()
+        self._slots: list[tuple[deque, list[int], int]] = [
+            (buf, counts, w)
+            for buf, counts, w in zip(self._bufs, self._counts, self._windows)
+        ]
+
+    # ------------------------------------------------------------------
+    def update(self, amount: float) -> None:
+        """O(len(windows)) — extract the leading digit and update all tallies."""
+        if amount is None or not math.isfinite(amount) or amount <= 0:
+            return
+        # Fast leading-digit extraction via log10 — avoids the while-loop in first_digit()
+        digit = int(10 ** (math.log10(amount) % 1))
+        if digit == 0:
+            digit = 1
+        idx = digit - 1
+        for buf, counts, maxlen in self._slots:
+            if len(buf) == maxlen:
+                counts[buf[0] - 1] -= 1
+            buf.append(digit)
+            counts[idx] += 1
+
+    def window_stats(self, window: int) -> BenfordStats:
+        """Return BenfordStats for the requested window size. O(9)."""
+        try:
+            wi = self._windows.index(window)
+        except ValueError:
+            raise ValueError(f"Window {window} not in configured windows {self._windows}")
+
+        counts = self._counts[wi]
+        n = sum(counts)
+        if n == 0:
+            return BenfordStats(chi_square=0.0, mad=0.0, z_scores=[0.0] * 9, n=0)
+
+        expected = self.BENFORD_EXPECTED
+        observed = [c / n for c in counts]
+
+        chi_sq = sum(
+            (o * n - e * n) ** 2 / (e * n)
+            for o, e in zip(observed, expected)
+            if e > 0
+        )
+        mad = float(sum(abs(o - e) for o, e in zip(observed, expected)) / 9)
+
+        zs = []
+        for o, e in zip(observed, expected):
+            num = max(abs(o - e) - 1 / (2 * n), 0.0)
+            denom = math.sqrt(e * (1 - e) / n)
+            zs.append(num / denom if denom > 0 else 0.0)
+
+        return BenfordStats(chi_square=float(chi_sq), mad=mad, z_scores=zs, n=n)
 
 # P(d) = log10(1 + 1/d) for d in 1..9
 BENFORD_EXPECTED: dict[int, float] = {d: math.log10(1 + 1 / d) for d in DIGITS}

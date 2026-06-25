@@ -7,7 +7,6 @@ build_feature_vector.
 """
 
 import pandas as pd
-import pytest
 
 from detection.benford_engine import AdaptiveBenfordWindow, BenfordWindowResult
 from detection.feature_engineering import (

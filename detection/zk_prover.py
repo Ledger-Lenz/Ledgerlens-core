@@ -10,14 +10,12 @@ The proof is non-interactive via the Fiat-Shamir heuristic.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from typing import Any
 
 from py_ecc.bn128 import FQ, G1, curve_order, neg as bn_neg, multiply, add as bn_add
 
 from detection.zk_commitment import (
-    generate_salt,
     h_generator,
     pedersen_commit,
     score_commitment,

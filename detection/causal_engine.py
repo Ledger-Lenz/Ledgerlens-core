@@ -71,6 +71,7 @@ from datetime import datetime, timezone
 import networkx as nx
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -877,3 +878,191 @@ def estimate_pdc(
         if treated.empty or control.empty:
             return 0.0
         return float(treated.mean() - control.mean())
+
+
+# ---------------------------------------------------------------------------
+# PC-skeleton causal feature selection
+# ---------------------------------------------------------------------------
+
+
+def _partial_correlation(
+    x: np.ndarray,
+    y: np.ndarray,
+    s_mat: np.ndarray,
+) -> float:
+    """Partial correlation of *x* and *y* given conditioning matrix *s_mat*.
+
+    When *s_mat* has zero columns the ordinary Pearson correlation is returned.
+    Residuals are computed via least-squares regression of each variable on the
+    conditioning set.
+    """
+    if s_mat.shape[1] == 0:
+        r = float(np.corrcoef(x, y)[0, 1])
+    else:
+        def _residual(v: np.ndarray) -> np.ndarray:
+            coef, _, _, _ = np.linalg.lstsq(s_mat, v, rcond=None)
+            return v - s_mat @ coef
+
+        x_res = _residual(x)
+        y_res = _residual(y)
+        denom = np.std(x_res) * np.std(y_res)
+        if denom < 1e-12:
+            return 0.0
+        r = float(np.cov(x_res, y_res)[0, 1] / (np.std(x_res) * np.std(y_res)))
+    return float(np.clip(r, -1 + 1e-10, 1 - 1e-10))
+
+
+def _fishers_z_test(
+    x: np.ndarray,
+    y: np.ndarray,
+    s_mat: np.ndarray,
+    alpha: float = 0.01,
+) -> bool:
+    """Return ``True`` if *x* ⊥ *y* | S (conditionally independent given S).
+
+    Uses Fisher's Z transform of the partial correlation, with a two-tailed
+    normal test. The statistic degenerates when ``n - |S| - 3 <= 0``; in that
+    case the edge is retained (returns ``False``).
+
+    Parameters
+    ----------
+    x, y:
+        1-D feature vectors (``float64``).
+    s_mat:
+        N × |S| conditioning matrix; pass ``np.empty((n, 0))`` for the
+        marginal test (|S| = 0).
+    alpha:
+        Significance level; edges are removed only when ``p > alpha``.
+    """
+    n = len(x)
+    df = n - s_mat.shape[1] - 3
+    if df <= 0:
+        return False  # too few samples to test
+    r = _partial_correlation(x, y, s_mat)
+    z = 0.5 * np.log((1 + r) / (1 - r))
+    se = 1.0 / max(np.sqrt(df), 1e-12)
+    pval = 2.0 * (1.0 - norm.cdf(abs(z) / se))
+    return bool(pval > alpha)
+
+
+class CausalFeatureSelector:
+    """Select features that are directly causally related to the wash-trading label.
+
+    Implements the skeleton phase of the PC algorithm (Spirtes, Glymour &
+    Scheines, 2000): edges between features and the target variable are tested
+    for conditional independence at increasing conditioning set sizes.  A
+    feature whose edge to the target survives all tests is *causally* connected
+    to the label and retained; all others are pruned.
+
+    Parameters
+    ----------
+    alpha:
+        Significance level for Fisher's Z conditional independence tests.
+        Lower values are more conservative (fewer edges removed).  Default: 0.01.
+    max_conditioning_size:
+        Maximum conditioning set size ``|S|`` in the PC skeleton phase.
+        Values beyond 3 become computationally expensive for large feature sets.
+        Default: 3.
+
+    Attributes
+    ----------
+    selected_features_:
+        List of feature names retained after fitting. Available after calling
+        :meth:`fit`.
+    n_features_in_:
+        Total number of features passed to :meth:`fit`.
+    separation_sets_:
+        Mapping ``(feature_name, "label") → separation_set_indices``.
+        Non-empty only for removed features.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.01,
+        max_conditioning_size: int = 3,
+    ) -> None:
+        self.alpha = alpha
+        self.max_conditioning_size = max_conditioning_size
+        self.selected_features_: List[str] = []
+        self.n_features_in_: int = 0
+        self.separation_sets_: dict = {}
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_names: List[str],
+    ) -> List[str]:
+        """Run the PC skeleton phase and return the selected feature names.
+
+        Tests each feature for conditional independence from the label *y*,
+        conditioning on growing subsets of the other features.  Features that
+        become d-separated from *y* by some conditioning set are removed.
+
+        Parameters
+        ----------
+        X:
+            ``(n_samples, n_features)`` feature matrix (``float64``).
+        y:
+            ``(n_samples,)`` binary label vector (0/1).
+        feature_names:
+            List of feature names corresponding to columns of *X*.
+
+        Returns
+        -------
+        List[str]
+            Names of features retained in the causal subset, in their original
+            order from *feature_names*.
+        """
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n, p = X.shape
+        self.n_features_in_ = p
+
+        if p == 0 or n < 10:
+            self.selected_features_ = list(feature_names)
+            return self.selected_features_
+
+        # adj[i] = True means feature i is still adjacent to target y
+        adj = [True] * p
+
+        @lru_cache(maxsize=None)
+        def _get_col(idx: int) -> bytes:
+            return X[:, idx].tobytes()
+
+        def _get_arr(idx: int) -> np.ndarray:
+            return X[:, idx]
+
+        for l in range(self.max_conditioning_size + 1):  # noqa: E741
+            removed_this_round = False
+            for i in range(p):
+                if not adj[i]:
+                    continue
+                # Conditioning candidates: other features still adjacent to y.
+                candidates = [j for j in range(p) if j != i and adj[j]]
+                if len(candidates) < l:
+                    continue
+                for s_indices in itertools.combinations(candidates, l):
+                    s_mat = X[:, list(s_indices)] if s_indices else np.empty((n, 0))
+                    if _fishers_z_test(_get_arr(i), y, s_mat, self.alpha):
+                        adj[i] = False
+                        self.separation_sets_[(feature_names[i], "label")] = list(s_indices)
+                        removed_this_round = True
+                        logger.debug(
+                            "CausalFeatureSelector: removed '%s' (sep set size=%d)",
+                            feature_names[i], l,
+                        )
+                        break
+            if not removed_this_round and l > 0:
+                # No edges were removed in this pass; stop early.
+                break
+
+        self.selected_features_ = [
+            name for name, is_adj in zip(feature_names, adj) if is_adj
+        ]
+        n_removed = p - len(self.selected_features_)
+        logger.info(
+            "CausalFeatureSelector: %d/%d features retained (%d removed)",
+            len(self.selected_features_), p, n_removed,
+        )
+        return self.selected_features_

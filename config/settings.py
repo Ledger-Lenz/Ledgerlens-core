@@ -7,7 +7,7 @@ error listing every problem at once.
 
 import time
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,13 @@ def _split_csv(raw: str) -> tuple[str, ...]:
     benford_mad_threshold: float = field(default_factory=lambda: float(os.getenv("BENFORD_MAD_THRESHOLD", "0.015")))
     benford_min_sample_count: int = field(default_factory=lambda: int(os.getenv("BENFORD_MIN_SAMPLE_COUNT", "30")))
     benford_max_window_days: int = field(default_factory=lambda: int(os.getenv("BENFORD_MAX_WINDOW_DAYS", "90")))
+    # Causal feature selection (PC algorithm)
+    causal_independence_alpha: float = field(
+        default_factory=lambda: float(os.getenv("CAUSAL_INDEPENDENCE_ALPHA", "0.01"))
+    )
+    causal_max_conditioning_size: int = field(
+        default_factory=lambda: int(os.getenv("CAUSAL_MAX_CONDITIONING_SIZE", "3"))
+    )
     _default_risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
     COMMITTEE_QUORUM: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_QUORUM", "3")))
     COMMITTEE_VOTE_DEADLINE_DAYS: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_VOTE_DEADLINE_DAYS", "14")))
@@ -24,6 +31,10 @@ def _split_csv(raw: str) -> tuple[str, ...]:
     ensemble_weight_xgb: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_XGB", "0.50")))
     ensemble_weight_lgbm: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_LGBM", "0.25")))
     temporal_weight: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_WEIGHT", "0.3")))
+    # Sequence model settings
+    temporal_model_type: str = field(default_factory=lambda: os.getenv("TEMPORAL_MODEL_TYPE", "lstm"))
+    temporal_max_seq_len: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_MAX_SEQ_LEN", "200")))
+    temporal_lstm_hidden_dim: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_LSTM_HIDDEN_DIM", "64")))
     _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
 
 class Settings(BaseSettings):

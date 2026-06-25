@@ -67,6 +67,10 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     *(_decreasable(f"benford_chi_square_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
     *(_decreasable(f"benford_mad_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
     *(_decreasable(f"benford_max_zscore_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+    # benford_window_expanded_* are observational flags set when the Benford
+    # analysis had to widen its look-back window due to sparse data. The wallet
+    # cannot undo past sparsity, so these flags are immutable.
+    *(_immutable(f"benford_window_expanded_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
 
     # --- Trade pattern features (4) -----------------------------------------
     # All four are [0, 1] ratios where a higher value is a hallmark of
@@ -137,14 +141,16 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _decreasable("avg_path_hop_count"),
     _decreasable("path_cycle_volume_ratio"),
 
-    # --- Multi-hop path-payment cycle features (4) --------------------------
-    # All four rise with cyclic self-dealing routed across separate path
+    # --- Multi-hop path-payment cycle features (6) --------------------------
+    # All six rise with cyclic self-dealing routed across separate path
     # payments, so they are only ever lowerable (floored at 0.0 for the
     # no-cycle default).
     _decreasable("path_cycle_count_24h"),
     _decreasable("path_cycle_xlm_volume_24h"),
     _decreasable("max_cycle_length"),
     _decreasable("cycle_asset_diversity"),
+    _decreasable("path_cycle_count"),
+    _decreasable("path_cycle_recovery_ratio"),
 
     # --- Sandwich-attack features (2) ---------------------------------------
     _decreasable("sandwich_ratio"),

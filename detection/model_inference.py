@@ -18,14 +18,42 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import config.settings as settings_module
+from detection.benford_engine import BenfordStreamCounter
 from detection.feature_engineering import FEATURE_NAMES
 from detection.gnn_model import _HAS_PYG, safe_load_gnn_checkpoint
 from detection.model_signing import assert_within_model_dir, safe_joblib_load
 
 logger = logging.getLogger("ledgerlens.model_inference")
 
+# ---------------------------------------------------------------------------
+# Per-wallet streaming Benford counters
+# ---------------------------------------------------------------------------
+# Maps wallet -> BenfordStreamCounter for incremental Benford feature extraction.
+# Populated lazily via ingest_trade(); safe for single-threaded use.
+_wallet_counters: dict[str, BenfordStreamCounter] = {}
+_DEFAULT_WINDOWS: list[int] = [100, 500, 1000]
+
+
+def ingest_trade(wallet: str, amount: float, windows: list[int] | None = None) -> None:
+    """Update the Benford stream counter for *wallet* with *amount*.
+
+    Creates the counter on first call for each wallet.  O(len(windows)).
+    """
+    if wallet not in _wallet_counters:
+        _wallet_counters[wallet] = BenfordStreamCounter(windows or _DEFAULT_WINDOWS)
+    _wallet_counters[wallet].update(amount)
+
+
+def get_benford_stats(wallet: str, window: int):
+    """Return BenfordStats for *wallet* at *window*, or None if no trades seen."""
+    counter = _wallet_counters.get(wallet)
+    if counter is None:
+        return None
+    return counter.window_stats(window)
+
 _WEIGHTS_FILENAME = "ensemble_weights.json"
 _REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib"})
 _weights_mtime: float | None = None
 _runtime_weights: dict[str, float] | None = None
 
@@ -40,6 +68,7 @@ _MODEL_FILENAMES = {
     "lightgbm": "lightgbm.joblib",
     "temporal_lstm": "temporal_lstm.joblib",
     "gnn": "gnn_model.pt",
+    "meta_learner": "meta_learner.joblib",
 }
 
 _CALIBRATION_FILENAMES = {
@@ -122,13 +151,16 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
     return weights
 
 
+_NON_VOTING_MODELS = frozenset({"temporal_lstm", "gnn", "meta_learner"})
+
+
 def _load_models_base(model_dir: str | None = None) -> dict:
     """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
     model_dir = model_dir or settings_module.settings.model_dir
     signing_key = settings_module.settings.model_signing_key.encode()
     models = {}
     for name, filename in _MODEL_FILENAMES.items():
-        if name == "gnn":
+        if name in ("gnn", "meta_learner"):
             continue
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
@@ -142,6 +174,17 @@ def _load_models_base(model_dir: str | None = None) -> dict:
         except RuntimeError as exc:
             logger.error("GNN checkpoint failed validation: %s", exc)
             raise
+
+    # Load meta-learner when available; absence is logged and scored with equal-weight fallback
+    meta_path = os.path.join(model_dir, _MODEL_FILENAMES["meta_learner"])
+    if os.path.exists(meta_path):
+        try:
+            assert_within_model_dir(meta_path, model_dir)
+            models["meta_learner"] = safe_joblib_load(meta_path, signing_key)
+        except Exception as exc:
+            logger.warning("Failed to load meta_learner.joblib: %s — using equal-weight averaging", exc)
+    else:
+        logger.info("meta-learner not found; using equal-weight averaging")
 
     if not models:
         raise FileNotFoundError(f"No trained models found in {model_dir}. Run model_training first.")
@@ -197,9 +240,10 @@ def _get_ensemble_weights(model_dir: str | None = None) -> dict[str, float]:
 def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, float]:
     """Return `(probability, confidence)` for a single feature vector.
 
-    `probability` is the weighted-average ensemble probability of a wash
-    trade pattern. `confidence` is the agreement between models (1.0 =
-    full agreement, lower = models disagree).
+    `probability` is the ensemble probability of a wash trade pattern. When a
+    meta-learner is available (Issue-111), it is used instead of equal-weight
+    averaging; otherwise falls back to weighted averaging per settings.
+    `confidence` is the agreement between base models (1.0 = full agreement).
     """
     X = np.array([[feature_vector[name] for name in FEATURE_NAMES]])
 
@@ -207,19 +251,27 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
     for name, model in models.items():
         if name in _NON_VOTING_MODELS:
             continue
-        if hasattr(model, "feature_names_in_"):
-            ordered = X[:, [FEATURE_NAMES.index(f) for f in model.feature_names_in_]]
+        fin = getattr(model, "feature_names_in_", None)
+        if fin is not None:
+            ordered = X[:, [FEATURE_NAMES.index(f) for f in fin]]
         else:
             ordered = X
         probabilities[name] = model.predict_proba(ordered)[0, 1]
 
-    weights = _get_ensemble_weights()
-    total_weight = sum(weights[n] for n in probabilities)
-    if total_weight <= 0:
-        raise ValueError("At least one loaded model must have a positive ensemble weight.")
-    weighted_prob = sum(probabilities[n] * weights[n] for n in probabilities) / total_weight
+    meta_learner = models.get("meta_learner")
+    if meta_learner is not None and len(probabilities) >= 2:
+        from detection.model_training import _build_meta_features
+        stack_input = np.array([[probabilities.get(k, 0.0) for k in ("random_forest", "xgboost", "lightgbm")]])
+        meta_features = _build_meta_features(stack_input)
+        weighted_prob = float(meta_learner.predict_proba(meta_features)[0, 1])
+    else:
+        weights = _get_ensemble_weights()
+        total_weight = sum(weights.get(n, 0.0) for n in probabilities)
+        if total_weight <= 0:
+            raise ValueError("At least one loaded model must have a positive ensemble weight.")
+        weighted_prob = sum(probabilities[n] * weights.get(n, 0.0) for n in probabilities) / total_weight
 
-    confidence = 1.0 - float(np.std(list(probabilities.values())))
+    confidence = 1.0 - float(np.std(list(probabilities.values()))) if probabilities else 0.0
     return float(weighted_prob), max(0.0, min(1.0, confidence))
 
 
@@ -234,35 +286,53 @@ def _score_feature_matrix_base(
     matrix instead of N × len(models) calls, reducing Python overhead and
     enabling scikit-learn's internal parallelism.
 
+    When a meta-learner is present (Issue-111), uses it instead of equal-weight
+    averaging; inline comment explains the fallback logic.
+
     Returns a list of (probability, confidence) tuples, one per input vector,
-    in the same order as `feature_vectors`. Results are numerically identical
-    to calling `score_feature_vector` for each vector individually.
+    in the same order as `feature_vectors`.
     """
     if not feature_vectors:
         return []
 
     X = np.array([[fv[name] for name in FEATURE_NAMES] for fv in feature_vectors])
-    weights = _get_ensemble_weights()
 
     model_probs: dict[str, np.ndarray] = {}
     for name, model in models.items():
         if name in _NON_VOTING_MODELS:
             continue
-        if hasattr(model, "feature_names_in_"):
-            col_idx = [FEATURE_NAMES.index(f) for f in model.feature_names_in_]
+        fin = getattr(model, "feature_names_in_", None)
+        if fin is not None:
+            col_idx = [FEATURE_NAMES.index(f) for f in fin]
             ordered = X[:, col_idx]
         else:
             ordered = X
         model_probs[name] = model.predict_proba(ordered)[:, 1]
 
-    total_weight = sum(weights[n] for n in model_probs)
-    if total_weight <= 0:
-        raise ValueError("At least one loaded model must have a positive ensemble weight.")
+    meta_learner = models.get("meta_learner")
+    if meta_learner is not None and len(model_probs) >= 2:
+        # Use meta-learner (Issue-111): stack base model outputs and predict
+        from detection.model_training import _build_meta_features
+        stack_input = np.column_stack([
+            model_probs.get("random_forest", np.zeros(len(feature_vectors))),
+            model_probs.get("xgboost", np.zeros(len(feature_vectors))),
+            model_probs.get("lightgbm", np.zeros(len(feature_vectors))),
+        ])
+        meta_features = _build_meta_features(stack_input)
+        weighted_probs = meta_learner.predict_proba(meta_features)[:, 1]
+    else:
+        # Fallback: weighted average per settings when no meta-learner available
+        weights = _get_ensemble_weights()
+        total_weight = sum(weights.get(n, 0.0) for n in model_probs)
+        if total_weight <= 0:
+            raise ValueError("At least one loaded model must have a positive ensemble weight.")
+        weighted_probs = sum(model_probs[n] * weights.get(n, 0.0) for n in model_probs) / total_weight
 
-    weighted_probs = sum(model_probs[n] * weights[n] for n in model_probs) / total_weight
-
-    all_probs = np.stack(list(model_probs.values()), axis=0)  # (M, N)
-    confidences = np.clip(1.0 - np.std(all_probs, axis=0), 0.0, 1.0)  # (N,)
+    if model_probs:
+        all_probs = np.stack(list(model_probs.values()), axis=0)  # (M, N)
+        confidences = np.clip(1.0 - np.std(all_probs, axis=0), 0.0, 1.0)  # (N,)
+    else:
+        confidences = np.zeros(len(feature_vectors))
 
     return [(float(weighted_probs[i]), float(confidences[i])) for i in range(len(feature_vectors))]
 
@@ -321,25 +391,69 @@ def score_with_uncertainty(
     }
 
 
-from detection.gnn_model import safe_load_gnn_checkpoint, _HAS_PYG  # noqa: E402
 from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
 
 _MODEL_FILENAMES = dict(globals().get("_MODEL_FILENAMES", {}))
 _MODEL_FILENAMES["gnn"] = "gnn_model.pt"
+_MODEL_FILENAMES["sequence_model"] = "temporal_model.pt"
+
+# Models excluded from the tabular ensemble probability vote.
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model"})
 
 
-def load_models(model_dir: str, *args, **kwargs) -> dict:
-    """Wraps the base model loader, also loading gnn_model.pt if present."""
-    models = _load_models_base(model_dir, *args, **kwargs)
+def load_models(model_dir: str | None = None, *args, **kwargs) -> dict:
+    """Wraps the base model loader, also loading gnn_model.pt and temporal_model.pt if present."""
+    actual_model_dir = model_dir or settings_module.settings.model_dir
+    models = _load_models_base(actual_model_dir, *args, **kwargs)
 
-    gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
+    gnn_path = os.path.join(actual_model_dir, _MODEL_FILENAMES["gnn"])
     if os.path.exists(gnn_path) and _HAS_PYG:
         try:
             models["gnn"] = safe_load_gnn_checkpoint(gnn_path)
         except RuntimeError as e:
             logger.error("GNN checkpoint failed validation: %s", e)
             raise
+
+    seq_path = os.path.join(actual_model_dir, _MODEL_FILENAMES["sequence_model"])
+    if os.path.exists(seq_path):
+        try:
+            from detection.temporal_model import load_sequence_model
+            s = settings_module.settings
+            seq_model = load_sequence_model(
+                actual_model_dir,
+                model_type=s.temporal_model_type,
+                lstm_hidden_dim=s.temporal_lstm_hidden_dim,
+                max_seq_len=s.temporal_max_seq_len,
+            )
+            if seq_model is not None:
+                models["sequence_model"] = seq_model
+        except Exception as exc:
+            logger.warning("Could not load temporal_model.pt: %s — skipping", exc)
+
     return models
+
+
+def fuse_sequence_score(
+    tabular_prob: float,
+    seq_prob: float,
+    w_seq: float,
+) -> float:
+    """Fuse tabular ensemble probability with sequence model probability.
+
+    Uses the same linear interpolation approach as GNN fusion.
+    ``w_seq`` is found by ``scipy.optimize.minimize_scalar`` on validation
+    AUC-PR; valid range is [0.0, 0.4].
+
+    Args:
+        tabular_prob: Ensemble tabular probability (0–1).
+        seq_prob:     WashTradeSequenceModel output probability (0–1).
+        w_seq:        Learned fusion weight in [0.0, 0.4].
+
+    Returns:
+        Blended probability in [0, 1].
+    """
+    w = max(0.0, min(0.4, w_seq))
+    return (1.0 - w) * tabular_prob + w * seq_prob
 
 
 def score_feature_matrix(batch, models: dict, *args, **kwargs):
@@ -381,3 +495,91 @@ def _gnn_forward_pass(model, snapshots) -> dict:
                     "gnn_neighbor_avg_score": float(neighbor_avg[idx].item()),
                 }
     return results
+
+
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm"})
+
+
+class ModelInference:
+    """Thin stateless wrapper around :func:`load_models` and :func:`score_feature_vector`.
+
+    Provides a single :meth:`score` method that returns a :class:`~detection.risk_score.RiskScore`
+    given a pre-built feature dict, making it easy to inject in tests.
+    """
+
+    def __init__(self, models: dict) -> None:
+        self._models = models
+
+    def score(self, wallet: str, asset_pair: str, features: dict):
+        from detection.risk_score import RiskScore
+
+        prob, confidence = score_feature_vector(self._models, features)
+        benford_mad = features.get("benford_mad_24h", 0.0)
+        from config.settings import settings as _settings
+        return RiskScore.combine(
+            wallet=wallet,
+            asset_pair=asset_pair,
+            benford_mad=benford_mad,
+            benford_mad_threshold=_settings.benford_mad_threshold,
+            ml_probability=prob,
+            ml_confidence=confidence,
+        )
+
+
+class IncrementalScorer:
+    """Stateful scorer that processes one trade at a time.
+
+    Maintains a :class:`~detection.rolling_window.RollingWindowState` and emits
+    a :class:`~detection.risk_score.RiskScore` for a wallet only when the new
+    score differs from the last emitted score by at least
+    *score_delta_threshold* points.
+
+    The first trade for a wallet always emits a score (no prior baseline).
+
+    Args:
+        window_state: The in-memory rolling-window store.
+        feature_engineering: A :class:`~detection.feature_engineering.FeatureEngineering` instance.
+        model_inference: A :class:`ModelInference` instance wrapping the loaded models.
+        score_delta_threshold: Minimum absolute score change required to emit a new score (default 5).
+    """
+
+    def __init__(
+        self,
+        window_state,
+        feature_engineering,
+        model_inference: "ModelInference",
+        score_delta_threshold: int = 5,
+    ) -> None:
+        from detection.rolling_window import RollingWindowState
+        from detection.feature_engineering import FeatureEngineering
+
+        self._window: RollingWindowState = window_state
+        self._fe: FeatureEngineering = feature_engineering
+        self._infer: ModelInference = model_inference
+        self._delta = score_delta_threshold
+        self._last_scores: dict[str, int] = {}
+
+    @property
+    def window_state(self):
+        return self._window
+
+    def score_on_trade(self, trade):
+        """Update rolling window with *trade* and return a :class:`~detection.risk_score.RiskScore`
+        if ``|new_score - last_score| >= delta``, else ``None``.
+        """
+        wallet = trade.base_account
+        self._window.add_trade(wallet, trade)
+
+        features = self._fe.compute_incremental(
+            wallet=wallet,
+            trades_1h=self._window.get_window(wallet, 1),
+            trades_4h=self._window.get_window(wallet, 4),
+            trades_24h=self._window.get_window(wallet, 24),
+        )
+        new_score = self._infer.score(wallet, trade.asset_pair, features)
+        last = self._last_scores.get(wallet, -999)
+
+        if abs(new_score.score - last) >= self._delta:
+            self._last_scores[wallet] = new_score.score
+            return new_score
+        return None

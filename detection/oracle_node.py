@@ -1,5 +1,4 @@
 from stellar_sdk import Keypair
-from typing import Optional
 
 class OracleNode:
     def __init__(self, keypair: Keypair, contract_id: str, horizon_url: str):

@@ -22,6 +22,7 @@ import sqlite3
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -31,14 +32,20 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRouter
-from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
+from api.namespace import list_namespaces
 from config.settings import settings
+from detection.tracing import (
+    configure_tracing,
+    extract_context_from_headers,
+    get_tracer,
+    start_span,
+)
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
@@ -126,6 +133,7 @@ _models: dict = {}
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; close WebSocket connections at shutdown."""
     global _models
+    configure_tracing()
     try:
         from detection.model_inference import load_models
         _models = load_models(settings.model_dir)
@@ -144,6 +152,20 @@ app = FastAPI(
     version="1.0.0",
     lifespan=_lifespan,
 )
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_operational_error_handler(request: Request, exc: sqlite3.OperationalError):
+    """Return 503 with Retry-After when SQLite is locked or unavailable."""
+    logger.error("SQLite operational error: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database temporarily unavailable. Please retry."},
+        headers={"Retry-After": "5"},
+    )
+
+
+app.include_router(analyst_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -184,47 +206,78 @@ class VoteBody(BaseModel):
     vote: str
 
 
+v1_router = APIRouter(prefix="/v1")
+
+
 @v1_router.get("/health")
 def health() -> JSONResponse:
-    """Returns 200 when healthy, 503 when any component check fails.
+    """Returns 200 when healthy, 503 when any hard-failure component check fails.
 
     Checks:
     - DB connectivity: executes SELECT 1 via the existing _connect helper.
     - Model files: each expected .joblib file exists and is non-empty.
+    - Circuit breakers: Horizon ingestion and the Redis feature store each
+      have a breaker (see `utils.circuit_breaker`). An OPEN/HALF_OPEN
+      circuit marks the response "degraded" but keeps returning 200 (the
+      service is still serving traffic in a reduced-functionality state,
+      not failed) — only DB/model failures return 503.
 
     The response body names every component but never leaks local filesystem
     paths — errors are logged server-side at ERROR level.
     """
     from detection.model_inference import _MODEL_FILENAMES
     from detection.storage import _connect
+    from ingestion.horizon_streamer import horizon_circuit
+    from utils.circuit_breaker import CircuitState
 
-    status: dict[str, str] = {}
+    status: dict[str, object] = {}
     healthy = True
+    degraded = False
 
     # --- DB check ---
-    try:
-        with _connect() as conn:
-            conn.execute("SELECT 1")
-        status["db"] = "ok"
-    except sqlite3.Error as exc:
-        logger.error("Health check: DB connectivity failure: %s", exc)
-        status["db"] = "error: database unreachable"
-        healthy = False
+    with start_span("db.health_check"):
+        try:
+            with _connect() as conn:
+                conn.execute("SELECT 1")
+            status["db"] = "ok"
+        except sqlite3.Error as exc:
+            logger.error("Health check: DB connectivity failure: %s", exc)
+            status["db"] = "error: database unreachable"
+            healthy = False
 
     # --- Model files check (existence + non-zero size only; no deserialization) ---
-    missing = [
-        name
-        for name, filename in _MODEL_FILENAMES.items()
-        if not _model_file_ok(os.path.join(settings.model_dir, filename))
-    ]
+    with start_span("models.health_check"):
+        missing = [
+            name
+            for name, filename in _MODEL_FILENAMES.items()
+            if not _model_file_ok(os.path.join(settings.model_dir, filename))
+        ]
     if missing:
         status["models"] = f"missing: {', '.join(sorted(missing))}"
         healthy = False
     else:
         status["models"] = "ok"
 
-    status["status"] = "ok" if healthy else "degraded"
-    http_status = 200 if healthy else 503
+    # --- Circuit breakers (open/half-open => degraded, not failed) ---
+    try:
+        feature_store_circuit_state = _get_health_feature_store().circuit_state
+    except Exception as exc:
+        logger.error("Health check: feature store circuit lookup failed: %s", exc)
+        feature_store_circuit_state = CircuitState.OPEN.value
+    circuits = {
+        "horizon": horizon_circuit.state.value,
+        "feature_store_redis": feature_store_circuit_state,
+    }
+    status["circuits"] = circuits
+    if any(state != CircuitState.CLOSED.value for state in circuits.values()):
+        degraded = True
+
+    if healthy:
+        status["status"] = "degraded" if degraded else "ok"
+        http_status = 200
+    else:
+        status["status"] = "degraded"
+        http_status = 503
     return JSONResponse(content=status, status_code=http_status)
 
 
@@ -296,13 +349,54 @@ def explain_wallet_score(
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
+    with start_span("redis.shap_lookup", attributes={"wallet": wallet, "asset_pair": asset_pair}):
+        cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
     if cached is None:
         raise HTTPException(
             status_code=404,
             detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
         )
     return cached
+
+
+class RateLimiterStatus(BaseModel):
+    configured_rate: float
+    current_rate: float
+    bucket_level: float
+    backpressure_active: bool
+    queue_size: int
+    last_429_at: Optional[datetime] = None
+
+
+@app.get(
+    "/stream/rate-limiter",
+    response_model=RateLimiterStatus,
+    dependencies=[Depends(require_admin_key)],
+)
+def rate_limiter_status() -> RateLimiterStatus:
+    """Return current rate limiter and backpressure state.
+
+    Requires the ``X-LedgerLens-Admin-Key`` header.  Returns 503 if no
+    streamer is currently registered.
+    """
+    bucket = _stream_rate_limiter_state.get("bucket")
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Rate limiter not active (no streamer running)")
+
+    bp = _stream_rate_limiter_state.get("backpressure")
+    adaptive = _stream_rate_limiter_state.get("adaptive")
+    last_429_dt: Optional[datetime] = None
+    if adaptive and adaptive.last_429_at is not None:
+        last_429_dt = datetime.fromtimestamp(adaptive.last_429_at, tz=timezone.utc)
+
+    return RateLimiterStatus(
+        configured_rate=bucket.current_rate,
+        current_rate=bucket.current_rate,
+        bucket_level=bucket.bucket_level,
+        backpressure_active=bp.is_paused if bp else False,
+        queue_size=bp.queue_size if bp else 0,
+        last_429_at=last_429_dt,
+    )
 
 
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
@@ -345,7 +439,8 @@ def wallet_counterfactual(
     from detection.model_inference import score_feature_vector
 
     resolved_target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
-    current_probability, _confidence = score_feature_vector(_models, feature_vector)
+    with start_span("model.inference", attributes={"wallet": wallet}):
+        current_probability, _confidence = score_feature_vector(_models, feature_vector)
     current_score = round(current_probability * 100)
 
     future = _counterfactual_executor.submit(
@@ -504,6 +599,19 @@ def circular_path_payments(
 ) -> list[dict]:
     """Return detected atomic circular path-payment routes, paginated."""
     return get_circular_routes(limit=limit, offset=offset)
+
+
+@app.get("/path-cycles")
+def list_path_cycles(
+    min_score: float = Query(0.6, ge=0.0, le=1.0),
+    wallet: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+) -> list[dict]:
+    """Return detected multi-hop path-payment wash-trade cycles."""
+    from detection.storage import get_hop_payment_cycles
+    if wallet is not None:
+        validate_stellar_address(wallet)
+    return get_hop_payment_cycles(min_score=min_score, wallet=wallet, limit=limit)
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +902,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 
 
 # ------------------------------------------------------------------
-# Governance
+# ZK Commitment endpoints (#147)
 # ------------------------------------------------------------------
 
 
@@ -803,7 +911,7 @@ def get_proposals():
     return [p.dict() for p in list_open_proposals()]
 
 
-class ProposalCreate(BaseModel):
+class LegacyProposalCreate(BaseModel):
     proposal_type: str
     proposed_value: str
     proposed_by_key_hash: str
@@ -818,7 +926,7 @@ def create_proposal_endpoint(body: ProposalCreate):
     return p.dict()
 
 
-class ProposalVote(BaseModel):
+class LegacyProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 

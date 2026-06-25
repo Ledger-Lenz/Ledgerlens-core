@@ -4,12 +4,27 @@ Implements Population Stability Index (PSI) computation to detect when the
 distribution of features in production scoring has shifted significantly from
 the training distribution. Persists scored feature vectors to SQLite and
 provides drift detection thresholds.
+
+Performance monitoring (Issue-110): :class:`PerformanceMonitor` collects
+ground-truth analyst labels and computes rolling precision/recall/F1 to detect
+model degradation over time. When F1 drops more than 5 percentage points from
+the training baseline, ``ModelDegradationAlert`` is raised and retraining is
+triggered automatically.
+
+Feedback collection loop architecture:
+  1. Analyst submits label via ``POST /performance/feedback``
+  2. Label written to ``feedback_labels`` table via :meth:`PerformanceMonitor.record_feedback`
+  3. ``cli.py retrain-check`` calls :meth:`PerformanceMonitor.check_degradation`
+  4. Degradation triggers retraining and fires a webhook ``model_degradation`` event
 """
 
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -270,3 +285,319 @@ def is_drift_detected(
         )
 
     return is_drifted
+
+
+# ---------------------------------------------------------------------------
+# Performance monitoring — Issue-110
+# ---------------------------------------------------------------------------
+
+_VALID_EVIDENCE_URL_SCHEMES = frozenset({"https"})
+_MAX_EVIDENCE_URL_LENGTH = 500
+
+
+def _validate_evidence_url(url: str) -> None:
+    """Raise ValueError for non-HTTPS or oversized evidence URLs (SSRF guard)."""
+    if len(url) > _MAX_EVIDENCE_URL_LENGTH:
+        raise ValueError(f"evidence_url exceeds {_MAX_EVIDENCE_URL_LENGTH} characters")
+    parsed = urlparse(url)
+    if parsed.scheme not in _VALID_EVIDENCE_URL_SCHEMES:
+        raise ValueError(
+            f"evidence_url must use HTTPS; got scheme '{parsed.scheme}'"
+        )
+
+
+class ModelDegradationAlert(Exception):
+    """Raised when F1 drops more than the configured threshold from the baseline."""
+
+
+@dataclass
+class PerformanceReport:
+    """Snapshot of model performance on analyst-labelled feedback samples."""
+
+    precision: float
+    recall: float
+    f1: float
+    n_samples: int
+    n_positive_labels: int
+    n_negative_labels: int
+    window_days: int
+    computed_at: datetime
+    degradation_detected: bool
+    f1_drop: Optional[float]
+
+
+_FEEDBACK_LABELS_DDL = """
+CREATE TABLE IF NOT EXISTS feedback_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT NOT NULL,
+    asset_pair TEXT NOT NULL,
+    predicted_score INTEGER NOT NULL,
+    true_label INTEGER NOT NULL CHECK(true_label IN (0, 1)),
+    submitted_by TEXT,
+    evidence_url TEXT,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    score_version TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_recorded_at
+    ON feedback_labels(recorded_at);
+"""
+
+_DEGRADATION_ALERTS_DDL = """
+CREATE TABLE IF NOT EXISTS degradation_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    baseline_f1 REAL,
+    current_f1 REAL,
+    f1_drop REAL,
+    precision_current REAL,
+    recall_current REAL,
+    n_feedback_samples INTEGER,
+    model_version TEXT,
+    retrain_triggered INTEGER DEFAULT 0
+);
+"""
+
+
+class PerformanceMonitor:
+    """Collect analyst feedback and detect model performance degradation.
+
+    Records ground-truth labels from human analysts, computes rolling
+    precision / recall / F1 against those labels, and raises
+    :class:`ModelDegradationAlert` when F1 drops by more than
+    ``f1_threshold_drop`` from the training baseline.
+
+    The baseline F1 is read from ``models/training_metadata.json``
+    (key: ``val_f1_score``).
+
+    Args:
+        db_path: SQLite database path. Defaults to ``settings.db_path``.
+        risk_score_threshold: Binary classification threshold (default 70).
+    """
+
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        risk_score_threshold: int = 70,
+    ) -> None:
+        from config.settings import settings as _settings
+
+        self.db_path = db_path or _settings.db_path
+        self.risk_score_threshold = risk_score_threshold
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(_FEEDBACK_LABELS_DDL)
+        conn.executescript(_DEGRADATION_ALERTS_DDL)
+        conn.commit()
+        conn.close()
+
+    def record_feedback(
+        self,
+        wallet: str,
+        asset_pair: str,
+        predicted_score: int,
+        true_label: int,
+        submitted_by: Optional[str] = "local_api",
+        evidence_url: Optional[str] = None,
+        score_version: Optional[str] = None,
+    ) -> int:
+        """Insert an analyst feedback label into ``feedback_labels``.
+
+        Args:
+            wallet: Stellar wallet address.
+            asset_pair: Asset pair string (e.g. ``"XLM/USDC"``).
+            predicted_score: 0-100 risk score produced by the model.
+            true_label: Analyst ground-truth (0 = clean, 1 = wash).
+            submitted_by: Analyst ID or ``"local_api"``; never user-supplied.
+            evidence_url: Optional HTTPS URL to supporting evidence.
+            score_version: Model version string that produced the score.
+
+        Returns:
+            Newly inserted row ID.
+
+        Raises:
+            ValueError: if ``true_label`` not in {0, 1} or evidence_url is invalid.
+        """
+        if true_label not in (0, 1):
+            raise ValueError(f"true_label must be 0 or 1, got {true_label!r}")
+        if evidence_url is not None:
+            _validate_evidence_url(evidence_url)
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.execute(
+            """
+            INSERT INTO feedback_labels
+                (wallet, asset_pair, predicted_score, true_label,
+                 submitted_by, evidence_url, recorded_at, score_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (wallet, asset_pair, predicted_score, true_label,
+             submitted_by, evidence_url, now, score_version),
+        )
+        conn.commit()
+        row_id = cur.lastrowid
+        conn.close()
+        return row_id
+
+    def compute_performance_metrics(self, days: int = 30) -> PerformanceReport:
+        """Compute precision / recall / F1 on feedback labels from the last ``days`` days.
+
+        Uses :attr:`risk_score_threshold` to binarise ``predicted_score``.
+
+        Returns:
+            :class:`PerformanceReport` with computed metrics.
+        """
+        from config.settings import settings as _settings
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT predicted_score, true_label FROM feedback_labels WHERE recorded_at >= ?",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
+
+        n = len(rows)
+        n_positive = sum(1 for _, lbl in rows if lbl == 1)
+        n_negative = n - n_positive
+        threshold = self.risk_score_threshold
+
+        min_samples = _settings.performance_min_feedback_samples
+        degradation_detected = False
+        f1_drop = None
+
+        if n < min_samples:
+            logger.warning(
+                "Only %d feedback samples available (< %d minimum); "
+                "skipping degradation alert check",
+                n, min_samples,
+            )
+            return PerformanceReport(
+                precision=0.0, recall=0.0, f1=0.0,
+                n_samples=n, n_positive_labels=n_positive, n_negative_labels=n_negative,
+                window_days=days, computed_at=datetime.now(timezone.utc),
+                degradation_detected=False, f1_drop=None,
+            )
+
+        tp = sum(1 for score, lbl in rows if score >= threshold and lbl == 1)
+        fp = sum(1 for score, lbl in rows if score >= threshold and lbl == 0)
+        fn = sum(1 for score, lbl in rows if score < threshold and lbl == 1)
+
+        if tp + fp == 0:
+            precision = 1.0
+        else:
+            precision = tp / (tp + fp)
+
+        if tp + fn == 0:
+            recall = 0.0
+        else:
+            recall = tp / (tp + fn)
+
+        if precision + recall == 0:
+            logger.warning("No positive predictions in feedback window; F1 = 0.0")
+            f1 = 0.0
+        else:
+            f1 = 2.0 * precision * recall / (precision + recall)
+
+        return PerformanceReport(
+            precision=precision, recall=recall, f1=f1,
+            n_samples=n, n_positive_labels=n_positive, n_negative_labels=n_negative,
+            window_days=days, computed_at=datetime.now(timezone.utc),
+            degradation_detected=degradation_detected, f1_drop=f1_drop,
+        )
+
+    def check_degradation(
+        self,
+        baseline_f1: float,
+        f1_threshold_drop: float = 0.05,
+        days: Optional[int] = None,
+    ) -> bool:
+        """Compute current F1 and raise :class:`ModelDegradationAlert` if degraded.
+
+        Args:
+            baseline_f1: F1 score recorded at training time.
+            f1_threshold_drop: Alert if current_f1 < baseline_f1 - this value.
+            days: Rolling window in days (defaults to settings value).
+
+        Returns:
+            True if degradation detected, False otherwise.
+
+        Raises:
+            ModelDegradationAlert: when degradation exceeds the threshold.
+        """
+        from config.settings import settings as _settings
+
+        window = days or _settings.performance_monitoring_window_days
+        report = self.compute_performance_metrics(days=window)
+
+        if report.n_samples < _settings.performance_min_feedback_samples:
+            return False
+
+        f1_drop = baseline_f1 - report.f1
+        if f1_drop > f1_threshold_drop:
+            self._save_degradation_alert(baseline_f1, report, f1_drop)
+            raise ModelDegradationAlert(
+                f"F1 degraded by {f1_drop:.4f} "
+                f"(baseline={baseline_f1:.4f}, current={report.f1:.4f})"
+            )
+
+        logger.info(
+            "Performance check: F1=%.4f, baseline=%.4f, drop=%.4f (threshold=%.4f) — OK",
+            report.f1, baseline_f1, f1_drop, f1_threshold_drop,
+        )
+        return False
+
+    def _save_degradation_alert(
+        self,
+        baseline_f1: float,
+        report: PerformanceReport,
+        f1_drop: float,
+        model_version: Optional[str] = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """
+            INSERT INTO degradation_alerts
+                (alert_timestamp, baseline_f1, current_f1, f1_drop,
+                 precision_current, recall_current, n_feedback_samples,
+                 model_version, retrain_triggered)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (now, baseline_f1, report.f1, f1_drop,
+             report.precision, report.recall, report.n_samples, model_version),
+        )
+        conn.commit()
+        conn.close()
+        logger.warning(
+            "ModelDegradationAlert saved: baseline_f1=%.4f current_f1=%.4f drop=%.4f",
+            baseline_f1, report.f1, f1_drop,
+        )
+
+    def get_latest_degradation_alerts(self, limit: int = 10) -> list[dict]:
+        """Return the most recent degradation alert records."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            """
+            SELECT id, alert_timestamp, baseline_f1, current_f1, f1_drop,
+                   precision_current, recall_current, n_feedback_samples,
+                   model_version, retrain_triggered
+            FROM degradation_alerts
+            ORDER BY alert_timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [
+            {
+                "id": r[0], "alert_timestamp": r[1], "baseline_f1": r[2],
+                "current_f1": r[3], "f1_drop": r[4], "precision_current": r[5],
+                "recall_current": r[6], "n_feedback_samples": r[7],
+                "model_version": r[8], "retrain_triggered": bool(r[9]),
+            }
+            for r in rows
+        ]
