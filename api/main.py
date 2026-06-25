@@ -25,12 +25,17 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.routing import APIRouter
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
+from api.admin_router import router as admin_router
+from api.export_router import router as export_router
+from api.batch_router import router as batch_router
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -43,7 +48,7 @@ from detection.storage import (
     get_bridge_transfers,
     get_circular_routes,
     get_drift_reports,
-    get_feature_vector_for_wallet,
+    get_feature_vector,
     get_latest_scores,
     get_liquidity_pool_trades,
     get_pair_correlations,
@@ -82,7 +87,7 @@ _models: dict = {}
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    """Load trained models at startup; release nothing at shutdown."""
+    """Load trained models at startup; close WebSocket connections at shutdown."""
     global _models
     try:
         from detection.model_inference import load_models
@@ -92,12 +97,14 @@ async def _lifespan(application: FastAPI):
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
     yield
+    from api.ws_router import manager as _ws_manager
+    await _ws_manager.close_all()
 
 
 app = FastAPI(
     title="LedgerLens (local)",
     description="Local read-only API serving RiskScore records from the detection engine.",
-    version="0.1.0",
+    version="1.0.0",
     lifespan=_lifespan,
 )
 
@@ -108,6 +115,17 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=False,
 )
+
+from api.ws_router import router as _ws_router  # noqa: E402
+app.include_router(_ws_router)
+
+app.include_router(admin_router)
+
+
+app.include_router(batch_router)
+
+
+app.include_router(export_router)
 
 
 class WebhookCreate(BaseModel):
@@ -129,7 +147,7 @@ class VoteBody(BaseModel):
     vote: str
 
 
-@app.get("/health")
+@v1_router.get("/health")
 def health() -> JSONResponse:
     """Returns 200 when healthy, 503 when any component check fails.
 
@@ -181,7 +199,7 @@ def _model_file_ok(path: str) -> bool:
         return False
 
 
-@app.get("/scores", response_model=list[RiskScore])
+@v1_router.get("/scores", response_model=list[RiskScore])
 def list_scores(
     min_score: int = 0,
     limit: int = Query(default=100, ge=1, le=1000),
@@ -220,7 +238,7 @@ def list_scores(
 
 
 
-@app.get("/scores/{wallet}/explain")
+@v1_router.get("/scores/{wallet}/explain")
 def explain_wallet_score(
     wallet: str,
     asset_pair: str = Query(..., description="Asset pair to explain, e.g. XLM/USDC"),
@@ -254,7 +272,7 @@ _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
 _counterfactual_executor = ThreadPoolExecutor(max_workers=4)
 
 
-@app.get("/scores/{wallet}/counterfactual")
+@v1_router.get("/scores/{wallet}/counterfactual")
 def wallet_counterfactual(
     wallet: str,
     asset_pair: str = Query(..., description="Asset pair to generate counterfactuals for, e.g. XLM/USDC"),
@@ -281,7 +299,7 @@ def wallet_counterfactual(
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    feature_vector = get_feature_vector_for_wallet(wallet, asset_pair)
+    feature_vector = get_feature_vector(wallet, asset_pair)
     if feature_vector is None:
         raise HTTPException(
             status_code=404, detail=f"No cached feature vector for wallet {wallet} on {asset_pair}"
@@ -319,7 +337,7 @@ def wallet_counterfactual(
     }
 
 
-@app.get("/scores/{wallet}")
+@v1_router.get("/scores/{wallet}")
 def wallet_scores(wallet: str) -> dict:
     """Return the latest score for `wallet` on each asset pair.
 
@@ -358,7 +376,7 @@ def wallet_scores(wallet: str) -> dict:
     }
 
 
-@app.get("/wallets/{wallet}/cross-chain")
+@v1_router.get("/wallets/{wallet}/cross-chain")
 def wallet_cross_chain(wallet: str) -> list[dict]:
     """Return the full bridge transfer history for ``wallet``.
 
@@ -371,7 +389,7 @@ def wallet_cross_chain(wallet: str) -> list[dict]:
     return history
 
 
-@app.get("/alerts")
+@v1_router.get("/alerts")
 def alerts(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -396,7 +414,7 @@ def alerts(
 
 
 
-@app.get("/assets/risk-ranking")
+@v1_router.get("/assets/risk-ranking")
 def asset_risk_ranking() -> list[dict]:
     """Return each asset pair ranked by its average wallet risk score (descending)."""
     scores = get_latest_scores()
@@ -411,13 +429,13 @@ def asset_risk_ranking() -> list[dict]:
     return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
 
 
-@app.get("/rings")
+@v1_router.get("/rings")
 def list_rings() -> list[dict]:
     """Return detected wash-trading rings from the latest pipeline run."""
     return get_rings()
 
 
-@app.get("/correlations")
+@v1_router.get("/correlations")
 def list_correlations() -> list[dict]:
     """Return the most recent set of correlated asset pairs from the pipeline.
 
@@ -428,7 +446,7 @@ def list_correlations() -> list[dict]:
     return get_pair_correlations()
 
 
-@app.get("/amm/pools/{pool_id}/risk")
+@v1_router.get("/amm/pools/{pool_id}/risk")
 def pool_risk(pool_id: str) -> dict:
     """Return pool-level round-trip ratio and trader concentration for `pool_id`.
 
@@ -442,7 +460,7 @@ def pool_risk(pool_id: str) -> dict:
     return {"pool_id": pool_id, **risk}
 
 
-@app.get("/path-payments/circular")
+@v1_router.get("/path-payments/circular")
 def circular_path_payments(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -463,7 +481,7 @@ class FeedbackRequest(BaseModel):
     scored_at: str     # ISO-8601 datetime of the scoring event
 
 
-@app.post("/feedback", dependencies=[Depends(require_admin_key)])
+@v1_router.post("/feedback", dependencies=[Depends(require_admin_key)])
 def submit_feedback(body: FeedbackRequest) -> dict:
     """Record ground-truth feedback for a previously scored wallet/asset_pair.
 
@@ -529,13 +547,13 @@ def submit_feedback(body: FeedbackRequest) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/admin/drift-reports", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/drift-reports", dependencies=[Depends(require_admin_key)])
 def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     """Return the most recent drift checks recorded by `cli.py retrain-check`."""
     return get_drift_reports(limit=limit)
 
 
-@app.get("/admin/robustness-report", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/robustness-report", dependencies=[Depends(require_admin_key)])
 def robustness_report() -> dict:
     """Return the latest RobustnessReport from the database (admin only)."""
     from detection.storage import get_latest_robustness_report
@@ -546,7 +564,7 @@ def robustness_report() -> dict:
     return report
 
 
-@app.get("/api/v1/model/robustness")
+@v1_router.get("/model/robustness")
 def model_robustness() -> dict:
     """Return live red team robustness metrics for the current model.
 
@@ -559,7 +577,7 @@ def model_robustness() -> dict:
     return live_robustness_metrics()
 
 
-@app.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])
 def retrain_runs(
     limit: int = Query(default=50, ge=1, le=1000),
     model_name: str | None = Query(default=None, description="Filter by model, e.g. random_forest"),
@@ -568,7 +586,7 @@ def retrain_runs(
     return get_retrain_runs(limit=limit, model_name=model_name)
 
 
-@app.get("/admin/federated/audit-log", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/federated/audit-log", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),
 ) -> list[dict]:
@@ -582,7 +600,7 @@ def federated_audit_log(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/v1/model/weights")
+@v1_router.get("/model/weights")
 def model_weights() -> JSONResponse:
     """Return current ensemble classifier weights from the adaptive reweighter."""
     from detection.adaptive_reweighter import (
@@ -616,7 +634,7 @@ def model_weights() -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/webhooks", status_code=201)
+@v1_router.post("/webhooks", status_code=201)
 def create_webhook(body: WebhookCreate) -> dict:
     """Register a new webhook subscriber."""
     try:
@@ -632,7 +650,7 @@ def create_webhook(body: WebhookCreate) -> dict:
     return {"subscriber_id": subscriber_id}
 
 
-@app.get("/webhooks")
+@v1_router.get("/webhooks")
 def list_webhooks() -> list[dict]:
     """Return all active subscribers (secrets are masked)."""
     return [
@@ -649,7 +667,7 @@ def list_webhooks() -> list[dict]:
     ]
 
 
-@app.delete("/webhooks/{subscriber_id}")
+@v1_router.delete("/webhooks/{subscriber_id}")
 def delete_webhook(subscriber_id: str) -> dict:
     """Deactivate a webhook subscriber."""
     if not deactivate_subscriber(subscriber_id):
@@ -657,7 +675,7 @@ def delete_webhook(subscriber_id: str) -> dict:
     return {"status": "deactivated"}
 
 
-@app.get("/webhooks/dead-letters")
+@v1_router.get("/webhooks/dead-letters")
 def dead_letters() -> list[dict]:
     """Return all deliveries that have permanently failed."""
     return [
@@ -678,7 +696,7 @@ def dead_letters() -> list[dict]:
 # ------------------------------------------------------------------
 
 
-@app.post("/disputes", status_code=201)
+@v1_router.post("/disputes", status_code=201)
 def create_dispute(body: DisputeCreate):
     try:
         dispute = submit_dispute(body.wallet, body.asset_pair, body.evidence_url)
@@ -690,7 +708,7 @@ def create_dispute(body: DisputeCreate):
     return dispute.dict()
 
 
-@app.get("/disputes/{dispute_id}")
+@v1_router.get("/disputes/{dispute_id}")
 def read_dispute(dispute_id: str):
     d = get_dispute(dispute_id)
     if d is None:
@@ -713,7 +731,7 @@ def read_dispute(dispute_id: str):
     }
 
 
-@app.post("/disputes/{dispute_id}/vote", dependencies=[Depends(require_admin_key)])
+@v1_router.post("/disputes/{dispute_id}/vote", dependencies=[Depends(require_admin_key)])
 def vote_dispute(dispute_id: str, body: VoteBody):
     # validate voter_key_hash format
     if len(body.voter_key_hash) != 64:
@@ -732,7 +750,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 # ------------------------------------------------------------------
 
 
-@app.get("/governance/proposals")
+@v1_router.get("/governance/proposals")
 def get_proposals():
     return [p.dict() for p in list_open_proposals()]
 
@@ -743,7 +761,7 @@ class ProposalCreate(BaseModel):
     proposed_by_key_hash: str
 
 
-@app.post("/governance/proposals", dependencies=[Depends(require_admin_key)])
+@v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)])
 def create_proposal_endpoint(body: ProposalCreate):
     try:
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
@@ -757,7 +775,7 @@ class ProposalVote(BaseModel):
     vote: str
 
 
-@app.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)])
+@v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)])
 def vote_proposal(proposal_id: str, body: ProposalVote):
     try:
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
@@ -782,7 +800,7 @@ class SARPackageRequest(BaseModel):
     end_date: str
 
 
-@app.get(
+@v1_router.get(
     "/compliance/ivms/{wallet}",
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
@@ -797,7 +815,7 @@ def compliance_ivms(wallet: str) -> dict:
     return asdict(build_ivms_risk_field(wallet))
 
 
-@app.post(
+@v1_router.post(
     "/compliance/sar-package",
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
@@ -823,7 +841,7 @@ def compliance_sar_package(body: SARPackageRequest) -> FileResponse:
     )
 
 
-@app.get(
+@v1_router.get(
     "/compliance/audit-trail/{wallet}",
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
@@ -835,3 +853,139 @@ def compliance_audit_trail(wallet: str) -> list[dict]:
     validate_stellar_address(wallet)
     return get_audit_trail(wallet)
 
+
+# ---------------------------------------------------------------------------
+# Mount versioned router and register legacy 302 redirect aliases
+# ---------------------------------------------------------------------------
+
+app.include_router(v1_router)
+
+# Legacy bare paths → /v1/... 302 redirects for 90-day deprecation window.
+# The DeprecationMiddleware above adds Deprecation/Sunset headers to these responses.
+_LEGACY_REDIRECTS = [
+    "/health",
+    "/scores",
+    "/alerts",
+    "/assets/risk-ranking",
+    "/rings",
+    "/correlations",
+    "/path-payments/circular",
+    "/webhooks",
+    "/webhooks/dead-letters",
+    "/governance/proposals",
+]
+
+for _path in _LEGACY_REDIRECTS:
+    # Capture _path in default arg to avoid late-binding closure issue
+    def _make_redirect(p):
+        def _redirect(request: Request):
+            # Preserve query string
+            qs = request.url.query
+            target = f"/v1{p}" + (f"?{qs}" if qs else "")
+            return RedirectResponse(url=target, status_code=302)
+        _redirect.__name__ = f"legacy_redirect_{p.replace('/', '_').strip('_')}"
+        return _redirect
+
+    app.get(_path, include_in_schema=False)(_make_redirect(_path))
+
+
+# Parameterised legacy redirects
+@app.get("/scores/{wallet}", include_in_schema=False)
+def legacy_scores_wallet(wallet: str, request: Request):
+    qs = request.url.query
+    target = f"/v1/scores/{wallet}" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/scores/{wallet}/explain", include_in_schema=False)
+def legacy_scores_explain(wallet: str, request: Request):
+    qs = request.url.query
+    target = f"/v1/scores/{wallet}/explain" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/scores/{wallet}/counterfactual", include_in_schema=False)
+def legacy_scores_counterfactual(wallet: str, request: Request):
+    qs = request.url.query
+    target = f"/v1/scores/{wallet}/counterfactual" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/wallets/{wallet}/cross-chain", include_in_schema=False)
+def legacy_wallets_cross_chain(wallet: str, request: Request):
+    qs = request.url.query
+    target = f"/v1/wallets/{wallet}/cross-chain" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/amm/pools/{pool_id}/risk", include_in_schema=False)
+def legacy_amm_pool_risk(pool_id: str, request: Request):
+    qs = request.url.query
+    target = f"/v1/amm/pools/{pool_id}/risk" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.post("/feedback", include_in_schema=False)
+def legacy_feedback(request: Request):
+    return RedirectResponse(url="/v1/feedback", status_code=302)
+
+
+@app.post("/webhooks", include_in_schema=False)
+def legacy_webhooks_post(request: Request):
+    return RedirectResponse(url="/v1/webhooks", status_code=302)
+
+
+@app.delete("/webhooks/{subscriber_id}", include_in_schema=False)
+def legacy_delete_webhook(subscriber_id: str, request: Request):
+    return RedirectResponse(url=f"/v1/webhooks/{subscriber_id}", status_code=302)
+
+
+@app.get("/admin/drift-reports", include_in_schema=False)
+def legacy_admin_drift_reports(request: Request):
+    qs = request.url.query
+    target = "/v1/admin/drift-reports" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/admin/robustness-report", include_in_schema=False)
+def legacy_admin_robustness_report(request: Request):
+    return RedirectResponse(url="/v1/admin/robustness-report", status_code=302)
+
+
+@app.get("/admin/retrain-runs", include_in_schema=False)
+def legacy_admin_retrain_runs(request: Request):
+    qs = request.url.query
+    target = "/v1/admin/retrain-runs" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/admin/federated/audit-log", include_in_schema=False)
+def legacy_admin_federated_audit_log(request: Request):
+    qs = request.url.query
+    target = "/v1/admin/federated/audit-log" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.post("/disputes", include_in_schema=False)
+def legacy_disputes_post(request: Request):
+    return RedirectResponse(url="/v1/disputes", status_code=302)
+
+
+@app.get("/disputes/{dispute_id}", include_in_schema=False)
+def legacy_dispute_get(dispute_id: str, request: Request):
+    return RedirectResponse(url=f"/v1/disputes/{dispute_id}", status_code=302)
+
+
+@app.post("/disputes/{dispute_id}/vote", include_in_schema=False)
+def legacy_dispute_vote(dispute_id: str, request: Request):
+    return RedirectResponse(url=f"/v1/disputes/{dispute_id}/vote", status_code=302)
+
+
+@app.post("/governance/proposals", include_in_schema=False)
+def legacy_governance_proposals_post(request: Request):
+    return RedirectResponse(url="/v1/governance/proposals", status_code=302)
+
+
+@app.post("/governance/proposals/{proposal_id}/vote", include_in_schema=False)
+def legacy_governance_proposal_vote(proposal_id: str, request: Request):
+    return RedirectResponse(url=f"/v1/governance/proposals/{proposal_id}/vote", status_code=302)

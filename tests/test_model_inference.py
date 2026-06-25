@@ -1,3 +1,5 @@
+import json
+import os
 from types import SimpleNamespace
 
 import joblib
@@ -7,7 +9,15 @@ from sklearn.ensemble import RandomForestClassifier
 
 import config.settings as settings_module
 from detection.feature_engineering import FEATURE_NAMES
-from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
+from detection.model_inference import (
+    _get_ensemble_weights,
+    load_calibration,
+    load_models,
+    load_runtime_weights,
+    score_feature_matrix,
+    score_feature_vector,
+    score_with_uncertainty,
+)
 from detection.model_signing import ModelIntegrityError, sign_model_file
 
 _TEST_KEY = b"test-signing-key-for-unit-tests-only"
@@ -31,6 +41,16 @@ def model_dir(tmp_path):
     _dump_and_sign(tmp_path / "xgboost.joblib", _trained_classifier(0.9))
     _dump_and_sign(tmp_path / "lightgbm.joblib", _trained_classifier(0.9))
     return str(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime_weights():
+    import detection.model_inference as mi
+    mi._weights_mtime = None
+    mi._runtime_weights = None
+    yield
+    mi._weights_mtime = None
+    mi._runtime_weights = None
 
 
 def test_load_models_raises_when_empty(tmp_path):
@@ -139,6 +159,18 @@ def test_score_feature_vector_normalizes_non_unit_weights(monkeypatch):
     assert 0.0 <= probability <= 1.0
 
 
+def test_score_feature_vector_raises_on_zero_total_weight(monkeypatch):
+    monkeypatch.setattr(
+        settings_module,
+        "settings",
+        SimpleNamespace(ensemble_weight_rf=0.0, ensemble_weight_xgb=0.0, ensemble_weight_lgbm=0.0),
+    )
+    feature_vector = dict.fromkeys(FEATURE_NAMES, 1.0)
+    models = {"random_forest": FixedProbabilityModel(0.5)}
+    with pytest.raises(ValueError, match="positive ensemble weight"):
+        score_feature_vector(models, feature_vector)
+
+
 # ---------------------------------------------------------------------------
 # score_feature_matrix tests
 # ---------------------------------------------------------------------------
@@ -221,3 +253,136 @@ def test_score_feature_matrix_raises_when_all_weights_zero(monkeypatch):
     models = {"random_forest": FixedProbabilityMatrixModel(0.5)}
     with pytest.raises(ValueError, match="positive ensemble weight"):
         score_feature_matrix(models, [dict.fromkeys(FEATURE_NAMES, 1.0)])
+
+
+# ---------------------------------------------------------------------------
+# load_runtime_weights tests
+# ---------------------------------------------------------------------------
+
+
+def test_load_runtime_weights_returns_none_when_file_absent(tmp_path):
+    assert load_runtime_weights(str(tmp_path)) is None
+
+
+def test_load_runtime_weights_loads_valid_file(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": 0.2, "xgboost": 0.5, "lightgbm": 0.3}, f)
+    weights = load_runtime_weights(str(tmp_path))
+    assert weights is not None
+    assert abs(weights["random_forest"] - 0.2) < 1e-9
+    assert abs(weights["xgboost"] - 0.5) < 1e-9
+    assert abs(weights["lightgbm"] - 0.3) < 1e-9
+
+
+def test_load_runtime_weights_returns_none_on_bad_json(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        f.write("not json")
+    assert load_runtime_weights(str(tmp_path)) is None
+
+
+def test_load_runtime_weights_returns_none_on_missing_keys(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": 0.2, "xgboost": 0.5}, f)
+    assert load_runtime_weights(str(tmp_path)) is None
+
+
+def test_load_runtime_weights_returns_none_on_extra_keys(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": 0.2, "xgboost": 0.5, "lightgbm": 0.3, "unknown": 0.0}, f)
+    assert load_runtime_weights(str(tmp_path)) is None
+
+
+def test_load_runtime_weights_returns_none_on_negative_weight(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": -0.1, "xgboost": 0.6, "lightgbm": 0.5}, f)
+    assert load_runtime_weights(str(tmp_path)) is None
+
+
+def test_load_runtime_weights_returns_none_on_non_numeric_weight(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": "abc", "xgboost": 0.5, "lightgbm": 0.3}, f)
+    assert load_runtime_weights(str(tmp_path)) is None
+
+
+def test_load_runtime_weights_returns_none_on_bad_sum(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": 0.5, "xgboost": 0.5, "lightgbm": 0.5}, f)
+    assert load_runtime_weights(str(tmp_path)) is None
+
+
+def test_load_runtime_weights_caches_valid_result(tmp_path):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": 0.2, "xgboost": 0.5, "lightgbm": 0.3}, f)
+    w1 = load_runtime_weights(str(tmp_path))
+    w2 = load_runtime_weights(str(tmp_path))
+    assert w1 is w2
+
+
+# ---------------------------------------------------------------------------
+# load_calibration tests
+# ---------------------------------------------------------------------------
+
+
+def test_load_calibration_returns_empty_when_no_files(tmp_path):
+    cal = load_calibration(str(tmp_path))
+    assert cal == {}
+
+
+# ---------------------------------------------------------------------------
+# score_with_uncertainty tests
+# ---------------------------------------------------------------------------
+
+
+def test_score_with_uncertainty_no_calibrators(model_dir):
+    models = load_models(model_dir)
+    fv = dict.fromkeys(FEATURE_NAMES, 1.0)
+    result = score_with_uncertainty(models, fv, calibrators=None)
+    assert "score" in result
+    assert result["score_lower"] == 0.0
+    assert result["score_upper"] == 100.0
+    assert result["prediction_set"] == []
+    assert result["coverage_guarantee"] == 1.0
+    assert 0.0 <= result["score"] <= 100.0
+
+
+# ---------------------------------------------------------------------------
+# _get_ensemble_weights tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_ensemble_weights_falls_back_to_settings_when_no_model_dir(monkeypatch):
+    monkeypatch.setattr(
+        settings_module,
+        "settings",
+        SimpleNamespace(
+            ensemble_weight_rf=0.3, ensemble_weight_xgb=0.3, ensemble_weight_lgbm=0.4
+        ),
+    )
+    weights = _get_ensemble_weights()
+    assert abs(weights["random_forest"] - 0.3) < 1e-9
+
+
+def test_get_ensemble_weights_uses_runtime_when_model_dir_provided(tmp_path, monkeypatch):
+    path = os.path.join(tmp_path, "ensemble_weights.json")
+    with open(path, "w") as f:
+        json.dump({"random_forest": 0.1, "xgboost": 0.8, "lightgbm": 0.1}, f)
+    monkeypatch.setattr(
+        settings_module,
+        "settings",
+        SimpleNamespace(
+            model_dir=str(tmp_path),
+            ensemble_weight_rf=0.3,
+            ensemble_weight_xgb=0.3,
+            ensemble_weight_lgbm=0.4,
+        ),
+    )
+    weights = _get_ensemble_weights()
+    assert abs(weights["xgboost"] - 0.8) < 1e-9
