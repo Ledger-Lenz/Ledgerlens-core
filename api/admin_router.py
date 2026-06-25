@@ -10,8 +10,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
 from api.auth import require_admin_key
+from api.webhook_sender import list_dlq, get_dlq_entry
+from api.webhook_sender import WebhookRetryQueue
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
+from detection.webhook_registry import get_subscriber
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
@@ -178,3 +181,52 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/webhooks/dlq
+# ---------------------------------------------------------------------------
+
+
+@router.get("/webhooks/dlq", include_in_schema=False)
+def list_webhook_dlq() -> list[dict]:
+    """List all dead-lettered webhook deliveries."""
+    entries = list_dlq(db_path=settings.db_path)
+    return [
+        {
+            "id": e.id,
+            "subscriber_id": e.subscriber_id,
+            "url": e.url,
+            "attempt_count": e.attempt_count,
+            "last_error": e.last_error,
+            "dead_lettered_at": e.dead_lettered_at,
+        }
+        for e in entries
+    ]
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/webhooks/dlq/{id}/retry
+# ---------------------------------------------------------------------------
+
+
+@router.post("/webhooks/dlq/{entry_id}/retry", include_in_schema=False)
+async def retry_webhook_dlq_entry(entry_id: int) -> dict:
+    """Manually retry a single dead-lettered delivery."""
+    entry = get_dlq_entry(entry_id, db_path=settings.db_path)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"DLQ entry {entry_id} not found")
+
+    sub = get_subscriber(entry.subscriber_id, db_path=settings.db_path)
+    if not sub:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Subscriber {entry.subscriber_id} not found; cannot re-sign payload",
+        )
+
+    queue = WebhookRetryQueue(db_path=settings.db_path)
+    success = await queue.retry_dlq_entry(entry_id, secret=sub.secret)
+    if not success:
+        raise HTTPException(status_code=502, detail="Retry delivery failed; entry remains in DLQ")
+
+    return {"id": entry_id, "status": "retried_and_delivered"}
