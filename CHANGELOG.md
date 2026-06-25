@@ -15,6 +15,8 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 - **ED25519 model signing** (`detection/model_signing.py`): `ModelSigner` class with asymmetric ED25519 sign/verify for `.joblib` model artifacts, preventing supply-chain attacks via tampered model files. Public key in `config/settings.py`; private key loaded from `MODEL_SIGNING_PRIVATE_KEY` environment variable only.
 - CLI commands `generate-signing-key` and `verify-models` for keypair generation and batch signature verification.
 - `docs/model_signing.md`: threat model, key management, rotation procedure, CI integration guide.
+- **Uniswap V3 adapter** (`ingestion/uniswap_adapter.py`): ingests `Swap` events from Uniswap V3 pools for EVM wallets linked to Stellar accounts, extending the cross-chain detection graph. Feature-flagged via `INGEST_UNISWAP=true`.
+- **Curve adapter** (`ingestion/curve_adapter.py`): ingests `TokenExchange` events from Curve pools for linked EVM wallets. Feature-flagged via `INGEST_CURVE=true`.
 
 ### Added
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
