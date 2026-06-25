@@ -38,6 +38,7 @@ from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
+from api.api_keys_router import router as api_keys_router, require_scope
 from api.namespace import list_namespaces
 from config.settings import settings
 from detection.tracing import (
@@ -185,6 +186,7 @@ app.include_router(batch_router)
 
 
 app.include_router(export_router)
+app.include_router(api_keys_router)
 
 
 class WebhookCreate(BaseModel):
@@ -289,7 +291,7 @@ def _model_file_ok(path: str) -> bool:
         return False
 
 
-@v1_router.get("/scores", response_model=list[RiskScore])
+@v1_router.get("/scores", response_model=list[RiskScore], dependencies=[Depends(require_scope("read:scores"))])
 def list_scores(
     min_score: int = 0,
     limit: int = Query(default=100, ge=1, le=1000),
@@ -469,7 +471,7 @@ def wallet_counterfactual(
     }
 
 
-@v1_router.get("/scores/{wallet}")
+@v1_router.get("/scores/{wallet}", dependencies=[Depends(require_scope("read:scores"))])
 def wallet_scores(wallet: str) -> dict:
     """Return the latest score for `wallet` on each asset pair.
 
