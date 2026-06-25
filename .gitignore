@@ -25,5 +25,5 @@ models/*.joblib
 .vscode/
 .idea/
 
-# Issue tracking file
+# Project specific
 somzilla.md
