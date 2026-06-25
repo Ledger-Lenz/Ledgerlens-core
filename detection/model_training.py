@@ -9,12 +9,14 @@ stratified by label) *before* any model training, then used after training
 to compute conformal prediction thresholds via ``ConformalCalibrator``.
 """
 
+import logging
 import joblib
 import mlflow
 import numpy as np
 import pandas as pd
 from detection.model_signing import sign_model_file
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import ADASYN, SMOTE, BorderlineSMOTE
+from imblearn.over_sampling.base import BaseOverSampler
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
@@ -23,6 +25,46 @@ from xgboost import XGBClassifier
 
 from config.settings import settings
 from detection.feature_engineering import FEATURE_NAMES
+
+logger = logging.getLogger("ledgerlens.model_training")
+
+
+def _get_oversampler(strategy: str, random_state: int = 42) -> BaseOverSampler | None:
+    """Factory function returning the requested over-sampling object.
+
+    Parameters
+    ----------
+    strategy:
+        One of ``"smote"``, ``"adasyn"``, ``"borderline1"``, ``"borderline2"``,
+        or ``"none"`` (no oversampling).
+    random_state:
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    BaseOverSampler or None
+        The configured oversampler, or ``None`` when strategy is ``"none"``.
+
+    Raises
+    ------
+    ValueError
+        If *strategy* is not one of the five accepted values.
+    """
+    strategy = strategy.lower()
+    if strategy == "smote":
+        return SMOTE(k_neighbors=5, sampling_strategy="minority", random_state=random_state)
+    if strategy == "adasyn":
+        return ADASYN(n_neighbors=5, sampling_strategy="minority", random_state=random_state)
+    if strategy == "borderline1":
+        return BorderlineSMOTE(k_neighbors=5, m_neighbors=10, kind="borderline-1", sampling_strategy="minority", random_state=random_state)
+    if strategy == "borderline2":
+        return BorderlineSMOTE(k_neighbors=5, m_neighbors=10, kind="borderline-2", sampling_strategy="minority", random_state=random_state)
+    if strategy == "none":
+        return None
+    raise ValueError(
+        f"Unknown imbalance_strategy {strategy!r}. "
+        "Choose from: 'smote', 'adasyn', 'borderline1', 'borderline2', 'none'."
+    )
 
 
 def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -40,6 +82,7 @@ def _train_ensemble_base(
     adversarial_augment: bool = True,
     calibrate: bool = True,
     adversarial_hardening: bool = False,
+    imbalance_strategy: str = "smote",
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -101,15 +144,19 @@ def _train_ensemble_base(
             X, y, test_size=0.2, random_state=random_state, stratify=y
         )
 
-    smote = SMOTE(random_state=random_state)
-    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+    oversampler = _get_oversampler(imbalance_strategy, random_state=random_state)
+    if oversampler is not None:
+        X_train_res, y_train_res = oversampler.fit_resample(X_train, y_train)
+    else:
+        X_train_res, y_train_res = X_train, y_train
+    _applied_imbalance_strategy = imbalance_strategy
 
     # Log hyperparameters
     mlflow.log_param("random_state", random_state)
     mlflow.log_param("adversarial_augment", adversarial_augment)
     mlflow.log_param("calibrate", calibrate)
     mlflow.log_param("adversarial_hardening", adversarial_hardening)
-    mlflow.log_param("smote_k_neighbors", smote.k_neighbors)
+    mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
 
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
@@ -239,6 +286,8 @@ def _train_ensemble_base(
         logger = logging.getLogger("ledgerlens.model_training")
         logger.exception("Failed to train temporal LSTM model: %s", e)
 
+    # Store the applied imbalance strategy so save_models can persist it.
+    results["_imbalance_strategy"] = _applied_imbalance_strategy
     return results
 
 
@@ -247,6 +296,77 @@ def _compute_empirical_coverage(model, X_cal, y_cal, q_hat):
     probs = model.predict_proba(X_cal)
     scores = 1.0 - probs[range(len(y_cal)), y_cal.values]
     return float((scores <= q_hat).mean())
+
+
+def compare_oversamplers(
+    df: pd.DataFrame,
+    strategies: list[str] | None = None,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Train the ensemble with each oversampling strategy and compare AUC-PR.
+
+    Trains RF, XGBoost, and LightGBM on the same temporal split for each
+    strategy.  AUC-PR is used as the primary metric because accuracy and
+    AUC-ROC can be misleading at high imbalance ratios.
+
+    Parameters
+    ----------
+    df:
+        Labelled feature DataFrame (must have a ``"label"`` column).
+    strategies:
+        List of strategy names to compare. Defaults to all four oversampling
+        variants: ``["smote", "adasyn", "borderline1", "borderline2"]``.
+    random_state:
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame with columns ``["strategy", "model", "auc_pr",
+        "auc_roc", "f1"]``, sorted by ``auc_pr`` descending.  The
+        ``"best_strategy"`` attribute on the returned DataFrame contains
+        the strategy name with the highest mean AUC-PR.
+    """
+    if strategies is None:
+        strategies = ["smote", "adasyn", "borderline1", "borderline2"]
+
+    rows = []
+    for strat in strategies:
+        logger.info("compare_oversamplers: training with strategy=%s", strat)
+        try:
+            results = _train_ensemble_base(
+                df,
+                random_state=random_state,
+                adversarial_augment=False,
+                calibrate=False,
+                imbalance_strategy=strat,
+            )
+            for model_name in ("random_forest", "xgboost", "lightgbm"):
+                if model_name in results:
+                    rows.append(
+                        {
+                            "strategy": strat,
+                            "model": model_name,
+                            "auc_pr": results[model_name].get("pr_auc", 0.0),
+                            "auc_roc": results[model_name].get("auc_roc", 0.0),
+                            "f1": results[model_name].get("f1", 0.0),
+                        }
+                    )
+        except Exception:
+            logger.exception("compare_oversamplers: strategy=%s failed", strat)
+
+    comparison = pd.DataFrame(rows, columns=["strategy", "model", "auc_pr", "auc_roc", "f1"])
+    comparison = comparison.sort_values("auc_pr", ascending=False).reset_index(drop=True)
+
+    if not comparison.empty:
+        mean_by_strategy = comparison.groupby("strategy")["auc_pr"].mean()
+        best = str(mean_by_strategy.idxmax())
+        comparison.attrs["best_strategy"] = best
+        logger.info("compare_oversamplers: best strategy=%s (mean AUC-PR=%.4f)", best, mean_by_strategy[best])
+    else:
+        comparison.attrs["best_strategy"] = "smote"
+
+    return comparison
 
 
 def save_models(
@@ -275,7 +395,7 @@ def save_models(
 
     signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
-        if name == "_calib":
+        if name in ("_calib", "_imbalance_strategy"):
             continue
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
@@ -304,6 +424,7 @@ def save_models(
         "training_dataset_path": training_dataset_path or "",
         "training_row_count": training_row_count,
         "column_hash": column_hash,
+        "imbalance_strategy": results.get("_imbalance_strategy", "smote"),
         "model_metrics": {
             name: {
                 "auc_roc": result.get("auc_roc", 0.0),
@@ -311,7 +432,7 @@ def save_models(
                 "f1": result.get("f1", 0.0),
             }
             for name, result in results.items()
-            if name != "_calib"
+            if name not in ("_calib", "_imbalance_strategy")
         },
     }
 
@@ -398,7 +519,7 @@ if __name__ == "__main__":
 
 
 from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
-from detection.mlflow_tracker import (
+from detection.mlflow_tracker import (  # noqa: E402
     log_metrics,
     log_training_dataset_metadata,
     mlflow_run,
@@ -412,6 +533,7 @@ def train_ensemble(
     *args,
     use_gnn: bool = False,
     model_dir: str = "models",
+    imbalance_strategy: str = "smote",
     experiment_name: str | None = None,
     tracking_uri: str | None = None,
     **kwargs,
@@ -425,8 +547,11 @@ def train_ensemble(
 
     Args:
         use_gnn: If True, trains a T-GNN on the training graph, appends its
-            two output features to the feature matrix before SMOTE, and
+            two output features to the feature matrix before oversampling, and
             saves the checkpoint as gnn_model.pt in model_dir.
+        imbalance_strategy: Oversampling strategy to apply before training.
+            One of ``"smote"`` (default), ``"adasyn"``, ``"borderline1"``,
+            ``"borderline2"``, or ``"none"``.  See :func:`_get_oversampler`.
         experiment_name: MLflow experiment name.  Falls back to
             ``settings.mlflow_experiment_name`` then ``"ledgerlens-training"``.
         tracking_uri: MLflow tracking URI.  Falls back to
@@ -458,7 +583,7 @@ def train_ensemble(
 
         results = _train_ensemble_base(
             df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
-            model_dir=model_dir, **kwargs
+            model_dir=model_dir, imbalance_strategy=imbalance_strategy, **kwargs
         )
 
         if run_id:
