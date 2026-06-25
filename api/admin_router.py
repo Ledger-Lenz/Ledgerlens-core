@@ -185,6 +185,54 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# SHAP feature importance endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/feature-importance/{version}", include_in_schema=False)
+def feature_importance(version: str, model_name: str | None = None) -> dict:
+    """Return stored SHAP importance data for a given model version."""
+    from detection.model_registry import load_shap_importances
+
+    importances = load_shap_importances(settings.model_dir)
+    if importances is None:
+        raise HTTPException(status_code=404, detail=f"No SHAP importance data found")
+
+    if model_name:
+        filtered = {model_name: importances.get(model_name, [])}
+        return {"version": version, "shap_importances": filtered}
+
+    return {"version": version, "shap_importances": importances}
+
+
+@router.get("/feature-importance/diff", include_in_schema=False)
+def feature_importance_diff(old: str = "old", new: str = "new") -> dict:
+    """Compare SHAP importance rankings between two model versions."""
+    import json as _json
+    from detection.model_registry import compare_importance_stability
+
+    metadata_path = os.path.join(settings.model_dir, "training_metadata.json")
+    if not os.path.exists(metadata_path):
+        raise HTTPException(status_code=404, detail="Training metadata not found")
+
+    with open(metadata_path, "r") as f:
+        metadata = _json.load(f)
+
+    old_meta = {"version": old, "shap_importances": metadata.get("shap_importances", {})}
+    new_meta = {"version": new, "shap_importances": metadata.get("shap_importances", {})}
+
+    report = compare_importance_stability(old_meta, new_meta)
+    return {
+        "version_old": report.version_old,
+        "version_new": report.version_new,
+        "spearman_rho": report.spearman_rho,
+        "stable": report.stable,
+        "changed_features": report.changed_features,
+        "computed_at": report.computed_at.isoformat(),
+    }
+
+
 @router.get("/psi-heatmap", include_in_schema=False)
 def psi_heatmap(days: int = 90):
     """Return the most recently generated PSI heatmap as a PNG image."""

@@ -125,6 +125,7 @@ def retrain_check(
     psi_threshold: float = typer.Option(0.20, help="PSI threshold for drift detection"),
     min_drifted_features: int = typer.Option(3, help="Minimum number of drifted features to trigger retraining"),
     force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
+    force_promote: bool = typer.Option(False, "--force-promote", help="Override SHAP stability check and promote models anyway"),
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
 
@@ -243,6 +244,40 @@ def retrain_check(
         result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
+    # Compute SHAP importance summaries for new models
+    from detection.feature_engineering import FEATURE_NAMES as _feat_names
+    from detection.model_registry import (
+        compare_importance_stability,
+        compute_shap_summary,
+        save_shap_importances,
+    )
+
+    new_shap: dict[str, list[dict]] = {}
+    feature_cols = [c for c in df.columns if c in _feat_names]
+    X_train = df[feature_cols].fillna(0.0).values
+    for name in model_names:
+        model_obj = new_results[name].get("model")
+        if model_obj is not None:
+            try:
+                new_shap[name] = compute_shap_summary(model_obj, X_train, feature_cols)
+            except Exception as shap_exc:
+                logger.warning("SHAP summary for %s failed: %s", name, shap_exc)
+
+    new_metadata_for_stability = {"version": "new", "shap_importances": new_shap}
+    old_metadata_for_stability = {"version": metadata.get("version", "old"), "shap_importances": metadata.get("shap_importances", {})}
+
+    stability = compare_importance_stability(old_metadata_for_stability, new_metadata_for_stability)
+    if not stability.stable:
+        logger.warning(
+            "Feature importance stability check FAILED: min Spearman rho = %.3f "
+            "(threshold: %.3f). Models NOT auto-promoted. "
+            "Rerun with --force-promote to override.",
+            min(stability.spearman_rho.values()) if stability.spearman_rho else 0.0,
+            0.70,
+        )
+        if not force_promote:
+            logger.info("Skipping promotion due to stability check failure")
+
     # Compare new models with previous models
     previous_metrics = metadata.get("model_metrics", {})
     promoted = False
@@ -271,12 +306,18 @@ def retrain_check(
                 new_auc,
             )
 
+    # Block promotion if stability check failed and --force-promote not set
+    if not stability.stable and not force_promote:
+        promoted = False
+
     # Save models and metadata
     training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
     df.to_csv(training_dataset_path, index=False)
 
     if promoted:
         save_models(new_results, training_dataset_path=training_dataset_path)
+        if new_shap:
+            save_shap_importances(new_shap, settings.model_dir)
         logger.info("Promoted new models to production")
     else:
         logger.info("New models not promoted; keeping previous versions")
