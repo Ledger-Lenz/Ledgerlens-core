@@ -11,13 +11,14 @@ from detection.feature_store import (
     _hash_counterparty,
     RING_BUFFER_CAPS,
 )
-from ingestion.data_models import Trade, Asset, TradeType
+from ingestion.data_models import Asset, TradeType
+from tests.factories import TradeFactory
 
 
 @pytest.fixture
 def sample_trade():
     """Create a sample trade for testing."""
-    return Trade(
+    return TradeFactory.trade(
         id="trade_123",
         ledger_close_time=datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc),
         base_account="GA123",
@@ -117,7 +118,7 @@ def test_ring_buffer_overflow(initial_state):
     
     # Add trades (200 trades spanning 20 seconds, all within 1h window)
     for i in range(200):
-        trade = Trade(
+        trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(milliseconds=i * 100),
             base_account="GA123",
@@ -142,7 +143,7 @@ def test_prune_expired_entries(initial_state):
     base_time = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
     
     # Add a trade at the beginning
-    trade1 = Trade(
+    trade1 = TradeFactory.trade(
         id="trade_1",
         ledger_close_time=base_time,
         base_account="GA123",
@@ -158,7 +159,7 @@ def test_prune_expired_entries(initial_state):
     assert len(state.trade_ring_1h) == 1
     
     # Add a trade 2 hours later
-    trade2 = Trade(
+    trade2 = TradeFactory.trade(
         id="trade_2",
         ledger_close_time=base_time + timedelta(hours=2),
         base_account="GA123",
@@ -193,7 +194,7 @@ def test_derive_feature_vector_benford(initial_state):
         digit = (i % 9) + 1  # digits 1-9
         amount = float(f"{digit}00.0")  # 100, 200, ..., 900
         
-        trade = Trade(
+        trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(seconds=i),
             base_account="GA123",
@@ -229,7 +230,7 @@ def test_derive_feature_vector_volume_ratio(initial_state):
     
     # Add 10 trades with 5 unique counterparties
     for i in range(10):
-        trade = Trade(
+        trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(seconds=i),
             base_account="GA123",
@@ -300,3 +301,99 @@ def test_fallback_dict_lru_eviction():
     
     # Should only have max_entries in fallback dict
     assert len(fs._fallback_dict) == max_entries
+
+
+class _FailingRedisClient:
+    """Stands in for a real `redis.Redis` whose calls always raise --
+    simulates a Redis outage without needing the `redis` package installed.
+    """
+
+    def get(self, key):
+        raise ConnectionError("redis unreachable")
+
+    def setex(self, key, ttl, value):
+        raise ConnectionError("redis unreachable")
+
+    def delete(self, key):
+        raise ConnectionError("redis unreachable")
+
+    def scan_iter(self, match=None):
+        raise ConnectionError("redis unreachable")
+        yield  # pragma: no cover - makes this a generator function
+
+
+def _feature_store_with_failing_redis():
+    """A FeatureStore wired to a Redis client that always raises, without
+    ever importing the real `redis` package."""
+    from detection.feature_store import FeatureStore
+
+    fs = FeatureStore(redis_url=None)
+    fs.redis_client = _FailingRedisClient()
+    fs._using_redis = True
+    return fs
+
+
+def test_redis_failure_falls_back_to_in_process_dict():
+    from utils.circuit_breaker import CircuitState
+
+    fs = _feature_store_with_failing_redis()
+    state = WalletFeatureState(wallet="GA1", asset_pair="USDC/XLM", last_updated=datetime.now(timezone.utc))
+
+    fs.set_state(state)
+    retrieved = fs.get_state("GA1", "USDC/XLM")
+    assert retrieved is not None, "should have fallen back to the in-process dict"
+    assert fs.circuit_state == CircuitState.CLOSED.value, "single failures shouldn't open the circuit yet"
+
+
+def test_redis_circuit_opens_after_threshold_and_stops_calling_redis():
+    from detection.feature_store import FEATURE_STORE_FAILURE_THRESHOLD
+    from utils.circuit_breaker import CircuitState
+
+    fs = _feature_store_with_failing_redis()
+
+    for i in range(FEATURE_STORE_FAILURE_THRESHOLD):
+        fs.get_state(f"GA{i}", "USDC/XLM")
+    assert fs.circuit_state == CircuitState.OPEN.value
+
+    call_count = {"n": 0}
+
+    class _CountingClient(_FailingRedisClient):
+        def get(self, key):
+            call_count["n"] += 1
+            return super().get(key)
+
+    fs.redis_client = _CountingClient()
+    fs.get_state("GA-extra", "USDC/XLM")
+    assert call_count["n"] == 0, "should not call Redis at all while the circuit is open"
+
+
+def test_redis_circuit_recovers_after_timeout():
+    import time
+
+    from detection.feature_store import FeatureStore
+
+    fs = _feature_store_with_failing_redis()
+    fs._circuit.failure_threshold = 1
+    fs._circuit.recovery_timeout = 0.05
+
+    fs.get_state("GA1", "USDC/XLM")
+    assert fs.circuit_state == "open"
+
+    time.sleep(0.06)
+    assert fs.circuit_state == "half_open"
+
+    # Redis has recovered: swap in a working client for the probe attempt.
+    class _WorkingClient:
+        def __init__(self):
+            self.store = {}
+
+        def get(self, key):
+            return self.store.get(key)
+
+        def setex(self, key, ttl, value):
+            self.store[key] = value.encode() if isinstance(value, str) else value
+
+    fs.redis_client = _WorkingClient()
+    state = WalletFeatureState(wallet="GA1", asset_pair="USDC/XLM", last_updated=datetime.now(timezone.utc))
+    fs.set_state(state)
+    assert fs.circuit_state == "closed"

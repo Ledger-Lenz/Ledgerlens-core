@@ -25,7 +25,6 @@ import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from detection.sandwich_engine import sandwich_candidates_to_alerts  # noqa: F401
 from ingestion.data_models import BridgeTransfer, PathPayment
 
 logger = logging.getLogger("ledgerlens.storage")
@@ -370,6 +369,15 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_path_payment_cycles_detected_at
             ON path_payment_cycles (detected_at);
+        """,
+    ),
+    (
+        13,
+        "add integrity verification columns to bridge_transfers",
+        """
+        ALTER TABLE bridge_transfers ADD COLUMN canonical_hash TEXT;
+        ALTER TABLE bridge_transfers ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'disabled';
+        ALTER TABLE bridge_transfers ADD COLUMN verified_at TIMESTAMP;
         """,
     ),
 ]
@@ -1374,8 +1382,9 @@ def save_bridge_transfer(transfer: BridgeTransfer, db_path: str | None = None) -
             """
             INSERT INTO bridge_transfers
                 (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
-                 tx_hash_evm, tx_hash_stellar, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 tx_hash_evm, tx_hash_stellar, timestamp,
+                 canonical_hash, verification_status, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 transfer.chain,
@@ -1387,6 +1396,9 @@ def save_bridge_transfer(transfer: BridgeTransfer, db_path: str | None = None) -
                 transfer.tx_hash_evm,
                 transfer.tx_hash_stellar,
                 transfer.timestamp.isoformat(),
+                transfer.canonical_hash,
+                transfer.verification_status,
+                transfer.verified_at.isoformat() if transfer.verified_at else None,
             ),
         )
         conn.commit()
@@ -1402,8 +1414,9 @@ def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None =
             """
             INSERT INTO bridge_transfers
                 (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
-                 tx_hash_evm, tx_hash_stellar, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 tx_hash_evm, tx_hash_stellar, timestamp,
+                 canonical_hash, verification_status, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1416,6 +1429,9 @@ def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None =
                     t.tx_hash_evm,
                     t.tx_hash_stellar,
                     t.timestamp.isoformat(),
+                    t.canonical_hash,
+                    t.verification_status,
+                    t.verified_at.isoformat() if t.verified_at else None,
                 )
                 for t in transfers
             ],
@@ -1448,7 +1464,8 @@ def get_bridge_transfers(
         rows = conn.execute(
             f"""
             SELECT chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
-                   tx_hash_evm, tx_hash_stellar, timestamp
+                   tx_hash_evm, tx_hash_stellar, timestamp,
+                   canonical_hash, verification_status, verified_at
             FROM bridge_transfers
             WHERE {where}
             ORDER BY timestamp DESC
@@ -1467,6 +1484,9 @@ def get_bridge_transfers(
             tx_hash_evm=row[6],
             tx_hash_stellar=row[7],
             timestamp=datetime.fromisoformat(row[8]),
+            canonical_hash=row[9],
+            verification_status=row[10] if row[10] is not None else "disabled",
+            verified_at=datetime.fromisoformat(row[11]) if row[11] else None,
         )
         for row in rows
     ]
@@ -1660,6 +1680,92 @@ def get_score_history(
             "timestamp": row[6],
         }
         for row in rows
+    ]
+
+
+def save_hop_payment_cycles(
+    cycles: list,
+    db_path: str | None = None,
+) -> None:
+    """Persist PathPaymentCycle records to the hop_payment_cycles table."""
+    import dataclasses
+    init_db(db_path)
+    if not cycles:
+        return
+    with _connect(db_path) as conn:
+        for cycle in cycles:
+            hops = [
+                {
+                    "src_wallet": h.src_wallet,
+                    "src_asset": h.src_asset,
+                    "dst_wallet": h.dst_wallet,
+                    "dst_asset": h.dst_asset,
+                    "amount": h.amount,
+                    "ledger_timestamp": h.ledger_timestamp.isoformat(),
+                    "operation_id": h.operation_id,
+                }
+                for h in cycle.hops
+            ]
+            conn.execute(
+                """
+                INSERT INTO hop_payment_cycles
+                    (origin_wallet, origin_asset, path_length, recovery_ratio,
+                     cycle_duration_seconds, counterparty_overlap, cycle_score,
+                     hop_json, detected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cycle.origin_wallet,
+                    cycle.origin_asset,
+                    cycle.path_length,
+                    cycle.recovery_ratio,
+                    cycle.cycle_duration_seconds,
+                    cycle.counterparty_overlap,
+                    cycle.cycle_score,
+                    json.dumps(hops),
+                    cycle.detected_at.isoformat(),
+                ),
+            )
+        conn.commit()
+
+
+def get_hop_payment_cycles(
+    min_score: float = 0.6,
+    wallet: str | None = None,
+    limit: int = 100,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Retrieve PathPaymentCycle records from storage."""
+    init_db(db_path)
+    query = """
+        SELECT id, origin_wallet, origin_asset, path_length, recovery_ratio,
+               cycle_duration_seconds, counterparty_overlap, cycle_score,
+               hop_json, detected_at
+        FROM hop_payment_cycles
+        WHERE cycle_score >= ?
+    """
+    params: list = [min_score]
+    if wallet:
+        query += " AND origin_wallet = ?"
+        params.append(wallet)
+    query += " ORDER BY cycle_score DESC LIMIT ?"
+    params.append(limit)
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [
+        {
+            "id": r[0],
+            "origin_wallet": r[1],
+            "origin_asset": r[2],
+            "path_length": r[3],
+            "recovery_ratio": r[4],
+            "cycle_duration_seconds": r[5],
+            "counterparty_overlap": r[6],
+            "cycle_score": r[7],
+            "hops": json.loads(r[8]),
+            "detected_at": r[9],
+        }
+        for r in rows
     ]
 
 

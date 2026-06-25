@@ -25,3 +25,6 @@ models/optuna_studies/
 # Editors
 .vscode/
 .idea/
+
+# Project specific
+somzilla.md

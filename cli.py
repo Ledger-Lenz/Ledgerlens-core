@@ -12,12 +12,42 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import tomllib
+from pathlib import Path
 
 import typer
+
+try:
+    _version_file = Path(__file__).resolve().parent / "pyproject.toml"
+    with open(_version_file, "rb") as _vf:
+        __version__ = tomllib.load(_vf)["project"]["version"]
+except Exception:
+    __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"ledgerlens-core v{__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Show the version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """LedgerLens detection engine CLI."""
+    pass
 
 
 @app.command("generate-data")
@@ -56,9 +86,7 @@ def train(
     ring_size: int = typer.Option(3, help="Accounts per wash ring"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
-    optimize: bool = typer.Option(False, "--optimize", help="Run Optuna Bayesian hyperparameter optimization before training"),
-    n_trials: int = typer.Option(100, "--n-trials", help="Number of Optuna trials per model (max 1000)"),
-    timeout: int = typer.Option(1800, "--timeout", help="Optuna wall-clock timeout in seconds per model (max 86400)"),
+    experiment_name: str = typer.Option(None, "--experiment-name", help="MLflow experiment name for tracking"),
 ) -> None:
     """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`.
 
@@ -84,30 +112,7 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
-    if optimize:
-        from detection.feature_engineering import FEATURE_NAMES as _FN
-        from detection.model_training import (
-            _save_best_hyperparams,
-            optimize_hyperparameters,
-        )
-
-        X = df[_FN].fillna(0.0).values
-        y = df["label"].values
-        best_params: dict = {}
-        best_auc_pr: dict = {}
-        n_trials_completed: dict = {}
-        for model_name in ("random_forest", "xgboost", "lightgbm"):
-            logger.info("Optimizing %s (%d trials, %ds timeout)...", model_name, n_trials, timeout)
-            params = optimize_hyperparameters(
-                model_name, X, y, n_trials=n_trials, timeout_seconds=timeout,
-            )
-            best_params[model_name] = params
-            best_auc_pr[model_name] = 0.0
-            n_trials_completed[model_name] = n_trials
-        _save_best_hyperparams(best_params, best_auc_pr, n_trials_completed)
-        logger.info("Hyperparameter optimization complete")
-
-    results = train_ensemble(df, calibrate=calibrate)
+    results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
         if name == "_calib":
             continue
@@ -127,6 +132,11 @@ def retrain_check(
     force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
+
+    Checks both PSI-based feature distribution drift and analyst-labelled
+    performance degradation. If F1 on recent feedback labels drops more than
+    5 percentage points from the training baseline, retraining is triggered
+    alongside drift-based retraining.
 
     Computes Population Stability Index (PSI) on recent scored features
     against the training reference distribution. If drift is detected
@@ -178,7 +188,30 @@ def retrain_check(
         min_drifted_features=min_drifted_features,
     )
 
-    if not drift_detected and not force_retrain:
+    # --- Performance degradation check (Issue-110) ---
+    performance_triggered = False
+    try:
+        from detection.drift_monitor import ModelDegradationAlert, PerformanceMonitor
+
+        monitor = PerformanceMonitor(db_path=settings.db_path)
+        baseline_f1: float = metadata.get("model_metrics", {}).get("random_forest", {}).get("f1", 0.0)
+        # Prefer val_f1_score when available (more representative than train split F1)
+        baseline_f1 = metadata.get("val_f1_score", baseline_f1)
+        if baseline_f1 == 0.0:
+            logger.warning("baseline F1 not available in training_metadata.json; degradation check skipped")
+        else:
+            try:
+                monitor.check_degradation(
+                    baseline_f1=baseline_f1,
+                    f1_threshold_drop=settings.performance_degradation_threshold,
+                )
+            except ModelDegradationAlert as alert:
+                logger.warning("Model degradation detected: %s — triggering retrain", alert)
+                performance_triggered = True
+    except Exception as perf_exc:
+        logger.warning("Performance degradation check failed: %s", perf_exc)
+
+    if not drift_detected and not force_retrain and not performance_triggered:
         logger.info("No drift detected; skipping retrain")
         return
 
@@ -416,11 +449,97 @@ def serve(
 def stream(
     batch_size: int = typer.Option(500, "--batch-size", help="Number of trades to accumulate before scoring"),
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
+    checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
+    score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
 ) -> None:
-    """Stream trades from Horizon SSE and score wallets in near-real-time."""
-    import run_pipeline
+    """Stream trades from Horizon SSE and score incrementally per wallet.
 
-    run_pipeline.run_streaming(batch_size=batch_size, flush_interval_seconds=flush_interval)
+    Maintains per-wallet rolling windows (1h/4h/24h), recomputes features on
+    each trade, and emits a RiskScore when the score changes by >= score_delta
+    points. Window state is checkpointed to SQLite every checkpoint_interval
+    trades. Graceful shutdown (SIGTERM/SIGINT) persists all in-memory state.
+    """
+    import signal
+    import threading
+
+    from config.settings import settings as cfg
+    from detection.feature_engineering import FeatureEngineering
+    from detection.model_inference import IncrementalScorer, ModelInference, load_models
+    from detection.rolling_window import RollingWindowState, RollingWindowStore
+    from detection.storage import init_db, save_scores
+    from detection.webhook_queue import enqueue
+    from detection.webhook_registry import get_matching_subscribers
+    from ingestion.horizon_streamer import stream_trades
+    import api.main as api_main
+
+    _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
+    _score_delta = score_delta if score_delta is not None else cfg.stream_score_delta_threshold
+
+    init_db()
+    checkpoint_store = RollingWindowStore()
+    window_state = RollingWindowState()
+    checkpoint_store.load_all(window_state)
+
+    try:
+        models = load_models(cfg.model_dir)
+    except FileNotFoundError:
+        logger.error("No trained models found in %s — run `python cli.py train` first", cfg.model_dir)
+        raise typer.Exit(1)
+
+    fe = FeatureEngineering()
+    scorer = IncrementalScorer(
+        window_state=window_state,
+        feature_engineering=fe,
+        model_inference=ModelInference(models),
+        score_delta_threshold=_score_delta,
+    )
+
+    stop_event = threading.Event()
+
+    def _shutdown(signum, frame):
+        logger.info("Shutdown signal received — checkpointing all window states…")
+        checkpoint_store.save_all(scorer.window_state)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    trades_since_checkpoint = 0
+
+    logger.info(
+        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d)",
+        _chk_interval,
+        _score_delta,
+    )
+
+    for trade in stream_trades():
+        if stop_event.is_set():
+            break
+
+        # Update stream status for /stream/status endpoint
+        api_main._stream_status_update(trade)
+        with api_main._stream_lock:
+            api_main._stream_active_wallets = scorer.window_state.active_wallets
+
+        result = scorer.score_on_trade(trade)
+        if result:
+            save_scores([result])
+            try:
+                subscribers = get_matching_subscribers(result)
+                for sub in subscribers:
+                    enqueue(sub.subscriber_id, result.model_dump(mode="json"))
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Webhook dispatch error: %s", exc)
+
+        trades_since_checkpoint += 1
+        if trades_since_checkpoint >= _chk_interval:
+            checkpoint_store.save_all(scorer.window_state)
+            trades_since_checkpoint = 0
+            logger.debug("Checkpointed %d wallet windows", scorer.window_state.active_wallets)
+
+    # Final checkpoint on clean exit
+    checkpoint_store.save_all(scorer.window_state)
+    logger.info("Stream stopped. Final checkpoint written.")
 
 
 @app.command("db-migrate")
@@ -441,6 +560,27 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+
+@app.command("governance-close-expired")
+def governance_close_expired() -> None:
+    """Close all active governance proposals whose voting period has expired.
+
+    Tallies each expired proposal and sets its status to 'passed' or 'rejected'
+    based on the quorum rule (>50% of committee votes 'for'). Designed to be
+    called on a schedule (e.g., cron or systemd timer).
+    """
+    from detection.storage import init_db
+    from detection.governance import GovernanceEngine
+
+    init_db()
+    engine = GovernanceEngine()
+    closed = engine.close_expired()
+    if not closed:
+        typer.echo("No expired proposals to close.")
+    else:
+        for p in closed:
+            typer.echo(f"Proposal {p.id} ({p.proposal_type}): {p.status}")
 
 
 @app.command("reweight")
@@ -673,6 +813,37 @@ def federated_join(
                 logger.info("Round %d: distillation update applied", round_num + 1)
 
     logger.info("Federated participation complete (%d round(s))", rounds)
+
+
+config_app = typer.Typer(help="Configuration commands")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("validate")
+def config_validate() -> None:
+    """Load and validate configuration, printing all settings (secrets masked)."""
+    import pydantic
+
+    _SECRETS = {
+        "ledgerlens_service_secret_key",
+        "ledgerlens_admin_api_key",
+        "ledgerlens_compliance_api_key",
+        "ledgerlens_model_signing_key",
+        "ledgerlens_webhook_encryption_key",
+    }
+
+    try:
+        from config.settings import Settings
+        s = Settings()
+    except (pydantic.ValidationError, Exception) as exc:
+        typer.echo(f"❌ Configuration invalid:\n{exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo("✅ Configuration is valid\n")
+    for name in Settings.model_fields:
+        raw = getattr(s, name)
+        value = "***" if name in _SECRETS and raw else raw
+        typer.echo(f"  {name}={value}")
 
 
 if __name__ == "__main__":

@@ -86,6 +86,8 @@ _TRANSLATIONS.update(
         "path_cycle_xlm_volume_24h": "Reduce the XLM value routed through multi-hop path-payment cycles that return to the originating account.",
         "max_cycle_length": "Stop chaining path payments across multiple intermediary accounts to obscure round-trip self-dealing.",
         "cycle_asset_diversity": "Stop spreading cyclic path payments across many intermediate assets to disguise round-trip trades.",
+        "path_cycle_count": "Reduce the number of confirmed multi-hop round-trip path-payment cycles attributed to this wallet.",
+        "path_cycle_recovery_ratio": "Avoid round-trip path payments that recover close to 100% of the originating amount, as this is a strong wash-trade signal.",
         "sandwich_ratio": "Stop placing trades immediately before and after other accounts' pool trades to capture price impact.",
         "sandwich_profit_xlm_30d": "Reduce the profit extracted from sandwiching other traders' pool trades over the last 30 days.",
         "benford_conformity_suspicion": (

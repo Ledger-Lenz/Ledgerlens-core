@@ -1,0 +1,137 @@
+# ── Global ───────────────────────────────────────────────────────────────────
+replicaCount: 2
+
+image:
+  repository: ledgerlens/core
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Service ──────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+
+# ── Ingress ──────────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: ledgerlens.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ── API Server ───────────────────────────────────────────────────────────────
+api:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /health/ready
+      port: 8000
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 2
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ── Ingestion Worker ─────────────────────────────────────────────────────────
+ingestionWorker:
+  enabled: true
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  livenessProbe:
+    tcpSocket:
+      port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# ── Horizontal Pod Autoscaler ────────────────────────────────────────────────
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# ── ConfigMap ────────────────────────────────────────────────────────────────
+config:
+  # Stellar Horizon
+  HORIZON_URL: "https://horizon.stellar.org"
+  HORIZON_STREAM_URL: "https://horizon.stellar.org"
+  NETWORK: "testnet"
+  # Polling / streaming
+  POLL_INTERVAL_SECONDS: "5"
+  TRADE_HISTORY_LOOKBACK_DAYS: "30"
+  CURSOR_PATH: "/data/horizon_cursor.txt"
+  # Detection engine
+  BENFORD_MAD_THRESHOLD: "0.015"
+  RISK_SCORE_THRESHOLD: "70"
+  # Feature store
+  REDIS_URL: "redis://redis:6379/0"
+  FEATURE_STORE_TTL_HOURS: "48"
+  FEATURE_STORE_FLUSH_INTERVAL_SECONDS: "300"
+  # Model artifacts
+  MODEL_DIR: "/data/models"
+  # Database
+  LEDGERLENS_DB_PATH: "/data/ledgerlens.db"
+  # Rate limiting
+  HORIZON_RATE_LIMIT: "50"
+  HORIZON_RATE_BUCKET_CAPACITY: "100"
+  HORIZON_QUEUE_HIGH_WATERMARK: "1000"
+  HORIZON_QUEUE_LOW_WATERMARK: "500"
+  RATE_RESTORE_SECONDS: "60"
+
+# ── Secrets (set via --set or --values) ───────────────────────────────────────
+secrets:
+  LEDGERLENS_SERVICE_SECRET_KEY: ""
+  LEDGERLENS_MODEL_SIGNING_KEY: ""
+  LEDGERLENS_ADMIN_API_KEY: ""
+  LEDGERLENS_COMPLIANCE_API_KEY: ""
+  LEDGERLENS_WEBHOOK_ENCRYPTION_KEY: ""
+
+# ── Persistent Volume ────────────────────────────────────────────────────────
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+
+# ── ServiceAccount ───────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""

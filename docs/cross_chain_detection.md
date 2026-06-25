@@ -189,3 +189,80 @@ See `.env.example` for the full list of EVM settings. Required variables:
 | `EVM_RPC_POLYGON` | JSON-RPC endpoint for Polygon |
 | `EVM_LOOKBACK_BLOCKS` | Number of blocks to look back when fetching events (default: 7200 ≈ 24h) |
 | `EVM_POOL_ADDRESSES` | Comma-separated list of EIP-55 checksummed pool addresses to monitor |
+
+## Bridge Event Integrity Verification
+
+### Threat model
+
+Bridge events are fetched from EVM chains via JSON-RPC (`eth_getLogs`). The on-chain log data is cryptographically committed to the block through the Merkle Patricia Trie, so any tampering would change the block hash. However, the JSON-RPC layer is an untrusted intermediary: a compromised RPC endpoint (e.g. a malicious Infura fork or an MitM proxy) could return fabricated log data that LedgerLens would otherwise accept as authentic — causing false wash-trading alerts against innocent wallets.
+
+LedgerLens implements two complementary defences:
+
+### 1. Canonical event hash
+
+For every ingested bridge event, `compute_canonical_event_hash` produces a deterministic SHA-256 fingerprint over the event's immutable fields:
+
+```python
+canonical = {
+    "chain_id": int,
+    "address": str,   # contract address, lowercase
+    "topics": list,   # lowercase hex strings
+    "data": str,      # ABI-encoded data, lowercase
+    "block_number": int,
+    "tx_hash": str,   # lowercase
+    "log_index": int,
+}
+digest = SHA-256(json.dumps(canonical, sort_keys=True, separators=(",", ":")))
+```
+
+This hash is stored in the `bridge_transfers.canonical_hash` column. It reflects what LedgerLens ingested — not what a subsequent attacker might claim — and can be used for audit and replay detection.
+
+### 2. Receipt-based log verification
+
+`BridgeEventVerifier.verify_event_via_receipt` calls `eth_getTransactionReceipt` for the event's transaction hash and compares the log at `log_index` against the fields returned by `eth_getLogs`:
+
+| Field compared | Rationale |
+|---|---|
+| `address` | Confirms the event came from the expected contract |
+| `topics` | Confirms the event signature and indexed parameters |
+| `data` | Confirms the non-indexed ABI-encoded payload |
+| `blockHash` | Confirms the event's block provenance |
+
+A mismatch on any field returns `VerificationResult.TAMPERED`.
+
+#### Possible outcomes
+
+| `VerificationResult` | Meaning |
+|---|---|
+| `verified` | Receipt matches — event is authentic |
+| `tampered` | Receipt does not match — event rejected, DLQ routed |
+| `receipt_not_found` | Transaction not yet mined or pruned from node |
+| `log_index_out_of_range` | Receipt has fewer logs than expected |
+| `skipped` | Event not selected by sampling (see below) |
+| `disabled` | Verification turned off (`BRIDGE_VERIFY_SAMPLE_RATE=0`) |
+
+#### Tampered event policy
+
+Tampered events are:
+- Logged at `ERROR` level with the transaction hash, log index, and chain ID (the full data field is intentionally excluded)
+- Enqueued on the dead-letter queue with `error_class=SCHEMA_ERROR`
+- **Not written** to the `bridge_transfers` table
+
+### Sampling configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `BRIDGE_VERIFY_SAMPLE_RATE` | `1.0` | Fraction of events to verify (0.0 = disabled, 1.0 = all) |
+| `BRIDGE_VERIFY_RECEIPT_TIMEOUT_SECONDS` | `10.0` | Per-call timeout for `eth_getTransactionReceipt` |
+
+Setting `BRIDGE_VERIFY_SAMPLE_RATE=0.0` disables all verification and emits a `WARNING` on startup:
+
+```
+Bridge event verification disabled — cross-chain integrity not guaranteed.
+```
+
+**Security vs cost trade-off**: full verification (`1.0`) doubles the RPC call volume for bridge events. Statistical sampling (`0.1`–`0.5`) provides probabilistic assurance at reduced cost. For production deployments processing untrusted or third-party RPC endpoints, `1.0` is recommended.
+
+### Limitation: not a full Merkle proof
+
+Receipt verification relies on `eth_getTransactionReceipt` reaching a trustworthy node. It does **not** verify the Merkle proof against the block header (that would require `eth_getProof` and a trusted block hash source). For maximum security, configure `EVMProviderPool` (ISSUE-013) with multiple independent providers — a tampering attack would then need to compromise all providers simultaneously.

@@ -25,6 +25,12 @@ class RiskScore(BaseModel):
     disputed: bool = False
     timestamp: datetime
 
+    # Streaming latency field (optional, populated on the streaming path)
+    latency_ms: float | None = Field(
+        default=None,
+        description="End-to-end latency in milliseconds from trade receipt to score update",
+    )
+
     # Conformal prediction uncertainty fields (optional, v2+)
     score_lower: float | None = Field(
         default=None, ge=0.0, le=100.0,

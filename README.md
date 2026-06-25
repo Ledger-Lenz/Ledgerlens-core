@@ -3,7 +3,7 @@
 [![Built on Stellar](https://img.shields.io/badge/Built%20on-Stellar-blue?logo=stellar)](https://stellar.org)
 [![Soroban Smart Contracts](https://img.shields.io/badge/Smart%20Contracts-Soroban-purple)](https://soroban.stellar.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
+[![Mutation Score](https://img.shields.io/badge/mutation%20score-%3E%3D80%25-brightgreen)](tests/)
 
 Hybrid on-chain fraud detection for the Stellar DEX — detecting wash trading and artificial volume using Benford's Law combined with ensemble machine learning, with risk scores anchored on Soroban.
 
@@ -36,13 +36,14 @@ At a high level, it does three things:
 
 - **Benford's Law Anomaly Engine**: Chi-square, per-digit Z-score, and MAD analysis of transaction amounts across rolling time windows (1h, 4h, 24h, 7d, 30d)
 - **Ensemble ML Scoring**: Random Forest, XGBoost, and LightGBM classifiers trained on labelled wash-trade patterns with SHAP interpretability
+- **Temporal Sequence Model**: LSTM or Transformer encoder that processes a wallet's ordered trade history (up to 200 trades) as a sequence, detecting temporal patterns invisible to aggregate features — regular inter-trade intervals, alternating buy/sell sequences, and burst-pause cycles; fused with the tabular ensemble score via a learned weight `w_seq` (see [docs/temporal_model.md](docs/temporal_model.md))
 - **LedgerLens Risk Score (0–100)**: Continuously updated composite score per wallet and per trading pair
 - **Cross-Chain Detection**: Links Stellar wallets to EVM counterparts (Ethereum, Base, Polygon) via Allbridge bridge events; detects round-trip wash-trade patterns across chains using six dedicated features (see [docs/cross_chain_detection.md](docs/cross_chain_detection.md))
 - **On-Chain Risk Registry**: Soroban smart contract exposes risk scores so AMMs, lending protocols, and aggregators can gate suspicious activity natively
 - **Public REST API**: Query scores, recent alerts, and asset risk rankings
 - **Lightweight Dashboard**: Web UI for risk-score visibility without requiring technical expertise
- 
- - Adversarial robustness evaluation: attack, certificate, and hardening tools (see docs/adversarial_robustness.md)
+
+- Adversarial robustness evaluation: attack, certificate, and hardening tools (see docs/adversarial_robustness.md)
 
 ## Architecture
 
@@ -112,6 +113,7 @@ graph TB
 - **detection/model_training.py**: Trains the Random Forest / XGBoost / LightGBM ensemble
 - **detection/model_inference.py**: Real-time risk scoring
 - **detection/shap_explainer.py**: SHAP-based interpretability layer
+- **detection/causal_engine.py**: DoWhy structural causal model — do-calculus interventions, ATE estimation, counterfactual scores
 
 The Soroban contract, REST API, and dashboard live in the
 `ledgerlens-contracts`, `ledgerlens-api`, and `ledgerlens-dashboard` repos
@@ -121,11 +123,11 @@ respectively — see [LedgerLens Organization](#ledgerlens-organization).
 
 Benford's Law predicts that the leading digit of naturally occurring transaction amounts follows a known, non-uniform distribution (digit 1 ≈ 30.1%, digit 9 ≈ 4.6%). Wash-trading bots tend to use fixed lot sizes or round/algorithmic amounts, producing distributions that diverge from this expectation.
 
-| Metric | What it measures |
-|---|---|
-| **Chi-square statistic** | Whether the overall digit distribution deviates significantly from Benford's expected distribution |
-| **Z-score (per digit)** | Whether any individual digit (1–9) appears with significantly higher or lower frequency than expected |
-| **Mean Absolute Deviation (MAD)** | Composite divergence measure; values above 0.015 indicate non-conformity |
+| Metric                            | What it measures                                                                                      |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **Chi-square statistic**          | Whether the overall digit distribution deviates significantly from Benford's expected distribution    |
+| **Z-score (per digit)**           | Whether any individual digit (1–9) appears with significantly higher or lower frequency than expected |
+| **Mean Absolute Deviation (MAD)** | Composite divergence measure; values above 0.015 indicate non-conformity                              |
 
 Benford signals alone are insufficient (legitimate market makers can also be non-Benford), so they are combined with the ML layer below.
 
@@ -147,24 +149,39 @@ Wash-ring discovery uses Tarjan's strongly connected components (SCCs) rather th
 
 The four graph-structural ML features are:
 
-| Feature | Meaning |
-|---|---|
-| `wash_ring_membership` | `1.0` when the account belongs to any detected SCC ring, else `0.0` |
-| `wash_ring_size` | Size of the largest ring containing the account, else `0.0` |
-| `cycle_volume_ratio` | Fraction of the account's outgoing volume explained by complete ring cycles |
-| `timing_tightness_score` | `1 / (1 + timing_tightness)` for the account's tightest ring, else `0.0` |
+| Feature                  | Meaning                                                                     |
+| ------------------------ | --------------------------------------------------------------------------- |
+| `wash_ring_membership`   | `1.0` when the account belongs to any detected SCC ring, else `0.0`         |
+| `wash_ring_size`         | Size of the largest ring containing the account, else `0.0`                 |
+| `cycle_volume_ratio`     | Fraction of the account's outgoing volume explained by complete ring cycles |
+| `timing_tightness_score` | `1 / (1 + timing_tightness)` for the account's tightest ring, else `0.0`    |
 
 The local API exposes the latest detected rings with `GET /rings`. Each response row includes `accounts`, `total_volume`, `cycle_volume`, and `detected_at`, plus ring metadata such as average trade count, timing tightness, and truncation status.
 
 ### Models
 
-| Model | Role |
-|---|---|
-| **Random Forest** | Stable baseline; handles missing features gracefully |
-| **XGBoost** | Primary classifier; strongest performance on tabular on-chain data |
-| **LightGBM** | High-speed inference for real-time scoring |
+| Model             | Role                                                               |
+| ----------------- | ------------------------------------------------------------------ |
+| **Random Forest** | Stable baseline; handles missing features gracefully               |
+| **XGBoost**       | Primary classifier; strongest performance on tabular on-chain data |
+| **LightGBM**      | High-speed inference for real-time scoring                         |
 
 Models are trained with **SMOTE** for class imbalance and evaluated with **AUC-ROC**, **Precision-Recall AUC**, and **F1-score**. SHAP values provide per-score interpretability.
+
+### Interpretability: SHAP and Causal Explanations
+
+LedgerLens provides two complementary interpretability layers:
+
+- **SHAP** (`detection/shap_explainer.py`): per-score feature contributions, served via `GET /scores/{wallet}/explain`. SHAP identifies _which_ features were important — but shares credit between correlated features (e.g. Benford signals and ring membership both appear influential even when only one is causal).
+
+- **Causal explanations** (`detection/causal_engine.py`): Average Treatment Effects (ATEs) via do-calculus on a fitted structural causal model, served via `GET /scores/{wallet}/causal-explanation`. This answers the regulatory question _"would this wallet still be flagged if it fixed its Benford distribution?"_ by measuring the independent causal contribution of each feature, separate from correlational effects.
+
+  Key capabilities:
+  - `feature_ate_table`: the causal ATE of each feature on `risk_score`
+  - `top_causal_features`: top-3 features by absolute ATE (the true causal drivers)
+  - `counterfactual_score`: predicted score under a specified feature override (e.g. `wash_ring_membership=0.0`)
+
+  See [docs/causal_inference.md](docs/causal_inference.md) for the full DAG design, do-calculus methodology, and ATE interpretation guide.
 
 ## Soroban Smart Contract Layer
 
@@ -183,6 +200,7 @@ LedgerLens includes an off-chain dispute and governance mechanism for managing p
 - Governance proposals allow runtime configuration changes (e.g. `risk_score_threshold`) and committee membership changes.
 
 See `docs/governance_protocol.md` for full details.
+
 - `get_score(wallet: Address, asset_pair: Symbol) -> RiskScore` - Read-only; returns the most recent risk score and timestamp for a wallet/asset pair, callable by any other Soroban contract
 
 ```rust
@@ -204,14 +222,14 @@ After each pipeline run, all `RiskScore` records above `RISK_SCORE_THRESHOLD` ar
 
 **Configuration** (see `.env.example` for defaults):
 
-| Variable | Purpose |
-|---|---|
-| `LEDGERLENS_SCORE_CONTRACT_ID` | Soroban contract ID of the deployed `ledgerlens-score` contract |
-| `LEDGERLENS_SERVICE_SECRET_KEY` | **Secret**: Stellar account key authorized to call `submit_score()` on the contract |
-| `SOROBAN_RPC_URL` | Soroban RPC endpoint (separate from Horizon; defaults to Testnet) |
-| `NETWORK_PASSPHRASE` | Stellar network passphrase (must match the network the contract is on) |
-| `SOROBAN_CIRCUIT_BREAKER_THRESHOLD` | Consecutive failures before the circuit opens (default: 5) |
-| `SOROBAN_CIRCUIT_RESET_SECONDS` | Seconds until the circuit resets (default: 300) |
+| Variable                            | Purpose                                                                             |
+| ----------------------------------- | ----------------------------------------------------------------------------------- |
+| `LEDGERLENS_SCORE_CONTRACT_ID`      | Soroban contract ID of the deployed `ledgerlens-score` contract                     |
+| `LEDGERLENS_SERVICE_SECRET_KEY`     | **Secret**: Stellar account key authorized to call `submit_score()` on the contract |
+| `SOROBAN_RPC_URL`                   | Soroban RPC endpoint (separate from Horizon; defaults to Testnet)                   |
+| `NETWORK_PASSPHRASE`                | Stellar network passphrase (must match the network the contract is on)              |
+| `SOROBAN_CIRCUIT_BREAKER_THRESHOLD` | Consecutive failures before the circuit opens (default: 5)                          |
+| `SOROBAN_CIRCUIT_RESET_SECONDS`     | Seconds until the circuit resets (default: 300)                                     |
 
 **Transaction lifecycle**:
 
@@ -231,6 +249,7 @@ After each pipeline run, all `RiskScore` records above `RISK_SCORE_THRESHOLD` ar
 **Circuit breaker**: after `SOROBAN_CIRCUIT_BREAKER_THRESHOLD` consecutive failures within a 60-second rolling window, the publisher stops calling the contract and raises `SorobanCircuitOpenError`. The circuit auto-resets after `SOROBAN_CIRCUIT_RESET_SECONDS`. This prevents submission storms on contract failures without blocking the pipeline.
 
 **Security**:
+
 - `LEDGERLENS_SERVICE_SECRET_KEY` is converted to a `Keypair` at construction time; the raw key string is not retained as an instance variable
 - The keypair object's secret is never included in `__repr__`, logs, or the `on_chain_submissions` audit table
 - The publisher overrides `__getstate__` to exclude the keypair from pickle serialization
@@ -356,15 +375,15 @@ LEDGERLENS_CORS_ALLOWED_ORIGINS=https://dashboard.ledgerlens.io,https://staging.
 
 `GET /health` performs two real checks on every call:
 
-| Component | Check | OK value |
-|---|---|---|
-| `db` | Executes `SELECT 1` via the existing SQLite connection | `"ok"` |
-| `models` | Each model `.joblib` file exists under `MODEL_DIR` and has size > 0 | `"ok"` |
+| Component | Check                                                               | OK value |
+| --------- | ------------------------------------------------------------------- | -------- |
+| `db`      | Executes `SELECT 1` via the existing SQLite connection              | `"ok"`   |
+| `models`  | Each model `.joblib` file exists under `MODEL_DIR` and has size > 0 | `"ok"`   |
 
 Returns **HTTP 200** when both pass:
 
 ```json
-{"status": "ok", "db": "ok", "models": "ok"}
+{ "status": "ok", "db": "ok", "models": "ok" }
 ```
 
 Returns **HTTP 503** when any check fails, naming the failing component:
@@ -393,7 +412,9 @@ docker compose up --build
 python cli.py generate-data   # write synthetic trades/labels to CSV
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
-python cli.py stream          # stream trades from Horizon SSE and score in rolling batches
+python cli.py stream          # stream trades from Horizon SSE and score incrementally
+                              #   --checkpoint-interval N  persist state every N trades (default: 100)
+                              #   --score-delta N          min score change to emit alert (default: 5)
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
@@ -413,6 +434,7 @@ Drift is detected using the **Population Stability Index (PSI)**, a statistical 
 $$\text{PSI} = \sum_{i=1}^{n} \left( \text{current}_i - \text{training}_i \right) \times \ln\left(\frac{\text{current}_i}{\text{training}_i}\right)$$
 
 **PSI Interpretation:**
+
 - **PSI = 0**: Distributions are identical
 - **0 < PSI < 0.10**: Negligible drift; no action needed
 - **0.10 ≤ PSI < 0.20**: Small drift; monitor closely
@@ -430,11 +452,13 @@ python cli.py retrain-check
 ```
 
 **Options:**
+
 - `--psi-threshold 0.20`: PSI threshold for marking a feature as drifted (default 0.20)
 - `--min-drifted-features 3`: Minimum number of drifted features to trigger retraining (default 3)
 - `--force-retrain`: Force retraining even if no drift detected (useful for manual updates)
 
 **What happens:**
+
 1. Computes PSI for all features, comparing production data (last 30 days) against training reference
 2. If drift detected (or force-retrain enabled), trains a new ensemble on the original training distribution (synthetic data)
 3. Compares new models' AUC-ROC scores against previous models
@@ -488,6 +512,7 @@ CREATE TABLE feature_distribution_snapshots (
 For production deployments, schedule retrain checks via cron or systemd timer:
 
 **Cron example (daily at 2 AM):**
+
 ```cron
 0 2 * * * cd /path/to/ledgerlens-core && python cli.py retrain-check >> /var/log/ledgerlens-retrain.log 2>&1
 ```
@@ -495,6 +520,7 @@ For production deployments, schedule retrain checks via cron or systemd timer:
 **Systemd timer example:**
 
 `/etc/systemd/system/ledgerlens-retrain.service`
+
 ```ini
 [Unit]
 Description=LedgerLens Continuous Retrain Check
@@ -509,6 +535,7 @@ StandardError=journal
 ```
 
 `/etc/systemd/system/ledgerlens-retrain.timer`
+
 ```ini
 [Unit]
 Description=Daily LedgerLens Retrain Check
@@ -523,6 +550,7 @@ WantedBy=timers.target
 ```
 
 Enable and start:
+
 ```bash
 systemctl enable ledgerlens-retrain.timer
 systemctl start ledgerlens-retrain.timer
@@ -549,10 +577,10 @@ ls -lh ./drift_reports/
 
 Every `cli.py retrain-check` run also persists its drift report and per-model retrain outcome to SQLite, queryable over HTTP instead of grepping `./drift_reports/`:
 
-| Method | Endpoint                | Description                                  |
-|--------|--------------------------|-----------------------------------------------|
-| `GET`  | `/admin/drift-reports`   | Most recent drift checks (PSI report, threshold, detected flag) |
-| `GET`  | `/admin/retrain-runs`    | Most recent per-model retrain outcomes (old/new version, AUC-ROC, promoted, forced); filter with `?model_name=` |
+| Method | Endpoint               | Description                                                                                                     |
+| ------ | ---------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/admin/drift-reports` | Most recent drift checks (PSI report, threshold, detected flag)                                                 |
+| `GET`  | `/admin/retrain-runs`  | Most recent per-model retrain outcomes (old/new version, AUC-ROC, promoted, forced); filter with `?model_name=` |
 
 Both endpoints require an admin key, since they expose internal model governance data. Set `LEDGERLENS_ADMIN_API_KEY` and pass it via the `X-LedgerLens-Admin-Key` header:
 
@@ -599,12 +627,12 @@ The response returns a `subscriber_id` (UUID) used for management.
 
 ### Management Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST`   | `/webhooks`                  | Register a subscriber        |
-| `GET`    | `/webhooks`                  | List active subscribers      |
-| `DELETE` | `/webhooks/{subscriber_id}`  | Deactivate a subscriber      |
-| `GET`    | `/webhooks/dead-letters`     | List permanently failed deliveries |
+| Method   | Path                        | Description                        |
+| -------- | --------------------------- | ---------------------------------- |
+| `POST`   | `/webhooks`                 | Register a subscriber              |
+| `GET`    | `/webhooks`                 | List active subscribers            |
+| `DELETE` | `/webhooks/{subscriber_id}` | Deactivate a subscriber            |
+| `GET`    | `/webhooks/dead-letters`    | List permanently failed deliveries |
 
 ### Payload Format
 
@@ -690,6 +718,7 @@ pytest
 ```
 
 Covers:
+
 - ✅ Benford's Law feature computation
 - ✅ ML feature engineering (trade pattern, volume/timing, graph-ring features)
 - ✅ Graph-based wash-ring discovery and ring storage
@@ -700,14 +729,16 @@ Covers:
 
 ## Roadmap
 
-### Phase 1 — Foundation *(Months 1–2)*
+### Phase 1 — Foundation _(Months 1–2)_
+
 - [x] Stellar Horizon API ingestion pipeline (historical + streaming)
 - [x] Benford's Law engine for on-chain transaction amounts
 - [x] Initial feature engineering from SDEX trade data
 - [x] Baseline ML model training on synthetic wash trade patterns
 - [ ] Internal testing on Stellar Testnet
 
-### Phase 2 — Core Product *(Months 3–4)*
+### Phase 2 — Core Product _(Months 3–4)_
+
 - [x] Full ensemble model training and evaluation
 - [x] SHAP interpretability integration
 - [ ] Soroban smart contract deployment on Testnet
@@ -715,14 +746,16 @@ Covers:
 - [ ] Public REST API with rate limiting (`ledgerlens-api`)
 - [ ] Web dashboard (beta)
 
-### Phase 3 — Ecosystem Integration *(Months 5–6)*
+### Phase 3 — Ecosystem Integration _(Months 5–6)_
+
 - [ ] Mainnet deployment
 - [ ] SDK for protocol integrations (Python + JavaScript)
 - [ ] Webhook alert system for asset issuers and protocol teams
 - [ ] Open dataset release: labelled SDEX wash trade patterns
 - [ ] Community feedback and model refinement cycle
 
-### Phase 4 — Scale *(Post-Grant)*
+### Phase 4 — Scale _(Post-Grant)_
+
 - [ ] Continuous model retraining pipeline
 - [ ] Coverage expansion to AMM pools and cross-asset paths
 - [ ] Integration partnerships with Stellar DEX aggregators
@@ -760,6 +793,7 @@ LedgerLens is being developed as an open-source contribution to the Stellar ecos
 - DeFi protocol integration
 
 Quick checklist for contributions:
+
 - All tests pass: `pytest`
 - Code follows project style guidelines
 - New features include tests
@@ -771,14 +805,14 @@ This repo is one of six in the LedgerLens organization. If a change here
 touches a shared contract (below), call it out so the matching repo can be
 updated.
 
-| Repo | Role | Primary language |
-|---|---|---|
-| **`.github`** | Org-wide GitHub config: shared workflows, issue/PR templates, CODEOWNERS, reusable CI actions | YAML |
-| **`ledgerlens-data`** | Canonical storage for raw + processed trade data and labelled training datasets used by `core` for model training | SQL / Python |
-| **`ledgerlens-core`** *(this repo)* | Detection engine: Horizon ingestion, Benford's Law analysis, ML feature engineering, ensemble training/inference, SHAP explanations, `RiskScore` computation | Python |
-| **`ledgerlens-api`** | Public REST API (FastAPI). Serves `RiskScore` records produced by `core`, exposes `/score`, `/alerts`, `/assets/risk-ranking`, and forwards confirmed scores to `ledgerlens-contracts` | Python (FastAPI) |
-| **`ledgerlens-dashboard`** | Web dashboard consuming `ledgerlens-api`. Visualizes risk scores, SHAP explanations, and asset risk rankings | TypeScript / React |
-| **`ledgerlens-contracts`** | Soroban smart contract(s) — the on-chain risk registry (`ledgerlens-score`). Exposes `submit_score` / `get_score` for composability with other Stellar protocols | Rust (Soroban) |
+| Repo                                | Role                                                                                                                                                                                   | Primary language   |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| **`.github`**                       | Org-wide GitHub config: shared workflows, issue/PR templates, CODEOWNERS, reusable CI actions                                                                                          | YAML               |
+| **`ledgerlens-data`**               | Canonical storage for raw + processed trade data and labelled training datasets used by `core` for model training                                                                      | SQL / Python       |
+| **`ledgerlens-core`** _(this repo)_ | Detection engine: Horizon ingestion, Benford's Law analysis, ML feature engineering, ensemble training/inference, SHAP explanations, `RiskScore` computation                           | Python             |
+| **`ledgerlens-api`**                | Public REST API (FastAPI). Serves `RiskScore` records produced by `core`, exposes `/score`, `/alerts`, `/assets/risk-ranking`, and forwards confirmed scores to `ledgerlens-contracts` | Python (FastAPI)   |
+| **`ledgerlens-dashboard`**          | Web dashboard consuming `ledgerlens-api`. Visualizes risk scores, SHAP explanations, and asset risk rankings                                                                           | TypeScript / React |
+| **`ledgerlens-contracts`**          | Soroban smart contract(s) — the on-chain risk registry (`ledgerlens-score`). Exposes `submit_score` / `get_score` for composability with other Stellar protocols                       | Rust (Soroban)     |
 
 ### Data Flow
 
@@ -832,12 +866,14 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 **2. Trade / Asset schema** — defined here at `ingestion/data_models.py` (`Trade`, `Asset`, `OrderBookEvent`). `ledgerlens-data` persists records in this shape; changing field names here requires a migration note for `ledgerlens-data`.
 
 **3. Environment variables / config keys** — `.env.example` defines the cross-repo keys:
+
 - `LEDGERLENS_API_URL` — where `core` publishes scores
 - `LEDGERLENS_SCORE_CONTRACT_ID` — the deployed Soroban contract id (also used by `ledgerlens-api` and `ledgerlens-contracts`)
 - `LEDGERLENS_SERVICE_SECRET_KEY` — the Soroban service account authorized to call `submit_score` (never commit; only `core`/`api` need this)
 - `RISK_SCORE_THRESHOLD` — score above which `api` pushes to the contract
 
 **4. Soroban contract interface** — `ledgerlens-contracts` exposes:
+
 - `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)`
 - `get_score(wallet: Address, asset_pair: Symbol) -> RiskScore`
 
@@ -858,19 +894,20 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 ## Support
 
 For issues and questions:
+
 - GitHub Issues: [Create an issue](https://github.com/yourusername/ledgerlens/issues)
 - Stellar Discord: https://discord.gg/stellar
 
 ## References
 
-- Benford, F. (1938) 'The law of anomalous numbers', *Proceedings of the American Philosophical Society*, 78(4), pp. 551–572.
-- Al Ali, A. et al. (2023) 'A powerful predicting model for financial statement fraud based on optimized XGBoost ensemble learning technique', *Applied Sciences*, 13(4).
-- Antonio, G.R. (2023) 'Numbers don't lie: Decoding financial error and fraud through Benford's law', *Journal of Entrepreneurship*.
-- Nti, I.K. and Somanathan, A.R. (2024) 'A scalable RF-XGBoost framework for financial fraud mitigation', *IEEE Transactions on Computational Social Systems*, 11(2), pp. 410–422.
-- Yadavalli, R. and Polisetti, R. (2025) 'Optimized financial fraud detection using SMOTE-enhanced ensemble learning with CatBoost and LightGBM', *ICVADV 2025*.
-- Harea, R. and Mihailă, S. (2025) 'Benford's law: Applicability in accounting and financial anomaly detection', *Challenges of Accounting for Young Researchers*, 3(1).
-- Stellar Development Foundation (2024) *Horizon API Documentation*. Available at: https://developers.stellar.org/api/horizon
-- Stellar Development Foundation (2024) *Soroban Smart Contract Documentation*. Available at: https://soroban.stellar.org/docs
+- Benford, F. (1938) 'The law of anomalous numbers', _Proceedings of the American Philosophical Society_, 78(4), pp. 551–572.
+- Al Ali, A. et al. (2023) 'A powerful predicting model for financial statement fraud based on optimized XGBoost ensemble learning technique', _Applied Sciences_, 13(4).
+- Antonio, G.R. (2023) 'Numbers don't lie: Decoding financial error and fraud through Benford's law', _Journal of Entrepreneurship_.
+- Nti, I.K. and Somanathan, A.R. (2024) 'A scalable RF-XGBoost framework for financial fraud mitigation', _IEEE Transactions on Computational Social Systems_, 11(2), pp. 410–422.
+- Yadavalli, R. and Polisetti, R. (2025) 'Optimized financial fraud detection using SMOTE-enhanced ensemble learning with CatBoost and LightGBM', _ICVADV 2025_.
+- Harea, R. and Mihailă, S. (2025) 'Benford's law: Applicability in accounting and financial anomaly detection', _Challenges of Accounting for Young Researchers_, 3(1).
+- Stellar Development Foundation (2024) _Horizon API Documentation_. Available at: https://developers.stellar.org/api/horizon
+- Stellar Development Foundation (2024) _Soroban Smart Contract Documentation_. Available at: https://soroban.stellar.org/docs
 
 ---
 
@@ -878,6 +915,6 @@ For issues and questions:
 
 **LedgerLens** — Making the Stellar ledger legible.
 
-*Built for the Stellar ecosystem. Open source. Community owned.*
+_Built for the Stellar ecosystem. Open source. Community owned._
 
 </div>

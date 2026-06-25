@@ -1,0 +1,59 @@
+{{- if .Values.ingestionWorker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ledgerlens.fullname" . }}-ingestion-worker
+  labels:
+    {{- include "ledgerlens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion-worker
+spec:
+  replicas: {{ .Values.ingestionWorker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ledgerlens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ingestion-worker
+  template:
+    metadata:
+      labels:
+        {{- include "ledgerlens.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ingestion-worker
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ledgerlens.serviceAccountName" . }}
+      containers:
+        - name: ingestion-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "cli", "stream"]
+          livenessProbe:
+            {{- toYaml .Values.ingestionWorker.livenessProbe | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "ledgerlens.fullname" . }}
+            - secretRef:
+                name: {{ include "ledgerlens.fullname" . }}
+          resources:
+            {{- toYaml .Values.ingestionWorker.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "ledgerlens.fullname" . }}
+      {{- with .Values.ingestionWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingestionWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingestionWorker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

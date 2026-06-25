@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ledgerlens.fullname" . }}
+  labels:
+    {{- include "ledgerlens.labels" . | nindent 4 }}
+data:
+  HORIZON_URL: {{ .Values.config.HORIZON_URL | quote }}
+  HORIZON_STREAM_URL: {{ .Values.config.HORIZON_STREAM_URL | quote }}
+  NETWORK: {{ .Values.config.NETWORK | quote }}
+  POLL_INTERVAL_SECONDS: {{ .Values.config.POLL_INTERVAL_SECONDS | quote }}
+  TRADE_HISTORY_LOOKBACK_DAYS: {{ .Values.config.TRADE_HISTORY_LOOKBACK_DAYS | quote }}
+  CURSOR_PATH: {{ .Values.config.CURSOR_PATH | quote }}
+  BENFORD_MAD_THRESHOLD: {{ .Values.config.BENFORD_MAD_THRESHOLD | quote }}
+  RISK_SCORE_THRESHOLD: {{ .Values.config.RISK_SCORE_THRESHOLD | quote }}
+  REDIS_URL: {{ .Values.config.REDIS_URL | quote }}
+  FEATURE_STORE_TTL_HOURS: {{ .Values.config.FEATURE_STORE_TTL_HOURS | quote }}
+  FEATURE_STORE_FLUSH_INTERVAL_SECONDS: {{ .Values.config.FEATURE_STORE_FLUSH_INTERVAL_SECONDS | quote }}
+  MODEL_DIR: {{ .Values.config.MODEL_DIR | quote }}
+  LEDGERLENS_DB_PATH: {{ .Values.config.LEDGERLENS_DB_PATH | quote }}
+  HORIZON_RATE_LIMIT: {{ .Values.config.HORIZON_RATE_LIMIT | quote }}
+  HORIZON_RATE_BUCKET_CAPACITY: {{ .Values.config.HORIZON_RATE_BUCKET_CAPACITY | quote }}
+  HORIZON_QUEUE_HIGH_WATERMARK: {{ .Values.config.HORIZON_QUEUE_HIGH_WATERMARK | quote }}
+  HORIZON_QUEUE_LOW_WATERMARK: {{ .Values.config.HORIZON_QUEUE_LOW_WATERMARK | quote }}
+  RATE_RESTORE_SECONDS: {{ .Values.config.RATE_RESTORE_SECONDS | quote }}

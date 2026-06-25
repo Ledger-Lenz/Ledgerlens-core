@@ -8,3 +8,35 @@ services:
     volumes:
       - ./models:/app/models
       - ./ledgerlens.db:/app/ledgerlens.db
+
+  # ── Observability (dev profile) ──────────────────────────────────────────
+  # docker compose --profile dev up
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    profiles: [dev]
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  # ── Chaos engineering (chaos profile) ────────────────────────────────────
+  # docker compose --profile chaos up -d
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: [chaos]
+    ports:
+      - "8474:8474"     # Toxiproxy REST API
+      - "18000:18000"   # Horizon proxy (latency scenario)
+      - "18001:18001"   # Horizon partition proxy (circuit breaker scenario)
+      - "16379:16379"   # Redis proxy (fallback scenario)
+    command: ["-host", "0.0.0.0", "-config", "/etc/toxiproxy/config.json"]
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy/config.json:ro
+
+  redis:
+    image: redis:7-alpine
+    profiles: [chaos, dev]
+    ports:
+      - "6379:6379"
