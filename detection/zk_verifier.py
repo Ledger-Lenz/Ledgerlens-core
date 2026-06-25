@@ -6,7 +6,6 @@ the on-chain verification logic so that proofs can be tested locally.
 
 from __future__ import annotations
 
-from typing import Any
 
 from detection.zk_prover import verify_threshold_proof, ProofError
 

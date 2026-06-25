@@ -12,7 +12,7 @@ import json
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from config.settings import settings
 from detection.red_team import EVASION_THRESHOLD, N_EVASION_TRIGGER

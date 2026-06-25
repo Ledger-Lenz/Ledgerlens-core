@@ -26,6 +26,7 @@ logger = logging.getLogger("ledgerlens.model_inference")
 
 _WEIGHTS_FILENAME = "ensemble_weights.json"
 _REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib"})
 _weights_mtime: float | None = None
 _runtime_weights: dict[str, float] | None = None
 
@@ -321,7 +322,6 @@ def score_with_uncertainty(
     }
 
 
-from detection.gnn_model import safe_load_gnn_checkpoint, _HAS_PYG  # noqa: E402
 from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
 
 _MODEL_FILENAMES = dict(globals().get("_MODEL_FILENAMES", {}))
