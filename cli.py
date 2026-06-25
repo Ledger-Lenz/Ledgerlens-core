@@ -841,5 +841,39 @@ def config_validate() -> None:
         typer.echo(f"  {name}={value}")
 
 
+db_app = typer.Typer(help="Database migration commands (Alembic-backed)")
+app.add_typer(db_app, name="db")
+
+
+@db_app.command("migrate")
+def db_migrate_alembic(
+    revision: str = typer.Option("head", "--revision", "-r", help="Target revision (default: head)"),
+) -> None:
+    """Apply pending Alembic migrations (equivalent to `alembic upgrade head`)."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", revision],
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    raise typer.Exit(result.returncode)
+
+
+@db_app.command("rollback")
+def db_rollback(
+    revision: str = typer.Option("-1", "--revision", "-r", help="Target revision (default: -1, one step back)"),
+) -> None:
+    """Roll back the most recent Alembic migration (equivalent to `alembic downgrade -1`)."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", revision],
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    raise typer.Exit(result.returncode)
+
+
 if __name__ == "__main__":
     app()
