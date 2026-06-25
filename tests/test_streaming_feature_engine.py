@@ -6,16 +6,14 @@ and the horizon_streamer integration function.
 
 from datetime import datetime, timezone
 
-import pytest
 
 from detection.streaming_features import (
     StreamingFeatureEngine,
     WindowState,
     _first_digit,
-    _WINDOW_SECONDS,
 )
 from detection.risk_score import RiskScore
-from ingestion.data_models import Asset, Trade, TradeType
+from ingestion.data_models import Asset, Trade
 
 # ---------------------------------------------------------------------------
 # Helpers

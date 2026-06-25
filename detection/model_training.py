@@ -56,7 +56,6 @@ def _train_ensemble_base(
     ``ConformalCalibrator`` instances are returned under the ``"calib"`` key
     and used by ``save_models`` to persist the artifacts.
     """
-    df = merge_evasion_samples(df, evasion_samples)
     if adversarial_augment:
         from detection.dataset import build_training_dataset
         from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset

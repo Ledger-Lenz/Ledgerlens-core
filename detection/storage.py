@@ -25,7 +25,6 @@ import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from detection.sandwich_engine import sandwich_candidates_to_alerts  # noqa: F401
 from ingestion.data_models import BridgeTransfer, PathPayment
 
 logger = logging.getLogger("ledgerlens.storage")

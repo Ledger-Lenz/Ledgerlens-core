@@ -3,12 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
-import pytest
 
 from detection.adaptive_reweighter import (
     ThompsonSamplingReweighter,
     _CLASSIFIER_NAMES,
-    _brier_reward,
     _run_update_cycle,
     cusum_detect,
     load_state,

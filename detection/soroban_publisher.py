@@ -22,7 +22,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any
 
 from stellar_sdk import Keypair, SorobanServer, TransactionBuilder
 from stellar_sdk import scval
@@ -31,9 +30,6 @@ from detection.risk_score import RiskScore
 from detection.storage import save_submission
 from detection.zk_commitment import (
     generate_salt,
-    pedersen_commit,
-    score_commitment,
-    serialize_point,
 )
 from detection.zk_prover import generate_threshold_proof
 

@@ -1,5 +1,3 @@
-import pytest
-from detection.oracle_node import OracleNode
 
 class TestOracleConsensus:
     def test_mock_multi_validator_consensus(self):
