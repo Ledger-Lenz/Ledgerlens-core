@@ -412,7 +412,9 @@ docker compose up --build
 python cli.py generate-data   # write synthetic trades/labels to CSV
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
-python cli.py stream          # stream trades from Horizon SSE and score in rolling batches
+python cli.py stream          # stream trades from Horizon SSE and score incrementally
+                              #   --checkpoint-interval N  persist state every N trades (default: 100)
+                              #   --score-delta N          min score change to emit alert (default: 5)
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker

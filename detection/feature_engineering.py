@@ -874,3 +874,112 @@ def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None
             float(feats.get("gnn_neighbor_avg_score", 0.0)),
         ]
     return vector
+
+
+class FeatureEngineering:
+    """Thin wrapper around the module-level feature functions.
+
+    Provides :meth:`compute_incremental` for the streaming path, which takes
+    per-wallet rolling-window trade lists (already scoped to 1h/4h/24h) and
+    builds the full feature vector without requiring a global DataFrame.
+    """
+
+    def compute_incremental(
+        self,
+        wallet: str,
+        trades_1h: list,
+        trades_4h: list,
+        trades_24h: list,
+    ) -> dict:
+        """Compute all features from rolling-window trade lists for *wallet*.
+
+        Benford features are computed over each window independently.
+        Graph and cross-pair features use 24-h trades only.
+        Returns a ``{feature_name: float}`` dict keyed to :data:`FEATURE_NAMES`.
+        """
+        import pandas as pd
+
+        def _to_df(trades: list) -> pd.DataFrame:
+            if not trades:
+                return pd.DataFrame()
+            rows = [t.model_dump() for t in trades]
+            df = pd.DataFrame(rows)
+            df["ledger_close_time"] = pd.to_datetime(df["ledger_close_time"], utc=True)
+            # Flatten nested asset dicts
+            if "base_asset" in df.columns and isinstance(df["base_asset"].iloc[0], dict):
+                df["base_asset"] = df["base_asset"].apply(lambda d: d)  # keep as dict for _asset_symbol
+            return df
+
+        df_1h = _to_df(trades_1h)
+        df_4h = _to_df(trades_4h)
+        df_24h = _to_df(trades_24h)
+        as_of = pd.Timestamp.now(tz="UTC")
+
+        features: dict = {}
+
+        # Benford features per window
+        for label, df in [("1h", df_1h), ("4h", df_4h), ("24h", df_24h)]:
+            if df.empty:
+                for metric in ("chi_square", "mad", "max_zscore"):
+                    features[f"benford_{metric}_{label}"] = 0.0
+            else:
+                from detection.benford_engine import compute_benford_metrics
+                metrics = compute_benford_metrics(df["base_amount"].tolist())
+                features[f"benford_chi_square_{label}"] = metrics["chi_square"]
+                features[f"benford_mad_{label}"] = metrics["mad"]
+                features[f"benford_max_zscore_{label}"] = max(metrics["z_scores"].values(), default=0.0)
+
+        # Remaining windows (7d, 30d) fallback to 0 — no data available in streaming
+        for label in ("7d", "30d"):
+            for metric in ("chi_square", "mad", "max_zscore"):
+                features[f"benford_{metric}_{label}"] = 0.0
+
+        # Trade-pattern and volume/timing features (use 24h window)
+        if not df_24h.empty:
+            features["counterparty_concentration_ratio"] = counterparty_concentration_ratio(df_24h, wallet)
+            features["round_trip_trade_frequency"] = round_trip_trade_frequency(df_24h, wallet)
+            features["self_matching_rate"] = self_matching_rate(df_24h)
+            features["order_cancellation_rate"] = 0.0
+            features["volume_to_unique_counterparty_ratio"] = volume_to_unique_counterparty_ratio(df_24h, wallet)
+            features["intra_minute_clustering_coefficient"] = intra_minute_clustering_coefficient(df_24h)
+            features["off_hours_activity_ratio"] = off_hours_activity_ratio(df_24h)
+            features["volume_spike_frequency"] = volume_spike_frequency(df_24h, as_of)
+        else:
+            for name in TRADE_PATTERN_FEATURE_NAMES + VOLUME_TIMING_FEATURE_NAMES:
+                features[name] = 0.0
+
+        # Graph/wallet features: no metadata available in streaming path
+        features["funding_source_similarity_score"] = 0.0
+        features["network_centrality"] = 0.0
+        features["account_age_days"] = 0.0
+        features.update(graph_ring_features(wallet, None))
+
+        # Cross-pair, AMM, path-payment, sandwich — not available incrementally
+        for name in CROSS_PAIR_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in AMM_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in PATH_PAYMENT_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in PATH_PAYMENT_CYCLE_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in SANDWICH_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in CAUSAL_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in MULTIVARIATE_BENFORD_FEATURE_NAMES:
+            features[name] = 1.0 if name == "benford_copula_pval" else 0.0
+        if _HAS_ADVERSARIAL:
+            from detection.adversarial_features import ADVERSARIAL_FEATURE_NAMES
+            for name in ADVERSARIAL_FEATURE_NAMES:
+                features[name] = 0.0
+        for name in CROSS_CHAIN_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in GNN_FEATURE_NAMES:
+            features[name] = 0.0
+
+        # Ensure every expected feature key is present
+        for name in FEATURE_NAMES:
+            features.setdefault(name, 0.0)
+
+        return features
