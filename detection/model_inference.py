@@ -68,6 +68,7 @@ _MODEL_FILENAMES = {
     "lightgbm": "lightgbm.joblib",
     "temporal_lstm": "temporal_lstm.joblib",
     "gnn": "gnn_model.pt",
+    "meta_learner": "meta_learner.joblib",
 }
 
 _CALIBRATION_FILENAMES = {
@@ -150,13 +151,16 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
     return weights
 
 
+_NON_VOTING_MODELS = frozenset({"temporal_lstm", "gnn", "meta_learner"})
+
+
 def _load_models_base(model_dir: str | None = None) -> dict:
     """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
     model_dir = model_dir or settings_module.settings.model_dir
     signing_key = settings_module.settings.model_signing_key.encode()
     models = {}
     for name, filename in _MODEL_FILENAMES.items():
-        if name == "gnn":
+        if name in ("gnn", "meta_learner"):
             continue
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
@@ -170,6 +174,17 @@ def _load_models_base(model_dir: str | None = None) -> dict:
         except RuntimeError as exc:
             logger.error("GNN checkpoint failed validation: %s", exc)
             raise
+
+    # Load meta-learner when available; absence is logged and scored with equal-weight fallback
+    meta_path = os.path.join(model_dir, _MODEL_FILENAMES["meta_learner"])
+    if os.path.exists(meta_path):
+        try:
+            assert_within_model_dir(meta_path, model_dir)
+            models["meta_learner"] = safe_joblib_load(meta_path, signing_key)
+        except Exception as exc:
+            logger.warning("Failed to load meta_learner.joblib: %s — using equal-weight averaging", exc)
+    else:
+        logger.info("meta-learner not found; using equal-weight averaging")
 
     if not models:
         raise FileNotFoundError(f"No trained models found in {model_dir}. Run model_training first.")
@@ -225,9 +240,10 @@ def _get_ensemble_weights(model_dir: str | None = None) -> dict[str, float]:
 def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, float]:
     """Return `(probability, confidence)` for a single feature vector.
 
-    `probability` is the weighted-average ensemble probability of a wash
-    trade pattern. `confidence` is the agreement between models (1.0 =
-    full agreement, lower = models disagree).
+    `probability` is the ensemble probability of a wash trade pattern. When a
+    meta-learner is available (Issue-111), it is used instead of equal-weight
+    averaging; otherwise falls back to weighted averaging per settings.
+    `confidence` is the agreement between base models (1.0 = full agreement).
     """
     X = np.array([[feature_vector[name] for name in FEATURE_NAMES]])
 
@@ -235,19 +251,27 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
     for name, model in models.items():
         if name in _NON_VOTING_MODELS:
             continue
-        if hasattr(model, "feature_names_in_"):
-            ordered = X[:, [FEATURE_NAMES.index(f) for f in model.feature_names_in_]]
+        fin = getattr(model, "feature_names_in_", None)
+        if fin is not None:
+            ordered = X[:, [FEATURE_NAMES.index(f) for f in fin]]
         else:
             ordered = X
         probabilities[name] = model.predict_proba(ordered)[0, 1]
 
-    weights = _get_ensemble_weights()
-    total_weight = sum(weights[n] for n in probabilities)
-    if total_weight <= 0:
-        raise ValueError("At least one loaded model must have a positive ensemble weight.")
-    weighted_prob = sum(probabilities[n] * weights[n] for n in probabilities) / total_weight
+    meta_learner = models.get("meta_learner")
+    if meta_learner is not None and len(probabilities) >= 2:
+        from detection.model_training import _build_meta_features
+        stack_input = np.array([[probabilities.get(k, 0.0) for k in ("random_forest", "xgboost", "lightgbm")]])
+        meta_features = _build_meta_features(stack_input)
+        weighted_prob = float(meta_learner.predict_proba(meta_features)[0, 1])
+    else:
+        weights = _get_ensemble_weights()
+        total_weight = sum(weights.get(n, 0.0) for n in probabilities)
+        if total_weight <= 0:
+            raise ValueError("At least one loaded model must have a positive ensemble weight.")
+        weighted_prob = sum(probabilities[n] * weights.get(n, 0.0) for n in probabilities) / total_weight
 
-    confidence = 1.0 - float(np.std(list(probabilities.values())))
+    confidence = 1.0 - float(np.std(list(probabilities.values()))) if probabilities else 0.0
     return float(weighted_prob), max(0.0, min(1.0, confidence))
 
 
@@ -262,35 +286,53 @@ def _score_feature_matrix_base(
     matrix instead of N × len(models) calls, reducing Python overhead and
     enabling scikit-learn's internal parallelism.
 
+    When a meta-learner is present (Issue-111), uses it instead of equal-weight
+    averaging; inline comment explains the fallback logic.
+
     Returns a list of (probability, confidence) tuples, one per input vector,
-    in the same order as `feature_vectors`. Results are numerically identical
-    to calling `score_feature_vector` for each vector individually.
+    in the same order as `feature_vectors`.
     """
     if not feature_vectors:
         return []
 
     X = np.array([[fv[name] for name in FEATURE_NAMES] for fv in feature_vectors])
-    weights = _get_ensemble_weights()
 
     model_probs: dict[str, np.ndarray] = {}
     for name, model in models.items():
         if name in _NON_VOTING_MODELS:
             continue
-        if hasattr(model, "feature_names_in_"):
-            col_idx = [FEATURE_NAMES.index(f) for f in model.feature_names_in_]
+        fin = getattr(model, "feature_names_in_", None)
+        if fin is not None:
+            col_idx = [FEATURE_NAMES.index(f) for f in fin]
             ordered = X[:, col_idx]
         else:
             ordered = X
         model_probs[name] = model.predict_proba(ordered)[:, 1]
 
-    total_weight = sum(weights[n] for n in model_probs)
-    if total_weight <= 0:
-        raise ValueError("At least one loaded model must have a positive ensemble weight.")
+    meta_learner = models.get("meta_learner")
+    if meta_learner is not None and len(model_probs) >= 2:
+        # Use meta-learner (Issue-111): stack base model outputs and predict
+        from detection.model_training import _build_meta_features
+        stack_input = np.column_stack([
+            model_probs.get("random_forest", np.zeros(len(feature_vectors))),
+            model_probs.get("xgboost", np.zeros(len(feature_vectors))),
+            model_probs.get("lightgbm", np.zeros(len(feature_vectors))),
+        ])
+        meta_features = _build_meta_features(stack_input)
+        weighted_probs = meta_learner.predict_proba(meta_features)[:, 1]
+    else:
+        # Fallback: weighted average per settings when no meta-learner available
+        weights = _get_ensemble_weights()
+        total_weight = sum(weights.get(n, 0.0) for n in model_probs)
+        if total_weight <= 0:
+            raise ValueError("At least one loaded model must have a positive ensemble weight.")
+        weighted_probs = sum(model_probs[n] * weights.get(n, 0.0) for n in model_probs) / total_weight
 
-    weighted_probs = sum(model_probs[n] * weights[n] for n in model_probs) / total_weight
-
-    all_probs = np.stack(list(model_probs.values()), axis=0)  # (M, N)
-    confidences = np.clip(1.0 - np.std(all_probs, axis=0), 0.0, 1.0)  # (N,)
+    if model_probs:
+        all_probs = np.stack(list(model_probs.values()), axis=0)  # (M, N)
+        confidences = np.clip(1.0 - np.std(all_probs, axis=0), 0.0, 1.0)  # (N,)
+    else:
+        confidences = np.zeros(len(feature_vectors))
 
     return [(float(weighted_probs[i]), float(confidences[i])) for i in range(len(feature_vectors))]
 

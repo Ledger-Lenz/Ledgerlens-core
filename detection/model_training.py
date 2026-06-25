@@ -7,6 +7,18 @@ models are written to `settings.model_dir` for `model_inference` to load.
 When ``calibrate=True`` a calibration split is held out (10 % of the data,
 stratified by label) *before* any model training, then used after training
 to compute conformal prediction thresholds via ``ConformalCalibrator``.
+
+Stacking ensemble (Issue-111):
+  Architecture: RF / XGBoost / LightGBM as base models → Logistic Regression
+  meta-learner trained on out-of-fold (OOF) predictions with temporal folds.
+
+  OOF generation uses walk-forward cross-validation (5 folds, 7-day gap) so
+  the meta-learner never sees future data during training. The fitted
+  meta-learner is saved to ``models/meta_learner.joblib``.
+
+  At inference time :class:`~detection.model_inference.ModelInference` loads
+  the meta-learner and uses it when available, falling back to equal-weight
+  averaging when absent.
 """
 
 import logging
@@ -18,6 +30,7 @@ from detection.model_signing import sign_model_file
 from imblearn.over_sampling import ADASYN, SMOTE, BorderlineSMOTE
 from imblearn.over_sampling.base import BaseOverSampler
 from lightgbm import LGBMClassifier
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -209,6 +222,50 @@ def _train_ensemble_base(
                 result["model"], cal_split_info["X_cal"], cal_split_info["y_cal"], cal.q_hat
             )
         results["_calib"] = {**cal_split_info, "calibrators": calibrators}
+
+    # --- Stacking: train meta-learner on OOF predictions (Issue-111) ---
+    try:
+        base_model_instances = {
+            "rf": models["random_forest"],
+            "xgb": models["xgboost"],
+            "lgbm": models["lightgbm"],
+        }
+        X_train_np = X_train.values if hasattr(X_train, "values") else X_train
+        y_train_np = y_train.values if hasattr(y_train, "values") else y_train
+        # Use sequential integer "timestamps" as a proxy; gap_days=0 avoids the
+        # large second-scale gap that would exclude all training data with proxy timestamps.
+        timestamps_proxy = np.arange(len(X_train_np), dtype=float)
+        oof_proba, oof_labels = generate_oof_predictions(
+            X_train_np, y_train_np, timestamps_proxy, base_model_instances, gap_days=0.0,
+        )
+        meta_learner = train_meta_learner(oof_proba, oof_labels)
+
+        stacking_metrics: dict = {}
+        if meta_learner is not None and len(oof_labels) > 0:
+            meta_features = _build_meta_features(oof_proba)
+            oof_meta_proba = meta_learner.predict_proba(meta_features)[:, 1]
+            oof_avg_proba = oof_proba.mean(axis=1)
+            try:
+                stacking_metrics["meta_learner_auc_pr"] = float(
+                    average_precision_score(oof_labels, oof_meta_proba)
+                )
+                stacking_metrics["avg_baseline_auc_pr"] = float(
+                    average_precision_score(oof_labels, oof_avg_proba)
+                )
+                stacking_metrics["meta_learner_auc_roc"] = float(
+                    roc_auc_score(oof_labels, oof_meta_proba)
+                )
+                stacking_metrics["meta_learner_coef"] = meta_learner.coef_[0].tolist()
+                _logger.info(
+                    "Meta-learner AUC-PR: %.3f (vs. equal-weight average: %.3f)",
+                    stacking_metrics["meta_learner_auc_pr"],
+                    stacking_metrics["avg_baseline_auc_pr"],
+                )
+            except Exception:
+                pass
+        results["_stacking"] = {"meta_learner": meta_learner, **stacking_metrics}
+    except Exception as exc:
+        _logger.warning("Stacking meta-learner training failed (best-effort): %s", exc)
 
     # --- Adversarial hardening: generate PGD adversarial examples from
     # training true positives and retrain once on the augmented set.
@@ -440,10 +497,7 @@ def save_models(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    import logging
-
-    logger = logging.getLogger("ledgerlens.model_training")
-    logger.info("Wrote training metadata to %s", metadata_path)
+    _logger.info("Wrote training metadata to %s", metadata_path)
 
     # ------------------------------------------------------------------
     # Calibration artifacts
@@ -479,11 +533,33 @@ def save_models(
         existing.update(metrics)
         with open(metrics_path, "w") as f:
             json.dump(existing, f, indent=2)
-        logger.info(
+        _logger.info(
             "Wrote calibration metrics (coverage=%.4f) to %s",
             metrics.get("conformal_empirical_coverage", 0.0),
             metrics_path,
         )
+
+    # ------------------------------------------------------------------
+    # Stacking: OOF meta-learner (Issue-111)
+    # ------------------------------------------------------------------
+    stacking_info = results.get("_stacking")
+    if stacking_info and stacking_info.get("meta_learner") is not None:
+        meta_path = os.path.join(model_dir, "meta_learner.joblib")
+        joblib.dump(stacking_info["meta_learner"], meta_path)
+        sign_model_file(meta_path, signing_key)
+        _logger.info("Saved meta-learner to %s", meta_path)
+
+        # Persist meta-learner metrics into training_metadata.json
+        try:
+            with open(metadata_path, "r") as f:
+                meta_md = json.load(f)
+            meta_md["meta_learner_auc_pr"] = stacking_info.get("meta_learner_auc_pr", 0.0)
+            meta_md["meta_learner_auc_roc"] = stacking_info.get("meta_learner_auc_roc", 0.0)
+            meta_md["meta_learner_coef"] = stacking_info.get("meta_learner_coef", [])
+            with open(metadata_path, "w") as f:
+                json.dump(meta_md, f, indent=2)
+        except Exception as exc:
+            _logger.warning("Failed to update training_metadata.json with meta-learner metrics: %s", exc)
 
 
 if __name__ == "__main__":

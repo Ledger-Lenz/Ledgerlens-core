@@ -116,11 +116,71 @@ In all cases, a wide interval is **correct behaviour** — it is the model
 telling you "I don't know." This is much safer than a confidently wrong
 point estimate.
 
+---
+
+## Multi-Class Extension: RAPS Prediction Sets (Issue-109)
+
+### Three-Class Risk Taxonomy
+
+LedgerLens now maps the 0-100 risk score to three risk classes:
+
+| Class | Label | Score Range |
+|-------|-------|-------------|
+| 0 | `clean` | 0–33 |
+| 1 | `suspicious` | 34–66 |
+| 2 | `wash` | 67–100 |
+
+### RAPS Algorithm
+
+RAPS (Regularised Adaptive Prediction Sets, Angelopoulos et al. 2021)
+extends split conformal prediction to multi-class settings. It reduces
+prediction set sizes via a regularisation term λ while maintaining marginal
+coverage guarantees.
+
+**Nonconformity score:**
+```
+s(x, y) = Σ_{j: π_j ≥ π_y} π_j  +  λ · max(o(y) − k_reg, 0)
+```
+where `o(y)` is the 1-indexed rank of class y in the sorted softmax, λ = 0.2,
+and k_reg = 2 (regularisation kicks in only for the third class and beyond).
+
+**Coverage guarantee:** The prediction set `C(x)` contains the true class with
+probability ≥ 1 − α for any test point, regardless of the data distribution.
+
+### Reading the Prediction Set
+
+The `prediction_set` field lists the class indices that are statistically
+compatible with the observed features at the chosen confidence level (90%):
+
+| `prediction_set` | Meaning |
+|-----------------|---------|
+| `[0]` | Model is confident the wallet is **clean** |
+| `[2]` | Model is confident the wallet is **wash trading** |
+| `[1, 2]` | Borderline between suspicious and wash |
+| `[0, 1, 2]` | Model is maximally uncertain |
+
+An analyst should take borderline sets (`[0, 1]`, `[1, 2]`) as a signal for
+closer manual review before acting on a prediction.
+
+### Security Notes for RAPS Artifacts
+
+- `q_hat` is validated as a finite positive float on load
+- A corrupted `conformal_calibration.json` with `q_hat=Inf` includes all
+  classes in every prediction set (useless but not harmful); a WARNING is
+  logged and the system continues
+- Calibration set labels are never returned via the API; only aggregate
+  statistics (`q_hat`, `alpha`, `achieved_coverage`) are persisted
+
+---
+
 ## References
 
 - Angelopoulos, A. N. & Bates, S. (2023). *Conformal Prediction: A
   Gentle Introduction.* Foundations and Trends in Machine Learning.
   https://arxiv.org/abs/2107.07511
+- Angelopoulos, A. N., Bates, S., Jordan, M. I., & Malik, J. (2021).
+  *Uncertainty Sets for Image Classifiers using Conformal Prediction.*
+  (RAPS algorithm) https://arxiv.org/abs/2009.14193
 - Romano, Y., Sesia, M., & Candès, E. J. (2020). *Classification with
   Valid and Adaptive Prediction Sets.*
   https://arxiv.org/abs/2004.09150

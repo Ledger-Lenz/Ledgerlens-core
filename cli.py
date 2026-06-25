@@ -128,6 +128,11 @@ def retrain_check(
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
 
+    Checks both PSI-based feature distribution drift and analyst-labelled
+    performance degradation. If F1 on recent feedback labels drops more than
+    5 percentage points from the training baseline, retraining is triggered
+    alongside drift-based retraining.
+
     Computes Population Stability Index (PSI) on recent scored features
     against the training reference distribution. If drift is detected
     (>= min_drifted_features with PSI > psi_threshold), triggers a
@@ -178,7 +183,30 @@ def retrain_check(
         min_drifted_features=min_drifted_features,
     )
 
-    if not drift_detected and not force_retrain:
+    # --- Performance degradation check (Issue-110) ---
+    performance_triggered = False
+    try:
+        from detection.drift_monitor import ModelDegradationAlert, PerformanceMonitor
+
+        monitor = PerformanceMonitor(db_path=settings.db_path)
+        baseline_f1: float = metadata.get("model_metrics", {}).get("random_forest", {}).get("f1", 0.0)
+        # Prefer val_f1_score when available (more representative than train split F1)
+        baseline_f1 = metadata.get("val_f1_score", baseline_f1)
+        if baseline_f1 == 0.0:
+            logger.warning("baseline F1 not available in training_metadata.json; degradation check skipped")
+        else:
+            try:
+                monitor.check_degradation(
+                    baseline_f1=baseline_f1,
+                    f1_threshold_drop=settings.performance_degradation_threshold,
+                )
+            except ModelDegradationAlert as alert:
+                logger.warning("Model degradation detected: %s — triggering retrain", alert)
+                performance_triggered = True
+    except Exception as perf_exc:
+        logger.warning("Performance degradation check failed: %s", perf_exc)
+
+    if not drift_detected and not force_retrain and not performance_triggered:
         logger.info("No drift detected; skipping retrain")
         return
 
