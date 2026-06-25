@@ -374,23 +374,11 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         13,
-        "add namespace_id for multi-tenant isolation",
+        "add integrity verification columns to bridge_transfers",
         """
-        ALTER TABLE risk_scores ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE on_chain_submissions ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE feature_vectors ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE pair_correlations ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE alerts ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE score_overrides ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE score_disputes ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE wallet_feature_states ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE wash_rings ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE circular_path_routes ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE path_payment_cycles ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE bridge_transfers ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE liquidity_pool_trades ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE path_payments ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
-        ALTER TABLE governance_proposals ADD COLUMN namespace_id TEXT NOT NULL DEFAULT 'default';
+        ALTER TABLE bridge_transfers ADD COLUMN canonical_hash TEXT;
+        ALTER TABLE bridge_transfers ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'disabled';
+        ALTER TABLE bridge_transfers ADD COLUMN verified_at TIMESTAMP;
         """,
     ),
 ]
@@ -1395,8 +1383,9 @@ def save_bridge_transfer(transfer: BridgeTransfer, db_path: str | None = None) -
             """
             INSERT INTO bridge_transfers
                 (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
-                 tx_hash_evm, tx_hash_stellar, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 tx_hash_evm, tx_hash_stellar, timestamp,
+                 canonical_hash, verification_status, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 transfer.chain,
@@ -1408,6 +1397,9 @@ def save_bridge_transfer(transfer: BridgeTransfer, db_path: str | None = None) -
                 transfer.tx_hash_evm,
                 transfer.tx_hash_stellar,
                 transfer.timestamp.isoformat(),
+                transfer.canonical_hash,
+                transfer.verification_status,
+                transfer.verified_at.isoformat() if transfer.verified_at else None,
             ),
         )
         conn.commit()
@@ -1423,8 +1415,9 @@ def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None =
             """
             INSERT INTO bridge_transfers
                 (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
-                 tx_hash_evm, tx_hash_stellar, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 tx_hash_evm, tx_hash_stellar, timestamp,
+                 canonical_hash, verification_status, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1437,6 +1430,9 @@ def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None =
                     t.tx_hash_evm,
                     t.tx_hash_stellar,
                     t.timestamp.isoformat(),
+                    t.canonical_hash,
+                    t.verification_status,
+                    t.verified_at.isoformat() if t.verified_at else None,
                 )
                 for t in transfers
             ],
@@ -1469,7 +1465,8 @@ def get_bridge_transfers(
         rows = conn.execute(
             f"""
             SELECT chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
-                   tx_hash_evm, tx_hash_stellar, timestamp
+                   tx_hash_evm, tx_hash_stellar, timestamp,
+                   canonical_hash, verification_status, verified_at
             FROM bridge_transfers
             WHERE {where}
             ORDER BY timestamp DESC
@@ -1488,6 +1485,9 @@ def get_bridge_transfers(
             tx_hash_evm=row[6],
             tx_hash_stellar=row[7],
             timestamp=datetime.fromisoformat(row[8]),
+            canonical_hash=row[9],
+            verification_status=row[10] if row[10] is not None else "disabled",
+            verified_at=datetime.fromisoformat(row[11]) if row[11] else None,
         )
         for row in rows
     ]
