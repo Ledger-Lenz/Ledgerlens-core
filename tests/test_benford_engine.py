@@ -93,11 +93,27 @@ def test_copula_statistic_degenerate_single_pair():
     assert benford_copula_statistic(np.zeros((1, 9))) == (0.0, 1.0)
 
 
+def test_copula_statistic_zeros_matrix():
+    stat, pval = benford_copula_statistic(np.zeros((4, 9)))
+    assert stat == 0.0
+    assert pval == 1.0
+
+
 def test_joint_digit_matrix_shape_and_rows():
     matrix = joint_digit_matrix(_coordinated_trades(), COORD_PAIRS)
     assert matrix.shape == (len(COORD_PAIRS), 9)
     # each populated row sums to ~1 (a frequency vector)
     assert np.allclose(matrix.sum(axis=1), 1.0)
+
+
+def test_joint_digit_matrix_none_or_empty():
+    matrix = joint_digit_matrix(None, COORD_PAIRS)
+    assert matrix.shape == (len(COORD_PAIRS), 9)
+    assert np.all(matrix == 0.0)
+
+    empty_df = pd.DataFrame()
+    matrix = joint_digit_matrix(empty_df, COORD_PAIRS)
+    assert np.all(matrix == 0.0)
 
 
 # --- synchrony + entropy ----------------------------------------------------
@@ -113,10 +129,22 @@ def test_cross_pair_sync_score_low_for_iid():
     assert sync < 0.5
 
 
+def test_cross_pair_sync_score_empty_or_no_timestamp():
+    assert cross_pair_sync_score(None, COORD_PAIRS) == 0.0
+    assert cross_pair_sync_score(pd.DataFrame(), COORD_PAIRS) == 0.0
+    df = pd.DataFrame({"base_amount": [100.0]})
+    assert cross_pair_sync_score(df, COORD_PAIRS) == 0.0
+
+
 def test_digit_entropy_delta_negative_for_concentrated():
     matrix = joint_digit_matrix(_coordinated_trades(), COORD_PAIRS)
     # concentrated joint distribution is lower-entropy than Benford
     assert digit_entropy_delta(matrix) < 0.0
+
+
+def test_digit_entropy_delta_empty_or_zero():
+    assert digit_entropy_delta(np.zeros((0, 9))) == 0.0
+    assert digit_entropy_delta(np.array([]).reshape(0, 0)) == 0.0
 
 
 # --- multivariate entry point ----------------------------------------------
@@ -134,6 +162,16 @@ def test_multivariate_benford_score_iid():
     wallet_pairs = [("W", p) for p in COORD_PAIRS]
     result = multivariate_benford_score(_iid_benford_trades(), wallet_pairs)
     assert result["copula_pval"] > 0.10
+
+
+def test_multivariate_benford_score_empty_or_single_pair():
+    result = multivariate_benford_score(None, [])
+    assert result["copula_pval"] == 1.0
+    assert result["sync_ratio"] == 0.0
+
+    wallet_pairs = [("W", "XLM/USDC")]
+    result = multivariate_benford_score(_coordinated_trades(), wallet_pairs)
+    assert result["copula_pval"] == 1.0
 
 
 # --- feature-engineering integration ---------------------------------------

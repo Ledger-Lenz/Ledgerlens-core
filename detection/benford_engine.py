@@ -12,13 +12,111 @@ statistically impossible under independent trading. The multivariate helpers
 `multivariate_benford_score`) surface that coordination signal.
 """
 
+import logging
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 from scipy.stats import chi2, norm
 
+logger = logging.getLogger("ledgerlens.benford_engine")
+
 DIGITS = list(range(1, 10))
+
+
+def _parse_benford_windows(default: list[int]) -> list[int]:
+    raw = os.getenv("BENFORD_WINDOWS", "")
+    if not raw:
+        return default
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        return default
+
+
+@dataclass
+class BenfordStats:
+    chi_square: float
+    mad: float
+    z_scores: list[float]  # length-9, index 0 = digit 1
+    n: int
+
+
+class BenfordStreamCounter:
+    """O(1) incremental Benford digit-frequency counter over configurable sliding windows.
+
+    Each window uses a circular buffer of leading digits (``deque(maxlen=window)``).
+    When a new digit enters a full window, the oldest digit is automatically evicted
+    and the per-digit tally is updated in O(1).  ``window_stats()`` iterates over
+    the 9-element tally in O(9) = O(1).
+
+    Circular buffer rollover: Python's ``collections.deque(maxlen=N)`` handles the
+    ring automatically — appending to a full deque evicts the leftmost element and
+    returns it via the ``appendleft``/``append`` mechanics, but we need the evicted
+    value to decrement the tally.  We store the raw deque and maintain a parallel
+    ``counts`` array; on each ``update`` we read ``buf[0]`` before appending when
+    the buffer is already full, then decrement that evicted digit.
+    """
+
+    BENFORD_EXPECTED = [math.log10(1 + 1 / d) for d in range(1, 10)]
+
+    def __init__(self, windows: list[int] | None = None) -> None:
+        self._windows: list[int] = _parse_benford_windows(windows or [100, 500, 1000])
+        # per-window: circular buffer of raw digits (1-9), digit count array
+        self._bufs: list[deque] = [deque(maxlen=w) for w in self._windows]
+        self._counts: list[list[int]] = [[0] * 9 for _ in self._windows]
+        # pre-built list of (buf, counts, maxlen) to avoid attribute lookups in update()
+        self._slots: list[tuple[deque, list[int], int]] = [
+            (buf, counts, w)
+            for buf, counts, w in zip(self._bufs, self._counts, self._windows)
+        ]
+
+    # ------------------------------------------------------------------
+    def update(self, amount: float) -> None:
+        """O(len(windows)) — extract the leading digit and update all tallies."""
+        if amount is None or not math.isfinite(amount) or amount <= 0:
+            return
+        # Fast leading-digit extraction via log10 — avoids the while-loop in first_digit()
+        digit = int(10 ** (math.log10(amount) % 1))
+        if digit == 0:
+            digit = 1
+        idx = digit - 1
+        for buf, counts, maxlen in self._slots:
+            if len(buf) == maxlen:
+                counts[buf[0] - 1] -= 1
+            buf.append(digit)
+            counts[idx] += 1
+
+    def window_stats(self, window: int) -> BenfordStats:
+        """Return BenfordStats for the requested window size. O(9)."""
+        try:
+            wi = self._windows.index(window)
+        except ValueError:
+            raise ValueError(f"Window {window} not in configured windows {self._windows}")
+
+        counts = self._counts[wi]
+        n = sum(counts)
+        if n == 0:
+            return BenfordStats(chi_square=0.0, mad=0.0, z_scores=[0.0] * 9, n=0)
+
+        expected = self.BENFORD_EXPECTED
+        observed = [c / n for c in counts]
+
+        chi_sq = sum(
+            (o * n - e * n) ** 2 / (e * n)
+            for o, e in zip(observed, expected)
+            if e > 0
+        )
+        mad = float(sum(abs(o - e) for o, e in zip(observed, expected)) / 9)
+
+        zs = []
+        for o, e in zip(observed, expected):
+            num = max(abs(o - e) - 1 / (2 * n), 0.0)
+            denom = math.sqrt(e * (1 - e) / n)
+            zs.append(num / denom if denom > 0 else 0.0)
+
+        return BenfordStats(chi_square=float(chi_sq), mad=mad, z_scores=zs, n=n)
 
 # P(d) = log10(1 + 1/d) for d in 1..9
 BENFORD_EXPECTED: dict[int, float] = {d: math.log10(1 + 1 / d) for d in DIGITS}
@@ -117,6 +215,151 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
 def is_anomalous(metrics: dict, mad_threshold: float = 0.015) -> bool:
     """Whether a `compute_benford_metrics` result exceeds the MAD threshold."""
     return metrics["mad"] > mad_threshold
+
+
+# ---------------------------------------------------------------------------
+# Adaptive window sizing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BenfordWindowResult:
+    """Result of an adaptive Benford window fit for a single target window.
+
+    Attributes
+    ----------
+    trades:
+        The trade amounts used for Benford analysis (sliced to the effective
+        window, possibly wider than the target).
+    effective_width:
+        The actual window duration used (a ``pd.Timedelta``); may be wider
+        than the target when the sample count was below ``min_sample_count``.
+    valid:
+        ``True`` when ``len(trades) >= min_sample_count`` so chi-square and
+        MAD statistics are statistically reliable.
+    expanded:
+        ``True`` when the window had to be widened beyond the target to meet
+        the minimum sample count.
+    merged:
+        ``True`` when two adjacent windows were merged because neither alone
+        reached the minimum sample count.
+    label:
+        The original target window label (e.g. ``"1h"``).
+    """
+
+    trades: list
+    effective_width: "pd.Timedelta"
+    valid: bool
+    expanded: bool
+    merged: bool
+    label: str
+
+
+class AdaptiveBenfordWindow:
+    """Adaptive rolling-window selector for Benford's Law analysis.
+
+    Ensures each window contains at least ``min_sample_count`` trades before
+    computing chi-square / MAD statistics. If the target window is too narrow,
+    the window is doubled up to ``max_window_days`` days. If even the maximum
+    window has too few trades, adjacent windows are merged.
+
+    Parameters
+    ----------
+    min_sample_count:
+        Minimum number of valid (positive, finite) trade amounts required for
+        statistically reliable Benford analysis. Default: 30.
+    max_window_days:
+        Maximum window width in days before falling back to merging. Default: 90.
+    """
+
+    def __init__(self, min_sample_count: int = 30, max_window_days: int = 90) -> None:
+        self.min_sample_count = min_sample_count
+        self.max_window_days = max_window_days
+
+    def _count_valid(self, amounts: list) -> int:
+        return sum(1 for a in amounts if first_digit(a) is not None)
+
+    def _slice_amounts(
+        self, trades: pd.DataFrame, as_of: pd.Timestamp, width: "pd.Timedelta"
+    ) -> list:
+        start = as_of - width
+        mask = (trades["ledger_close_time"] > start) & (trades["ledger_close_time"] <= as_of)
+        return trades.loc[mask, "base_amount"].tolist()
+
+    def fit(
+        self,
+        trades: pd.DataFrame,
+        target_window_label: str,
+        as_of: pd.Timestamp,
+        window_map: "dict[str, pd.Timedelta]",
+    ) -> BenfordWindowResult:
+        """Fit the adaptive window for ``target_window_label``.
+
+        Expands the window by doubling until either ``min_sample_count`` is
+        reached or ``max_window_days`` is exceeded. When neither single-window
+        expansion reaches the threshold, the *all-time* slice up to ``as_of``
+        is used and the result is marked ``merged=True``.
+
+        Parameters
+        ----------
+        trades:
+            DataFrame with ``ledger_close_time`` and ``base_amount`` columns.
+        target_window_label:
+            One of the keys in ``window_map`` (e.g. ``"1h"``).
+        as_of:
+            The reference timestamp (end of all windows).
+        window_map:
+            Mapping from window label to ``pd.Timedelta``; used to determine
+            the starting width.
+        """
+        max_width = pd.Timedelta(days=self.max_window_days)
+        target_width = window_map[target_window_label]
+
+        width = target_width
+        expanded = False
+        while True:
+            amounts = self._slice_amounts(trades, as_of, width)
+            if self._count_valid(amounts) >= self.min_sample_count:
+                if width > target_width:
+                    logger.warning(
+                        "Benford window '%s' expanded from %s to %s (sample count was below %d)",
+                        target_window_label, target_width, width, self.min_sample_count,
+                    )
+                    expanded = True
+                return BenfordWindowResult(
+                    trades=amounts,
+                    effective_width=width,
+                    valid=True,
+                    expanded=expanded,
+                    merged=False,
+                    label=target_window_label,
+                )
+            if width >= max_width:
+                break
+            width = min(width * 2, max_width)
+
+        # Neither expansion nor max_width was sufficient; use all available trades.
+        all_amounts = trades["base_amount"].tolist() if not trades.empty else []
+        valid = self._count_valid(all_amounts) >= self.min_sample_count
+        if not valid:
+            logger.warning(
+                "Benford window '%s': only %d valid trades available (min_sample_count=%d). "
+                "Statistics may be unreliable.",
+                target_window_label, self._count_valid(all_amounts), self.min_sample_count,
+            )
+        else:
+            logger.warning(
+                "Benford window '%s' merged to full trade history (%d trades) "
+                "because no single expansion reached %d samples.",
+                target_window_label, self._count_valid(all_amounts), self.min_sample_count,
+            )
+        return BenfordWindowResult(
+            trades=all_amounts,
+            effective_width=max_width,
+            valid=valid,
+            expanded=True,
+            merged=True,
+            label=target_window_label,
+        )
 
 
 # ---------------------------------------------------------------------------

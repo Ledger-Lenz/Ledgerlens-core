@@ -16,8 +16,12 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from ingestion.data_models import Trade
+from utils.circuit_breaker import CircuitBreaker, CircuitState
 
 logger = logging.getLogger(__name__)
+
+FEATURE_STORE_FAILURE_THRESHOLD = 3
+FEATURE_STORE_RECOVERY_TIMEOUT_SECONDS = 30.0
 
 
 class WalletFeatureState(BaseModel):
@@ -337,6 +341,11 @@ class FeatureStore:
         self._lru_order: deque[str] = deque()
         self.redis_client = None
         self._using_redis = False
+        self._circuit = CircuitBreaker(
+            name="feature_store_redis",
+            failure_threshold=FEATURE_STORE_FAILURE_THRESHOLD,
+            recovery_timeout=FEATURE_STORE_RECOVERY_TIMEOUT_SECONDS,
+        )
 
         if self.redis_url:
             try:
@@ -352,6 +361,17 @@ class FeatureStore:
                 )
                 self.redis_client = None
 
+    @property
+    def circuit_state(self) -> str:
+        """Current Redis circuit breaker state (`closed`/`open`/`half_open`),
+        exposed for the `/health` endpoint."""
+        return self._circuit.state.value
+
+    def _redis_available(self) -> bool:
+        """Whether a Redis call should be attempted: Redis is configured,
+        connected, and the circuit breaker isn't currently OPEN."""
+        return bool(self._using_redis and self.redis_client) and self._circuit.allow_request()
+
     @staticmethod
     def _hash_key(wallet: str, asset_pair: str) -> str:
         """Hash wallet+asset_pair for security (prevent wallet exposure in Redis SCAN)."""
@@ -363,12 +383,14 @@ class FeatureStore:
         """Retrieve cached feature state from Redis (hot) or fallback dict (cold)."""
         key = self._hash_key(wallet, asset_pair)
 
-        if self._using_redis and self.redis_client:
+        if self._redis_available():
             try:
                 data = self.redis_client.get(key)
+                self._circuit.record_success()
                 if data:
                     return WalletFeatureState.model_validate_json_compat(data.decode())
             except Exception as e:
+                self._circuit.record_failure()
                 logger.warning("FeatureStore.get_state: Redis error (%s), falling back", e)
 
         # Fallback to in-process dict
@@ -378,14 +400,16 @@ class FeatureStore:
         """Store feature state in Redis (hot) with TTL or fallback dict."""
         key = self._hash_key(state.wallet, state.asset_pair)
 
-        if self._using_redis and self.redis_client:
+        if self._redis_available():
             try:
                 ttl_hours = getattr(settings, "feature_store_ttl_hours", 48)
                 ttl_seconds = ttl_hours * 3600
                 serialized = state.model_dump_json_compat()
                 self.redis_client.setex(key, ttl_seconds, serialized)
+                self._circuit.record_success()
                 return
             except Exception as e:
+                self._circuit.record_failure()
                 logger.warning("FeatureStore.set_state: Redis error (%s), falling back", e)
 
         # Fallback to in-process dict with LRU eviction
@@ -403,11 +427,13 @@ class FeatureStore:
         """Delete feature state from Redis or fallback dict."""
         key = self._hash_key(wallet, asset_pair)
 
-        if self._using_redis and self.redis_client:
+        if self._redis_available():
             try:
                 self.redis_client.delete(key)
+                self._circuit.record_success()
                 return
             except Exception as e:
+                self._circuit.record_failure()
                 logger.warning("FeatureStore.delete_state: Redis error (%s)", e)
 
         # Fallback
@@ -417,13 +443,15 @@ class FeatureStore:
 
     def scan_all_keys(self) -> list[str]:
         """Scan all feature store keys (for bulk promotion to cold storage)."""
-        if self._using_redis and self.redis_client:
+        if self._redis_available():
             try:
                 keys = []
                 for key in self.redis_client.scan_iter(match="ll:feature:*"):
                     keys.append(key.decode() if isinstance(key, bytes) else key)
+                self._circuit.record_success()
                 return keys
             except Exception as e:
+                self._circuit.record_failure()
                 logger.warning("FeatureStore.scan_all_keys: Redis error (%s)", e)
 
         # Fallback

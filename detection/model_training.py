@@ -10,13 +10,14 @@ to compute conformal prediction thresholds via ``ConformalCalibrator``.
 """
 
 import joblib
+import mlflow
 import numpy as np
 import pandas as pd
 from detection.model_signing import sign_model_file
 from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
@@ -56,7 +57,6 @@ def _train_ensemble_base(
     ``ConformalCalibrator`` instances are returned under the ``"calib"`` key
     and used by ``save_models`` to persist the artifacts.
     """
-    df = merge_evasion_samples(df, evasion_samples)
     if adversarial_augment:
         from detection.dataset import build_training_dataset
         from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
@@ -104,11 +104,22 @@ def _train_ensemble_base(
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
 
+    # Log hyperparameters
+    mlflow.log_param("random_state", random_state)
+    mlflow.log_param("adversarial_augment", adversarial_augment)
+    mlflow.log_param("calibrate", calibrate)
+    mlflow.log_param("adversarial_hardening", adversarial_hardening)
+    mlflow.log_param("smote_k_neighbors", smote.k_neighbors)
+
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
         "xgboost": XGBClassifier(eval_metric="logloss", random_state=random_state),
         "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1),
     }
+
+    for mname, m in models.items():
+        for key, value in m.get_params().items():
+            mlflow.log_param(f"{mname}_{key}", value)
 
     results = {}
     for name, model in models.items():
@@ -116,11 +127,25 @@ def _train_ensemble_base(
         y_proba = model.predict_proba(X_test)[:, 1]
         y_pred = model.predict(X_test)
 
+        auc_roc = roc_auc_score(y_test, y_proba)
+        pr_auc = average_precision_score(y_test, y_proba)
+        f1 = f1_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0.0)
+        rec = recall_score(y_test, y_pred, zero_division=0.0)
+
+        mlflow.log_metric(f"{name}_auc_roc", auc_roc)
+        mlflow.log_metric(f"{name}_pr_auc", pr_auc)
+        mlflow.log_metric(f"{name}_f1", f1)
+        mlflow.log_metric(f"{name}_precision", prec)
+        mlflow.log_metric(f"{name}_recall", rec)
+
+        mlflow.sklearn.log_model(model, artifact_path=name, registered_model_name=None)
+
         results[name] = {
             "model": model,
-            "auc_roc": roc_auc_score(y_test, y_proba),
-            "pr_auc": average_precision_score(y_test, y_proba),
-            "f1": f1_score(y_test, y_pred),
+            "auc_roc": auc_roc,
+            "pr_auc": pr_auc,
+            "f1": f1,
         }
 
     if calibrate:
@@ -373,17 +398,39 @@ if __name__ == "__main__":
 
 
 from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
+from detection.mlflow_tracker import (
+    log_metrics,
+    log_training_dataset_metadata,
+    mlflow_run,
+)
 from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
 import os  # noqa: E402
 
 
-def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", **kwargs):
+def train_ensemble(
+    df,
+    *args,
+    use_gnn: bool = False,
+    model_dir: str = "models",
+    experiment_name: str | None = None,
+    tracking_uri: str | None = None,
+    **kwargs,
+):
     """Wraps the base ensemble trainer, optionally pre-training a T-GNN.
+
+    When *experiment_name* or *tracking_uri* is provided (or configured via
+    environment / settings), wraps training in an MLflow run that logs
+    hyperparameters, training/validation metrics, dataset metadata, and
+    model artifacts.
 
     Args:
         use_gnn: If True, trains a T-GNN on the training graph, appends its
             two output features to the feature matrix before SMOTE, and
             saves the checkpoint as gnn_model.pt in model_dir.
+        experiment_name: MLflow experiment name.  Falls back to
+            ``settings.mlflow_experiment_name`` then ``"ledgerlens-training"``.
+        tracking_uri: MLflow tracking URI.  Falls back to
+            ``MLFLOW_TRACKING_URI`` env var, then ``settings.mlflow_tracking_uri``.
     """
     gnn_features_by_wallet = {}
 
@@ -404,7 +451,44 @@ def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", 
         os.makedirs(model_dir, exist_ok=True)
         save_gnn_checkpoint(model, os.path.join(model_dir, "gnn_model.pt"))
 
-    return _train_ensemble_base(
-        df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
-        model_dir=model_dir, **kwargs
-    )
+    with mlflow_run(experiment_name=experiment_name, tracking_uri=tracking_uri) as run_id:
+        if run_id:
+            log_training_dataset_metadata(df)
+            _log_train_test_split_params(kwargs.get("random_state", 42), kwargs.get("calibrate", True))
+
+        results = _train_ensemble_base(
+            df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
+            model_dir=model_dir, **kwargs
+        )
+
+        if run_id:
+            log_metrics(_collect_aggregate_metrics(results))
+
+    return results
+
+
+def _collect_aggregate_metrics(results: dict) -> dict:
+    """Collect ensemble-average metrics for MLflow logging."""
+    metrics = {}
+    model_scores = {
+        "avg_auc_roc": [],
+        "avg_pr_auc": [],
+        "avg_f1": [],
+    }
+    for name, result in results.items():
+        if name == "_calib":
+            continue
+        model_scores["avg_auc_roc"].append(result.get("auc_roc", 0.0))
+        model_scores["avg_pr_auc"].append(result.get("pr_auc", 0.0))
+        model_scores["avg_f1"].append(result.get("f1", 0.0))
+
+    for key, values in model_scores.items():
+        if values:
+            metrics[key] = sum(values) / len(values)
+    return metrics
+
+
+def _log_train_test_split_params(random_state: int, calibrate: bool) -> None:
+    """Log the train/test/calibration split configuration."""
+    mlflow.log_param("test_split_ratio", 0.2)
+    mlflow.log_param("calibration_split_ratio", 0.1 if calibrate else 0.0)

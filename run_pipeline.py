@@ -187,7 +187,7 @@ def run(
         graph = build_transaction_graph(trades)
         rings = find_wash_rings(graph)
         all_rings.extend(rings)
-        ring_membership = build_ring_membership_index(rings, trades=trades)
+        _ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
         account_metadata = load_account_metadata(list(accounts))
