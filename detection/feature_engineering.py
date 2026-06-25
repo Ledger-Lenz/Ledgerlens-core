@@ -93,6 +93,12 @@ PATH_PAYMENT_CYCLE_FEATURE_NAMES = [
     "cycle_asset_diversity",  # distinct intermediate assets across this account's cycles
 ]
 
+# Hop-graph cycle features from PathCycleDetector (issue #121)
+HOP_CYCLE_FEATURE_NAMES = [
+    "path_cycle_count",           # total confirmed round-trip cycles for this wallet
+    "path_cycle_recovery_ratio",  # max recovery ratio across all cycles
+]
+
 SANDWICH_FEATURE_NAMES = [
     "sandwich_ratio",  # fraction of an account's pool trades that are attacker legs of a sandwich
     "sandwich_profit_xlm_30d",  # XLM the account extracted as a sandwich attacker over the last 30d
@@ -148,6 +154,9 @@ FEATURE_NAMES = FEATURE_NAMES + CROSS_CHAIN_FEATURE_NAMES  # type: ignore[assign
 # Multivariate-Benford and causal (PDC) features are appended after
 # cross-chain features for the same checkpoint-compatibility reason.
 FEATURE_NAMES = FEATURE_NAMES + MULTIVARIATE_BENFORD_FEATURE_NAMES + CAUSAL_FEATURE_NAMES  # type: ignore[assignment]
+
+# Hop-graph cycle features (issue #121) appended for checkpoint compatibility.
+FEATURE_NAMES = FEATURE_NAMES + HOP_CYCLE_FEATURE_NAMES  # type: ignore[assignment]
 
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
