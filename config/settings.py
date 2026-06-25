@@ -25,6 +25,13 @@ class Settings:
     benford_mad_threshold: float = field(default_factory=lambda: float(os.getenv("BENFORD_MAD_THRESHOLD", "0.015")))
     benford_min_sample_count: int = field(default_factory=lambda: int(os.getenv("BENFORD_MIN_SAMPLE_COUNT", "30")))
     benford_max_window_days: int = field(default_factory=lambda: int(os.getenv("BENFORD_MAX_WINDOW_DAYS", "90")))
+    # Causal feature selection (PC algorithm)
+    causal_independence_alpha: float = field(
+        default_factory=lambda: float(os.getenv("CAUSAL_INDEPENDENCE_ALPHA", "0.01"))
+    )
+    causal_max_conditioning_size: int = field(
+        default_factory=lambda: int(os.getenv("CAUSAL_MAX_CONDITIONING_SIZE", "3"))
+    )
     _default_risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
     COMMITTEE_QUORUM: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_QUORUM", "3")))
     COMMITTEE_VOTE_DEADLINE_DAYS: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_VOTE_DEADLINE_DAYS", "14")))

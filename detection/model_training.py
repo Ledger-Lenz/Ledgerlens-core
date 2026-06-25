@@ -39,6 +39,7 @@ def _train_ensemble_base(
     adversarial_augment: bool = True,
     calibrate: bool = True,
     adversarial_hardening: bool = False,
+    causal_feature_selection: bool = False,
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -100,6 +101,31 @@ def _train_ensemble_base(
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=random_state, stratify=y
         )
+
+    # --- Causal feature selection (PC skeleton phase)
+    _causal_selected_features = None
+    if causal_feature_selection:
+        from detection.causal_engine import CausalFeatureSelector
+
+        selector = CausalFeatureSelector(
+            alpha=settings.causal_independence_alpha,
+            max_conditioning_size=settings.causal_max_conditioning_size,
+        )
+        selected = selector.fit(
+            X_train.to_numpy(dtype=float),
+            y_train.to_numpy(dtype=float),
+            feature_names=list(X_train.columns),
+        )
+        if selected:
+            X_train = X_train[selected]
+            X_test = X_test[selected]
+            if calibrate and "X_cal" in cal_split_info:
+                cal_split_info["X_cal"] = cal_split_info["X_cal"][selected]
+            _causal_selected_features = selected
+            logger.info(
+                "Causal feature selection retained %d/%d features",
+                len(selected), X_train.shape[1] + (len(list(X_train.columns)) - len(selected)),
+            )
 
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
@@ -214,6 +240,9 @@ def _train_ensemble_base(
         logger = logging.getLogger("ledgerlens.model_training")
         logger.exception("Failed to train temporal LSTM model: %s", e)
 
+    if _causal_selected_features is not None:
+        results["_causal_selected_features"] = _causal_selected_features
+
     return results
 
 
@@ -250,7 +279,7 @@ def save_models(
 
     signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
-        if name == "_calib":
+        if name in ("_calib", "_causal_selected_features"):
             continue
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
@@ -273,12 +302,15 @@ def save_models(
 
     version = _compute_version_hash(training_row_count, column_hash)
 
+    _causal_selected = results.get("_causal_selected_features")
     metadata = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": version,
         "training_dataset_path": training_dataset_path or "",
         "training_row_count": training_row_count,
         "column_hash": column_hash,
+        "causal_feature_selection": _causal_selected is not None,
+        "causal_selected_features": _causal_selected or [],
         "model_metrics": {
             name: {
                 "auc_roc": result.get("auc_roc", 0.0),
@@ -286,7 +318,7 @@ def save_models(
                 "f1": result.get("f1", 0.0),
             }
             for name, result in results.items()
-            if name != "_calib"
+            if name not in ("_calib", "_causal_selected_features")
         },
     }
 
@@ -377,13 +409,24 @@ from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
 import os  # noqa: E402
 
 
-def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", **kwargs):
+def train_ensemble(
+    df,
+    *args,
+    use_gnn: bool = False,
+    model_dir: str = "models",
+    causal_feature_selection: bool = False,
+    **kwargs,
+):
     """Wraps the base ensemble trainer, optionally pre-training a T-GNN.
 
     Args:
         use_gnn: If True, trains a T-GNN on the training graph, appends its
             two output features to the feature matrix before SMOTE, and
             saves the checkpoint as gnn_model.pt in model_dir.
+        causal_feature_selection: When True, runs the PC-skeleton causal
+            feature selector before SMOTE resampling.  Selected features are
+            stored in ``results["_causal_selected_features"]`` and written to
+            ``training_metadata.json`` by :func:`save_models`.
     """
     gnn_features_by_wallet = {}
 
@@ -406,5 +449,5 @@ def train_ensemble(df, *args, use_gnn: bool = False, model_dir: str = "models", 
 
     return _train_ensemble_base(
         df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
-        model_dir=model_dir, **kwargs
+        model_dir=model_dir, causal_feature_selection=causal_feature_selection, **kwargs
     )
