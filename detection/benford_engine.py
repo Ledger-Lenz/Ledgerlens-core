@@ -14,7 +14,7 @@ statistically impossible under independent trading. The multivariate helpers
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
