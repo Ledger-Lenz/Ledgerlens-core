@@ -31,6 +31,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
+from api.admin_router import router as admin_router
+from api.export_router import router as export_router
+from api.batch_router import router as batch_router
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -82,7 +85,7 @@ _models: dict = {}
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    """Load trained models at startup; release nothing at shutdown."""
+    """Load trained models at startup; close WebSocket connections at shutdown."""
     global _models
     try:
         from detection.model_inference import load_models
@@ -92,6 +95,8 @@ async def _lifespan(application: FastAPI):
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
     yield
+    from api.ws_router import manager as _ws_manager
+    await _ws_manager.close_all()
 
 
 app = FastAPI(
@@ -108,6 +113,17 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=False,
 )
+
+from api.ws_router import router as _ws_router  # noqa: E402
+app.include_router(_ws_router)
+
+app.include_router(admin_router)
+
+
+app.include_router(batch_router)
+
+
+app.include_router(export_router)
 
 
 class WebhookCreate(BaseModel):
