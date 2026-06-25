@@ -1,0 +1,93 @@
+# ────────────────────────────────────────────────────────────────────
+# Release Please — Automated Semantic Versioning & Release Pipeline
+# ────────────────────────────────────────────────────────────────────
+#
+# Triggered by pushes to `main`.  When a conventional-commit push is
+# detected, release-please creates or updates a release PR.  Merging
+# that PR:
+#   1. Tags the commit as v{MAJOR}.{MINOR}.{PATCH} in Git.
+#   2. Generates / updates CHANGELOG.md from conventional commits.
+#   3. Bumps the version in pyproject.toml and any configured files.
+#   4. Creates a GitHub Release with auto-generated release notes.
+#   5. Pushes a tagged Docker image to GHCR.
+#
+# Required secrets:
+#   GHCR_TOKEN    – GitHub token with `write:packages` scope
+#
+# Required .env variables (at build time):
+#   none – version is baked into the image label from the Git tag.
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: google-github-actions/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release-type: python
+          package-name: ledgerlens-core
+          changelog-types: |
+            [
+              {"type":"feat","section":"Features","hidden":false},
+              {"type":"fix","section":"Bug Fixes","hidden":false},
+              {"type":"chore","section":"Miscellaneous","hidden":false},
+              {"type":"docs","section":"Documentation","hidden":false},
+              {"type":"style","section":"Styling","hidden":false},
+              {"type":"refactor","section":"Code Refactoring","hidden":false},
+              {"type":"perf","section":"Performance Improvements","hidden":false},
+              {"type":"test","section":"Tests","hidden":false},
+              {"type":"build","section":"Build System","hidden":false},
+              {"type":"ci","section":"CI","hidden":false}
+            ]
+
+  docker:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=ledgerlens-core
+            org.opencontainers.image.description=Benford's Law + ensemble ML wash-trading detection engine
+            org.opencontainers.image.version=${{ needs.release-please.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

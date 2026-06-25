@@ -1,0 +1,82 @@
+site_name: LedgerLens Core
+site_description: Benford's Law + ensemble ML wash-trading detection engine for the Stellar DEX
+site_url: https://ledger-lenz.github.io/Ledgerlens-core
+repo_url: https://github.com/Ledger-Lenz/Ledgerlens-core
+repo_name: Ledger-Lenz/Ledgerlens-core
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            heading_level: 2
+            members_order: source
+            show_signature_annotations: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Architecture:
+    - Feature Store: feature_store.md
+    - Cross-Chain Detection: cross_chain_detection.md
+    - Federated Learning: federated_learning.md
+    - Adversarial Robustness: adversarial_robustness.md
+    - Uncertainty Quantification: uncertainty_quantification.md
+    - Governance Protocol: governance_protocol.md
+    - Oracle Network: oracle_network.md
+  - API Reference:
+    - REST API: api_reference.md
+    - Detection Engine: api/detection.md
+    - Ingestion: api/ingestion.md
+    - API Module: api/api.md
+  - OpenAPI: openapi.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Ledger-Lenz/Ledgerlens-core
