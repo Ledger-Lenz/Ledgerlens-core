@@ -12,12 +12,42 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import tomllib
+from pathlib import Path
 
 import typer
+
+try:
+    _version_file = Path(__file__).resolve().parent / "pyproject.toml"
+    with open(_version_file, "rb") as _vf:
+        __version__ = tomllib.load(_vf)["project"]["version"]
+except Exception:
+    __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"ledgerlens-core v{__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Show the version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """LedgerLens detection engine CLI."""
+    pass
 
 
 @app.command("generate-data")
@@ -56,6 +86,7 @@ def train(
     ring_size: int = typer.Option(3, help="Accounts per wash ring"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
+    experiment_name: str = typer.Option(None, "--experiment-name", help="MLflow experiment name for tracking"),
 ) -> None:
     """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
     import os
@@ -76,7 +107,7 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
-    results = train_ensemble(df, calibrate=calibrate)
+    results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
         if name == "_calib":
             continue
@@ -496,6 +527,27 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+
+@app.command("governance-close-expired")
+def governance_close_expired() -> None:
+    """Close all active governance proposals whose voting period has expired.
+
+    Tallies each expired proposal and sets its status to 'passed' or 'rejected'
+    based on the quorum rule (>50% of committee votes 'for'). Designed to be
+    called on a schedule (e.g., cron or systemd timer).
+    """
+    from detection.storage import init_db
+    from detection.governance import GovernanceEngine
+
+    init_db()
+    engine = GovernanceEngine()
+    closed = engine.close_expired()
+    if not closed:
+        typer.echo("No expired proposals to close.")
+    else:
+        for p in closed:
+            typer.echo(f"Proposal {p.id} ({p.proposal_type}): {p.status}")
 
 
 @app.command("reweight")

@@ -1,5 +1,6 @@
 """Tests for ingestion/evm_loader.py."""
 
+import time
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -228,3 +229,124 @@ def test_validate_evm_address_rejects_too_short():
 def test_unsupported_chain_raises():
     with pytest.raises(ValueError, match="Unsupported chain"):
         EVMTradeLoader(chain="solana", rpc_url=MOCK_RPC_URL)
+
+
+# ---------------------------------------------------------------------------
+# Base and Arbitrum chain support
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chain", ["base", "arbitrum"])
+def test_l2_chain_accepted(chain):
+    """Base and Arbitrum are valid chains and the loader initialises."""
+    loader = EVMTradeLoader(chain=chain, rpc_url=MOCK_RPC_URL)
+    assert loader.chain == chain
+
+
+@pytest.mark.parametrize("chain", ["base", "arbitrum"])
+@responses_lib.activate
+def test_l2_load_trades_returns_cross_chain_trade(chain):
+    """Base/Arbitrum loader parses a Swap event into a CrossChainTrade with the correct chain."""
+    responses_lib.add(responses_lib.POST, MOCK_RPC_URL, json=_rpc_response("0x64"))
+    responses_lib.add(responses_lib.POST, MOCK_RPC_URL, json=_rpc_response([MOCK_SWAP_LOG]))
+    responses_lib.add(responses_lib.POST, MOCK_RPC_URL, json=MOCK_BLOCK)
+
+    loader = EVMTradeLoader(chain=chain, rpc_url=MOCK_RPC_URL, pool_addresses=[VALID_POOL])
+    trades = loader.load_trades(lookback_blocks=10)
+
+    assert len(trades) == 1
+    assert trades[0].chain == chain
+
+
+# ---------------------------------------------------------------------------
+# Per-network rate limiting
+# ---------------------------------------------------------------------------
+
+
+def test_per_network_rate_limit_applied():
+    """Each chain gets its own rate-limited token bucket at 10 req/s."""
+    from ingestion.evm_loader import _NETWORK_RATE_LIMITS
+
+    for chain in ["base", "arbitrum"]:
+        assert _NETWORK_RATE_LIMITS[chain] == 10.0
+        loader = EVMTradeLoader(chain=chain, rpc_url=MOCK_RPC_URL)
+        assert loader._rate_limiter._rate == 10.0
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker — Base outage does not affect Arbitrum
+# ---------------------------------------------------------------------------
+
+
+def test_circuit_breakers_are_independent():
+    """A tripped Base circuit breaker does not affect the Arbitrum loader."""
+    from ingestion.evm_loader import _CircuitBreaker
+
+    base_cb = _CircuitBreaker(threshold=1)
+    arb_loader = EVMTradeLoader(chain="arbitrum", rpc_url=MOCK_RPC_URL)
+
+    base_cb.record_failure()  # open Base circuit
+    assert base_cb.is_open
+
+    # Arbitrum circuit is untouched
+    assert not arb_loader._circuit_breaker.is_open
+
+
+def test_circuit_breaker_opens_after_threshold():
+    """Circuit opens after threshold consecutive failures."""
+    from ingestion.evm_loader import _CircuitBreaker
+
+    cb = _CircuitBreaker(threshold=3)
+    for _ in range(3):
+        cb.record_failure()
+    assert cb.is_open
+
+
+def test_circuit_breaker_resets_after_timeout():
+    """Circuit auto-resets after reset_seconds."""
+    from ingestion.evm_loader import _CircuitBreaker
+
+    cb = _CircuitBreaker(threshold=1, reset_seconds=0.01)
+    cb.record_failure()
+    assert cb.is_open
+    time.sleep(0.02)
+    assert not cb.is_open
+
+
+def test_circuit_open_raises_on_rpc_call():
+    """_rpc_call raises CircuitOpenError immediately when circuit is open."""
+    from ingestion.evm_loader import _CircuitBreaker
+
+    cb = _CircuitBreaker(threshold=1)
+    cb.record_failure()
+
+    loader = EVMTradeLoader(chain="base", rpc_url=MOCK_RPC_URL, _circuit_breaker=cb)
+    with pytest.raises(_CircuitBreaker.CircuitOpenError):
+        loader._rpc_call("eth_blockNumber", [])
+
+
+# ---------------------------------------------------------------------------
+# ABI mismatch — log warning, skip event, do not crash
+# ---------------------------------------------------------------------------
+
+
+@responses_lib.activate
+def test_abi_mismatch_skips_event_and_continues():
+    """A malformed event in a batch is skipped with a warning; valid events are returned."""
+    bad_log = {
+        **MOCK_SWAP_LOG,
+        "data": "0x" + "aa" * 10,  # too short — ABI mismatch
+        "transactionHash": "0xbadbadbad",
+    }
+    good_log = MOCK_SWAP_LOG  # valid
+
+    responses_lib.add(responses_lib.POST, MOCK_RPC_URL, json=_rpc_response("0x64"))
+    responses_lib.add(responses_lib.POST, MOCK_RPC_URL, json=_rpc_response([bad_log, good_log]))
+    responses_lib.add(responses_lib.POST, MOCK_RPC_URL, json=MOCK_BLOCK)
+
+    loader = EVMTradeLoader(chain="base", rpc_url=MOCK_RPC_URL, pool_addresses=[VALID_POOL])
+    trades = loader.load_trades(lookback_blocks=10)
+
+    # Only the good log produces a trade; bad one is silently skipped
+    assert len(trades) == 1
+    assert trades[0].tx_hash == MOCK_SWAP_LOG["transactionHash"]
