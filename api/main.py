@@ -22,6 +22,7 @@ import sqlite3
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -353,6 +354,46 @@ def explain_wallet_score(
             detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
         )
     return cached
+
+
+class RateLimiterStatus(BaseModel):
+    configured_rate: float
+    current_rate: float
+    bucket_level: float
+    backpressure_active: bool
+    queue_size: int
+    last_429_at: Optional[datetime] = None
+
+
+@app.get(
+    "/stream/rate-limiter",
+    response_model=RateLimiterStatus,
+    dependencies=[Depends(require_admin_key)],
+)
+def rate_limiter_status() -> RateLimiterStatus:
+    """Return current rate limiter and backpressure state.
+
+    Requires the ``X-LedgerLens-Admin-Key`` header.  Returns 503 if no
+    streamer is currently registered.
+    """
+    bucket = _stream_rate_limiter_state.get("bucket")
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Rate limiter not active (no streamer running)")
+
+    bp = _stream_rate_limiter_state.get("backpressure")
+    adaptive = _stream_rate_limiter_state.get("adaptive")
+    last_429_dt: Optional[datetime] = None
+    if adaptive and adaptive.last_429_at is not None:
+        last_429_dt = datetime.fromtimestamp(adaptive.last_429_at, tz=timezone.utc)
+
+    return RateLimiterStatus(
+        configured_rate=bucket.current_rate,
+        current_rate=bucket.current_rate,
+        bucket_level=bucket.bucket_level,
+        backpressure_active=bp.is_paused if bp else False,
+        queue_size=bp.queue_size if bp else 0,
+        last_429_at=last_429_dt,
+    )
 
 
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
