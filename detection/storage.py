@@ -380,6 +380,26 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         ALTER TABLE bridge_transfers ADD COLUMN verified_at TIMESTAMP;
         """,
     ),
+    (
+        14,
+        "create analyst_feedback table for analyst review dashboard",
+        """
+        CREATE TABLE IF NOT EXISTS analyst_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL DEFAULT 'XLM/USDC',
+            verdict TEXT NOT NULL,
+            notes TEXT,
+            analyst_key_hash TEXT,
+            submitted_at TEXT NOT NULL,
+            review_started_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_wallet
+            ON analyst_feedback (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted_at
+            ON analyst_feedback (submitted_at);
+        """,
+    ),
 ]
 
 
