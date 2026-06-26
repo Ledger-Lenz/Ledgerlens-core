@@ -53,3 +53,13 @@ ledgerlens completion --shell fish | source
 `stream --reset-cursor` deletes the durable Horizon paging-token checkpoint
 before connecting. The checkpoint location is configured with
 `CURSOR_CHECKPOINT_PATH` and must be inside `DATA_DIR`.
+
+The stream command also accepts:
+
+- `--queue-depth N`: maximum buffered trade count (default
+  `STREAMER_QUEUE_MAXSIZE=1000`).
+- `--overflow-strategy block|drop_newest|drop_oldest`: behavior when the queue
+  is full (default `STREAMER_OVERFLOW_STRATEGY=drop_oldest`).
+
+See [Ingestion](ingestion.md#flow-control-and-backpressure) for policy
+trade-offs and recovery guidance.

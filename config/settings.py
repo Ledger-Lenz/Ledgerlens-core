@@ -58,8 +58,9 @@ class Settings(BaseSettings):
     cursor_flush_seconds: float = 10.0  # Persist after this many seconds.
     horizon_rate_limit: float = 50.0
     horizon_rate_bucket_capacity: float = 100.0
-    horizon_queue_high_watermark: int = 1000
-    horizon_queue_low_watermark: int = 500
+    streamer_queue_maxsize: int = 1000  # Hard cap on buffered Horizon trades.
+    streamer_overflow_strategy: str = "drop_oldest"  # block/drop_newest/drop_oldest.
+    streamer_high_water_ratio: float = 0.8  # Begin producer throttling at 80%.
     rate_restore_seconds: float = 60.0
     stream_checkpoint_interval: int = 100
     stream_score_delta_threshold: int = 5
@@ -142,7 +143,8 @@ class Settings(BaseSettings):
                      "soroban_circuit_reset_seconds", "evm_lookback_blocks",
                      "committee_quorum", "committee_vote_deadline_days",
                      "federated_min_participants", "cursor_flush_events",
-                     "stream_checkpoint_interval", mode="before")
+                     "stream_checkpoint_interval", "streamer_queue_maxsize",
+                     mode="before")
     @classmethod
     def must_be_positive(cls, v: object) -> object:
         if int(v) <= 0:
@@ -187,6 +189,24 @@ class Settings(BaseSettings):
         if float(v) <= 0:
             raise ValueError("CURSOR_FLUSH_SECONDS must be positive")
         return v
+
+    @field_validator("streamer_overflow_strategy", mode="before")
+    @classmethod
+    def valid_streamer_overflow_strategy(cls, v: object) -> object:
+        strategy = str(v).strip().lower()
+        if strategy not in {"block", "drop_newest", "drop_oldest"}:
+            raise ValueError(
+                "STREAMER_OVERFLOW_STRATEGY must be block, drop_newest, or drop_oldest"
+            )
+        return strategy
+
+    @field_validator("streamer_high_water_ratio", mode="before")
+    @classmethod
+    def valid_streamer_high_water_ratio(cls, v: object) -> object:
+        ratio = float(v)
+        if not 0 < ratio <= 1:
+            raise ValueError("STREAMER_HIGH_WATER_RATIO must be in (0, 1]")
+        return ratio
 
     @field_validator("horizon_default_cursor", mode="before")
     @classmethod

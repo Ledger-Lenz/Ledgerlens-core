@@ -447,6 +447,19 @@ def stream(
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
     checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
     score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
+    queue_depth: int = typer.Option(
+        None,
+        "--queue-depth",
+        min=1,
+        envvar="STREAMER_QUEUE_MAXSIZE",
+        help="Maximum number of buffered Horizon trades (default from settings).",
+    ),
+    overflow_strategy: str = typer.Option(
+        None,
+        "--overflow-strategy",
+        envvar="STREAMER_OVERFLOW_STRATEGY",
+        help="Queue overflow policy: block, drop_newest, or drop_oldest.",
+    ),
     reset_cursor: bool = typer.Option(
         False,
         "--reset-cursor",
@@ -476,6 +489,17 @@ def stream(
 
     _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
     _score_delta = score_delta if score_delta is not None else cfg.stream_score_delta_threshold
+    _queue_depth = queue_depth if queue_depth is not None else cfg.streamer_queue_maxsize
+    _overflow_strategy = (
+        overflow_strategy
+        if overflow_strategy is not None
+        else cfg.streamer_overflow_strategy
+    )
+    if _overflow_strategy not in {"block", "drop_newest", "drop_oldest"}:
+        raise typer.BadParameter(
+            "must be block, drop_newest, or drop_oldest",
+            param_hint="--overflow-strategy",
+        )
     cursor_checkpoint = CursorCheckpoint(
         resolve_checkpoint_path(cfg.cursor_checkpoint_path, cfg.data_dir)
     )
@@ -528,9 +552,12 @@ def stream(
     last_cursor = cursor
 
     logger.info(
-        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d)",
+        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d, "
+        "queue_depth=%d, overflow_strategy=%s)",
         _chk_interval,
         _score_delta,
+        _queue_depth,
+        _overflow_strategy,
     )
 
     for trade, event_cursor in stream_trades_with_cursor(

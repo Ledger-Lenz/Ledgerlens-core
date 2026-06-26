@@ -1,10 +1,9 @@
-import asyncio
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from ingestion.checkpoint import CursorCheckpoint, FlushPolicy
-from ingestion.horizon_streamer import HorizonStreamer
+from ingestion.horizon_streamer import BoundedTradeQueue, HorizonStreamer
 
 
 def _record(token: str, ledger: int = 42) -> dict:
@@ -37,7 +36,7 @@ async def test_streamer_advances_checkpoint_at_flush_interval(tmp_path, monkeypa
 
     monkeypatch.setattr(checkpoint, "save", record_save)
     streamer = HorizonStreamer(
-        asyncio.Queue(),
+        BoundedTradeQueue(),
         checkpoint=checkpoint,
         flush_policy=FlushPolicy(max_events=2, max_seconds=999),
         rate_limit=10_000,
@@ -59,7 +58,7 @@ async def test_streamer_advances_checkpoint_at_flush_interval(tmp_path, monkeypa
 async def test_restart_uses_checkpoint_cursor_in_request(tmp_path, monkeypatch):
     checkpoint = CursorCheckpoint(tmp_path / "cursor.json")
     checkpoint.save("987654-0")
-    streamer = HorizonStreamer(asyncio.Queue(), checkpoint=checkpoint)
+    streamer = HorizonStreamer(BoundedTradeQueue(), checkpoint=checkpoint)
     requested_urls = []
 
     class Response:
@@ -82,7 +81,7 @@ async def test_restart_uses_checkpoint_cursor_in_request(tmp_path, monkeypatch):
 async def test_gone_checkpoint_falls_back_to_now(tmp_path, monkeypatch):
     checkpoint = CursorCheckpoint(tmp_path / "cursor.json")
     checkpoint.save("987654-0")
-    streamer = HorizonStreamer(asyncio.Queue(), checkpoint=checkpoint)
+    streamer = HorizonStreamer(BoundedTradeQueue(), checkpoint=checkpoint)
     streamer._running = True
 
     import httpx

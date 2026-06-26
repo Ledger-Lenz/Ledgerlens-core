@@ -415,6 +415,8 @@ python cli.py score           # run the pipeline against live Horizon data
 python cli.py stream          # stream trades from Horizon SSE and score incrementally
                               #   --checkpoint-interval N  persist state every N trades (default: 100)
                               #   --score-delta N          min score change to emit alert (default: 5)
+                              #   --queue-depth N          cap buffered trades (default: 1000)
+                              #   --overflow-strategy S    block, drop_newest, or drop_oldest
                               #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API

@@ -18,7 +18,10 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
-from typing import TYPE_CHECKING, Callable, Optional
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from threading import Lock
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import httpx
 import sseclient
@@ -33,7 +36,6 @@ from ingestion.checkpoint import (
 from ingestion.data_models import Asset, Trade, TradeType
 from ingestion.rate_limiter import (
     AdaptiveRateController,
-    BackpressureController,
     TokenBucket,
 )
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
@@ -45,6 +47,8 @@ HORIZON_RECOVERY_TIMEOUT_SECONDS = 60.0
 # Delay between reconnect attempts while the circuit is still CLOSED, so a
 # string of immediate failures doesn't itself become a connection storm.
 _RECONNECT_BACKOFF_SECONDS = 1.0
+HIGH_WATER_RATIO = 0.8
+OverflowStrategy = Literal["block", "drop_newest", "drop_oldest"]
 
 horizon_circuit = CircuitBreaker(
     name="horizon",
@@ -179,6 +183,98 @@ def _decode_event(data: str) -> dict | None:
 # ── Async HorizonStreamer with rate limiting / backpressure ──────────────────
 
 
+class BoundedTradeQueue:
+    """Bounded async trade queue with an immutable overflow policy.
+
+    ``block`` propagates pressure to the SSE reader and preserves every event.
+    ``drop_newest`` preserves queued work, while ``drop_oldest`` prioritizes
+    recent trades. The two drop policies bound memory without stalling reads.
+    """
+
+    _VALID_STRATEGIES = {"block", "drop_newest", "drop_oldest"}
+
+    def __init__(
+        self,
+        maxsize: int = 1000,
+        overflow_strategy: OverflowStrategy = "drop_oldest",
+    ) -> None:
+        if maxsize <= 0:
+            raise ValueError("maxsize must be a positive integer")
+        if overflow_strategy not in self._VALID_STRATEGIES:
+            raise ValueError(f"unsupported overflow strategy: {overflow_strategy}")
+        self.maxsize = maxsize
+        self._overflow_strategy: OverflowStrategy = overflow_strategy
+        self._queue: asyncio.Queue[Trade] = asyncio.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._high_water_hits = 0
+
+    @property
+    def overflow_strategy(self) -> OverflowStrategy:
+        return self._overflow_strategy
+
+    @overflow_strategy.setter
+    def overflow_strategy(self, _value: OverflowStrategy) -> None:
+        raise RuntimeError("overflow strategy cannot be changed after construction")
+
+    async def put(self, trade: Trade) -> bool:
+        """Enqueue a trade, returning ``False`` only when the incoming trade drops."""
+        if self._overflow_strategy == "block":
+            await self._queue.put(trade)
+            self._record_high_water()
+            return True
+        if not self._queue.full():
+            self._queue.put_nowait(trade)
+            self._record_high_water()
+            return True
+        if self._overflow_strategy == "drop_newest":
+            self._dropped += 1
+            self._record_high_water()
+            return False
+
+        # No await occurs between full() and get_nowait(), so another task on
+        # this event loop cannot invalidate the state check.
+        self._queue.get_nowait()
+        self._dropped += 1
+        self._queue.put_nowait(trade)
+        self._record_high_water()
+        return True
+
+    def _record_high_water(self) -> None:
+        if self.depth() / self.maxsize >= HIGH_WATER_RATIO:
+            self._high_water_hits += 1
+
+    async def get(self) -> Trade:
+        return await self._queue.get()
+
+    def get_nowait(self) -> Trade:
+        return self._queue.get_nowait()
+
+    def depth(self) -> int:
+        return self._queue.qsize()
+
+    def dropped_count(self) -> int:
+        return self._dropped
+
+    def high_water_mark_reached_count(self) -> int:
+        return self._high_water_hits
+
+
+@dataclass
+class StreamerMetrics:
+    """Aggregate ingestion and backpressure metrics; never contains event data."""
+
+    events_received: int = 0
+    events_queued: int = 0
+    events_dropped: int = 0
+    dropped_newest: int = 0
+    dropped_oldest: int = 0
+    queue_depth_current: int = 0
+    queue_depth_peak: int = 0
+    high_water_mark_hits: int = 0
+    throttle_sleep_total_seconds: float = 0.0
+    last_event_at: datetime | None = None
+
+
 class HorizonStreamer:
     """Async SSE consumer with configurable rate limiting and backpressure.
 
@@ -190,39 +286,51 @@ class HorizonStreamer:
     Parameters
     ----------
     queue:
-        The downstream :class:`asyncio.Queue` to push parsed trades into.
+        The bounded downstream queue. When omitted, configuration settings
+        create one. Plain ``asyncio.Queue`` instances are rejected so callers
+        cannot accidentally retain and consume from an unbounded queue.
     cursor:
         Horizon paging token to resume from (default ``"now"``).
     rate_limit:
         Tokens per second (default 50).
     bucket_capacity:
         Maximum token burst (default ``rate_limit * 2``).
-    high_watermark:
-        Queue size at which backpressure engages (default 1000).
-    low_watermark:
-        Queue size at which consumption resumes (default 500).
     restore_seconds:
         Seconds over which to restore rate after a 429 (default 60).
     """
 
     def __init__(
         self,
-        queue: asyncio.Queue,
+        queue: BoundedTradeQueue | None = None,
         cursor: str | None = None,
         rate_limit: Optional[float] = None,
         bucket_capacity: Optional[float] = None,
         high_watermark: Optional[int] = None,
         low_watermark: Optional[int] = None,
         restore_seconds: Optional[float] = None,
+        queue_depth: int | None = None,
+        overflow_strategy: OverflowStrategy | None = None,
+        high_water_ratio: float | None = None,
         checkpoint: CursorCheckpoint | None = None,
         flush_policy: FlushPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         rate_limit = rate_limit if rate_limit is not None else settings.horizon_rate_limit
         bucket_capacity = bucket_capacity if bucket_capacity is not None else settings.horizon_rate_bucket_capacity
-        high_watermark = high_watermark if high_watermark is not None else settings.horizon_queue_high_watermark
-        low_watermark = low_watermark if low_watermark is not None else settings.horizon_queue_low_watermark
         restore_seconds = restore_seconds if restore_seconds is not None else settings.rate_restore_seconds
+        queue_depth = queue_depth if queue_depth is not None else settings.streamer_queue_maxsize
+        overflow_strategy = (
+            overflow_strategy
+            if overflow_strategy is not None
+            else settings.streamer_overflow_strategy
+        )
+        high_water_ratio = (
+            high_water_ratio
+            if high_water_ratio is not None
+            else settings.streamer_high_water_ratio
+        )
+        if not 0 < high_water_ratio <= 1:
+            raise ValueError("high_water_ratio must be in (0, 1]")
         if checkpoint is None:
             checkpoint_path = resolve_checkpoint_path(
                 settings.cursor_checkpoint_path, settings.data_dir
@@ -238,7 +346,19 @@ class HorizonStreamer:
         else:
             self._cursor = validate_cursor(settings.horizon_default_cursor)
             logger.info("Starting fresh from cursor %s", self._cursor)
-        self._queue = queue
+        if isinstance(queue, BoundedTradeQueue):
+            self.queue = queue
+        else:
+            if queue is not None:
+                raise TypeError(
+                    "queue must be a BoundedTradeQueue; plain asyncio.Queue is unsupported"
+                )
+            self.queue = BoundedTradeQueue(queue_depth, overflow_strategy)
+        self._queue = self.queue
+        self._high_water_ratio = high_water_ratio
+        self._throttle_level = 0
+        self._metrics = StreamerMetrics()
+        self._metrics_lock = Lock()
         self._checkpoint = checkpoint
         self._flush_policy = flush_policy or FlushPolicy(
             max_events=settings.cursor_flush_events,
@@ -249,9 +369,6 @@ class HorizonStreamer:
         self._last_flush_time = clock()
         self._last_ledger_sequence: int | None = None
         self._bucket = TokenBucket(rate=rate_limit, capacity=bucket_capacity)
-        self._backpressure = BackpressureController(
-            queue, high_watermark=high_watermark, low_watermark=low_watermark
-        )
         self._adaptive = AdaptiveRateController(
             self._bucket, configured_rate=rate_limit, restore_seconds=restore_seconds
         )
@@ -263,12 +380,60 @@ class HorizonStreamer:
         return self._bucket
 
     @property
-    def backpressure(self) -> BackpressureController:
-        return self._backpressure
-
-    @property
     def adaptive(self) -> AdaptiveRateController:
         return self._adaptive
+
+    def metrics_snapshot(self) -> StreamerMetrics:
+        """Return a thread-safe copy suitable for API or Prometheus export."""
+        with self._metrics_lock:
+            snapshot = replace(self._metrics)
+        snapshot.queue_depth_current = self.queue.depth()
+        return snapshot
+
+    async def _maybe_throttle(self) -> None:
+        """Apply bounded exponential delay once the queue reaches its high-water mark.
+
+        The delay slows producer reads before enqueueing, decays after the queue
+        drains, and is capped at two seconds so a slow consumer cannot stall the
+        streamer indefinitely.
+        """
+        ratio = self.queue.depth() / self.queue.maxsize
+        if ratio >= self._high_water_ratio:
+            delay = min(0.05 * (2**self._throttle_level), 2.0)
+            self._throttle_level += 1
+            with self._metrics_lock:
+                self._metrics.high_water_mark_hits += 1
+                self._metrics.throttle_sleep_total_seconds += delay
+            await asyncio.sleep(delay)
+        else:
+            self._throttle_level = max(0, self._throttle_level - 1)
+
+    async def _enqueue(self, trade: Trade) -> bool:
+        await self._maybe_throttle()
+        before_dropped = self.queue.dropped_count()
+        accepted = await self.queue.put(trade)
+        dropped = self.queue.dropped_count() - before_dropped
+        depth = self.queue.depth()
+        with self._metrics_lock:
+            if accepted:
+                self._metrics.events_queued += 1
+            if dropped:
+                self._metrics.events_dropped += dropped
+                if self.queue.overflow_strategy == "drop_newest":
+                    self._metrics.dropped_newest += dropped
+                elif self.queue.overflow_strategy == "drop_oldest":
+                    self._metrics.dropped_oldest += dropped
+            self._metrics.queue_depth_current = depth
+            self._metrics.queue_depth_peak = max(self._metrics.queue_depth_peak, depth)
+            total_dropped = self._metrics.events_dropped
+        if dropped and total_dropped % 100 == 0:
+            logger.warning(
+                "Dropped %d Horizon trade events (strategy=%s, queue_depth=%d)",
+                total_dropped,
+                self.queue.overflow_strategy,
+                depth,
+            )
+        return accepted
 
     async def _connect(self) -> httpx.AsyncClient:
         """Open an SSE connection to Horizon."""
@@ -347,14 +512,16 @@ class HorizonStreamer:
         self._running = True
         try:
             async for record in self.stream_events():
+                with self._metrics_lock:
+                    self._metrics.events_received += 1
+                    self._metrics.last_event_at = datetime.now(timezone.utc)
                 try:
                     trade = _parse_trade(record)
                 except (KeyError, ValueError, TypeError) as exc:
                     logger.warning("Failed to parse trade record: %s", exc)
                     continue
 
-                await self._backpressure.check_and_wait()
-                await self._queue.put(trade)
+                await self._enqueue(trade)
                 self._record_processed_event(record)
         finally:
             self._flush_checkpoint()
@@ -368,17 +535,20 @@ class HorizonStreamer:
         self._running = True
         try:
             async for record in self.stream_events():
+                with self._metrics_lock:
+                    self._metrics.events_received += 1
+                    self._metrics.last_event_at = datetime.now(timezone.utc)
                 try:
                     trade = _parse_trade(record)
                 except (KeyError, ValueError, TypeError) as exc:
                     logger.warning("Failed to parse trade record: %s", exc)
                     continue
 
-                await self._backpressure.check_and_wait()
-                await self._queue.put(trade)
+                accepted = await self._enqueue(trade)
                 self._record_processed_event(record)
                 event_cursor = self._cursor
-                yield trade, event_cursor
+                if accepted:
+                    yield trade, event_cursor
         finally:
             self._flush_checkpoint()
 
