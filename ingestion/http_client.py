@@ -127,3 +127,7 @@ class AsyncHorizonClient:
 
     async def __aexit__(self, *_: object) -> None:
         await self.close()
+
+
+# Backward-compatible descriptive name used by the historical ingestion API.
+RetryingHorizonClient = AsyncHorizonClient

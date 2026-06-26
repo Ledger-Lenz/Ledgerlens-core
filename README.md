@@ -412,14 +412,25 @@ docker compose up --build
 python cli.py generate-data   # write synthetic trades/labels to CSV
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
+python cli.py historical-load --start 2026-05-01T00:00:00Z --end 2026-05-31T00:00:00Z \
+  --concurrency 8 --chunk-hours 6 --resume
+                              # parallel, restart-safe Horizon trade backfill
 python cli.py stream          # stream trades from Horizon SSE and score incrementally
                               #   --checkpoint-interval N  persist state every N trades (default: 100)
                               #   --score-delta N          min score change to emit alert (default: 5)
+                              #   --queue-depth N          cap buffered trades (default: 1000)
+                              #   --overflow-strategy S    block, drop_newest, or drop_oldest
+                              #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
+
+The Horizon stream position is stored atomically in
+`CURSOR_CHECKPOINT_PATH` (default `./data/horizon_cursor.json`). The path must
+remain inside `DATA_DIR`. Use `--reset-cursor` when an intentional fresh start
+or replay is required.
 
 ## Continuous Retraining
 
