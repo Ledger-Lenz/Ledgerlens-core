@@ -25,21 +25,37 @@ import json
 import os
 import zipfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import networkx as nx
 from scipy import stats
 
+from config.settings import settings
 from detection.benford_engine import compute_benford_metrics
 from detection.sar_narrative import generate_sar_narrative, risk_level_from_score
 from detection.storage import (
     _connect,
+    count_compliance_exports_since,
     get_alerts,
     get_latest_scores,
     get_score_history,
     get_shap_values,
     init_db,
+    log_compliance_export,
 )
+
+
+class ComplianceRateLimitExceeded(RuntimeError):
+    """Raised when the configured hourly compliance-export rate limit is hit."""
+
+
+class ComplianceScoreTooLow(RuntimeError):
+    """Raised when a wallet's risk score is below the configured SAR minimum."""
+
+    def __init__(self, score: float, minimum: int):
+        self.score = score
+        self.minimum = minimum
+        super().__init__(f"risk score {score} is below the SAR minimum ({minimum})")
 
 
 @dataclass
@@ -70,6 +86,16 @@ def _evidence_hash(wallet: str, score: float, score_timestamp: str) -> str:
     """
     commitment = f"{wallet}|{int(round(score))}|{score_timestamp}"
     return hashlib.sha256(commitment.encode("utf-8")).hexdigest()
+
+
+def hash_wallet(wallet: str) -> str:
+    """Stable SHA-256 digest identifying ``wallet`` in the audit log.
+
+    Distinct from :func:`_evidence_hash`: this identifies the wallet itself
+    for audit correlation, not a specific scored fact, so the compliance
+    export audit trail never stores a plaintext wallet address.
+    """
+    return hashlib.sha256(wallet.encode("utf-8")).hexdigest()
 
 
 def build_ivms_risk_field(wallet: str, db_path: str | None = None) -> IVMSRiskField:
@@ -301,6 +327,75 @@ def generate_sar_package(
         archive.writestr("manifest.json", manifest_bytes)
 
     return zip_path
+
+
+# ---------------------------------------------------------------------------
+# Compliance-gated export wrappers
+#
+# These wrap the lower-level generators above with the controls regulators
+# expect of an export pipeline: a minimum-risk-score gate before issuing a
+# SAR, an hourly rate limit (SAR generation triggers SHAP recomputation and
+# graph building, so it isn't free), and an audit log entry per export.
+# `dry_run` skips only the audit log write, per its documented limitation:
+# it must not be used to produce a regulatory-submission copy of the export.
+# ---------------------------------------------------------------------------
+
+
+def export_sar_package(
+    wallet: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str,
+    dry_run: bool = False,
+    db_path: str | None = None,
+) -> str:
+    """Compliance-gated wrapper around :func:`generate_sar_package`.
+
+    Raises :class:`ComplianceRateLimitExceeded` if the configured hourly
+    export rate limit has been reached, or :class:`ComplianceScoreTooLow` if
+    ``wallet``'s current risk score is below ``settings.compliance_sar_min_score``.
+    Logs the export to the ``compliance_exports`` audit table unless
+    ``dry_run`` is set.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    if count_compliance_exports_since(since, db_path=db_path) >= settings.compliance_export_rate_limit_per_hour:
+        raise ComplianceRateLimitExceeded()
+
+    risk = build_ivms_risk_field(wallet, db_path=db_path)
+    if risk.ledgerlens_score < settings.compliance_sar_min_score:
+        raise ComplianceScoreTooLow(risk.ledgerlens_score, settings.compliance_sar_min_score)
+
+    zip_path = generate_sar_package(wallet, start_date, end_date, output_dir, db_path=db_path)
+
+    if not dry_run:
+        log_compliance_export(
+            export_type="sar",
+            wallet_hash=hash_wallet(wallet),
+            risk_score=int(risk.ledgerlens_score),
+            dry_run=False,
+            db_path=db_path,
+        )
+
+    return zip_path
+
+
+def export_travel_rule(wallet: str, dry_run: bool = False, db_path: str | None = None) -> IVMSRiskField:
+    """Compliance-gated wrapper around :func:`build_ivms_risk_field`.
+
+    Logs the export to the ``compliance_exports`` audit table unless
+    ``dry_run`` is set. No minimum risk score is enforced here -- the Travel
+    Rule applies to qualifying transfer amounts, not risk level.
+    """
+    field = build_ivms_risk_field(wallet, db_path=db_path)
+    if not dry_run:
+        log_compliance_export(
+            export_type="travel_rule",
+            wallet_hash=hash_wallet(wallet),
+            risk_score=int(field.ledgerlens_score),
+            dry_run=False,
+            db_path=db_path,
+        )
+    return field
 
 
 # ---------------------------------------------------------------------------

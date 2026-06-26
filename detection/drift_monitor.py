@@ -5,6 +5,14 @@ distribution of features in production scoring has shifted significantly from
 the training distribution. Persists scored feature vectors to SQLite and
 provides drift detection thresholds.
 
+Per-feature PSI tracking: :func:`compute_psi_for_feature` computes PSI for a
+single feature against a training reference distribution.
+:func:`compute_per_feature_psi` returns a ``{feature_name: psi}`` dict for
+all features. :func:`record_psi_snapshot` persists per-feature PSI values
+to the ``feature_psi_history`` table. :func:`check_psi_and_alert` fires a
+``feature_drift`` alert when 3+ features exceed PSI > 0.20 simultaneously.
+:func:`export_psi_heatmap` renders a colour-coded (feature x date) heatmap.
+
 Performance monitoring (Issue-110): :class:`PerformanceMonitor` collects
 ground-truth analyst labels and computes rolling precision/recall/F1 to detect
 model degradation over time. When F1 drops more than 5 percentage points from
@@ -18,6 +26,7 @@ Feedback collection loop architecture:
   4. Degradation triggers retraining and fires a webhook ``model_degradation`` event
 """
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -30,6 +39,10 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("ledgerlens.drift_monitor")
+
+PSI_THRESHOLD: float = 0.20
+PSI_MIN_DRIFTED_FEATURES: int = 3
+PSI_ALERT_COOLDOWN_HOURS: int = 24
 
 MAX_SNAPSHOT_ROWS = 500_000
 MIN_SNAPSHOT_ROWS_AFTER_PRUNE = 450_000
@@ -285,6 +298,293 @@ def is_drift_detected(
         )
 
     return is_drifted
+
+
+# ---------------------------------------------------------------------------
+# Per-feature PSI tracking
+# ---------------------------------------------------------------------------
+
+_FEATURE_PSI_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS feature_psi_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_name TEXT NOT NULL,
+    psi_value REAL NOT NULL,
+    window_days INTEGER NOT NULL DEFAULT 30,
+    n_reference_samples INTEGER,
+    n_current_samples INTEGER,
+    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_psi_history_feature ON feature_psi_history(feature_name, computed_at);
+"""
+
+
+def _init_psi_tables(db_path: str) -> None:
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_FEATURE_PSI_HISTORY_DDL)
+    try:
+        conn.execute("ALTER TABLE degradation_alerts ADD COLUMN alert_type TEXT DEFAULT 'model_degradation'")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    conn.close()
+
+
+def compute_psi_for_feature(
+    reference: np.ndarray,
+    current: np.ndarray,
+    n_bins: int = 10,
+    epsilon: float = 1e-6,
+) -> float:
+    """Compute PSI between reference and current distributions for a single feature."""
+    reference = reference[~np.isnan(reference)]
+    current = current[~np.isnan(current)]
+
+    if len(reference) == 0 or len(current) == 0:
+        return 0.0
+
+    percentile_bins = np.percentile(reference, np.linspace(0, 100, n_bins + 1))
+    percentile_bins = np.unique(percentile_bins)
+    if len(percentile_bins) < 3:
+        return 0.0
+
+    ref_counts, _ = np.histogram(reference, bins=percentile_bins)
+    cur_counts, _ = np.histogram(current, bins=percentile_bins)
+
+    ref_pct = ref_counts / (len(reference) + epsilon)
+    cur_pct = cur_counts / (len(current) + epsilon)
+
+    ref_pct = np.clip(ref_pct, epsilon, None)
+    cur_pct = np.clip(cur_pct, epsilon, None)
+
+    psi = np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct))
+    return float(psi)
+
+
+def compute_per_feature_psi(
+    training_dataset_path: str,
+    db_path: str | None = None,
+    window_days: int = 30,
+    n_bins: int = 10,
+) -> dict[str, float]:
+    """Compute PSI for each feature comparing training reference to recent production data."""
+    from config.settings import settings
+    from detection.feature_engineering import FEATURE_NAMES
+
+    db_path = db_path or settings.db_path
+    _init_db(db_path)
+
+    try:
+        training_df = pd.read_csv(training_dataset_path)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Training reference file not found: {training_dataset_path}. "
+            "Run 'cli.py train' to generate it."
+        )
+
+    cutoff_time = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+    conn = sqlite3.connect(db_path)
+    scored_df = pd.read_sql_query(
+        "SELECT feature_name, feature_value FROM feature_distribution_snapshots WHERE recorded_at >= ?",
+        conn,
+        params=(cutoff_time,),
+    )
+    conn.close()
+
+    if scored_df.empty:
+        logger.warning("No scored features found in the last %d days; returning all-zero PSI", window_days)
+        return {f: 0.0 for f in FEATURE_NAMES if f in training_df.columns}
+
+    scored_names = set(scored_df["feature_name"].unique())
+    feature_names = [f for f in FEATURE_NAMES if f in training_df.columns]
+
+    psi_dict: dict[str, float] = {}
+    for feature_name in feature_names:
+        training_dist = training_df[feature_name].dropna().values.astype(float)
+        if feature_name in scored_names:
+            current_dist = scored_df[scored_df["feature_name"] == feature_name]["feature_value"].values.astype(float)
+        else:
+            current_dist = np.array([])
+
+        if len(training_dist) == 0 or len(current_dist) == 0:
+            psi_dict[feature_name] = 0.0
+        else:
+            psi_dict[feature_name] = compute_psi_for_feature(training_dist, current_dist, n_bins=n_bins)
+
+    return psi_dict
+
+
+def record_psi_snapshot(
+    psi_dict: dict[str, float],
+    window_days: int = 30,
+    n_reference_samples: int | None = None,
+    n_current_samples: int | None = None,
+    db_path: str | None = None,
+) -> None:
+    """Persist per-feature PSI values to the feature_psi_history table."""
+    from config.settings import settings
+
+    db_path = db_path or settings.db_path
+    _init_psi_tables(db_path)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(db_path)
+    rows = [
+        (fname, psi_val, window_days, n_reference_samples, n_current_samples, now)
+        for fname, psi_val in psi_dict.items()
+    ]
+    conn.executemany(
+        """INSERT INTO feature_psi_history
+           (feature_name, psi_value, window_days, n_reference_samples, n_current_samples, computed_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Recorded PSI snapshot for %d features", len(rows))
+
+
+def check_psi_and_alert(
+    psi_dict: dict[str, float],
+    psi_threshold: float = PSI_THRESHOLD,
+    min_drifted_features: int = PSI_MIN_DRIFTED_FEATURES,
+    cooldown_hours: int = PSI_ALERT_COOLDOWN_HOURS,
+    db_path: str | None = None,
+) -> bool:
+    """Check per-feature PSI and fire a feature_drift alert if thresholds exceeded.
+
+    Returns True if an alert was triggered.
+    """
+    from config.settings import settings
+
+    db_path = db_path or settings.db_path
+
+    drifted = {fname: psi for fname, psi in psi_dict.items() if psi > psi_threshold}
+    n_drifted = len(drifted)
+
+    if n_drifted < min_drifted_features:
+        logger.info(
+            "PSI alert check: %d features drifted (threshold %d); no alert",
+            n_drifted, min_drifted_features,
+        )
+        return False
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_FEATURE_PSI_HISTORY_DDL)
+    except Exception:
+        pass
+
+    cooldown_cutoff = (datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)).isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM degradation_alerts WHERE alert_type = 'feature_drift' AND alert_timestamp > ?",
+        (cooldown_cutoff,),
+    ).fetchone()
+
+    if row and row[0] > 0:
+        logger.info("PSI alert suppressed: cooldown period (%dh) not elapsed", cooldown_hours)
+        conn.close()
+        return False
+
+    now = datetime.now(timezone.utc).isoformat()
+    affected_features = sorted(drifted.keys())
+    conn.execute(
+        """INSERT INTO degradation_alerts
+           (alert_timestamp, alert_type, baseline_f1, current_f1, f1_drop,
+            precision_current, recall_current, n_feedback_samples, model_version, retrain_triggered)
+           VALUES (?, 'feature_drift', NULL, NULL, NULL, NULL, NULL, ?, NULL, 0)""",
+        (now, n_drifted),
+    )
+    conn.commit()
+    conn.close()
+
+    logger.warning(
+        "Feature drift alert: %d features exceed PSI %.2f: %s",
+        n_drifted, psi_threshold, affected_features,
+    )
+
+    try:
+        from detection.webhook_registry import get_matching_subscribers
+        from detection.webhook_queue import enqueue
+
+        event_payload = {
+            "event_type": "feature_drift",
+            "n_drifted": n_drifted,
+            "drifted_features": affected_features,
+            "psi_values": {f: round(v, 4) for f, v in drifted.items()},
+            "timestamp": now,
+        }
+        for sub in get_matching_subscribers(None):
+            enqueue(sub.subscriber_id, event_payload)
+    except Exception as exc:
+        logger.debug("Webhook dispatch for feature_drift skipped: %s", exc)
+
+    return True
+
+
+def load_psi_history(days_back: int = 90, db_path: str | None = None) -> pd.DataFrame:
+    """Load PSI history from the database for heatmap generation."""
+    from config.settings import settings
+
+    db_path = db_path or settings.db_path
+    _init_psi_tables(db_path)
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query(
+        """SELECT feature_name, psi_value, computed_at
+           FROM feature_psi_history
+           WHERE computed_at >= ?
+           ORDER BY computed_at""",
+        conn,
+        params=(cutoff,),
+    )
+    conn.close()
+
+    if not df.empty:
+        df["computed_at_date"] = pd.to_datetime(df["computed_at"]).dt.date.astype(str)
+
+    return df
+
+
+def export_psi_heatmap(output_path: Path, days_back: int = 90, db_path: str | None = None) -> Path:
+    """Generate a (n_features x n_dates) heatmap of PSI values as a PNG."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    df = load_psi_history(days_back=days_back, db_path=db_path)
+    if df.empty:
+        logger.warning("No PSI history available for heatmap; creating empty plot")
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.set_title(f"Feature PSI Heatmap (last {days_back} days) — No Data")
+        plt.tight_layout()
+        plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
+        plt.close()
+        return output_path
+
+    pivot = df.pivot_table(
+        index="feature_name", columns="computed_at_date", values="psi_value", aggfunc="mean",
+    )
+    pivot = pivot.fillna(0.0)
+
+    fig, ax = plt.subplots(
+        figsize=(max(8, len(pivot.columns) * 0.5), max(6, len(pivot.index) * 0.3))
+    )
+    cmap = LinearSegmentedColormap.from_list("psi", ["white", "yellow", "orange", "red"], N=256)
+
+    im = ax.imshow(pivot.values, aspect="auto", cmap=cmap, vmin=0.0, vmax=0.30, interpolation="nearest")
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index, fontsize=7)
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=45, ha="right", fontsize=7)
+    fig.colorbar(im, ax=ax, label="PSI")
+    ax.set_title(f"Feature PSI Heatmap (last {days_back} days)")
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close()
+    return output_path
 
 
 # ---------------------------------------------------------------------------

@@ -4,20 +4,15 @@ Computes the chi-square statistic, per-digit Z-scores, and Mean Absolute
 Deviation (MAD) of the leading-digit distribution of a set of amounts,
 relative to the theoretical Benford distribution.
 
-Also provides an incremental O(1) engine (`IncrementalBenfordEngine`) for
-real-time streaming pipelines (issue #128).
-"""
+Stratification
+--------------
+``stratified_benford_analysis()`` groups trades by canonical asset pair
+(lexicographically ordered, e.g. ``USDC/XLM`` not ``XLM/USDC``) and computes
+Benford statistics independently per stratum. Strata with fewer than 30
+observations are marked ``valid=False`` (reason ``"insufficient_sample"``).
+When *all* strata fall below the minimum, the engine falls back to a global
+(unstratified) computation and sets ``fallback_global=True`` on the summary.
 
-from __future__ import annotations
-
-import collections
-import json
-import math
-import sqlite3
-import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
 The univariate helpers (`compute_benford_metrics` etc.) score a single
 `(wallet, asset_pair)` stream. A coordinated wash-trading syndicate can keep
 each individual pair close to Benford while the *joint* cross-pair behaviour is
@@ -26,6 +21,9 @@ statistically impossible under independent trading. The multivariate helpers
 `multivariate_benford_score`) surface that coordination signal.
 """
 
+from __future__ import annotations
+
+import functools
 import logging
 import math
 from dataclasses import dataclass
@@ -232,201 +230,366 @@ def is_anomalous(metrics: dict, mad_threshold: float = 0.015) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Incremental Benford Engine (O(1) per new transaction, issue #128)
+# Kolmogorov-Smirnov and Kuiper tests for Benford conformity
 # ---------------------------------------------------------------------------
 
-BENFORD_EXPECTED_ARR = np.array([math.log10(1 + 1 / d) for d in range(1, 10)])
+# Benford CDF: F(d) = sum_{k=1}^{d} log10(1 + 1/k) for d = 1..9
+_BENFORD_CDF = np.cumsum([BENFORD_EXPECTED[d] for d in DIGITS])
+
+KS_MIN_N = 5
 
 
 @dataclass
-class DigitCounter:
-    """9-element leading-digit count accumulator."""
-
-    counts: np.ndarray = field(default_factory=lambda: np.zeros(9, dtype=np.int64))
-
-    def increment(self, amount: float) -> None:
-        d = first_digit(amount)
-        if d is not None:
-            self.counts[d - 1] += 1
-
-    def decrement(self, amount: float) -> None:
-        d = first_digit(amount)
-        if d is not None:
-            self.counts[d - 1] = max(0, self.counts[d - 1] - 1)
-
-    @property
-    def total(self) -> int:
-        return int(self.counts.sum())
-
-    def chi_square(self) -> float:
-        n = self.total
-        if n == 0:
-            return 0.0
-        observed_p = self.counts / n
-        expected = BENFORD_EXPECTED_ARR * n
-        return float(np.sum((self.counts - expected) ** 2 / np.where(expected > 0, expected, 1)))
-
-    def z_score(self) -> dict[int, float]:
-        n = self.total
-        if n == 0:
-            return {d: 0.0 for d in range(1, 10)}
-        observed_p = self.counts / n
-        scores = {}
-        for i, d in enumerate(range(1, 10)):
-            p = BENFORD_EXPECTED_ARR[i]
-            numerator = max(abs(observed_p[i] - p) - 1 / (2 * n), 0.0)
-            denom = math.sqrt(p * (1 - p) / n)
-            scores[d] = numerator / denom if denom > 0 else 0.0
-        return scores
-
-    def mad(self) -> float:
-        n = self.total
-        if n == 0:
-            return 0.0
-        observed_p = self.counts / n
-        return float(np.mean(np.abs(observed_p - BENFORD_EXPECTED_ARR)))
-
-    def to_dict(self) -> dict:
-        return {"counts": self.counts.tolist()}
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "DigitCounter":
-        counts = np.array(d["counts"], dtype=np.int64)
-        return cls(counts=counts)
+class KSResult:
+    """Result of a one-sample KS test against the Benford CDF."""
+    d_statistic: float = float("nan")
+    p_value: float = float("nan")
+    ks_flag: bool = False
+    valid: bool = False
 
 
-# In-memory expiry deque entry: (timestamp_unix_float, amount)
-_Entry = tuple[float, float]
+@dataclass
+class KuiperResult:
+    """Result of a Kuiper test against the Benford CDF."""
+    v_statistic: float = float("nan")
+    p_value: float = float("nan")
+    kuiper_flag: bool = False
+    valid: bool = False
 
-_FOUR_HOURS_S: float = 4 * 3600.0  # seconds; windows longer than this use SQLite
 
+def compute_ks_statistic(digit_counts: np.ndarray) -> KSResult:
+    """One-sample KS test of observed digit distribution against Benford CDF.
 
-class IncrementalWindow:
-    """Wraps a DigitCounter with a timestamped expiry queue.
+    ``digit_counts`` must be a length-9 array of non-negative integers (counts
+    for digits 1-9). Valid for N >= 5; returns NaN statistics for smaller samples.
 
-    For windows <= 4h, a deque is used. For longer windows, a SQLite-backed
-    queue bounds memory for wallets with millions of events.
+    The KS D-statistic is D = max_d |F_observed(d) - F_benford(d)|.
+    Critical value at alpha=0.05: D_crit = 1.358 / sqrt(N).
     """
+    digit_counts = np.asarray(digit_counts, dtype=float)
+    if digit_counts.shape != (9,) or np.any(digit_counts < 0):
+        return KSResult()
 
-    def __init__(
-        self,
-        window_seconds: float,
-        wallet: str,
-        window_name: str,
-        db_path: str | None = None,
-    ) -> None:
-        self.window_seconds = window_seconds
-        self.wallet = wallet
-        self.window_name = window_name
-        self.counter = DigitCounter()
-        self._use_sqlite = window_seconds > _FOUR_HOURS_S
-        self._db_path = db_path or ":memory:"
-        if self._use_sqlite:
-            self._init_sqlite()
-        else:
-            self._deque: collections.deque[_Entry] = collections.deque()
+    n = digit_counts.sum()
+    if n < KS_MIN_N:
+        return KSResult()
 
-    def _init_sqlite(self) -> None:
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS window_events "
-            "(wallet TEXT, window_name TEXT, ts REAL, amount REAL)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_we ON window_events(wallet, window_name, ts)"
-        )
-        self._conn.commit()
+    observed_cdf = np.cumsum(digit_counts) / n
+    differences = np.abs(observed_cdf - _BENFORD_CDF)
+    d_stat = float(np.max(differences))
+    d_crit = 1.358 / math.sqrt(n)
 
-    def add_transaction(self, amount: float, ts: datetime) -> None:
-        ts_f = ts.timestamp()
-        self.counter.increment(amount)
-        if self._use_sqlite:
-            self._conn.execute(
-                "INSERT INTO window_events VALUES (?,?,?,?)",
-                (self.wallet, self.window_name, ts_f, amount),
-            )
-            self._conn.commit()
-        else:
-            self._deque.append((ts_f, amount))
+    # Approximate p-value using Kolmogorov distribution
+    lam = (math.sqrt(n) + 0.12 + 0.11 / math.sqrt(n)) * d_stat
+    p_value = _ks_pvalue(lam)
 
-    def expire_transactions(self, as_of: datetime) -> None:
-        cutoff = as_of.timestamp() - self.window_seconds
-        if self._use_sqlite:
-            expired = self._conn.execute(
-                "SELECT amount FROM window_events WHERE wallet=? AND window_name=? AND ts<?",
-                (self.wallet, self.window_name, cutoff),
-            ).fetchall()
-            for (amt,) in expired:
-                self.counter.decrement(amt)
-            self._conn.execute(
-                "DELETE FROM window_events WHERE wallet=? AND window_name=? AND ts<?",
-                (self.wallet, self.window_name, cutoff),
-            )
-            self._conn.commit()
-        else:
-            while self._deque and self._deque[0][0] < cutoff:
-                _, amt = self._deque.popleft()
-                self.counter.decrement(amt)
-
-    def get_features(self) -> dict:
-        return {
-            "chi_square": self.counter.chi_square(),
-            "mad": self.counter.mad(),
-            "max_zscore": max(self.counter.z_score().values(), default=0.0),
-            "sample_size": self.counter.total,
-        }
+    return KSResult(
+        d_statistic=d_stat,
+        p_value=p_value,
+        ks_flag=d_stat > d_crit,
+        valid=True,
+    )
 
 
-_WINDOW_SIZES_S: dict[str, float] = {
-    "1h": 3600.0,
-    "4h": 4 * 3600.0,
-    "24h": 24 * 3600.0,
-    "7d": 7 * 86400.0,
-    "30d": 30 * 86400.0,
-}
+def _ks_pvalue(lam: float) -> float:
+    """Approximate survival function of the Kolmogorov distribution."""
+    if lam <= 0:
+        return 1.0
+    p = 0.0
+    for j in range(1, 101):
+        term = ((-1) ** (j - 1)) * math.exp(-2.0 * j * j * lam * lam)
+        p += term
+    p = max(0.0, min(1.0, 2.0 * p))
+    return p
 
 
-class IncrementalBenfordEngine:
-    """Per-wallet incremental Benford feature engine.
+def compute_kuiper_statistic(digit_counts: np.ndarray) -> KuiperResult:
+    """Kuiper test of observed digit distribution against Benford CDF.
 
-    Maintains five rolling windows (1h, 4h, 24h, 7d, 30d) per wallet.
-    Each new transaction is processed in O(1); feature retrieval is O(9).
+    The Kuiper V-statistic is V = D_plus + D_minus where
+    D_plus = max(F_obs - F_benford) and D_minus = max(F_benford - F_obs).
+    Rotation-invariant, making it more sensitive to tail deviations (digits 1
+    and 9) where wash-trading bots using round lot sizes tend to deviate.
+
+    Valid for N >= 5.
     """
+    digit_counts = np.asarray(digit_counts, dtype=float)
+    if digit_counts.shape != (9,) or np.any(digit_counts < 0):
+        return KuiperResult()
 
-    def __init__(self, db_path: str | None = None) -> None:
-        self._db_path = db_path
-        self._wallet_windows: dict[str, dict[str, IncrementalWindow]] = {}
-        self._lock = threading.Lock()
+    n = digit_counts.sum()
+    if n < KS_MIN_N:
+        return KuiperResult()
 
-    def _get_windows(self, wallet: str) -> dict[str, IncrementalWindow]:
-        windows = self._wallet_windows.get(wallet)
-        if windows is None:
-            windows = {
-                name: IncrementalWindow(size_s, wallet, name, self._db_path)
-                for name, size_s in _WINDOW_SIZES_S.items()
-            }
-            self._wallet_windows[wallet] = windows
-        return windows
+    observed_cdf = np.cumsum(digit_counts) / n
+    d_plus = float(np.max(observed_cdf - _BENFORD_CDF))
+    d_minus = float(np.max(_BENFORD_CDF - observed_cdf))
+    v_stat = d_plus + d_minus
 
-    def update(self, wallet: str, amount: float, timestamp: datetime) -> None:
-        """Process a new transaction for `wallet`."""
-        with self._lock:
-            windows = self._get_windows(wallet)
-            for window in windows.values():
-                window.expire_transactions(timestamp)
-                window.add_transaction(amount, timestamp)
+    p_value = _kuiper_pvalue(v_stat, int(n))
 
-    def get_features(self, wallet: str) -> dict:
-        """Return Benford feature dict for `wallet` (same keys as BENFORD_FEATURE_NAMES)."""
-        with self._lock:
-            windows = self._get_windows(wallet)
-            features = {}
-            for name, window in windows.items():
-                wf = window.get_features()
-                features[f"benford_chi_square_{name}"] = wf["chi_square"]
-                features[f"benford_mad_{name}"] = wf["mad"]
-                features[f"benford_max_zscore_{name}"] = wf["max_zscore"]
-            return features
+    return KuiperResult(
+        v_statistic=v_stat,
+        p_value=p_value,
+        kuiper_flag=p_value < 0.05,
+        valid=True,
+    )
+
+
+def _kuiper_pvalue(V: float, N: int) -> float:
+    """Approximate Kuiper survival function P(V > v).
+
+    Uses the series expansion from Press et al., Numerical Recipes, ch. 14.3:
+    P(V > v) = 2 * sum_{j=1}^{100} (4j^2 v^2 - 1) * exp(-2 j^2 v^2)
+    where v = V * (sqrt(N) + 0.155 + 0.24/sqrt(N)).
+    """
+    if V <= 0 or N < 1:
+        return 1.0
+    sqrt_n = math.sqrt(N)
+    v = V * (sqrt_n + 0.155 + 0.24 / sqrt_n)
+    if v <= 0:
+        return 1.0
+
+    p = 0.0
+    for j in range(1, 101):
+        j2v2 = j * j * v * v
+        exp_val = -2.0 * j2v2
+        if exp_val < -300:
+            break
+        term = (4.0 * j2v2 - 1.0) * math.exp(exp_val)
+        p += term
+
+    p = max(0.0, min(1.0, 2.0 * p))
+    return p
+
+
+def compute_benford_ks_kuiper(amounts: List[float]) -> dict:
+    """Compute KS and Kuiper statistics for a list of trade amounts.
+
+    Returns a dict with ks_stat, ks_pval, ks_flag, kuiper_stat, kuiper_pval,
+    kuiper_flag keys.
+    """
+    counts, n = _extract_digit_histogram(amounts)
+
+    ks = compute_ks_statistic(counts)
+    kuiper = compute_kuiper_statistic(counts)
+
+    return {
+        "ks_stat": ks.d_statistic,
+        "ks_pval": ks.p_value,
+        "ks_flag": ks.ks_flag,
+        "kuiper_stat": kuiper.v_statistic,
+        "kuiper_pval": kuiper.p_value,
+        "kuiper_flag": kuiper.kuiper_flag,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stratified Benford analysis per asset pair
+# ---------------------------------------------------------------------------
+
+_ASSET_PAIR_RE = re.compile(r"^[A-Z0-9/.:\-]{1,30}$")
+CHI2_CRITICAL_005 = 15.507  # df=8, alpha=0.05
+MIN_STRATUM_SIZE = 30
+
+
+@dataclass
+class BenfordResult:
+    """Per-stratum Benford analysis result."""
+
+    asset_pair: str
+    chi_square: float = 0.0
+    mad: float = 0.0
+    z_scores: Dict[int, float] = field(default_factory=dict)
+    flagged_digits: List[int] = field(default_factory=list)
+    benford_flag: bool = False
+    sample_size: int = 0
+    valid: bool = True
+    reason: str = ""
+    observed_distribution: Dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
+class StratifiedBenfordSummary:
+    """Aggregated summary across all per-stratum Benford results."""
+
+    stratum_results: Dict[str, BenfordResult] = field(default_factory=dict)
+    max_stratum_chi2: float = 0.0
+    max_stratum_MAD: float = 0.0
+    mean_stratum_MAD: float = 0.0
+    n_strata_above_0015: int = 0
+    n_flagged_strata: int = 0
+    fallback_global: bool = False
+
+
+def _sanitize_asset_pair(pair: str) -> str | None:
+    if not pair or len(pair) > 30:
+        return None
+    if not _ASSET_PAIR_RE.match(pair.upper()):
+        return None
+    return pair
+
+
+def _canonical_asset_pair(base: str, counter: str) -> str:
+    parts = sorted([base, counter])
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _extract_digit_histogram(amounts: List[float]) -> Tuple[np.ndarray, int]:
+    """Extract a 9-element digit frequency histogram from amounts.
+
+    Returns (histogram, n_valid). Caches only the histogram, not raw amounts.
+    """
+    counts = np.zeros(9, dtype=int)
+    n = 0
+    for a in amounts:
+        if a is None or not math.isfinite(a) or a <= 0:
+            continue
+        d = first_digit(a)
+        if d is not None:
+            counts[d - 1] += 1
+            n += 1
+    return counts, n
+
+
+def compute_stratum_benford(asset_pair: str, amounts: List[float]) -> BenfordResult:
+    """Compute Benford statistics for a single asset-pair stratum."""
+    counts, n = _extract_digit_histogram(amounts)
+
+    if n < MIN_STRATUM_SIZE:
+        return BenfordResult(
+            asset_pair=asset_pair,
+            sample_size=n,
+            valid=False,
+            reason="insufficient_sample",
+        )
+
+    observed = {d: counts[d - 1] / n for d in DIGITS}
+    chi_sq = chi_square_statistic(observed, n)
+    zs = z_scores(observed, n)
+    mad_val = mean_absolute_deviation(observed)
+    flagged = [d for d in DIGITS if abs(zs.get(d, 0.0)) > 1.96]
+
+    return BenfordResult(
+        asset_pair=asset_pair,
+        chi_square=chi_sq,
+        mad=mad_val,
+        z_scores=zs,
+        flagged_digits=flagged,
+        benford_flag=chi_sq > CHI2_CRITICAL_005,
+        sample_size=n,
+        valid=True,
+        observed_distribution=observed,
+    )
+
+
+def stratified_benford_analysis(
+    trades: List | pd.DataFrame,
+    min_stratum_size: int = MIN_STRATUM_SIZE,
+) -> StratifiedBenfordSummary:
+    """Group trades by canonical asset pair and compute per-stratum Benford stats.
+
+    Accepts either a list of Trade objects (from ingestion.data_models) or a
+    DataFrame with ``base_asset``, ``counter_asset``, and ``base_amount`` columns.
+    """
+    if isinstance(trades, pd.DataFrame):
+        grouped = _group_trades_df(trades)
+    else:
+        grouped = _group_trades_list(trades)
+
+    if not grouped:
+        return StratifiedBenfordSummary(fallback_global=True)
+
+    results: Dict[str, BenfordResult] = {}
+    for pair, amounts in grouped.items():
+        results[pair] = compute_stratum_benford(pair, amounts)
+
+    valid_results = [r for r in results.values() if r.valid]
+
+    if not valid_results:
+        all_amounts: List[float] = []
+        for amounts in grouped.values():
+            all_amounts.extend(amounts)
+        global_result = compute_stratum_benford("__global__", all_amounts)
+        results["__global__"] = global_result
+        valid_results = [global_result] if global_result.valid else []
+        return StratifiedBenfordSummary(
+            stratum_results=results,
+            max_stratum_chi2=global_result.chi_square if global_result.valid else 0.0,
+            max_stratum_MAD=global_result.mad if global_result.valid else 0.0,
+            mean_stratum_MAD=global_result.mad if global_result.valid else 0.0,
+            n_strata_above_0015=1 if global_result.valid and global_result.mad > 0.015 else 0,
+            n_flagged_strata=1 if global_result.valid and global_result.benford_flag else 0,
+            fallback_global=True,
+        )
+
+    max_chi2 = max(r.chi_square for r in valid_results)
+    mads = [r.mad for r in valid_results]
+    max_mad = max(mads)
+    mean_mad = sum(mads) / len(mads)
+    n_above = sum(1 for m in mads if m > 0.015)
+    n_flagged = sum(1 for r in valid_results if r.benford_flag)
+
+    return StratifiedBenfordSummary(
+        stratum_results=results,
+        max_stratum_chi2=max_chi2,
+        max_stratum_MAD=max_mad,
+        mean_stratum_MAD=mean_mad,
+        n_strata_above_0015=n_above,
+        n_flagged_strata=n_flagged,
+        fallback_global=False,
+    )
+
+
+def _group_trades_df(trades: pd.DataFrame) -> Dict[str, List[float]]:
+    """Group a trades DataFrame by canonical asset pair."""
+    grouped: Dict[str, List[float]] = {}
+    if trades.empty:
+        return grouped
+
+    for _, row in trades.iterrows():
+        base_asset = row.get("base_asset")
+        counter_asset = row.get("counter_asset")
+        amount = row.get("base_amount")
+
+        if base_asset is None or counter_asset is None:
+            continue
+
+        if isinstance(base_asset, dict):
+            base_sym = base_asset.get("code", "")
+        else:
+            base_sym = getattr(base_asset, "pair_symbol", str(base_asset))
+
+        if isinstance(counter_asset, dict):
+            counter_sym = counter_asset.get("code", "")
+        else:
+            counter_sym = getattr(counter_asset, "pair_symbol", str(counter_asset))
+
+        pair = _canonical_asset_pair(base_sym, counter_sym)
+        if _sanitize_asset_pair(pair) is None:
+            logger.debug("Skipping unsanitizable asset pair: %s", pair)
+            continue
+
+        grouped.setdefault(pair, []).append(float(amount))
+
+    return grouped
+
+
+def _group_trades_list(trades: list) -> Dict[str, List[float]]:
+    """Group a list of Trade model objects by canonical asset pair."""
+    grouped: Dict[str, List[float]] = {}
+    for trade in trades:
+        base_sym = trade.base_asset.pair_symbol
+        counter_sym = trade.counter_asset.pair_symbol
+        pair = _canonical_asset_pair(base_sym, counter_sym)
+        if _sanitize_asset_pair(pair) is None:
+            logger.debug("Skipping unsanitizable asset pair: %s", pair)
+            continue
+        grouped.setdefault(pair, []).append(float(trade.base_amount))
+    return grouped
+
+
+# ---------------------------------------------------------------------------
 # Adaptive window sizing
 # ---------------------------------------------------------------------------
 
