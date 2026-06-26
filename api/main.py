@@ -755,8 +755,32 @@ def wallet_scores(wallet: str) -> dict:
     database), the response includes a ``"cross_chain_links"`` field listing
     the linked EVM wallets and the chain they were last seen on.  EVM RPC
     endpoint URLs are never exposed in this response.
+
+    If the wallet is allowlisted, all scores are overridden to 0.
+    If denylisted, all scores are overridden to 100.
     """
     validate_stellar_address(wallet)
+
+    # Check for manual override before hitting the score store
+    override_entry = get_active_override(wallet)
+    if override_entry:
+        list_type = override_entry["list_type"]
+        override_score = 0 if list_type == "allowlist" else 100
+        override_label = list_type[:-4]  # "allowlist" → "allow", handled below
+        override_label = "allowlisted" if list_type == "allowlist" else "denylisted"
+        return {
+            "scores": [
+                {
+                    "wallet": wallet,
+                    "score": override_score,
+                    "override": override_label,
+                    "reason": override_entry.get("reason", ""),
+                }
+            ],
+            "cross_chain_links": [],
+            "override": override_label,
+        }
+
     scores = get_latest_scores(wallet=wallet)
     if not scores:
         raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
