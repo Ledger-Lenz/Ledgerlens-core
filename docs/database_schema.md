@@ -353,6 +353,29 @@ Typed manipulation alert records (e.g. `SANDWICH_ATTACK`, `CIRCULAR_ROUTE`).
 
 ---
 
+## Compliance Exports
+
+### `compliance_exports`
+
+Audit log of regulatory exports (SAR / FATF Travel Rule) issued via
+`/compliance/sar-package` and `/compliance/ivms/{wallet}`. See
+[compliance_export.md](compliance_export.md). Dry-run exports
+(`?dry_run=true`) are never written here.
+
+| Column        | Type       | Notes                                          |
+| ------------- | ---------- | ----------------------------------------------- |
+| `id`          | INTEGER PK |                                                  |
+| `export_type` | TEXT       | `"sar"` or `"travel_rule"`                      |
+| `wallet_hash` | TEXT       | SHA-256 of the wallet address -- never plaintext |
+| `asset_pairs` | TEXT       | Nullable JSON array                             |
+| `risk_score`  | INTEGER    | Nullable; wallet's score at export time          |
+| `exported_at` | TEXT       | ISO 8601 UTC                                    |
+| `dry_run`     | INTEGER    | `0`/`1`; always `0` for rows in this table        |
+
+Index: `exported_at`
+
+---
+
 ## Streaming Feature Store
 
 ### `wallet_feature_states`
