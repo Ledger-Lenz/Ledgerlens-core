@@ -347,9 +347,24 @@ This scores each wallet/asset-pair combination and writes the resulting
 python cli.py serve --reload
 ```
 
-Exposes `/health`, `/scores`, `/scores/{wallet}`, `/alerts`, `/assets/risk-ranking`,
-`/correlations`, and `/rings` over the locally stored `RiskScore` records — a
-stand-in for `ledgerlens-api` during local development.
+Exposes `/health`, `/scores`, `/scores/{wallet}`, `/scores/{wallet}/explain`,
+`/alerts`, `/assets/risk-ranking`, `/correlations`, and `/rings` over the
+locally stored `RiskScore` records — a stand-in for `ledgerlens-api` during
+local development.
+
+##### SHAP Explanation Endpoint
+
+```bash
+# Get waterfall-style SHAP explanation (requires admin key)
+curl -H "X-LedgerLens-Admin-Key: your-admin-key" \
+  "http://localhost:8000/v1/scores/GABCD...XYZ/explain?asset_pair=XLM/USDC&model=random_forest"
+```
+
+Response returns base value, ranked feature contributions, and a
+human-readable summary sentence. Supports `model` query parameter:
+`random_forest` (default), `xgboost`, `lightgbm`. See
+[docs/shap_explanation.md](docs/shap_explanation.md) for the full caching
+strategy and TTL.
 
 #### CORS configuration
 

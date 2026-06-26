@@ -148,6 +148,7 @@ CROSS_CHAIN_FEATURE_NAMES = [
     "evm_counterparty_concentration",
     "bridge_volume_ratio",
     "cross_chain_time_lag_median_h",
+    "cross_chain_round_trip_score",
 ]
 
 CAUSAL_FEATURE_NAMES = [
@@ -747,6 +748,13 @@ def build_cross_chain_features(
     else:
         hhi = 0.0
 
+    # Compute cross-chain round-trip score from bridge transfers
+    from detection.cross_chain_correlator import CrossChainCorrelator
+    from detection.storage import get_bridge_transfers
+    transfers = get_bridge_transfers(stellar_wallet=wallet, since_days=90)
+    correlator = CrossChainCorrelator()
+    round_trip_score = correlator.compute_round_trip_score(wallet, transfers)
+
     return {
         "has_evm_link": 1.0,
         "evm_round_trip_frequency": float(pattern.get("round_trip_frequency", 0.0)),
@@ -754,6 +762,7 @@ def build_cross_chain_features(
         "evm_counterparty_concentration": float(hhi),
         "bridge_volume_ratio": float(bridge_volume_ratio),
         "cross_chain_time_lag_median_h": 0.0,
+        "cross_chain_round_trip_score": round_trip_score,
     }
 
 
