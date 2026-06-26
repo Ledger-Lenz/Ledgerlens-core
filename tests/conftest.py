@@ -8,9 +8,14 @@ do not break tests that need the real SDK
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
+
+# MLflow ≥ 2.22 deprecated the filesystem tracking backend.
+# Allow it in the test environment without requiring a database migration.
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 TEST_SIGNING_KEY = "test-signing-key-for-unit-tests-only"
 
