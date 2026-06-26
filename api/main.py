@@ -1517,9 +1517,9 @@ def root_compliance_ivms(wallet: str) -> dict:
 
 @app.post("/compliance/sar-package", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
 def root_compliance_sar_package(body: SARPackageRequest) -> FileResponse:
+    import os
     from detection.compliance_exporter import generate_sar_package
     from fastapi.responses import FileResponse as _FileResponse
-    import tempfile, os
     pkg_path = generate_sar_package(
         wallet=body.wallet,
         start_date=body.start_date,
