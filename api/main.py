@@ -1064,14 +1064,18 @@ class SARPackageRequest(BaseModel):
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
 )
-def compliance_ivms(wallet: str) -> dict:
-    """Return the IVMS 101 risk-augmentation block for ``wallet``."""
+def compliance_ivms(wallet: str, dry_run: bool = Query(False)) -> dict:
+    """Return the IVMS 101 risk-augmentation block for ``wallet``.
+
+    Logged as a Travel-Rule export to the compliance audit trail unless
+    ``dry_run=true``.
+    """
     from dataclasses import asdict
 
-    from detection.compliance_exporter import build_ivms_risk_field
+    from detection.compliance_exporter import export_travel_rule
 
     validate_stellar_address(wallet)
-    return asdict(build_ivms_risk_field(wallet))
+    return asdict(export_travel_rule(wallet, dry_run=dry_run))
 
 
 @v1_router.post(
@@ -1079,20 +1083,37 @@ def compliance_ivms(wallet: str) -> dict:
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
 )
-def compliance_sar_package(body: SARPackageRequest) -> FileResponse:
-    """Generate a SAR evidence ZIP for a wallet and return it as a download."""
+def compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)) -> FileResponse:
+    """Generate a SAR evidence ZIP for a wallet and return it as a download.
+
+    Requires the wallet's current risk score to be at least
+    ``COMPLIANCE_SAR_MIN_SCORE`` (400 otherwise) and is rate-limited to
+    ``COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR`` exports/hour (429 otherwise).
+    Logged to the compliance audit trail unless ``dry_run=true``.
+    """
     import tempfile
 
-    from detection.compliance_exporter import generate_sar_package
+    from detection.compliance_exporter import (
+        ComplianceRateLimitExceeded,
+        ComplianceScoreTooLow,
+        export_sar_package,
+    )
 
     validate_stellar_address(body.wallet)
     output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
-    zip_path = generate_sar_package(
-        wallet=body.wallet,
-        start_date=body.start_date,
-        end_date=body.end_date,
-        output_dir=output_dir,
-    )
+    try:
+        zip_path = export_sar_package(
+            wallet=body.wallet,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            output_dir=output_dir,
+            dry_run=dry_run,
+        )
+    except ComplianceScoreTooLow as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ComplianceRateLimitExceeded:
+        raise HTTPException(status_code=429, detail="Compliance export rate limit exceeded")
+
     return FileResponse(
         zip_path,
         media_type="application/zip",

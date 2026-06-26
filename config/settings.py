@@ -185,6 +185,21 @@ class Settings(BaseSettings):
             raise ValueError("SOROBAN_CIRCUIT_BREAKER_THRESHOLD must be >= 1")
         return v
 
+    @field_validator("compliance_sar_min_score", mode="before")
+    @classmethod
+    def valid_sar_min_score(cls, v: object) -> object:
+        val = int(v)
+        if not (0 <= val <= 100):
+            raise ValueError(f"COMPLIANCE_SAR_MIN_SCORE {val} must be 0-100")
+        return v
+
+    @field_validator("compliance_export_rate_limit_per_hour", mode="before")
+    @classmethod
+    def valid_export_rate_limit(cls, v: object) -> object:
+        if int(v) < 1:
+            raise ValueError("COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR must be >= 1")
+        return v
+
     @field_validator("benford_mad_threshold", "temporal_weight",
                      "sandwich_score_weight", "benford_copula_weight",
                      "pdc_discount_weight", mode="before")
