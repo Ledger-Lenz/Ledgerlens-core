@@ -286,6 +286,25 @@ class HorizonStreamer:
         self._running = False
 
 
+def stream_with_features(cursor: str = "now") -> Iterator[tuple]:
+    """Yield ``(Trade, feature_vector)`` pairs from the live SDEX stream.
+
+    Combines :func:`stream_trades` with
+    :class:`~detection.streaming_features.StreamingFeatureEngine` so callers
+    get incrementally updated feature vectors without having to manage the
+    engine themselves.
+    """
+    if TYPE_CHECKING:
+        from detection.streaming_features import StreamingFeatureEngine
+    else:
+        from detection.streaming_features import StreamingFeatureEngine
+
+    engine = StreamingFeatureEngine()
+    for trade in stream_trades(cursor):
+        fv = engine.update(trade)
+        yield trade, fv
+
+
 if __name__ == "__main__":
     for trade in stream_trades():
         print(trade.model_dump())

@@ -702,7 +702,7 @@ def audit_verify(
     db_path: str = typer.Option(None, "--db-path", help="Path to audit log database"),
 ) -> None:
     """Verify the HMAC-SHA256 chain integrity of the audit log."""
-    from storage.audit_log import is_chain_intact, verify_chain
+    from storage.audit_log import verify_chain
 
     results = verify_chain(db_path=db_path or None)
     broken = [r for r in results if r["error"] is not None]

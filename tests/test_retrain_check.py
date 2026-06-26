@@ -1,6 +1,5 @@
 """Tests for continuous retraining with drift detection."""
 
-import dataclasses
 import json
 from unittest.mock import MagicMock, patch
 
