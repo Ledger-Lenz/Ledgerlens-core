@@ -89,7 +89,12 @@ def train(
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
     experiment_name: str = typer.Option(None, "--experiment-name", help="MLflow experiment name for tracking"),
 ) -> None:
-    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
+    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`.
+
+    Use --optimize to run 100-trial Bayesian hyperparameter optimization (Optuna TPE)
+    before final training. Override trial budget with --n-trials and wall-clock cap
+    with --timeout.
+    """
     import os
 
     from config.settings import settings
