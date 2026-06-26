@@ -136,6 +136,25 @@ def patch_config(body: RuntimeConfigPatch) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GET /admin/oracle/status
+# ---------------------------------------------------------------------------
+
+
+@router.get("/oracle/status", include_in_schema=False)
+def oracle_status() -> list[dict]:
+    """Return the status of the oracle nodes in the quorum."""
+    nodes = _get_oracle_nodes()
+    return [
+        {
+            "name": node.name,
+            "public_key": node.public_key_hex,
+            "last_seen": node.last_seen,
+        }
+        for node in nodes
+    ]
+
+
+# ---------------------------------------------------------------------------
 # POST /admin/retrain
 # ---------------------------------------------------------------------------
 

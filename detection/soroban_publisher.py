@@ -414,6 +414,91 @@ class SorobanPublisher:
         finally:
             server.close()
 
+    def submit_with_quorum(
+        self,
+        wallet: str,
+        asset_pair: str,
+        score: int,
+        timestamp: int,
+        quorum: QuorumSignature,
+    ) -> bool:
+        """Submit a multi-signature quorum for on-chain verification."""
+        try:
+            self._check_circuit()
+        except SorobanCircuitOpenError:
+            save_submission(wallet, asset_pair, score, "skipped", error_message="Circuit breaker open")
+            return False
+
+        server = SorobanServer(self._soroban_rpc_url)
+        try:
+            source_account = server.load_account(self._keypair.public_key)
+
+            # Convert signatures to Soroban Vector of pairs
+            sig_pairs = []
+            for pub, sig in quorum.signatures:
+                sig_pairs.append(
+                    scval.to_vec([
+                        scval.to_bytes(bytes.fromhex(pub)),
+                        scval.to_bytes(bytes.fromhex(sig)),
+                    ])
+                )
+
+            params = [
+                scval.to_address(wallet),
+                scval.to_symbol(asset_pair),
+                scval.to_uint32(max(0, min(100, score))),
+                scval.to_uint64(timestamp),
+                scval.to_vec(sig_pairs),
+            ]
+
+            tx = (
+                TransactionBuilder(
+                    source_account=source_account,
+                    network_passphrase=self._network_passphrase,
+                    base_fee=100,
+                )
+                .append_invoke_contract_function_op(
+                    contract_id=self._contract_id,
+                    function_name="submit_with_quorum",
+                    parameters=params,
+                )
+                .build()
+            )
+
+            sim_result = server.simulate_transaction(tx)
+            if sim_result.error:
+                logger.error("Simulation failed for submit_with_quorum: %s", sim_result.error)
+                return False
+
+            fee = int(int(sim_result.min_resource_fee) * 1.0)
+            tx.set_transaction_fee(fee)
+            tx.sign(self._keypair)
+
+            send_result = server.send_transaction(tx)
+            if send_result.status == "ERROR":
+                logger.error("Send failed for submit_with_quorum: %s", send_result.error)
+                return False
+
+            tx_hash = send_result.hash
+
+            for _ in range(30):
+                get_result = server.get_transaction(tx_hash)
+                if get_result.status == "SUCCESS":
+                    save_submission(wallet, asset_pair, score, "submitted", tx_hash=tx_hash)
+                    return True
+                if get_result.status == "FAILED":
+                    logger.error("Transaction failed: %s", get_result)
+                    return False
+                time.sleep(1)
+
+            logger.error("Transaction polling timeout")
+            return False
+        except Exception as e:
+            logger.error("Unexpected error in submit_with_quorum: %s", e)
+            return False
+        finally:
+            server.close()
+
     def submit_batch(self, scores: list[RiskScore], dry_run: bool = False) -> dict[str, str]:
         """Submit a list of scores.
 
