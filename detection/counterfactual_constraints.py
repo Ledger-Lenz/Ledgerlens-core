@@ -217,6 +217,9 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # neighbours; a wallet lowers it by trading with lower-risk counterparties.
     _decreasable("gnn_wash_ring_probability"),
     _decreasable("gnn_neighbor_avg_score"),
+    # cross_chain_round_trip_score: lowering this reduces cross-chain
+    # round-trip detection signal.
+    _decreasable("cross_chain_round_trip_score"),
 ]
 
 _missing = set(FEATURE_NAMES) - {c.feature_name for c in FEATURE_CONSTRAINTS}

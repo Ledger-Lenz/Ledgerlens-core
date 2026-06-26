@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import AdaptiveBenfordWindow, compute_benford_metrics
+from detection.benford_engine import (
+    AdaptiveBenfordWindow,
+    compute_benford_ks_kuiper,
+    compute_benford_metrics,
+    stratified_benford_analysis,
+)
 from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
@@ -46,6 +51,31 @@ BENFORD_FEATURE_NAMES = [
 # adaptively expanded or merged due to insufficient sample count.
 BENFORD_WINDOW_EXPANDED_FEATURE_NAMES = [
     f"benford_window_expanded_{window}" for window in ROLLING_WINDOWS
+]
+
+# Per-stratum Benford summary features (3 features x 5 windows = 15 new)
+BENFORD_STRATUM_FEATURE_NAMES = [
+    f"max_stratum_chi2_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"max_stratum_MAD_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"n_flagged_strata_{window}" for window in ROLLING_WINDOWS
+]
+
+# KS and Kuiper test features (4 per window x 5 windows = 20 new)
+BENFORD_KS_KUIPER_FEATURE_NAMES = [
+    f"ks_stat_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"ks_pval_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"kuiper_stat_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"kuiper_pval_{window}" for window in ROLLING_WINDOWS
+]
+
+# Majority-vote combined Benford flag (1 per window x 5 windows = 5 new)
+BENFORD_COMBINED_FLAG_FEATURE_NAMES = [
+    f"benford_combined_flag_{window}" for window in ROLLING_WINDOWS
 ]
 
 TRADE_PATTERN_FEATURE_NAMES = [
@@ -120,6 +150,7 @@ CROSS_CHAIN_FEATURE_NAMES = [
     "evm_counterparty_concentration",
     "bridge_volume_ratio",
     "cross_chain_time_lag_median_h",
+    "cross_chain_round_trip_score",
 ]
 
 CAUSAL_FEATURE_NAMES = [
@@ -145,6 +176,9 @@ FEATURE_NAMES = (
     + CAUSAL_FEATURE_NAMES
     + MULTIVARIATE_BENFORD_FEATURE_NAMES
     + BENFORD_WINDOW_EXPANDED_FEATURE_NAMES
+    + BENFORD_STRATUM_FEATURE_NAMES
+    + BENFORD_KS_KUIPER_FEATURE_NAMES
+    + BENFORD_COMBINED_FLAG_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -199,6 +233,9 @@ def benford_features(
 ) -> dict:
     """Chi-square, MAD, and max Z-score for `base_amount` across each rolling window.
 
+    Also computes per-stratum Benford summary features (max chi-square, max MAD,
+    and flagged strata count) for each window via ``stratified_benford_analysis``.
+
     When ``adaptive_window`` is provided the window is expanded (or merged) as
     needed to reach the configured minimum sample count, and a boolean
     ``benford_window_expanded_{label}`` flag is set for each window that was
@@ -210,6 +247,7 @@ def benford_features(
             result = adaptive_window.fit(trades, label, as_of, ROLLING_WINDOWS)
             amounts = result.trades
             features[f"benford_window_expanded_{label}"] = float(result.expanded or result.merged)
+            subset = _window_slice(trades, as_of, window)
         else:
             subset = _window_slice(trades, as_of, window)
             amounts = subset["base_amount"].tolist()
@@ -218,7 +256,32 @@ def benford_features(
         features[f"benford_chi_square_{label}"] = metrics["chi_square"]
         features[f"benford_mad_{label}"] = metrics["mad"]
         features[f"benford_max_zscore_{label}"] = max(metrics["z_scores"].values(), default=0.0)
+
+        summary = stratified_benford_analysis(subset)
+        features[f"max_stratum_chi2_{label}"] = summary.max_stratum_chi2
+        features[f"max_stratum_MAD_{label}"] = summary.max_stratum_MAD
+        features[f"n_flagged_strata_{label}"] = float(summary.n_flagged_strata)
+
+        ks_kuiper = compute_benford_ks_kuiper(amounts)
+        features[f"ks_stat_{label}"] = ks_kuiper["ks_stat"] if not _is_nan(ks_kuiper["ks_stat"]) else 0.0
+        features[f"ks_pval_{label}"] = ks_kuiper["ks_pval"] if not _is_nan(ks_kuiper["ks_pval"]) else 1.0
+        features[f"kuiper_stat_{label}"] = ks_kuiper["kuiper_stat"] if not _is_nan(ks_kuiper["kuiper_stat"]) else 0.0
+        features[f"kuiper_pval_{label}"] = ks_kuiper["kuiper_pval"] if not _is_nan(ks_kuiper["kuiper_pval"]) else 1.0
+
+        chi2_flag = metrics["chi_square"] > 15.507
+        ks_flag = ks_kuiper.get("ks_flag", False)
+        kuiper_flag = ks_kuiper.get("kuiper_flag", False)
+        n_flags = sum([chi2_flag, ks_flag, kuiper_flag])
+        features[f"benford_combined_flag_{label}"] = 1.0 if n_flags >= 2 else 0.0
     return features
+
+
+def _is_nan(value: float) -> bool:
+    import math
+    try:
+        return math.isnan(value)
+    except (TypeError, ValueError):
+        return False
 
 
 def counterparty_concentration_ratio(trades: pd.DataFrame, account: str) -> float:
@@ -696,6 +759,13 @@ def build_cross_chain_features(
     else:
         hhi = 0.0
 
+    # Compute cross-chain round-trip score from bridge transfers
+    from detection.cross_chain_correlator import CrossChainCorrelator
+    from detection.storage import get_bridge_transfers
+    transfers = get_bridge_transfers(stellar_wallet=wallet, since_days=90)
+    correlator = CrossChainCorrelator()
+    round_trip_score = correlator.compute_round_trip_score(wallet, transfers)
+
     return {
         "has_evm_link": 1.0,
         "evm_round_trip_frequency": float(pattern.get("round_trip_frequency", 0.0)),
@@ -703,6 +773,7 @@ def build_cross_chain_features(
         "evm_counterparty_concentration": float(hhi),
         "bridge_volume_ratio": float(bridge_volume_ratio),
         "cross_chain_time_lag_median_h": 0.0,
+        "cross_chain_round_trip_score": round_trip_score,
     }
 
 

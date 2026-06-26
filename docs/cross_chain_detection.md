@@ -98,7 +98,7 @@ Links Stellar wallets to their EVM counterparts and computes EVM-side trading st
   - `unique_counterparties` — distinct counterparty addresses seen
   - `benford_mad` — Benford MAD on the trade amounts
 
-## Six Cross-Chain Features
+## Seven Cross-Chain Features
 
 These features are appended to the end of `FEATURE_NAMES` (backward-compatible; existing model scores are unchanged until a retrain includes EVM data).
 
@@ -110,6 +110,7 @@ These features are appended to the end of `FEATURE_NAMES` (backward-compatible; 
 | `evm_counterparty_concentration` | HHI of counterparty addresses in EVM trades (0=diverse, 1=monopoly) | High = trading with very few counterparties |
 | `bridge_volume_ratio` | EVM bridge volume / (Stellar SDEX volume + EVM bridge volume) | High = activity concentrated on bridge |
 | `cross_chain_time_lag_median_h` | Median hours between paired EVM and Stellar trades | Very low = near-instant round-trips |
+| `cross_chain_round_trip_score` | Correlation score (0–1) for Stellar→EVM→Stellar round-trip bridge patterns based on amount similarity (within 5%), timing proximity (within 24h), and intermediate hops | High = strong evidence of multi-network wash cycles |
 
 ## API Changes
 

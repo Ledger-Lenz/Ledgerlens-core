@@ -328,35 +328,111 @@ def list_scores(
 
 
 
-@v1_router.get("/scores/{wallet}/explain")
+class ShapExplanationResponse(BaseModel):
+    """Response schema for GET /scores/{wallet}/explain (waterfall-style)."""
+
+    wallet: str
+    model_version: str
+    model_name: str
+    base_value: float
+    contributions: list[dict]
+    summary_sentence: str
+
+
+@v1_router.get(
+    "/scores/{wallet}/explain",
+    response_model=ShapExplanationResponse,
+)
 def explain_wallet_score(
     wallet: str,
     asset_pair: str = Query(..., description="Asset pair to explain, e.g. XLM/USDC"),
-) -> list[dict]:
-    """Return the top-5 SHAP feature contributions for ``wallet`` on ``asset_pair``.
+    model: str = Query(
+        default="random_forest",
+        description="Model to use for SHAP explanation (random_forest, xgboost, or lightgbm)",
+    ),
+) -> ShapExplanationResponse:
+    """Return a waterfall-style SHAP explanation for ``wallet`` on ``asset_pair``.
 
-    The wallet parameter must be a valid Stellar account ID (56 characters, starting
-    with 'G', containing only base32 characters A-Z and 2-7).
+    Produces ranked per-feature SHAP contributions, the SHAP base value
+    (expected model output), and a human-readable summary sentence.
 
-    Response schema: list of ``{"feature": str, "shap_value": float}`` ordered
-    by absolute SHAP contribution descending.
+    Requires ``X-LedgerLens-Admin-Key`` header for authentication.
 
-    - **200** — cache hit: returns up to 5 feature contributions.
-    - **404** — no SHAP cache found for the given wallet / asset pair combination.
-    - **503** — models were not loaded at startup (run the training pipeline first).
+    - **200** — waterfall explanation returned.
+    - **404** — no feature vector or scores found for the given wallet.
+    - **422** — unknown ``model`` name.
+    - **503** — models were not loaded at startup.
     """
+    from detection.shap_explainer import ShapExplainer, VALID_MODEL_NAMES
+
     if not _models:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    with start_span("redis.shap_lookup", attributes={"wallet": wallet, "asset_pair": asset_pair}):
-        cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
-    if cached is None:
+
+    if model not in VALID_MODEL_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown model '{model}'. Valid models: {sorted(VALID_MODEL_NAMES)}",
+        )
+
+    # Fetch the stored feature vector for the wallet / asset pair
+    feature_vector = get_feature_vector(wallet, asset_pair)
+    if feature_vector is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
+            detail=f"No scores found for wallet {wallet}",
         )
-    return cached
+
+    # Validate feature vector: reject NaN/inf values
+    import math
+    for name, val in feature_vector.items():
+        if isinstance(val, (int, float)) and not math.isfinite(val):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Feature '{name}' has non-finite value; cannot compute SHAP explanation.",
+            )
+
+    # Get model version for cache keying
+    from detection.model_registry import get_current_version
+    model_version = get_current_version(model, settings.model_dir) or "unknown"
+
+    model_obj = _models.get(model)
+    if model_obj is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model '{model}' is not currently loaded.",
+        )
+
+    # Model name for summary sentence
+    model_display_names = {
+        "random_forest": "Random Forest",
+        "xgboost": "XGBoost",
+        "lightgbm": "LightGBM",
+    }
+    model_display = model_display_names.get(model, model)
+
+    explainer = ShapExplainer()
+    with start_span("model.shap_explain", attributes={"wallet": wallet, "model": model}):
+        explanation = explainer.explain(
+            model_obj,
+            feature_vector,
+            wallet=wallet,
+            model_version=model_version,
+            model_name=model_display,
+        )
+
+    return ShapExplanationResponse(
+        wallet=explanation.wallet,
+        model_version=explanation.model_version,
+        model_name=explanation.model_name,
+        base_value=explanation.base_value,
+        contributions=[
+            {"feature": c.feature, "shap_value": c.shap_value, "rank": c.rank}
+            for c in explanation.contributions
+        ],
+        summary_sentence=explanation.summary_sentence,
+    )
 
 
 class RateLimiterStatus(BaseModel):
@@ -888,7 +964,7 @@ def create_dispute(body: DisputeCreate):
         if "Rate limit" in str(exc):
             raise HTTPException(status_code=429, detail=str(exc))
         raise HTTPException(status_code=422, detail=str(exc))
-    return dispute.dict()
+    return dispute.model_dump()
 
 
 @v1_router.get("/disputes/{dispute_id}")
@@ -925,7 +1001,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
         d = cast_vote(dispute_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return d.dict()
+    return d.model_dump()
 
 
 # ------------------------------------------------------------------
@@ -935,7 +1011,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 
 @v1_router.get("/governance/proposals")
 def get_proposals():
-    return [p.dict() for p in list_open_proposals()]
+    return [p.model_dump() for p in list_open_proposals()]
 
 
 class LegacyProposalCreate(BaseModel):
@@ -950,7 +1026,7 @@ def create_proposal_endpoint(body: ProposalCreate):
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 class LegacyProposalVote(BaseModel):
@@ -964,7 +1040,7 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 # ------------------------------------------------------------------

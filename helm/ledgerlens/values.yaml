@@ -110,8 +110,9 @@ config:
   # Rate limiting
   HORIZON_RATE_LIMIT: "50"
   HORIZON_RATE_BUCKET_CAPACITY: "100"
-  HORIZON_QUEUE_HIGH_WATERMARK: "1000"
-  HORIZON_QUEUE_LOW_WATERMARK: "500"
+  STREAMER_QUEUE_MAXSIZE: "1000"
+  STREAMER_OVERFLOW_STRATEGY: "drop_oldest"
+  STREAMER_HIGH_WATER_RATIO: "0.8"
   RATE_RESTORE_SECONDS: "60"
 
 # ── Secrets (set via --set or --values) ───────────────────────────────────────
