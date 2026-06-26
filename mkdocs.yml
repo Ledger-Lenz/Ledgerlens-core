@@ -62,6 +62,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Architecture:
+    - Ingestion: ingestion.md
     - Feature Store: feature_store.md
     - Cross-Chain Detection: cross_chain_detection.md
     - Federated Learning: federated_learning.md

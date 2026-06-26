@@ -3,19 +3,27 @@
 import glob
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from api.auth import require_admin_key
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
+from detection.storage import get_krum_aggregation_log
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
 _MODEL_NAMES = ["random_forest", "xgboost", "lightgbm"]
+
+# Rate limiter instance for the reset endpoint
+_limiter = Limiter(key_func=get_remote_address)
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +105,12 @@ def get_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
-class ConfigPatch(BaseModel):
+class RuntimeConfigPatch(BaseModel):
     updates: dict[str, str]
 
 
 @router.patch("/config", include_in_schema=False)
-def patch_config(body: ConfigPatch) -> dict:
+def patch_config(body: RuntimeConfigPatch) -> dict:
     """Persist config key/value updates to SQLite and invalidate the in-process cache."""
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(settings.db_path) as conn:
@@ -125,6 +133,25 @@ def patch_config(body: ConfigPatch) -> dict:
     _runtime_cache["config"] = {}
 
     return {"updated": list(body.updates.keys())}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/oracle/status
+# ---------------------------------------------------------------------------
+
+
+@router.get("/oracle/status", include_in_schema=False)
+def oracle_status() -> list[dict]:
+    """Return the status of the oracle nodes in the quorum."""
+    nodes = _get_oracle_nodes()
+    return [
+        {
+            "name": node.name,
+            "public_key": node.public_key_hex,
+            "last_seen": node.last_seen,
+        }
+        for node in nodes
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +199,30 @@ def _run_retrain(job_id: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# GET /admin/shadow/report
+# ---------------------------------------------------------------------------
+
+
+@router.get("/shadow/report", include_in_schema=False)
+def shadow_report() -> dict:
+    """Return shadow model scoring report: mean divergence, p95, high-divergence wallets."""
+    from detection.shadow_scoring import get_shadow_model_version, get_shadow_report
+
+    version = get_shadow_model_version()
+    if not version:
+        raise HTTPException(status_code=404, detail="Shadow mode not active (SHADOW_MODEL_VERSION not set)")
+
+    report = get_shadow_report(settings.db_path)
+    report["shadow_model_version"] = version
+    return report
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/retrain
+# ---------------------------------------------------------------------------
+
+
 @router.post("/retrain", include_in_schema=False)
 def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     """Enqueue an async retraining job and return its job ID."""
@@ -181,73 +232,48 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# GET /admin/red-team/latest  (Issue-133)
+# FL Privacy endpoint  (Issue #145)
 # ---------------------------------------------------------------------------
 
-
-@router.get("/red-team/latest", include_in_schema=False)
-def get_latest_red_team_report(report_dir: str = "./red_team_reports") -> dict:
-    """Return the most recent red-team campaign summary JSON."""
-    import json as _json
-    report_files = sorted(glob.glob(os.path.join(report_dir, "*.json")))
-    if not report_files:
-        raise HTTPException(status_code=404, detail="No red-team campaign reports found")
-    with open(report_files[-1], "r", encoding="utf-8") as fh:
-        return _json.load(fh)
+import logging as _logging
+_logger = _logging.getLogger("ledgerlens.admin")
 
 
-# ---------------------------------------------------------------------------
-# GET /admin/drift-reports/latest  (Issue-135)
-# ---------------------------------------------------------------------------
+class FLPrivacyStatus(BaseModel):
+    current_epsilon: float
+    target_epsilon: float
+    delta: float
+    noise_multiplier: float
+    clip_norm: float
+    budget_exhausted: bool
+    rounds_completed: int
 
 
-@router.get("/drift-reports/latest", include_in_schema=False)
-def get_latest_drift_report() -> dict:
-    """Return the most recent per-feature PSI drift report."""
-    from detection.drift_monitor import DriftMonitor
-    monitor = DriftMonitor(db_path=settings.db_path)
-    return monitor.get_latest_report()
+@router.get("/fl/privacy", response_model=FLPrivacyStatus, include_in_schema=False)
+def fl_privacy_status() -> FLPrivacyStatus:
+    """Return current FL differential privacy budget status (admin-key gated)."""
+    db_path = settings.db_path
+    try:
+        from detection.federated.privacy_utils import get_privacy_log
+        rows = get_privacy_log(db_path)
+    except Exception:
+        rows = []
 
-
-# ---------------------------------------------------------------------------
-# GET /admin/ensemble-weights  (Issue-136)
-# GET /admin/label-feedback
-# POST /admin/label-feedback
-# ---------------------------------------------------------------------------
-
-
-class LabelFeedbackRequest(BaseModel):
-    wallet: str
-    asset_pair: str
-    true_label: int
-    model_scores: dict[str, float]
-    ensemble_score: int
-    analyst_id: str
-
-
-@router.get("/ensemble-weights", include_in_schema=False)
-def get_ensemble_weights() -> dict:
-    """Return current adaptive ensemble weights."""
-    from detection.adaptive_reweighter import AdaptiveReweighter
-    reweighter = AdaptiveReweighter(db_path=settings.db_path)
-    return {"weights": reweighter.current_weights(), "updated_at": datetime.now(timezone.utc).isoformat()}
-
-
-@router.post("/label-feedback", include_in_schema=False)
-def submit_label_feedback(body: LabelFeedbackRequest) -> dict:
-    """Submit analyst-confirmed label feedback and update ensemble weights."""
-    from detection.adaptive_reweighter import AdaptiveReweighter, LabelFeedback
-    if body.true_label not in (0, 1):
-        raise HTTPException(status_code=422, detail="true_label must be 0 or 1")
-    feedback = LabelFeedback(
-        wallet=body.wallet,
-        asset_pair=body.asset_pair,
-        true_label=body.true_label,
-        model_scores=body.model_scores,
-        ensemble_score=body.ensemble_score,
-        analyst_id=body.analyst_id,
+    target_epsilon = float(os.environ.get("FL_DP_TARGET_EPSILON", "1.0"))
+    delta = float(os.environ.get("FL_DP_DELTA", "1e-5"))
+    noise_multiplier = float(os.environ.get("FL_DP_NOISE_MULTIPLIER", "0.0")) or float(
+        getattr(settings, "federated_noise_multiplier", 0.0)
     )
-    reweighter = AdaptiveReweighter(db_path=settings.db_path)
-    reweighter.record_feedback(feedback)
-    reweighter.update_weights()
-    return {"status": "accepted", "weights": reweighter.current_weights()}
+    clip_norm = float(os.environ.get("FL_DP_CLIP_NORM", "1.0"))
+    current_epsilon = rows[-1]["epsilon"] if rows else 0.0
+    budget_exhausted = current_epsilon >= target_epsilon
+
+    return FLPrivacyStatus(
+        current_epsilon=current_epsilon,
+        target_epsilon=target_epsilon,
+        delta=delta,
+        noise_multiplier=noise_multiplier,
+        clip_norm=clip_norm,
+        budget_exhausted=budget_exhausted,
+        rounds_completed=len(rows),
+    )

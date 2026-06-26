@@ -6,7 +6,6 @@ automatic fallback to in-process dict when Redis is unavailable.
 """
 
 import hashlib
-import json
 import logging
 from collections import deque
 from datetime import datetime, timezone
@@ -50,37 +49,6 @@ class WalletFeatureState(BaseModel):
 
     # Hashed counterparty wallet IDs (32-bit integers)
     counterparty_hashes_30d: list[int] = []
-
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat(),
-        }
-
-    def model_dump_json_compat(self) -> str:
-        """Serialize to JSON for Redis storage."""
-        return json.dumps(
-            {
-                "wallet": self.wallet,
-                "asset_pair": self.asset_pair,
-                "last_updated": self.last_updated.isoformat(),
-                "trade_count": self.trade_count,
-                "trade_ring_1h": self.trade_ring_1h,
-                "trade_ring_4h": self.trade_ring_4h,
-                "trade_ring_24h": self.trade_ring_24h,
-                "trade_ring_7d": self.trade_ring_7d,
-                "trade_ring_30d": self.trade_ring_30d,
-                "benford_digit_counts_30d": self.benford_digit_counts_30d,
-                "counterparty_hashes_30d": self.counterparty_hashes_30d,
-            }
-        )
-
-    @classmethod
-    def model_validate_json_compat(cls, data: str) -> "WalletFeatureState":
-        """Deserialize from JSON loaded from Redis."""
-        d = json.loads(data)
-        d["last_updated"] = datetime.fromisoformat(d["last_updated"])
-        return cls(**d)
-
 
 # Ring buffer size caps (max entries per ring)
 RING_BUFFER_CAPS = {
@@ -388,7 +356,7 @@ class FeatureStore:
                 data = self.redis_client.get(key)
                 self._circuit.record_success()
                 if data:
-                    return WalletFeatureState.model_validate_json_compat(data.decode())
+                    return WalletFeatureState.model_validate_json(data)
             except Exception as e:
                 self._circuit.record_failure()
                 logger.warning("FeatureStore.get_state: Redis error (%s), falling back", e)
@@ -404,7 +372,7 @@ class FeatureStore:
             try:
                 ttl_hours = getattr(settings, "feature_store_ttl_hours", 48)
                 ttl_seconds = ttl_hours * 3600
-                serialized = state.model_dump_json_compat()
+                serialized = state.model_dump_json()
                 self.redis_client.setex(key, ttl_seconds, serialized)
                 self._circuit.record_success()
                 return

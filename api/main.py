@@ -38,6 +38,7 @@ from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
+from api.cross_chain_router import router as cross_chain_router
 from api.namespace import list_namespaces
 from config.settings import settings
 from detection.tracing import (
@@ -66,6 +67,7 @@ from detection.storage import (
     get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
+from detection.feedback_store import AnalystFeedbackStore
 from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
@@ -128,11 +130,19 @@ def validate_stellar_address(wallet: str) -> None:
 
 _models: dict = {}
 
+# ---------------------------------------------------------------------------
+# Graceful shutdown state
+# ---------------------------------------------------------------------------
+_shutting_down: bool = False
+SHUTDOWN_TIMEOUT = int(os.environ.get("SHUTDOWN_TIMEOUT", "30"))
+_inflight_requests: int = 0
+_inflight_lock = __import__("threading").Lock()
+
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    """Load trained models at startup; close WebSocket connections at shutdown."""
-    global _models
+    """Load trained models at startup; drain requests and clean up on shutdown."""
+    global _models, _shutting_down
     configure_tracing()
     try:
         from detection.model_inference import load_models
@@ -142,8 +152,53 @@ async def _lifespan(application: FastAPI):
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
     yield
+
+    # ── Shutdown sequence ────────────────────────────────────────────────
+    import asyncio
+
+    _shutting_down = True
+    logger.info("[shutdown] Stopping new requests (returning 503)")
+
+    # Wait for in-flight requests to drain
+    deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+    while time.monotonic() < deadline:
+        with _inflight_lock:
+            count = _inflight_requests
+        if count == 0:
+            logger.info("[shutdown] All in-flight requests drained")
+            break
+        await asyncio.sleep(0.25)
+    else:
+        with _inflight_lock:
+            count = _inflight_requests
+        if count > 0:
+            logger.warning("[shutdown] Timed out with %d in-flight requests", count)
+
+    # Close WebSocket connections
     from api.ws_router import manager as _ws_manager
     await _ws_manager.close_all()
+    logger.info("[shutdown] WebSocket connections closed")
+
+    # SQLite WAL checkpoint
+    try:
+        from detection.storage import _connect
+        with _connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.info("[shutdown] SQLite WAL checkpoint complete")
+    except Exception as exc:
+        logger.warning("[shutdown] SQLite WAL checkpoint failed: %s", exc)
+
+    # Flush Redis connection if available
+    try:
+        from detection.feature_store import FeatureStore
+        fs = FeatureStore.__dict__.get("_instance")
+        if fs and hasattr(fs, "_redis") and fs._redis:
+            fs._redis.close()
+            logger.info("[shutdown] Redis connection closed")
+    except Exception as exc:
+        logger.warning("[shutdown] Redis cleanup failed: %s", exc)
+
+    logger.info("[shutdown] Shutdown sequence complete")
 
 
 app = FastAPI(
@@ -152,6 +207,26 @@ app = FastAPI(
     version="1.0.0",
     lifespan=_lifespan,
 )
+
+
+@app.middleware("http")
+async def _shutdown_guard_middleware(request: Request, call_next):
+    """Reject new requests during shutdown; track in-flight count."""
+    global _inflight_requests
+    if _shutting_down and not request.url.path.startswith("/health"):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server is shutting down."},
+            headers={"Retry-After": "5"},
+        )
+    with _inflight_lock:
+        _inflight_requests += 1
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        with _inflight_lock:
+            _inflight_requests -= 1
 
 
 @app.exception_handler(sqlite3.OperationalError)
@@ -185,6 +260,9 @@ app.include_router(batch_router)
 
 
 app.include_router(export_router)
+
+
+app.include_router(cross_chain_router)
 
 
 class WebhookCreate(BaseModel):
@@ -289,6 +367,129 @@ def _model_file_ok(path: str) -> bool:
         return False
 
 
+@app.get("/health/ready")
+def health_ready() -> JSONResponse:
+    """Kubernetes readiness probe. Returns 503 during shutdown."""
+    if _shutting_down:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "shutting_down"},
+        )
+    return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+# ---------------------------------------------------------------------------
+# Analyst feedback endpoints
+# ---------------------------------------------------------------------------
+
+class FeedbackSubmission(BaseModel):
+    wallet: str
+    asset_pair: str
+    analyst_label: int
+    confidence: float = 1.0
+
+
+class FeedbackRecordOut(BaseModel):
+    id: int
+    wallet: str
+    asset_pair: str
+    analyst_label: int
+    original_score: int
+    confidence: float
+    importance_weight: float
+    has_feature_vector: bool
+    created_at: str
+
+
+class PaginatedFeedback(BaseModel):
+    records: list[FeedbackRecordOut]
+    total: int
+    page: int
+    page_size: int
+
+
+_feedback_rate_buckets: dict[str, list[float]] = defaultdict(list)
+_FEEDBACK_RATE_LIMIT = 100
+_FEEDBACK_RATE_WINDOW = 3600.0
+
+
+def _check_feedback_rate_limit(client_ip: str) -> None:
+    now = time.monotonic()
+    bucket = _feedback_rate_buckets[client_ip]
+    _feedback_rate_buckets[client_ip] = [t for t in bucket if now - t < _FEEDBACK_RATE_WINDOW]
+    if len(_feedback_rate_buckets[client_ip]) >= _FEEDBACK_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded: 100 corrections per hour.")
+    _feedback_rate_buckets[client_ip].append(now)
+
+
+@v1_router.post("/feedback", status_code=201, response_model=FeedbackRecordOut,
+                dependencies=[Depends(require_admin_key)])
+def submit_analyst_feedback(payload: FeedbackSubmission, request: Request):
+    """Submit an analyst label correction. Admin-key required."""
+    _check_feedback_rate_limit(request.client.host if request.client else "unknown")
+
+    if not _STELLAR_ADDRESS_PATTERN.match(payload.wallet):
+        raise HTTPException(status_code=422, detail="Invalid Stellar wallet address format.")
+    if payload.analyst_label not in (0, 1):
+        raise HTTPException(status_code=422, detail="analyst_label must be 0 or 1.")
+    if not (0.0 <= payload.confidence <= 1.0):
+        raise HTTPException(status_code=422, detail="confidence must be in [0.0, 1.0].")
+
+    store = AnalystFeedbackStore(db_path=settings.db_path)
+
+    scores = get_latest_scores(wallet=payload.wallet, limit=1)
+    original_score = scores[0].score if scores else 0
+
+    record = store.add_correction(
+        wallet=payload.wallet,
+        asset_pair=payload.asset_pair,
+        analyst_label=payload.analyst_label,
+        original_score=original_score,
+        confidence=payload.confidence,
+    )
+    return FeedbackRecordOut(
+        id=record.id,
+        wallet=record.wallet,
+        asset_pair=record.asset_pair,
+        analyst_label=record.analyst_label,
+        original_score=record.original_score,
+        confidence=record.confidence,
+        importance_weight=record.importance_weight,
+        has_feature_vector=record.has_feature_vector,
+        created_at=record.created_at.isoformat(),
+    )
+
+
+@v1_router.get("/feedback", response_model=PaginatedFeedback,
+               dependencies=[Depends(require_admin_key)])
+def list_analyst_feedback(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    """Paginated correction history (most recent first). Admin-key required."""
+    store = AnalystFeedbackStore(db_path=settings.db_path)
+    records, total = store.get_corrections_paginated(page=page, page_size=page_size)
+    return PaginatedFeedback(
+        records=[
+            FeedbackRecordOut(
+                id=r.id,
+                wallet=r.wallet,
+                asset_pair=r.asset_pair,
+                analyst_label=r.analyst_label,
+                original_score=r.original_score,
+                confidence=r.confidence,
+                importance_weight=r.importance_weight,
+                has_feature_vector=r.has_feature_vector,
+                created_at=r.created_at.isoformat(),
+            )
+            for r in records
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
 @v1_router.get("/scores", response_model=list[RiskScore])
 def list_scores(
     min_score: int = 0,
@@ -328,35 +529,111 @@ def list_scores(
 
 
 
-@v1_router.get("/scores/{wallet}/explain")
+class ShapExplanationResponse(BaseModel):
+    """Response schema for GET /scores/{wallet}/explain (waterfall-style)."""
+
+    wallet: str
+    model_version: str
+    model_name: str
+    base_value: float
+    contributions: list[dict]
+    summary_sentence: str
+
+
+@v1_router.get(
+    "/scores/{wallet}/explain",
+    response_model=ShapExplanationResponse,
+)
 def explain_wallet_score(
     wallet: str,
     asset_pair: str = Query(..., description="Asset pair to explain, e.g. XLM/USDC"),
-) -> list[dict]:
-    """Return the top-5 SHAP feature contributions for ``wallet`` on ``asset_pair``.
+    model: str = Query(
+        default="random_forest",
+        description="Model to use for SHAP explanation (random_forest, xgboost, or lightgbm)",
+    ),
+) -> ShapExplanationResponse:
+    """Return a waterfall-style SHAP explanation for ``wallet`` on ``asset_pair``.
 
-    The wallet parameter must be a valid Stellar account ID (56 characters, starting
-    with 'G', containing only base32 characters A-Z and 2-7).
+    Produces ranked per-feature SHAP contributions, the SHAP base value
+    (expected model output), and a human-readable summary sentence.
 
-    Response schema: list of ``{"feature": str, "shap_value": float}`` ordered
-    by absolute SHAP contribution descending.
+    Requires ``X-LedgerLens-Admin-Key`` header for authentication.
 
-    - **200** — cache hit: returns up to 5 feature contributions.
-    - **404** — no SHAP cache found for the given wallet / asset pair combination.
-    - **503** — models were not loaded at startup (run the training pipeline first).
+    - **200** — waterfall explanation returned.
+    - **404** — no feature vector or scores found for the given wallet.
+    - **422** — unknown ``model`` name.
+    - **503** — models were not loaded at startup.
     """
+    from detection.shap_explainer import ShapExplainer, VALID_MODEL_NAMES
+
     if not _models:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    with start_span("redis.shap_lookup", attributes={"wallet": wallet, "asset_pair": asset_pair}):
-        cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
-    if cached is None:
+
+    if model not in VALID_MODEL_NAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown model '{model}'. Valid models: {sorted(VALID_MODEL_NAMES)}",
+        )
+
+    # Fetch the stored feature vector for the wallet / asset pair
+    feature_vector = get_feature_vector(wallet, asset_pair)
+    if feature_vector is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
+            detail=f"No scores found for wallet {wallet}",
         )
-    return cached
+
+    # Validate feature vector: reject NaN/inf values
+    import math
+    for name, val in feature_vector.items():
+        if isinstance(val, (int, float)) and not math.isfinite(val):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Feature '{name}' has non-finite value; cannot compute SHAP explanation.",
+            )
+
+    # Get model version for cache keying
+    from detection.model_registry import get_current_version
+    model_version = get_current_version(model, settings.model_dir) or "unknown"
+
+    model_obj = _models.get(model)
+    if model_obj is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model '{model}' is not currently loaded.",
+        )
+
+    # Model name for summary sentence
+    model_display_names = {
+        "random_forest": "Random Forest",
+        "xgboost": "XGBoost",
+        "lightgbm": "LightGBM",
+    }
+    model_display = model_display_names.get(model, model)
+
+    explainer = ShapExplainer()
+    with start_span("model.shap_explain", attributes={"wallet": wallet, "model": model}):
+        explanation = explainer.explain(
+            model_obj,
+            feature_vector,
+            wallet=wallet,
+            model_version=model_version,
+            model_name=model_display,
+        )
+
+    return ShapExplanationResponse(
+        wallet=explanation.wallet,
+        model_version=explanation.model_version,
+        model_name=explanation.model_name,
+        base_value=explanation.base_value,
+        contributions=[
+            {"feature": c.feature, "shap_value": c.shap_value, "rank": c.rank}
+            for c in explanation.contributions
+        ],
+        summary_sentence=explanation.summary_sentence,
+    )
 
 
 class RateLimiterStatus(BaseModel):
@@ -576,6 +853,33 @@ def list_correlations() -> list[dict]:
     run timestamp.
     """
     return get_pair_correlations()
+
+
+@v1_router.get("/amm-anomalies")
+def list_amm_anomalies(
+    min_score: float = Query(0.5, ge=0.0, le=1.0),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
+    """Return AMM wash-trade anomalies ordered by anomaly_score DESC."""
+    from detection.amm_engine import AMMEngine
+
+    engine = AMMEngine()
+    anomalies = engine.get_anomalies(min_score=min_score, limit=limit, offset=offset)
+    return [
+        {
+            "wallet": a.wallet,
+            "pool_id": a.pool_id,
+            "session_start": a.session_start.isoformat() if a.session_start else None,
+            "tenure_seconds": a.tenure_seconds,
+            "volume_to_liquidity_ratio": a.volume_to_liquidity_ratio,
+            "deposit_withdraw_symmetry": a.deposit_withdraw_symmetry,
+            "counterparty_concentration": a.counterparty_concentration,
+            "anomaly_score": a.anomaly_score,
+            "detected_at": a.detected_at.isoformat() if a.detected_at else None,
+        }
+        for a in anomalies
+    ]
 
 
 @v1_router.get("/amm/pools/{pool_id}/risk")
@@ -847,6 +1151,68 @@ def dead_letters() -> list[dict]:
     ]
 
 
+@app.get("/sandwiches")
+def get_sandwiches(
+    asset_pair: str | None = Query(None, description="Filter by asset pair"),
+    min_confidence: float = Query(0.7, ge=0.0, le=1.0, description="Minimum sandwich confidence"),
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict]:
+    """Return detected sandwich attack events from the stored risk scores.
+
+    Results are ordered newest-first and filtered by `min_confidence`.
+    """
+    from detection.storage import _connect, init_db
+    init_db()
+    with _connect() as conn:
+        query = """
+            SELECT wallet, asset_pair, score, scored_at, metadata
+            FROM risk_scores
+            WHERE metadata LIKE '%sandwich%'
+        """
+        params: list = []
+        if asset_pair:
+            query += " AND asset_pair = ?"
+            params.append(asset_pair)
+        query += " ORDER BY scored_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+
+    results = []
+    for wallet, pair, score, scored_at, metadata_json in rows:
+        try:
+            meta = json.loads(metadata_json) if metadata_json else {}
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        conf = meta.get("sandwich_confidence", 0.0)
+        if conf >= min_confidence:
+            results.append(
+                {
+                    "attacker_wallet": wallet,
+                    "asset_pair": pair,
+                    "risk_score": score,
+                    "scored_at": scored_at,
+                    "sandwich_confidence": conf,
+                    "victim_wallet": meta.get("victim_wallet"),
+                    "victim_amount": meta.get("victim_amount"),
+                    "price_impact": meta.get("price_impact"),
+                    "front_run_time": meta.get("front_run_time"),
+                    "back_run_time": meta.get("back_run_time"),
+                }
+            )
+    return results
+
+
+@app.get("/admin/gnn-stats", dependencies=[Depends(require_admin_key)])
+def gnn_stats() -> dict:
+    """Return GNN model architecture summary and last inference time."""
+    try:
+        from detection.gnn_model import GNNInferenceEngine
+        engine = GNNInferenceEngine.get_instance()
+        return engine.stats()
+    except ImportError:
+        return {"status": "unavailable", "reason": "torch_geometric not installed"}
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
 # ------------------------------------------------------------------
 # Disputes
 # ------------------------------------------------------------------
@@ -861,7 +1227,7 @@ def create_dispute(body: DisputeCreate):
         if "Rate limit" in str(exc):
             raise HTTPException(status_code=429, detail=str(exc))
         raise HTTPException(status_code=422, detail=str(exc))
-    return dispute.dict()
+    return dispute.model_dump()
 
 
 @v1_router.get("/disputes/{dispute_id}")
@@ -898,7 +1264,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
         d = cast_vote(dispute_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return d.dict()
+    return d.model_dump()
 
 
 # ------------------------------------------------------------------
@@ -908,7 +1274,7 @@ def vote_dispute(dispute_id: str, body: VoteBody):
 
 @v1_router.get("/governance/proposals")
 def get_proposals():
-    return [p.dict() for p in list_open_proposals()]
+    return [p.model_dump() for p in list_open_proposals()]
 
 
 class LegacyProposalCreate(BaseModel):
@@ -923,7 +1289,7 @@ def create_proposal_endpoint(body: ProposalCreate):
         p = create_proposal(body.proposal_type, body.proposed_value, body.proposed_by_key_hash)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 class LegacyProposalVote(BaseModel):
@@ -937,7 +1303,7 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
         p = cast_proposal_vote(proposal_id, body.voter_key_hash, body.vote)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return p.dict()
+    return p.model_dump()
 
 
 # ------------------------------------------------------------------
@@ -961,14 +1327,18 @@ class SARPackageRequest(BaseModel):
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
 )
-def compliance_ivms(wallet: str) -> dict:
-    """Return the IVMS 101 risk-augmentation block for ``wallet``."""
+def compliance_ivms(wallet: str, dry_run: bool = Query(False)) -> dict:
+    """Return the IVMS 101 risk-augmentation block for ``wallet``.
+
+    Logged as a Travel-Rule export to the compliance audit trail unless
+    ``dry_run=true``.
+    """
     from dataclasses import asdict
 
-    from detection.compliance_exporter import build_ivms_risk_field
+    from detection.compliance_exporter import export_travel_rule
 
     validate_stellar_address(wallet)
-    return asdict(build_ivms_risk_field(wallet))
+    return asdict(export_travel_rule(wallet, dry_run=dry_run))
 
 
 @v1_router.post(
@@ -976,20 +1346,37 @@ def compliance_ivms(wallet: str) -> dict:
     dependencies=[Depends(require_compliance_key)],
     include_in_schema=False,
 )
-def compliance_sar_package(body: SARPackageRequest) -> FileResponse:
-    """Generate a SAR evidence ZIP for a wallet and return it as a download."""
+def compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)) -> FileResponse:
+    """Generate a SAR evidence ZIP for a wallet and return it as a download.
+
+    Requires the wallet's current risk score to be at least
+    ``COMPLIANCE_SAR_MIN_SCORE`` (400 otherwise) and is rate-limited to
+    ``COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR`` exports/hour (429 otherwise).
+    Logged to the compliance audit trail unless ``dry_run=true``.
+    """
     import tempfile
 
-    from detection.compliance_exporter import generate_sar_package
+    from detection.compliance_exporter import (
+        ComplianceRateLimitExceeded,
+        ComplianceScoreTooLow,
+        export_sar_package,
+    )
 
     validate_stellar_address(body.wallet)
     output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
-    zip_path = generate_sar_package(
-        wallet=body.wallet,
-        start_date=body.start_date,
-        end_date=body.end_date,
-        output_dir=output_dir,
-    )
+    try:
+        zip_path = export_sar_package(
+            wallet=body.wallet,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            output_dir=output_dir,
+            dry_run=dry_run,
+        )
+    except ComplianceScoreTooLow as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ComplianceRateLimitExceeded:
+        raise HTTPException(status_code=429, detail="Compliance export rate limit exceeded")
+
     return FileResponse(
         zip_path,
         media_type="application/zip",

@@ -89,6 +89,38 @@ def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
+def _extract_timestamps(df: pd.DataFrame) -> np.ndarray | None:
+    """Extract Unix epoch timestamps from training DataFrame.
+
+    Looks for a ``timestamp`` or ``ledger_close_time`` column. Returns None
+    if neither is present (caller falls back to random split).
+    """
+    for col in ("timestamp", "ledger_close_time"):
+        if col in df.columns:
+            ts = pd.to_datetime(df[col], errors="coerce")
+            epoch = ts.astype("int64") / 1e9
+            if epoch.notna().all():
+                return epoch.values
+    return None
+
+
+def _extract_timestamps_from_array(
+    original_ts: np.ndarray,
+    original_X: np.ndarray,
+    subset_X: np.ndarray,
+) -> np.ndarray | None:
+    """Recover timestamps for a subset of X after a temporal split.
+
+    Matches rows by position in the sorted timestamp order.
+    """
+    if original_ts is None or len(subset_X) == 0:
+        return None
+    sort_idx = np.argsort(original_ts)
+    sorted_ts = original_ts[sort_idx]
+    n_subset = len(subset_X)
+    return sorted_ts[:n_subset]
+
+
 def _train_ensemble_base(
     df: pd.DataFrame,
     random_state: int = 42,
@@ -96,6 +128,7 @@ def _train_ensemble_base(
     calibrate: bool = True,
     adversarial_hardening: bool = False,
     imbalance_strategy: str = "smote",
+    sample_weights: np.ndarray | None = None,
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -138,30 +171,91 @@ def _train_ensemble_base(
 
     X, y = _split_features_labels(df)
 
+    # Temporal splitting: use timestamps when available, otherwise fall back
+    # to random splitting.  SMOTE is applied AFTER the split, on training only.
+    assert "timestamp" not in FEATURE_NAMES, "timestamp must not be a training feature"
+
+    timestamps = _extract_timestamps(df)
+    use_temporal = timestamps is not None
+
     if calibrate:
-        X_remaining, X_cal, y_remaining, y_cal = train_test_split(
-            X, y, test_size=0.10, random_state=random_state, stratify=y
-        )
+        if use_temporal:
+            from detection.dataset import temporal_train_val_split, data_leakage_audit
+            X_remaining, X_cal, y_remaining, y_cal = temporal_train_val_split(
+                X.values, y.values, timestamps, val_ratio=0.10,
+            )
+            X_remaining = pd.DataFrame(X_remaining, columns=X.columns)
+            X_cal = pd.DataFrame(X_cal, columns=X.columns)
+            y_remaining = pd.Series(y_remaining, name="label")
+            y_cal = pd.Series(y_cal, name="label")
+        else:
+            X_remaining, X_cal, y_remaining, y_cal = train_test_split(
+                X, y, test_size=0.10, random_state=random_state, stratify=y
+            )
         cal_split_info = {
             "X_cal": X_cal,
             "y_cal": y_cal,
-            "cal_index_start": X_cal.index.min(),
-            "cal_index_end": X_cal.index.max(),
+            "cal_index_start": X_cal.index.min() if hasattr(X_cal.index, "min") else 0,
+            "cal_index_end": X_cal.index.max() if hasattr(X_cal.index, "max") else 0,
         }
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
-        )
+        if use_temporal:
+            ts_remaining = _extract_timestamps_from_array(timestamps, X.values, X_remaining.values)
+            if ts_remaining is not None:
+                X_train, X_test, y_train, y_test = temporal_train_val_split(
+                    X_remaining.values, y_remaining.values, ts_remaining, val_ratio=0.2,
+                )
+            else:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+                )
+            X_train = pd.DataFrame(X_train, columns=X.columns)
+            X_test = pd.DataFrame(X_test, columns=X.columns)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+            )
     else:
         cal_split_info = {}
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=random_state, stratify=y
-        )
+        if use_temporal:
+            from detection.dataset import temporal_train_val_split
+            X_train, X_test, y_train, y_test = temporal_train_val_split(
+                X.values, y.values, timestamps, val_ratio=0.2,
+            )
+            X_train = pd.DataFrame(X_train, columns=X.columns)
+            X_test = pd.DataFrame(X_test, columns=X.columns)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=random_state, stratify=y
+            )
+
+    # Propagate sample weights through train/test split
+    _train_weights = None
+    if sample_weights is not None:
+        if calibrate:
+            _, _, w_remaining, _ = train_test_split(
+                sample_weights, sample_weights, test_size=0.10, random_state=random_state, stratify=y
+            )
+            w_train, _ = train_test_split(
+                w_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+            )[:2] if len(w_remaining) > 0 else (w_remaining, np.array([]))
+        else:
+            w_train, _ = train_test_split(
+                sample_weights, test_size=0.2, random_state=random_state, stratify=y
+            )[:2]
+    else:
+        w_train = None
 
     oversampler = _get_oversampler(imbalance_strategy, random_state=random_state)
     if oversampler is not None:
         X_train_res, y_train_res = oversampler.fit_resample(X_train, y_train)
+        _train_weights = None  # SMOTE generates new samples; weights don't apply cleanly
     else:
         X_train_res, y_train_res = X_train, y_train
+        _train_weights = w_train
     _applied_imbalance_strategy = imbalance_strategy
 
     # Log hyperparameters
@@ -170,6 +264,7 @@ def _train_ensemble_base(
     mlflow.log_param("calibrate", calibrate)
     mlflow.log_param("adversarial_hardening", adversarial_hardening)
     mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
+    mlflow.log_param("has_sample_weights", sample_weights is not None)
 
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
@@ -183,7 +278,10 @@ def _train_ensemble_base(
 
     results = {}
     for name, model in models.items():
-        model.fit(X_train_res, y_train_res)
+        fit_kwargs = {}
+        if _train_weights is not None and len(_train_weights) == len(y_train_res):
+            fit_kwargs["sample_weight"] = _train_weights
+        model.fit(X_train_res, y_train_res, **fit_kwargs)
         y_proba = model.predict_proba(X_test)[:, 1]
         y_pred = model.predict(X_test)
 
