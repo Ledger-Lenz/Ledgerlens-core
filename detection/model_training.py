@@ -42,6 +42,136 @@ from detection.feature_engineering import FEATURE_NAMES
 logger = logging.getLogger("ledgerlens.model_training")
 
 
+# ---------------------------------------------------------------------------
+# Stacking / OOF helpers (Issue-111)
+# ---------------------------------------------------------------------------
+
+def _walk_forward_cv(
+    X: np.ndarray,
+    timestamps: np.ndarray,
+    n_splits: int = 5,
+    gap_days: float = 7.0,
+):
+    """Yield (train_idx, val_idx) using walk-forward temporal splits.
+
+    Each split trains on all data before the validation window and validates
+    on the next chunk.  A *gap* of ``gap_days`` is excluded between train and
+    val to prevent look-ahead leakage (the gap is defined in the same units as
+    ``timestamps``).
+    """
+    n = len(X)
+    fold_size = n // (n_splits + 1)
+    for fold in range(n_splits):
+        train_end = fold_size * (fold + 1)
+        val_start = int(train_end + gap_days)
+        val_end = min(val_start + fold_size, n)
+        if val_start >= n or val_end <= val_start:
+            continue
+        train_idx = np.arange(train_end)
+        val_idx = np.arange(val_start, val_end)
+        if len(train_idx) < 2 or len(val_idx) < 2:
+            continue
+        yield train_idx, val_idx
+
+
+def _build_meta_features(oof_proba: np.ndarray, use_disagreement: bool = False) -> np.ndarray:
+    """Build the meta-feature matrix from base model OOF probabilities.
+
+    Parameters
+    ----------
+    oof_proba:
+        Array of shape ``(n_samples, n_base_models)`` with positive-class probs.
+    use_disagreement:
+        When True, append two extra columns: (max-min) spread and mean.
+
+    Returns
+    -------
+    np.ndarray of shape ``(n_samples, n_base_models)`` or
+    ``(n_samples, n_base_models + 2)`` when ``use_disagreement=True``.
+    """
+    if not use_disagreement:
+        return oof_proba
+    spread = oof_proba.max(axis=1, keepdims=True) - oof_proba.min(axis=1, keepdims=True)
+    mean = oof_proba.mean(axis=1, keepdims=True)
+    return np.hstack([oof_proba, spread, mean])
+
+
+def generate_oof_predictions(
+    X: np.ndarray,
+    y: np.ndarray,
+    timestamps: np.ndarray,
+    models: dict,
+    n_splits: int = 5,
+    gap_days: float = 7.0,
+):
+    """Generate out-of-fold predictions for all base models using walk-forward CV.
+
+    Parameters
+    ----------
+    X, y:
+        Feature matrix and binary labels.
+    timestamps:
+        1-D array of numeric timestamps (same units as ``gap_days``).
+    models:
+        Dict of ``{name: unfitted_estimator}``.
+    n_splits:
+        Number of walk-forward folds.
+    gap_days:
+        Gap between train end and val start (same units as timestamps).
+
+    Returns
+    -------
+    oof_proba : np.ndarray of shape (n_oof_samples, n_models)
+    oof_labels : np.ndarray of shape (n_oof_samples,)
+    """
+    from sklearn.linear_model import LogisticRegression  # noqa (local import for speed)
+
+    n_models = len(models)
+    model_names = list(models.keys())
+    all_proba = []
+    all_labels = []
+
+    for train_idx, val_idx in _walk_forward_cv(X, timestamps, n_splits=n_splits, gap_days=gap_days):
+        X_tr, X_val = X[train_idx], X[val_idx]
+        y_tr, y_val = y[train_idx], y[val_idx]
+        if len(np.unique(y_tr)) < 2:
+            continue
+        fold_proba = np.zeros((len(val_idx), n_models))
+        for col, name in enumerate(model_names):
+            m = clone(models[name])
+            try:
+                m.fit(X_tr, y_tr)
+                fold_proba[:, col] = m.predict_proba(X_val)[:, 1]
+            except Exception as exc:
+                raise ValueError(f"Model '{name}' failed during OOF fold fit: {exc}") from exc
+        all_proba.append(fold_proba)
+        all_labels.append(y_val)
+
+    if not all_proba:
+        return np.empty((0, n_models)), np.empty(0, dtype=int)
+    return np.vstack(all_proba), np.concatenate(all_labels)
+
+
+def train_meta_learner(
+    oof_proba: np.ndarray,
+    oof_labels: np.ndarray,
+    use_disagreement_features: bool = False,
+):
+    """Fit a LogisticRegression meta-learner on OOF base model predictions.
+
+    Returns ``None`` when the OOF set has fewer than 2 distinct labels
+    (meta-learner would be degenerate).
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    if len(oof_labels) == 0 or len(np.unique(oof_labels)) < 2:
+        return None
+    meta_X = _build_meta_features(oof_proba, use_disagreement=use_disagreement_features)
+    meta = LogisticRegression(C=1.0, max_iter=500, random_state=42, solver="lbfgs")
+    meta.fit(meta_X, oof_labels)
+    return meta
+
+
 def _get_oversampler(strategy: str, random_state: int = 42) -> BaseOverSampler | None:
     """Factory function returning the requested over-sampling object.
 

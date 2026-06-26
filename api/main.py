@@ -210,6 +210,15 @@ class VoteBody(BaseModel):
 v1_router = APIRouter(prefix="/v1")
 
 
+def _get_health_feature_store():
+    """Return the singleton FeatureStore used for health checks.
+
+    Lazy import avoids a Redis connection attempt at module import time.
+    """
+    from detection.feature_store import FeatureStore
+    return FeatureStore()
+
+
 @v1_router.get("/health")
 def health() -> JSONResponse:
     """Returns 200 when healthy, 503 when any hard-failure component check fails.
