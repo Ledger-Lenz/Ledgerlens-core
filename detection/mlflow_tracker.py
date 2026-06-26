@@ -48,8 +48,10 @@ def _resolve_tracking_uri(uri: str | None) -> str:
 
 
 def _compute_dataset_hash(df: pd.DataFrame) -> str:
-    """Return a short SHA-256 hex digest of the DataFrame columns + row count."""
-    raw = f"{len(df)}|{','.join(sorted(df.columns))}"
+    """Return a short SHA-256 hex digest of the DataFrame schema and content."""
+    schema = f"{len(df)}|{','.join(sorted(df.columns))}"
+    content = df.to_json(orient="values")
+    raw = schema + "|" + content
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 

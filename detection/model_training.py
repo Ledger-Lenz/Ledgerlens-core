@@ -164,12 +164,15 @@ def _train_ensemble_base(
         X_train_res, y_train_res = X_train, y_train
     _applied_imbalance_strategy = imbalance_strategy
 
-    # Log hyperparameters
-    mlflow.log_param("random_state", random_state)
-    mlflow.log_param("adversarial_augment", adversarial_augment)
-    mlflow.log_param("calibrate", calibrate)
-    mlflow.log_param("adversarial_hardening", adversarial_hardening)
-    mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
+    _active_run = mlflow.active_run()
+
+    # Log hyperparameters (only when inside an active MLflow run)
+    if _active_run:
+        mlflow.log_param("random_state", random_state)
+        mlflow.log_param("adversarial_augment", adversarial_augment)
+        mlflow.log_param("calibrate", calibrate)
+        mlflow.log_param("adversarial_hardening", adversarial_hardening)
+        mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
 
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
@@ -177,9 +180,10 @@ def _train_ensemble_base(
         "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1),
     }
 
-    for mname, m in models.items():
-        for key, value in m.get_params().items():
-            mlflow.log_param(f"{mname}_{key}", value)
+    if _active_run:
+        for mname, m in models.items():
+            for key, value in m.get_params().items():
+                mlflow.log_param(f"{mname}_{key}", value)
 
     results = {}
     for name, model in models.items():
@@ -193,13 +197,24 @@ def _train_ensemble_base(
         prec = precision_score(y_test, y_pred, zero_division=0.0)
         rec = recall_score(y_test, y_pred, zero_division=0.0)
 
-        mlflow.log_metric(f"{name}_auc_roc", auc_roc)
-        mlflow.log_metric(f"{name}_pr_auc", pr_auc)
-        mlflow.log_metric(f"{name}_f1", f1)
-        mlflow.log_metric(f"{name}_precision", prec)
-        mlflow.log_metric(f"{name}_recall", rec)
-
-        mlflow.sklearn.log_model(model, artifact_path=name, registered_model_name=None)
+        if _active_run:
+            mlflow.log_metric(f"{name}_auc_roc", auc_roc)
+            mlflow.log_metric(f"{name}_pr_auc", pr_auc)
+            mlflow.log_metric(f"{name}_f1", f1)
+            mlflow.log_metric(f"{name}_precision", prec)
+            mlflow.log_metric(f"{name}_recall", rec)
+            mlflow.sklearn.log_model(
+                model,
+                name=name,
+                registered_model_name=None,
+                skops_trusted_types=[
+                    "xgboost.core.Booster",
+                    "xgboost.sklearn.XGBClassifier",
+                    "lightgbm.sklearn.LGBMClassifier",
+                    "sklearn.calibration.CalibratedClassifierCV",
+                    "sklearn.ensemble._forest.RandomForestClassifier",
+                ],
+            )
 
         results[name] = {
             "model": model,
@@ -256,7 +271,7 @@ def _train_ensemble_base(
                     roc_auc_score(oof_labels, oof_meta_proba)
                 )
                 stacking_metrics["meta_learner_coef"] = meta_learner.coef_[0].tolist()
-                _logger.info(
+                logger.info(
                     "Meta-learner AUC-PR: %.3f (vs. equal-weight average: %.3f)",
                     stacking_metrics["meta_learner_auc_pr"],
                     stacking_metrics["avg_baseline_auc_pr"],
@@ -265,7 +280,7 @@ def _train_ensemble_base(
                 pass
         results["_stacking"] = {"meta_learner": meta_learner, **stacking_metrics}
     except Exception as exc:
-        _logger.warning("Stacking meta-learner training failed (best-effort): %s", exc)
+        logger.warning("Stacking meta-learner training failed (best-effort): %s", exc)
 
     # --- Adversarial hardening: generate PGD adversarial examples from
     # training true positives and retrain once on the augmented set.
@@ -496,7 +511,7 @@ def save_models(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    _logger.info("Wrote training metadata to %s", metadata_path)
+    logger.info("Wrote training metadata to %s", metadata_path)
 
     # ------------------------------------------------------------------
     # Calibration artifacts
@@ -532,7 +547,7 @@ def save_models(
         existing.update(metrics)
         with open(metrics_path, "w") as f:
             json.dump(existing, f, indent=2)
-        _logger.info(
+        logger.info(
             "Wrote calibration metrics (coverage=%.4f) to %s",
             metrics.get("conformal_empirical_coverage", 0.0),
             metrics_path,
@@ -546,7 +561,7 @@ def save_models(
         meta_path = os.path.join(model_dir, "meta_learner.joblib")
         joblib.dump(stacking_info["meta_learner"], meta_path)
         sign_model_file(meta_path, signing_key)
-        _logger.info("Saved meta-learner to %s", meta_path)
+        logger.info("Saved meta-learner to %s", meta_path)
 
         # Persist meta-learner metrics into training_metadata.json
         try:
@@ -558,7 +573,7 @@ def save_models(
             with open(metadata_path, "w") as f:
                 json.dump(meta_md, f, indent=2)
         except Exception as exc:
-            _logger.warning("Failed to update training_metadata.json with meta-learner metrics: %s", exc)
+            logger.warning("Failed to update training_metadata.json with meta-learner metrics: %s", exc)
 
 
 if __name__ == "__main__":

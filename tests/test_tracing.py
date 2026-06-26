@@ -171,7 +171,7 @@ def test_async_span_preserves_trace_id(in_memory_tracer):
         with start_span("async.parent"):
             await _inner()
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
     spans = in_memory_tracer.get_finished_spans()
     assert len(spans) >= 2
@@ -193,7 +193,7 @@ def test_create_task_with_context_preserves_trace(in_memory_tracer):
             task = create_task_with_context(_task_work())
             await task
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
     spans = in_memory_tracer.get_finished_spans()
     names = [s.name for s in spans]

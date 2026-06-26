@@ -360,6 +360,9 @@ def explain_wallet_score(
     return cached
 
 
+_stream_rate_limiter_state: dict = {}
+
+
 class RateLimiterStatus(BaseModel):
     configured_rate: float
     current_rate: float
@@ -402,6 +405,42 @@ def rate_limiter_status() -> RateLimiterStatus:
 
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
 _counterfactual_executor = ThreadPoolExecutor(max_workers=4)
+
+# ---------------------------------------------------------------------------
+# Stream status — lightweight ingestion telemetry.
+# ---------------------------------------------------------------------------
+_stream_status: dict = {
+    "last_trade_at": None,
+    "trades_per_second": 0.0,
+    "active_wallets": 0,
+    "_recent_timestamps": [],
+}
+
+
+def _stream_status_update(trade) -> None:
+    """Update in-memory stream status after each ingested trade."""
+    now = time.time()
+    _stream_status["last_trade_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    recent = [t for t in _stream_status["_recent_timestamps"] if now - t < 10.0]
+    recent.append(now)
+    _stream_status["_recent_timestamps"] = recent
+    _stream_status["trades_per_second"] = len(recent) / 10.0
+    wallet = getattr(trade, "base_account", None) or ""
+    if wallet:
+        wallets = _stream_status.get("_active_wallets") or set()
+        wallets.add(wallet)
+        _stream_status["_active_wallets"] = wallets
+        _stream_status["active_wallets"] = len(wallets)
+
+
+@app.get("/stream/status")
+def stream_status() -> dict:
+    """Return real-time ingestion statistics (trades/s, active wallets, last trade time)."""
+    return {
+        "trades_per_second": _stream_status["trades_per_second"],
+        "active_wallets": _stream_status["active_wallets"],
+        "last_trade_at": _stream_status["last_trade_at"],
+    }
 
 
 @v1_router.get("/scores/{wallet}/counterfactual")
@@ -1356,7 +1395,11 @@ for _path in _LEGACY_REDIRECTS:
             # Preserve query string
             qs = request.url.query
             target = f"/v1{p}" + (f"?{qs}" if qs else "")
-            return RedirectResponse(url=target, status_code=302)
+            response = RedirectResponse(url=target, status_code=302)
+            response.headers["Deprecation"] = "true"
+            response.headers["Sunset"] = "Sat, 01 Jan 2028 00:00:00 GMT"
+            response.headers["Link"] = f'</v1{p}>; rel="successor-version"'
+            return response
         _redirect.__name__ = f"legacy_redirect_{p.replace('/', '_').strip('_')}"
         return _redirect
 

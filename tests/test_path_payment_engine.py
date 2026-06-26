@@ -228,17 +228,16 @@ def test_detector_7hop_cycle_score():
 
 def test_api_path_cycles_endpoint(tmp_path):
     """GET /path-cycles endpoint returns correct schema."""
-    from dataclasses import replace
     from unittest.mock import patch
 
     from fastapi.testclient import TestClient
 
+    import config.settings as settings_module
     from api.main import app
-    from config.settings import settings
     from detection.storage import init_db, save_hop_payment_cycles
 
     db = str(tmp_path / "test.db")
-    test_settings = replace(settings, db_path=db)
+    object.__setattr__(settings_module.settings, "ledgerlens_db_path", db)
 
     init_db(db)
     cycle = PathPaymentCycle(
@@ -252,7 +251,7 @@ def test_api_path_cycles_endpoint(tmp_path):
     )
     save_hop_payment_cycles([cycle], db_path=db)
 
-    with patch("detection.storage.settings", test_settings):
+    with patch("detection.storage.settings", settings_module.settings):
         client = TestClient(app)
         resp = client.get("/path-cycles?min_score=0.6")
 

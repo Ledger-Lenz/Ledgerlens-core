@@ -59,7 +59,9 @@ def test_mlflow_run_logs_training_duration(tmp_mlruns):
         pass
 
     client = mlflow.tracking.MlflowClient(tmp_mlruns)
-    runs = client.search_runs(experiment_ids=["0"])
+    experiment = client.get_experiment_by_name("test-duration")
+    assert experiment is not None, "experiment 'test-duration' should exist"
+    runs = client.search_runs(experiment_ids=[experiment.experiment_id])
     durations = [r.data.metrics.get("training_duration_seconds", 0.0) for r in runs if r.data.metrics]
     assert any(d > 0.0 for d in durations)
 
