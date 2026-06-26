@@ -1518,12 +1518,15 @@ def root_compliance_ivms(wallet: str) -> dict:
 @app.post("/compliance/sar-package", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
 def root_compliance_sar_package(body: SARPackageRequest) -> FileResponse:
     import os
+    import tempfile
     from detection.compliance_exporter import generate_sar_package
     from fastapi.responses import FileResponse as _FileResponse
+    output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
     pkg_path = generate_sar_package(
         wallet=body.wallet,
         start_date=body.start_date,
         end_date=body.end_date,
+        output_dir=output_dir,
     )
     return _FileResponse(pkg_path, media_type="application/zip", filename=os.path.basename(pkg_path))
 

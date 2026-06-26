@@ -119,7 +119,7 @@ def train(
 
     results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
-        if name == "_calib":
+        if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
             continue
         logger.info("%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
@@ -231,7 +231,7 @@ def retrain_check(
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     new_results = train_ensemble(df)
-    model_names = [k for k in new_results if k != "_calib"]
+    model_names = [k for k in new_results if not k.startswith("_") and isinstance(new_results[k], dict) and "auc_roc" in new_results[k]]
     for name in model_names:
         result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])

@@ -294,8 +294,11 @@ def analyst_feedback_export(
     Example: ``GET /analyst/feedback?since=2026-06-01T00:00:00Z``
     """
     try:
-        # URL query strings decode '+' as ' '; restore it for timezone offsets like +00:00
+        # URL query strings decode '+' as ' '; restore for timezone offsets like +00:00.
+        # Also replace trailing 'Z' with '+00:00' since fromisoformat rejects 'Z' in Python ≤3.10.
         since_normalized = since.replace(" ", "+")
+        if since_normalized.endswith("Z"):
+            since_normalized = since_normalized[:-1] + "+00:00"
         since_dt = datetime.fromisoformat(since_normalized)
         if since_dt.tzinfo is None:
             since_dt = since_dt.replace(tzinfo=timezone.utc)

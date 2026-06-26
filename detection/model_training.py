@@ -226,6 +226,7 @@ def _train_ensemble_base(
     calibrate: bool = True,
     adversarial_hardening: bool = False,
     imbalance_strategy: str = "smote",
+    causal_feature_selection: bool = False,
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -267,6 +268,14 @@ def _train_ensemble_base(
         df = pd.concat(augment_dfs, ignore_index=True)
 
     X, y = _split_features_labels(df)
+
+    _causal_features: list[str] | None = None
+    if causal_feature_selection:
+        from detection.causal_engine import CausalFeatureSelector
+        selector = CausalFeatureSelector()
+        _causal_features = selector.fit(X.values, y.values, list(X.columns))
+        if _causal_features:
+            X = X[_causal_features]
 
     if calibrate:
         X_remaining, X_cal, y_remaining, y_cal = train_test_split(
@@ -335,7 +344,7 @@ def _train_ensemble_base(
             mlflow.log_metric(f"{name}_recall", rec)
             mlflow.sklearn.log_model(
                 model,
-                name=name,
+                artifact_path=name,
                 registered_model_name=None,
                 skops_trusted_types=[
                     "builtins.dict",
@@ -495,6 +504,8 @@ def _train_ensemble_base(
 
     # Store the applied imbalance strategy so save_models can persist it.
     results["_imbalance_strategy"] = _applied_imbalance_strategy
+    if _causal_features is not None:
+        results["_causal_selected_features"] = _causal_features
     return results
 
 
@@ -602,7 +613,7 @@ def save_models(
 
     signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
-        if name in ("_calib", "_imbalance_strategy"):
+        if name.startswith("_") or not isinstance(result, dict) or "model" not in result:
             continue
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
@@ -633,6 +644,8 @@ def save_models(
         "training_row_count": training_row_count,
         "column_hash": column_hash,
         "imbalance_strategy": results.get("_imbalance_strategy", "smote"),
+        "causal_feature_selection": _causal_selected is not None,
+        "causal_selected_features": _causal_selected or [],
         "model_metrics": {
             name: {
                 "auc_roc": result.get("auc_roc", 0.0),
@@ -640,7 +653,7 @@ def save_models(
                 "f1": result.get("f1", 0.0),
             }
             for name, result in results.items()
-            if name not in ("_calib", "_imbalance_strategy")
+            if not name.startswith("_") and isinstance(result, dict) and "model" in result
         },
     }
 
