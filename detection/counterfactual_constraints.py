@@ -140,6 +140,7 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _decreasable("atomic_self_payment_ratio"),
     _decreasable("avg_path_hop_count"),
     _decreasable("path_cycle_volume_ratio"),
+    _decreasable("path_payment_frequency"),
 
     # --- Multi-hop path-payment cycle features (6) --------------------------
     # All six rise with cyclic self-dealing routed across separate path

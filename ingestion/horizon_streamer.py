@@ -13,6 +13,7 @@ after a delay -- the breaker will allow exactly one probe connection once
 `HORIZON_RECOVERY_TIMEOUT_SECONDS` has elapsed.
 """
 
+import asyncio
 import logging
 import time
 from collections.abc import Iterator

@@ -609,14 +609,19 @@ def benford_copula_statistic(digit_matrix: np.ndarray) -> tuple[float, float]:
     if matrix.ndim != 2 or matrix.shape[0] < 2:
         return 0.0, 1.0
 
-    deviations = matrix - _EXPECTED_VECTOR
+    # Drop pairs with no observations; a zero-row has no Benford signal.
+    active = matrix[matrix.sum(axis=1) > 0]
+    if active.shape[0] < 2:
+        return 0.0, 1.0
+
+    deviations = active - _EXPECTED_VECTOR
     scored = np.vstack([_normal_scores(row) for row in deviations])
 
     corr = np.corrcoef(scored)
     corr = np.nan_to_num(corr, nan=0.0)
 
-    k = matrix.shape[0]
-    dof_per_corr = matrix.shape[1] - 1  # 9 digits, 1 lost to the copula transform
+    k = active.shape[0]
+    dof_per_corr = active.shape[1] - 1  # 9 digits, 1 lost to the copula transform
     upper = corr[np.triu_indices(k, k=1)]
     statistic = float(dof_per_corr * np.sum(upper**2))
     df = len(upper)
