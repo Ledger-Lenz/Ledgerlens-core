@@ -9,25 +9,16 @@ Releases are automated via [release-please](https://github.com/google-github-act
 merging a release PR (created by the `release-please` GitHub Action) tags the
 commit, generates this file, and publishes a tagged Docker image to GHCR.
 
-## Unreleased
+## [Unreleased]
 
 ### Added
-- **Bayesian cross-chain linking**: `CrossChainLinker.score_hypothesis()` assigns probabilistic confidence scores (0–1) to Stellar↔EVM wallet link hypotheses using timing similarity, amount matching, direction consistency, and address-pattern features. Links below confidence=0.7 are rejected.
-- `WalletLinkHypothesis` dataclass and `LinkStatus` enum (`rejected`, `probable`, `confirmed`).
-- SQLite `cross_chain_links` table for persisting accepted hypotheses with upsert support.
-- `GET /cross-chain/links/{stellar_wallet}` endpoint returning accepted link hypotheses sorted by confidence.
-- `GET /cross-chain/links/{stellar_wallet}/explain` endpoint (admin-key gated) returning evidence feature breakdown.
-- `cross_chain_link_confidence` feature added to the cross-chain feature vector in `feature_engineering.py`.
-- `CROSS_CHAIN_TIMING_SIGMA_SECONDS`, `CROSS_CHAIN_AMOUNT_TOLERANCE`, `CROSS_CHAIN_MIN_CONFIDENCE`, `CROSS_CHAIN_CONFIRMED_CONFIDENCE` configuration variables.
-- **Analyst feedback store** (`detection/feedback_store.py`): `AnalystFeedbackStore` persists analyst label corrections with importance weights. `get_weighted_corrections()` applies exponential recency decay (`exp(-λ × days)`) to corrections. `merge_analyst_corrections()` in `model_training.py` integrates weighted corrections into the training pipeline via `sample_weight` in sklearn/XGBoost/LightGBM `fit()` calls.
-- `POST /v1/feedback` and `GET /v1/feedback` endpoints (admin-key gated) for submitting and listing analyst corrections.
-- `docs/active_learning.md` documenting the feedback workflow, weight formula, and poisoning risk mitigation.
-- **Graceful shutdown**: SIGTERM/SIGINT stops accepting new requests (503), drains in-flight requests with configurable `SHUTDOWN_TIMEOUT` (default 30s), checkpoints SQLite WAL, and closes Redis/WebSocket connections. `GET /health/ready` returns 503 during shutdown for Kubernetes readiness probes.
-- **Backtesting framework** (`backtesting/backtest_runner.py`): loads labelled CSV datasets, runs the full feature extraction and scoring pipeline, and computes precision/recall/F1/AUC-ROC/average precision at configurable thresholds.
-- `cli.py backtest run` command for running backtests from the command line.
-- Synthetic labelled dataset in `data/backtest/known_cases.csv` for CI validation.
+- Multi-signature Oracle Quorum for tamper-resistant on-chain risk score publication using a 3-of-5 ED25519 threshold.
+- `GET /admin/oracle/status` endpoint to monitor oracle node health and keys.
+- Rust `oracle_aggregator` Soroban contract for robust on-chain threshold verification.
 
 ### Added
+- **#144** `tests/test_webhook_security.py`: exhaustive webhook HMAC and security test suite — `TestHMACVerification`, `TestTimestampReplayPrevention` (freezegun), `TestSecretRotation`, `TestDeadLetterBehaviour` (exactly 8 failures, exponential backoff), `TestConcurrency`, `TestSSRFProtection`, and AST static-analysis test for `hmac.compare_digest`.
+- **#144** `docs/webhook_security_model.md`: HMAC signing, replay prevention, secret rotation, dead-letter recovery, and SSRF protection documentation.
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
 - **#147** API endpoints `POST /scores/{wallet}/commit` and `POST /scores/verify-threshold` for ZK threshold proofs.
 - **#150** Full governance proposal engine (`detection/governance.py`): `GovernanceEngine` with `submit_proposal`, `cast_vote`, `tally_proposal`, `close_proposal`, `execute_proposal`, `close_expired`; `SettingsReloader` with compile-time allowlist and atomic `.env` write.

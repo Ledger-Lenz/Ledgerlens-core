@@ -1,31 +1,34 @@
-name: CI
+﻿name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+push:
+branches: [main]
+pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
+test:
+runs-on: ubuntu-latest
+timeout-minutes: 60
+strategy:
+matrix:
+python-version: ["3.10", "3.12"]
+steps:
+- uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+- name: Set up Python ${{ matrix.python-version }}
+uses: actions/setup-python@v5
+with:
+python-version: ${{ matrix.python-version }}
+cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt ruff
+- name: Install dependencies
+run: pip install --timeout 300 -r requirements.txt ruff
 
-      - name: Lint
-        run: ruff check .
+- name: Lint
+run: ruff check .
 
+- name: Test
+run: pytest --cov=detection --cov=ingestion --cov=config -q
       - name: Test
         run: pytest --cov=detection --cov=ingestion --cov=config -q
 

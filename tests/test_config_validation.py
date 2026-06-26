@@ -92,6 +92,22 @@ def test_evm_lookback_blocks_must_be_positive(monkeypatch):
         Settings()
 
 
+def test_streamer_queue_configuration_is_validated(monkeypatch):
+    monkeypatch.setenv("STREAMER_QUEUE_MAXSIZE", "0")
+    with pytest.raises((ValidationError, ValueError)):
+        Settings()
+
+    monkeypatch.setenv("STREAMER_QUEUE_MAXSIZE", "10")
+    monkeypatch.setenv("STREAMER_OVERFLOW_STRATEGY", "overwrite")
+    with pytest.raises((ValidationError, ValueError), match="block"):
+        Settings()
+
+    monkeypatch.setenv("STREAMER_OVERFLOW_STRATEGY", "block")
+    monkeypatch.setenv("STREAMER_HIGH_WATER_RATIO", "1.1")
+    with pytest.raises((ValidationError, ValueError), match="\\(0, 1\\]"):
+        Settings()
+
+
 # ---------------------------------------------------------------------------
 # NETWORK enum validation
 # ---------------------------------------------------------------------------

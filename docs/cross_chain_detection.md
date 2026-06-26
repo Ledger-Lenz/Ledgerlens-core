@@ -101,37 +101,7 @@ Links Stellar wallets to their EVM counterparts and computes EVM-side trading st
 - `persist_hypothesis(hypothesis)` — persist accepted hypotheses (confidence >= 0.7) to SQLite
 - `get_accepted_links(stellar_wallet, min_confidence=None)` — retrieve accepted link hypotheses sorted by confidence descending
 
-### Bayesian Linking Methodology
-
-Each link hypothesis H: (stellar_wallet, evm_wallet) is scored by computing P(same_entity | evidence) using log-likelihood ratios over four evidence features:
-
-| Feature | Method | Description |
-|---|---|---|
-| Timing similarity | Gaussian(σ=300s) / Uniform(0, 3600s) | How close are bridge timestamps between paired events? |
-| Amount matching | 10.0 if within 0.5%, else 1.0 | Do bridge amounts match after fee adjustment? |
-| Direction consistency | 1.0 + 4.0 × transition_ratio | Do bridge directions alternate (round-trip pattern)? |
-| Address pattern | 1.5 if suffix match, else 1.0 | Weak prior from address suffix heuristics |
-
-The log-likelihood ratios are summed and mapped through a logistic sigmoid to produce confidence ∈ [0, 1].
-
-**Confidence interpretation:**
-
-| Range | Status | Meaning |
-|---|---|---|
-| < 0.70 | `rejected` | Insufficient evidence; link not used in features |
-| 0.70 – 0.89 | `probable` | Moderate evidence; included in features with reduced weight |
-| ≥ 0.90 | `confirmed` | Strong evidence; high-confidence link |
-
-**Prior parameter guidance:**
-
-| Parameter | Default | Setting |
-|---|---|---|
-| `CROSS_CHAIN_TIMING_SIGMA_SECONDS` | 300.0 | Gaussian σ for timing likelihood |
-| `CROSS_CHAIN_AMOUNT_TOLERANCE` | 0.005 | Fractional tolerance for amount matching |
-| `CROSS_CHAIN_MIN_CONFIDENCE` | 0.70 | Minimum confidence to accept a link |
-| `CROSS_CHAIN_CONFIRMED_CONFIDENCE` | 0.90 | Threshold for confirmed status |
-
-## Cross-Chain Features
+## Seven Cross-Chain Features
 
 These features are appended to the end of `FEATURE_NAMES` (backward-compatible; existing model scores are unchanged until a retrain includes EVM data).
 
@@ -143,7 +113,7 @@ These features are appended to the end of `FEATURE_NAMES` (backward-compatible; 
 | `evm_counterparty_concentration` | HHI of counterparty addresses in EVM trades (0=diverse, 1=monopoly) | High = trading with very few counterparties |
 | `bridge_volume_ratio` | EVM bridge volume / (Stellar SDEX volume + EVM bridge volume) | High = activity concentrated on bridge |
 | `cross_chain_time_lag_median_h` | Median hours between paired EVM and Stellar trades | Very low = near-instant round-trips |
-| `cross_chain_link_confidence` | Max Bayesian confidence score across all accepted links for the wallet | Higher = stronger evidence of cross-chain identity |
+| `cross_chain_round_trip_score` | Correlation score (0–1) for Stellar→EVM→Stellar round-trip bridge patterns based on amount similarity (within 5%), timing proximity (within 24h), and intermediate hops | High = strong evidence of multi-network wash cycles |
 
 ## API Changes
 

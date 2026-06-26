@@ -89,54 +89,36 @@ def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-def merge_analyst_corrections(
-    synthetic_df: pd.DataFrame,
-    feedback_weight_multiplier: float = 5.0,
-    db_path: str | None = None,
-) -> tuple[pd.DataFrame, np.ndarray]:
-    """Merge synthetic training data with analyst corrections.
+def _extract_timestamps(df: pd.DataFrame) -> np.ndarray | None:
+    """Extract Unix epoch timestamps from training DataFrame.
 
-    Synthetic samples receive weight=1.0. Correction samples receive
-    weight = feedback_weight_multiplier * importance_weight.
-
-    Returns (merged_df, sample_weights).
+    Looks for a ``timestamp`` or ``ledger_close_time`` column. Returns None
+    if neither is present (caller falls back to random split).
     """
-    from detection.feedback_store import AnalystFeedbackStore
-    from detection.storage import get_feature_vector
+    for col in ("timestamp", "ledger_close_time"):
+        if col in df.columns:
+            ts = pd.to_datetime(df[col], errors="coerce")
+            epoch = ts.astype("int64") / 1e9
+            if epoch.notna().all():
+                return epoch.values
+    return None
 
-    store = AnalystFeedbackStore(db_path=db_path)
-    corrections = store.get_weighted_corrections()
 
-    if not corrections:
-        weights = np.ones(len(synthetic_df))
-        return synthetic_df, weights
+def _extract_timestamps_from_array(
+    original_ts: np.ndarray,
+    original_X: np.ndarray,
+    subset_X: np.ndarray,
+) -> np.ndarray | None:
+    """Recover timestamps for a subset of X after a temporal split.
 
-    correction_rows = []
-    correction_weights = []
-    for wallet, label, weight in corrections:
-        try:
-            fv = get_feature_vector(wallet, db_path=db_path)
-            if not fv:
-                continue
-        except Exception:
-            continue
-
-        row = {fname: fv.get(fname, 0.0) for fname in FEATURE_NAMES}
-        row["label"] = label
-        correction_rows.append(row)
-        correction_weights.append(feedback_weight_multiplier * weight)
-
-    if not correction_rows:
-        return synthetic_df, np.ones(len(synthetic_df))
-
-    corrections_df = pd.DataFrame(correction_rows)
-    merged = pd.concat([synthetic_df, corrections_df], ignore_index=True)
-    weights = np.concatenate([
-        np.ones(len(synthetic_df)),
-        np.array(correction_weights),
-    ])
-
-    return merged, weights
+    Matches rows by position in the sorted timestamp order.
+    """
+    if original_ts is None or len(subset_X) == 0:
+        return None
+    sort_idx = np.argsort(original_ts)
+    sorted_ts = original_ts[sort_idx]
+    n_subset = len(subset_X)
+    return sorted_ts[:n_subset]
 
 
 def _train_ensemble_base(
@@ -189,24 +171,66 @@ def _train_ensemble_base(
 
     X, y = _split_features_labels(df)
 
+    # Temporal splitting: use timestamps when available, otherwise fall back
+    # to random splitting.  SMOTE is applied AFTER the split, on training only.
+    assert "timestamp" not in FEATURE_NAMES, "timestamp must not be a training feature"
+
+    timestamps = _extract_timestamps(df)
+    use_temporal = timestamps is not None
+
     if calibrate:
-        X_remaining, X_cal, y_remaining, y_cal = train_test_split(
-            X, y, test_size=0.10, random_state=random_state, stratify=y
-        )
+        if use_temporal:
+            from detection.dataset import temporal_train_val_split, data_leakage_audit
+            X_remaining, X_cal, y_remaining, y_cal = temporal_train_val_split(
+                X.values, y.values, timestamps, val_ratio=0.10,
+            )
+            X_remaining = pd.DataFrame(X_remaining, columns=X.columns)
+            X_cal = pd.DataFrame(X_cal, columns=X.columns)
+            y_remaining = pd.Series(y_remaining, name="label")
+            y_cal = pd.Series(y_cal, name="label")
+        else:
+            X_remaining, X_cal, y_remaining, y_cal = train_test_split(
+                X, y, test_size=0.10, random_state=random_state, stratify=y
+            )
         cal_split_info = {
             "X_cal": X_cal,
             "y_cal": y_cal,
-            "cal_index_start": X_cal.index.min(),
-            "cal_index_end": X_cal.index.max(),
+            "cal_index_start": X_cal.index.min() if hasattr(X_cal.index, "min") else 0,
+            "cal_index_end": X_cal.index.max() if hasattr(X_cal.index, "max") else 0,
         }
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
-        )
+        if use_temporal:
+            ts_remaining = _extract_timestamps_from_array(timestamps, X.values, X_remaining.values)
+            if ts_remaining is not None:
+                X_train, X_test, y_train, y_test = temporal_train_val_split(
+                    X_remaining.values, y_remaining.values, ts_remaining, val_ratio=0.2,
+                )
+            else:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+                )
+            X_train = pd.DataFrame(X_train, columns=X.columns)
+            X_test = pd.DataFrame(X_test, columns=X.columns)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+            )
     else:
         cal_split_info = {}
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=random_state, stratify=y
-        )
+        if use_temporal:
+            from detection.dataset import temporal_train_val_split
+            X_train, X_test, y_train, y_test = temporal_train_val_split(
+                X.values, y.values, timestamps, val_ratio=0.2,
+            )
+            X_train = pd.DataFrame(X_train, columns=X.columns)
+            X_test = pd.DataFrame(X_test, columns=X.columns)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=random_state, stratify=y
+            )
 
     # Propagate sample weights through train/test split
     _train_weights = None

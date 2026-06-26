@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from detection.cross_chain_linker import CrossChainLinker
+from detection.cross_chain_correlator import CrossChainCorrelator
 from detection.storage import save_bridge_transfer
 from ingestion.data_models import BridgeTransfer
 
@@ -214,3 +215,115 @@ def test_get_evm_trade_pattern_volume_and_benford(tmp_path):
     assert pattern["total_evm_volume"] == pytest.approx(450.0)
     assert pattern["unique_counterparties"] == 2
     assert isinstance(pattern["benford_mad"], float)
+
+
+# ---------------------------------------------------------------------------
+# CrossChainCorrelator tests (issue #182)
+# ---------------------------------------------------------------------------
+
+
+def _bridge_transfer(
+    stellar: str,
+    evm: str,
+    direction: str,
+    ts: datetime,
+    amount: float = 100.0,
+) -> BridgeTransfer:
+    return BridgeTransfer(
+        chain="ethereum",
+        direction=direction,
+        evm_wallet=evm,
+        stellar_wallet=stellar,
+        amount_usd=amount,
+        token="USDC",
+        tx_hash_evm="0x" + "bb" * 32,
+        tx_hash_stellar=None,
+        timestamp=ts,
+    )
+
+
+def test_correlator_empty_transfers_returns_zero():
+    correlator = CrossChainCorrelator()
+    assert correlator.compute_round_trip_score("GABCD", []) == 0.0
+
+
+def test_correlator_single_transfer_returns_zero():
+    correlator = CrossChainCorrelator()
+    transfers = [_bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", NOW)]
+    assert correlator.compute_round_trip_score("GABCD", transfers) == 0.0
+
+
+def test_correlator_no_matching_direction_returns_zero():
+    correlator = CrossChainCorrelator()
+    transfers = [
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", NOW),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", NOW),
+    ]
+    assert correlator.compute_round_trip_score("GABCD", transfers) == 0.0
+
+
+def test_correlator_round_trip_within_window_scores_positive():
+    correlator = CrossChainCorrelator(window_hours=24)
+    t0 = NOW
+    t1 = t0 + timedelta(hours=2)
+    transfers = [
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", t0, 100.0),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "evm_to_stellar", t1, 100.0),
+    ]
+    score = correlator.compute_round_trip_score("GABCD", transfers)
+    assert score > 0.0
+    assert score <= 1.0
+
+
+def test_correlator_round_trip_outside_window_returns_zero():
+    correlator = CrossChainCorrelator(window_hours=1)
+    t0 = NOW
+    t1 = t0 + timedelta(hours=2)
+    transfers = [
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", t0, 100.0),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "evm_to_stellar", t1, 100.0),
+    ]
+    assert correlator.compute_round_trip_score("GABCD", transfers) == 0.0
+
+
+def test_correlator_amount_mismatch_returns_zero():
+    correlator = CrossChainCorrelator(amount_tolerance=0.05)
+    t0 = NOW
+    t1 = t0 + timedelta(hours=1)
+    transfers = [
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", t0, 100.0),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "evm_to_stellar", t1, 50.0),
+    ]
+    assert correlator.compute_round_trip_score("GABCD", transfers) == 0.0
+
+
+def test_correlator_multiple_round_trips():
+    correlator = CrossChainCorrelator(window_hours=24)
+    transfers = [
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", NOW, 100.0),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "evm_to_stellar", NOW + timedelta(hours=1), 100.0),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", NOW + timedelta(hours=2), 200.0),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "evm_to_stellar", NOW + timedelta(hours=3), 200.0),
+    ]
+    score = correlator.compute_round_trip_score("GABCD", transfers)
+    assert 0.0 < score <= 1.0
+
+
+def test_correlator_different_evm_wallets_no_match():
+    correlator = CrossChainCorrelator(window_hours=24)
+    transfers = [
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", NOW, 100.0),
+        _bridge_transfer("GABCD", EVM_WALLET_B, "evm_to_stellar", NOW + timedelta(hours=1), 100.0),
+    ]
+    assert correlator.compute_round_trip_score("GABCD", transfers) == 0.0
+
+
+def test_correlator_inbound_before_outbound_returns_zero():
+    correlator = CrossChainCorrelator(window_hours=24)
+    t0 = NOW
+    t1 = t0 - timedelta(hours=1)
+    transfers = [
+        _bridge_transfer("GABCD", EVM_WALLET_A, "stellar_to_evm", t0, 100.0),
+        _bridge_transfer("GABCD", EVM_WALLET_A, "evm_to_stellar", t1, 100.0),
+    ]
+    assert correlator.compute_round_trip_score("GABCD", transfers) == 0.0
