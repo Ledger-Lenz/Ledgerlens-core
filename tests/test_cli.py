@@ -41,6 +41,22 @@ def test_cli_robustness_eval_runs():
 runner = CliRunner()
 
 
+def test_stream_help_lists_backpressure_options():
+    result = runner.invoke(app, ["stream", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--queue-depth" in result.output
+    assert "--overflow-strategy" in result.output
+
+
+def test_historical_load_help_lists_parallel_options():
+    result = runner.invoke(app, ["historical-load", "--help"])
+
+    assert result.exit_code == 0, result.output
+    for option in ("--start", "--end", "--concurrency", "--chunk-hours", "--resume"):
+        assert option in result.output
+
+
 def test_generate_data_writes_csvs(tmp_path):
     out_dir = str(tmp_path / "synthetic")
     result = runner.invoke(

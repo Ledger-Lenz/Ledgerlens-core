@@ -15,6 +15,9 @@ def test_defaults_when_env_unset(monkeypatch):
         "ENSEMBLE_WEIGHT_RF",
         "ENSEMBLE_WEIGHT_XGB",
         "ENSEMBLE_WEIGHT_LGBM",
+        "STREAMER_QUEUE_MAXSIZE",
+        "STREAMER_OVERFLOW_STRATEGY",
+        "STREAMER_HIGH_WATER_RATIO",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -28,6 +31,9 @@ def test_defaults_when_env_unset(monkeypatch):
     assert settings.ensemble_weight_rf == 0.25
     assert settings.ensemble_weight_xgb == 0.50
     assert settings.ensemble_weight_lgbm == 0.25
+    assert settings.streamer_queue_maxsize == 1000
+    assert settings.streamer_overflow_strategy == "drop_oldest"
+    assert settings.streamer_high_water_ratio == 0.8
 
 
 def test_env_overrides_are_applied(monkeypatch):
