@@ -799,6 +799,16 @@ def wallet_cross_chain(wallet: str) -> list[dict]:
     return history
 
 
+@v1_router.get("/alerts/dedup-state/{wallet}", tags=["Alerts"])
+def alert_dedup_state(wallet: str) -> dict:
+    """Return the current deduplication state and event history for a wallet."""
+    from detection.alert_engine import AlertDeduplicator
+    deduplicator = AlertDeduplicator()
+    state = deduplicator.get_state(wallet)
+    events = deduplicator.get_events(wallet)
+    return {"state": state, "events": events}
+
+
 @v1_router.get("/alerts")
 def alerts(
     limit: int = Query(default=100, ge=1, le=1000),
