@@ -1507,6 +1507,34 @@ def legacy_dispute_vote(dispute_id: str, request: Request):
     return RedirectResponse(url=f"/v1/disputes/{dispute_id}/vote", status_code=302)
 
 
+@app.get("/compliance/ivms/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_ivms(wallet: str) -> dict:
+    from dataclasses import asdict
+    from detection.compliance_exporter import build_ivms_risk_field
+    validate_stellar_address(wallet)
+    return asdict(build_ivms_risk_field(wallet))
+
+
+@app.post("/compliance/sar-package", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_sar_package(body: SARPackageRequest) -> FileResponse:
+    from detection.compliance_exporter import generate_sar_package
+    from fastapi.responses import FileResponse as _FileResponse
+    import tempfile, os
+    pkg_path = generate_sar_package(
+        wallet=body.wallet,
+        start_date=body.start_date,
+        end_date=body.end_date,
+    )
+    return _FileResponse(pkg_path, media_type="application/zip", filename=os.path.basename(pkg_path))
+
+
+@app.get("/compliance/audit-trail/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_audit_trail(wallet: str) -> list[dict]:
+    from detection.compliance_exporter import get_audit_trail
+    validate_stellar_address(wallet)
+    return get_audit_trail(wallet)
+
+
 @app.post("/governance/proposals", include_in_schema=False)
 def legacy_governance_proposals_post(request: Request):
     return RedirectResponse(url="/v1/governance/proposals", status_code=302)
