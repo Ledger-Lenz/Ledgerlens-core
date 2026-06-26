@@ -950,6 +950,68 @@ def dead_letters() -> list[dict]:
     ]
 
 
+@app.get("/sandwiches")
+def get_sandwiches(
+    asset_pair: str | None = Query(None, description="Filter by asset pair"),
+    min_confidence: float = Query(0.7, ge=0.0, le=1.0, description="Minimum sandwich confidence"),
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict]:
+    """Return detected sandwich attack events from the stored risk scores.
+
+    Results are ordered newest-first and filtered by `min_confidence`.
+    """
+    from detection.storage import _connect, init_db
+    init_db()
+    with _connect() as conn:
+        query = """
+            SELECT wallet, asset_pair, score, scored_at, metadata
+            FROM risk_scores
+            WHERE metadata LIKE '%sandwich%'
+        """
+        params: list = []
+        if asset_pair:
+            query += " AND asset_pair = ?"
+            params.append(asset_pair)
+        query += " ORDER BY scored_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+
+    results = []
+    for wallet, pair, score, scored_at, metadata_json in rows:
+        try:
+            meta = json.loads(metadata_json) if metadata_json else {}
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        conf = meta.get("sandwich_confidence", 0.0)
+        if conf >= min_confidence:
+            results.append(
+                {
+                    "attacker_wallet": wallet,
+                    "asset_pair": pair,
+                    "risk_score": score,
+                    "scored_at": scored_at,
+                    "sandwich_confidence": conf,
+                    "victim_wallet": meta.get("victim_wallet"),
+                    "victim_amount": meta.get("victim_amount"),
+                    "price_impact": meta.get("price_impact"),
+                    "front_run_time": meta.get("front_run_time"),
+                    "back_run_time": meta.get("back_run_time"),
+                }
+            )
+    return results
+
+
+@app.get("/admin/gnn-stats", dependencies=[Depends(require_admin_key)])
+def gnn_stats() -> dict:
+    """Return GNN model architecture summary and last inference time."""
+    try:
+        from detection.gnn_model import GNNInferenceEngine
+        engine = GNNInferenceEngine.get_instance()
+        return engine.stats()
+    except ImportError:
+        return {"status": "unavailable", "reason": "torch_geometric not installed"}
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
 # ------------------------------------------------------------------
 # Disputes
 # ------------------------------------------------------------------

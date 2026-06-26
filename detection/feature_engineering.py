@@ -164,6 +164,10 @@ MULTIVARIATE_BENFORD_FEATURE_NAMES = [
     "digit_entropy_delta",
 ]
 
+GNN_FEATURE_NAMES = [
+    "gnn_wash_ring_prob",
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -172,6 +176,7 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
+    + GNN_FEATURE_NAMES
     + SANDWICH_FEATURE_NAMES
     + CAUSAL_FEATURE_NAMES
     + MULTIVARIATE_BENFORD_FEATURE_NAMES
@@ -829,6 +834,8 @@ def _build_feature_vector_base(
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
+    pool_events: list | None = None,
+    gnn_scores: dict[str, float] | None = None,
     path_cycles: list[dict] | None = None,
     ring_membership: dict[str, dict] | None = None,
     prices: pd.DataFrame | None = None,
@@ -855,6 +862,8 @@ def _build_feature_vector_base(
     omitting them yields `0.0` for the AMM/path-payment features that depend
     on them.
 
+    `gnn_scores` is a wallet->probability mapping from `GNNInferenceEngine.score_graph`;
+    omitting it yields `0.0` for `gnn_wash_ring_prob`.
     `prices` (a `timestamp` + `mid_price`/`price` series for the pair) and
     `pair` drive the causal PDC features; omitting `prices` yields `0.0` for
     `pdc_5m`/`pdc_1h`.
@@ -880,6 +889,9 @@ def _build_feature_vector_base(
     )
     features.update(graph_ring_features(account, ring_membership))
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
+    features.update(amm_features(trades, account, liquidity_pools, pool_deposits, pool_events))
+    features.update(path_payment_features(path_payments, account))
+    features["gnn_wash_ring_prob"] = float((gnn_scores or {}).get(account, 0.0))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account, trades))
     features.update(path_payment_cycle_features(path_payments, path_cycles, account))
