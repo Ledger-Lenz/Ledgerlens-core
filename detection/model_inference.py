@@ -53,7 +53,7 @@ def get_benford_stats(wallet: str, window: int):
 
 _WEIGHTS_FILENAME = "ensemble_weights.json"
 _REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib", "meta_learner", "sequence_model"})
 _weights_mtime: float | None = None
 _runtime_weights: dict[str, float] | None = None
 
@@ -407,7 +407,7 @@ _MODEL_FILENAMES["gnn"] = "gnn_model.pt"
 _MODEL_FILENAMES["sequence_model"] = "temporal_model.pt"
 
 # Models excluded from the tabular ensemble probability vote.
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model", "meta_learner"})
 
 
 def load_models(model_dir: str | None = None, *args, **kwargs) -> dict:
@@ -506,7 +506,7 @@ def _gnn_forward_pass(model, snapshots) -> dict:
     return results
 
 
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "meta_learner", "sequence_model"})
 
 
 class ModelInference:
