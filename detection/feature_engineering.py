@@ -114,6 +114,8 @@ AMM_FEATURE_NAMES = [
     "pool_trade_ratio",  # fraction of an account's volume that is pool, not orderbook
     "pool_round_trip_ratio",
     "pool_share_concentration",
+    "amm_tenure_ratio",
+    "amm_volume_concentration",
 ]
 
 PATH_PAYMENT_FEATURE_NAMES = [
@@ -560,15 +562,18 @@ def amm_features(
     account: str,
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
+    amm_engine: "AMMEngine | None" = None,
 ) -> dict:
-    """Compute the three AMM pool features for `account`.
+    """Compute the AMM pool features for `account`.
 
     `pool_trade_ratio` and `pool_round_trip_ratio` are derived from `trades`
     alone (rows with `trade_type == LIQUIDITY_POOL`). `pool_share_concentration`
     additionally needs `liquidity_pools` (id -> `LiquidityPool`) and
     `pool_deposits` (id -> deposit/withdraw DataFrame); omitting either yields
-    `0.0` for that feature.
+    `0.0` for that feature. `amm_tenure_ratio` and `amm_volume_concentration`
+    come from the AMMEngine session tracker when available.
     """
+    from detection.amm_engine import AMMEngine as _AMMEngine
     zero = {name: 0.0 for name in AMM_FEATURE_NAMES}
     if trades.empty or "trade_type" not in trades.columns:
         return zero
@@ -597,10 +602,16 @@ def amm_features(
                 concentrations.append(pool_share_concentration(pool, deposits))
     avg_concentration = float(sum(concentrations) / len(concentrations)) if concentrations else 0.0
 
+    amm_feats = {"amm_tenure_ratio": 0.0, "amm_volume_concentration": 0.0}
+    if amm_engine is not None:
+        amm_feats = amm_engine.get_features(account)
+
     return {
         "pool_trade_ratio": pool_trade_ratio,
         "pool_round_trip_ratio": avg_round_trip,
         "pool_share_concentration": avg_concentration,
+        "amm_tenure_ratio": amm_feats.get("amm_tenure_ratio", 0.0),
+        "amm_volume_concentration": amm_feats.get("amm_volume_concentration", 0.0),
     }
 
 

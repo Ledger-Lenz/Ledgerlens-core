@@ -654,6 +654,33 @@ def list_correlations() -> list[dict]:
     return get_pair_correlations()
 
 
+@v1_router.get("/amm-anomalies")
+def list_amm_anomalies(
+    min_score: float = Query(0.5, ge=0.0, le=1.0),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
+    """Return AMM wash-trade anomalies ordered by anomaly_score DESC."""
+    from detection.amm_engine import AMMEngine
+
+    engine = AMMEngine()
+    anomalies = engine.get_anomalies(min_score=min_score, limit=limit, offset=offset)
+    return [
+        {
+            "wallet": a.wallet,
+            "pool_id": a.pool_id,
+            "session_start": a.session_start.isoformat() if a.session_start else None,
+            "tenure_seconds": a.tenure_seconds,
+            "volume_to_liquidity_ratio": a.volume_to_liquidity_ratio,
+            "deposit_withdraw_symmetry": a.deposit_withdraw_symmetry,
+            "counterparty_concentration": a.counterparty_concentration,
+            "anomaly_score": a.anomaly_score,
+            "detected_at": a.detected_at.isoformat() if a.detected_at else None,
+        }
+        for a in anomalies
+    ]
+
+
 @v1_router.get("/amm/pools/{pool_id}/risk")
 def pool_risk(pool_id: str) -> dict:
     """Return pool-level round-trip ratio and trader concentration for `pool_id`.

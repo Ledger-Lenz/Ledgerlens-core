@@ -47,6 +47,9 @@ rich>=13.0.0
 alembic>=1.13.0
 sqlalchemy>=2.0.0
 
+# Visualization
+matplotlib>=3.8.0
+
 # PDF report generation (optional)
 # weasyprint>=60.0
 

@@ -131,6 +131,7 @@ def retrain_check(
     psi_threshold: float = typer.Option(0.20, help="PSI threshold for drift detection"),
     min_drifted_features: int = typer.Option(3, help="Minimum number of drifted features to trigger retraining"),
     force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
+    force_promote: bool = typer.Option(False, "--force-promote", help="Override SHAP stability check and promote models anyway"),
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
 
@@ -151,7 +152,13 @@ def retrain_check(
 
     from config.settings import settings
     from detection.dataset import build_training_dataset
-    from detection.drift_monitor import is_drift_detected, run_drift_report
+    from detection.drift_monitor import (
+        check_psi_and_alert,
+        compute_per_feature_psi,
+        is_drift_detected,
+        record_psi_snapshot,
+        run_drift_report,
+    )
     from detection.model_registry import (
         get_current_version,
         rollback_model,
@@ -178,6 +185,17 @@ def retrain_check(
         return
 
     logger.info("Drift report: %s", report)
+
+    # Per-feature PSI tracking
+    try:
+        psi_dict = compute_per_feature_psi(training_dataset_path)
+        record_psi_snapshot(psi_dict)
+        check_psi_and_alert(psi_dict, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
+        logger.info("Per-feature PSI: %d features computed", len(psi_dict))
+    except FileNotFoundError as exc:
+        logger.warning("Per-feature PSI skipped: %s", exc)
+    except Exception as exc:
+        logger.warning("Per-feature PSI computation failed: %s", exc)
 
     # Check if drift detected
     drift_detected = is_drift_detected(report, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
@@ -232,6 +250,40 @@ def retrain_check(
         result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
+    # Compute SHAP importance summaries for new models
+    from detection.feature_engineering import FEATURE_NAMES as _feat_names
+    from detection.model_registry import (
+        compare_importance_stability,
+        compute_shap_summary,
+        save_shap_importances,
+    )
+
+    new_shap: dict[str, list[dict]] = {}
+    feature_cols = [c for c in df.columns if c in _feat_names]
+    X_train = df[feature_cols].fillna(0.0).values
+    for name in model_names:
+        model_obj = new_results[name].get("model")
+        if model_obj is not None:
+            try:
+                new_shap[name] = compute_shap_summary(model_obj, X_train, feature_cols)
+            except Exception as shap_exc:
+                logger.warning("SHAP summary for %s failed: %s", name, shap_exc)
+
+    new_metadata_for_stability = {"version": "new", "shap_importances": new_shap}
+    old_metadata_for_stability = {"version": metadata.get("version", "old"), "shap_importances": metadata.get("shap_importances", {})}
+
+    stability = compare_importance_stability(old_metadata_for_stability, new_metadata_for_stability)
+    if not stability.stable:
+        logger.warning(
+            "Feature importance stability check FAILED: min Spearman rho = %.3f "
+            "(threshold: %.3f). Models NOT auto-promoted. "
+            "Rerun with --force-promote to override.",
+            min(stability.spearman_rho.values()) if stability.spearman_rho else 0.0,
+            0.70,
+        )
+        if not force_promote:
+            logger.info("Skipping promotion due to stability check failure")
+
     # Compare new models with previous models
     previous_metrics = metadata.get("model_metrics", {})
     promoted = False
@@ -260,12 +312,18 @@ def retrain_check(
                 new_auc,
             )
 
+    # Block promotion if stability check failed and --force-promote not set
+    if not stability.stable and not force_promote:
+        promoted = False
+
     # Save models and metadata
     training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
     df.to_csv(training_dataset_path, index=False)
 
     if promoted:
         save_models(new_results, training_dataset_path=training_dataset_path)
+        if new_shap:
+            save_shap_importances(new_shap, settings.model_dir)
         logger.info("Promoted new models to production")
     else:
         logger.info("New models not promoted; keeping previous versions")
@@ -291,12 +349,16 @@ def retrain_check(
     os.makedirs(drift_report_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     report_path = os.path.join(drift_report_dir, f"{timestamp}.json")
+    drifted_features = [f for f, v in report.items() if v > psi_threshold]
     with open(report_path, "w") as f:
         json.dump(
             {
                 "timestamp": timestamp,
                 "drift_detected": drift_detected,
+                "n_drifted_features": len(drifted_features),
                 "psi_report": report,
+                "per_feature_psi": report,
+                "drifted_features": drifted_features,
                 "promoted": promoted,
                 "new_model_metrics": {k: v.get("auc_roc") for k, v in new_results.items()},
             },
