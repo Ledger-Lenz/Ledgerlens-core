@@ -1232,7 +1232,7 @@ def red_team(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
-db_app = typer.Typer(help="Database maintenance commands")
+db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
 app.add_typer(db_app, name="db")
 
 
@@ -1293,10 +1293,6 @@ def config_validate() -> None:
         raw = getattr(s, name)
         value = "***" if name in _SECRETS and raw else raw
         typer.echo(f"  {name}={value}")
-
-
-db_app = typer.Typer(help="Database migration commands (Alembic-backed)")
-app.add_typer(db_app, name="db")
 
 
 @db_app.command("migrate")
