@@ -408,11 +408,12 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             origin_wallet TEXT NOT NULL,
             origin_asset TEXT NOT NULL,
-            hops TEXT NOT NULL,
-            recovery_ratio REAL NOT NULL,
-            cycle_duration_seconds REAL NOT NULL,
+            path_length INTEGER NOT NULL DEFAULT 0,
+            recovery_ratio REAL NOT NULL DEFAULT 0.0,
+            cycle_duration_seconds REAL NOT NULL DEFAULT 0.0,
             counterparty_overlap REAL NOT NULL DEFAULT 0.0,
-            cycle_score REAL NOT NULL,
+            cycle_score REAL NOT NULL DEFAULT 0.0,
+            hop_json TEXT NOT NULL DEFAULT '[]',
             detected_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_hop_payment_cycles_wallet

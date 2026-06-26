@@ -828,7 +828,7 @@ def _collect_aggregate_metrics(results: dict) -> dict:
         "avg_f1": [],
     }
     for name, result in results.items():
-        if name == "_calib":
+        if name.startswith("_") or not isinstance(result, dict):
             continue
         model_scores["avg_auc_roc"].append(result.get("auc_roc", 0.0))
         model_scores["avg_pr_auc"].append(result.get("pr_auc", 0.0))

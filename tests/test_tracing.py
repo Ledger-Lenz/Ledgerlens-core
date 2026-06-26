@@ -40,16 +40,24 @@ def in_memory_tracer():
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    # OTel SDK blocks override once a real provider is set; reset the global
-    # directly so each test gets its own isolated in-memory exporter.
+
+    # OTel SDK's set_tracer_provider() is guarded by a SetOnce that blocks
+    # re-assignment.  Assign the private global directly so each test gets its
+    # own isolated in-memory exporter, and configure the W3C propagator so
+    # inject/extract work inside spans.
     import opentelemetry.trace as _trace_api
-    _trace_api._TRACER_PROVIDER = None
-    trace.set_tracer_provider(provider)
+    import opentelemetry.propagate as _propagate
+
+    old_provider = _trace_api._TRACER_PROVIDER
+    _trace_api._TRACER_PROVIDER = provider
+
+    from opentelemetry.propagators.composite import CompositePropagator
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+    _propagate.set_global_textmap(CompositePropagator([TraceContextTextMapPropagator()]))
+
     yield exporter
     exporter.clear()
-    # Reset back to proxy so the next test can set its own provider
-    _trace_api._TRACER_PROVIDER = None
-    trace.set_tracer_provider(trace.ProxyTracerProvider())
+    _trace_api._TRACER_PROVIDER = old_provider
 
 
 # ---------------------------------------------------------------------------
