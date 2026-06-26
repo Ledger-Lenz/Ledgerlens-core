@@ -137,6 +137,7 @@ class Trade(IngestionModel):
     transaction_hash: StrictString | None = None  # links a trade back to its parent tx
     path_payment_id: StrictString | None = None  # originating path payment operation ID
     hop_index: int | None = None         # position in the path (0 = first hop)
+    source: str = "stellar"              # ingestion origin: "stellar" | "solana" | ...
 
     @field_validator("base_amount", "counter_amount", "price", mode="before")
     @classmethod
