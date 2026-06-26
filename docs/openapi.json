@@ -1,0 +1,2790 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "LedgerLens API",
+    "description": "LedgerLens REST API for Stellar wallet risk scoring, alert management, AMM pool risk, cross-chain linking, and compliance exports. See [ReDoc](/redoc) for an alternative documentation view.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/analyst/wallet/{wallet}": {
+      "get": {
+        "tags": [
+          "analyst"
+        ],
+        "summary": "Analyst Wallet View",
+        "description": "Return combined analyst view for ``wallet``.\n\nResponse sections:\n1. current_score      \u2014 latest RiskScore record\n2. shap_top_10        \u2014 top-10 SHAP feature contributions\n3. trade_timeline     \u2014 last 30 days of scoring events\n4. ring_membership    \u2014 wash-trading rings containing this wallet\n5. score_trend        \u2014 historical score values (last 30 days)\n6. open_alerts        \u2014 typed manipulation alerts for this wallet",
+        "operationId": "analyst_wallet_view_analyst_wallet__wallet__get",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "asset_pair",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Asset pair to focus on (optional; defaults to highest-scored pair)",
+              "title": "Asset Pair"
+            },
+            "description": "Asset pair to focus on (optional; defaults to highest-scored pair)"
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Analyst Wallet View Analyst Wallet  Wallet  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyst/wallet/{wallet}/feedback": {
+      "post": {
+        "tags": [
+          "analyst"
+        ],
+        "summary": "Submit Feedback",
+        "description": "Capture analyst verdict for ``wallet``.\n\nThe verdict is stored in ``analyst_feedback`` and is available to the\nactive learning loop via ``GET /analyst/feedback?since=<ISO_TIMESTAMP>``.\n\nAccepted verdicts: ``confirmed_wash``, ``false_positive``, ``needs_review``.",
+        "operationId": "submit_feedback_analyst_wallet__wallet__feedback_post",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalystFeedbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Submit Feedback Analyst Wallet  Wallet  Feedback Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyst/queue": {
+      "get": {
+        "tags": [
+          "analyst"
+        ],
+        "summary": "Analyst Queue",
+        "description": "Return the top ``limit`` wallets awaiting analyst review, sorted by score desc.\n\nA wallet is \"awaiting review\" when it has a risk score >= threshold and\nhas not been reviewed today.",
+        "operationId": "analyst_queue_analyst_queue_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Analyst Queue Analyst Queue Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyst/stats": {
+      "get": {
+        "tags": [
+          "analyst"
+        ],
+        "summary": "Analyst Stats",
+        "description": "Return aggregate analyst review statistics.\n\nResponse fields:\n- cases_reviewed_today: int\n- false_positive_rate_30d: float (0.0\u20131.0)\n- avg_review_time_seconds: float | None",
+        "operationId": "analyst_stats_analyst_stats_get",
+        "parameters": [
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Analyst Stats Analyst Stats Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/analyst/feedback": {
+      "get": {
+        "tags": [
+          "analyst"
+        ],
+        "summary": "Analyst Feedback Export",
+        "description": "Export analyst feedback records for the active learning loop (Issue #052).\n\nConsumed by the retraining pipeline to ingest human labels.  Returns all\nfeedback submitted on or after ``since`` in ascending chronological order.\n\nExample: ``GET /analyst/feedback?since=2026-06-01T00:00:00Z``",
+        "operationId": "analyst_feedback_export_analyst_feedback_get",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "ISO-8601 timestamp; returns all feedback submitted at or after this time",
+              "title": "Since"
+            },
+            "description": "ISO-8601 timestamp; returns all feedback submitted at or after this time"
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Analyst Feedback Export Analyst Feedback Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scores/batch": {
+      "post": {
+        "tags": [
+          "batch"
+        ],
+        "summary": "Create Batch Job",
+        "description": "Queue a batch scoring job for up to 1000 wallets.",
+        "operationId": "create_batch_job_scores_batch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchJobQueued"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scores/batch/{job_id}": {
+      "get": {
+        "tags": [
+          "batch"
+        ],
+        "summary": "Get Batch Job",
+        "description": "Return the status and results of a batch scoring job.",
+        "operationId": "get_batch_job_scores_batch__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchJobStatus"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/export/scores.csv": {
+      "get": {
+        "tags": [
+          "export"
+        ],
+        "summary": "Export Csv",
+        "description": "Stream risk scores as CSV. Max 90-day window. Requires admin key.",
+        "operationId": "export_csv_export_scores_csv_get",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Start date YYYY-MM-DD",
+              "title": "From"
+            },
+            "description": "Start date YYYY-MM-DD"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "End date YYYY-MM-DD",
+              "title": "To"
+            },
+            "description": "End date YYYY-MM-DD"
+          },
+          {
+            "name": "min_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 0,
+              "default": 0,
+              "title": "Min Score"
+            }
+          },
+          {
+            "name": "wallet",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/export/scores.parquet": {
+      "get": {
+        "tags": [
+          "export"
+        ],
+        "summary": "Export Parquet",
+        "description": "Stream risk scores as Parquet (snappy compressed). Max 90-day window. Requires admin key.",
+        "operationId": "export_parquet_export_scores_parquet_get",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Start date YYYY-MM-DD",
+              "title": "From"
+            },
+            "description": "Start date YYYY-MM-DD"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "End date YYYY-MM-DD",
+              "title": "To"
+            },
+            "description": "End date YYYY-MM-DD"
+          },
+          {
+            "name": "min_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 0,
+              "default": 0,
+              "title": "Min Score"
+            }
+          },
+          {
+            "name": "wallet",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stream/rate-limiter": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Stream rate-limiter status",
+        "description": "Return current Horizon stream rate limiter and backpressure state (admin only).",
+        "operationId": "rate_limiter_status_stream_rate_limiter_get",
+        "parameters": [
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimiterStatus"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/path-cycles": {
+      "get": {
+        "summary": "List Path Cycles",
+        "description": "Return detected multi-hop path-payment wash-trade cycles.",
+        "operationId": "list_path_cycles_path_cycles_get",
+        "parameters": [
+          {
+            "name": "min_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "default": 0.6,
+              "title": "Min Score"
+            }
+          },
+          {
+            "name": "wallet",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "default": 100,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response List Path Cycles Path Cycles Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/namespaces": {
+      "get": {
+        "summary": "Admin Namespaces",
+        "description": "Return every namespace with per-table record counts.\n\nAdmin-only (requires the ``LEDGERLENS_ADMIN_API_KEY`` header).\nGated by `require_admin_key` \u2014 the admin wildcard API key is\nrequired to see cross-namespace data.",
+        "operationId": "admin_namespaces_admin_namespaces_get",
+        "parameters": [
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Admin Namespaces Admin Namespaces Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scores/{wallet}/causal-explanation": {
+      "get": {
+        "summary": "Causal Explanation",
+        "description": "Return a causal explanation of the risk score for ``wallet``.\n\nUnlike SHAP, which conflates causal and correlational contributions, this\nendpoint returns *causal* average treatment effects (ATEs) estimated via\ndo-calculus interventions on the fitted structural causal model.\n\nResponse fields\n---------------\n- ``feature_ate_table``: ATE of each feature on risk_score \u2014 the expected\n  change in score if that feature alone is moved from 0 to 1.\n- ``top_causal_features``: top-3 features by absolute ATE.\n- ``counterfactual_score``: predicted score if ``feature_override`` were\n  applied (only present when ``feature_override`` is supplied).\n- ``coverage_note``: advisory note about sample size and estimate quality.\n\nSecurity\n--------\n- ``feature_override`` is strictly validated: feature must be a known\n  observable feature name; value must be a finite float in [-1000, 1000].\n- Rate-limited to 10 requests per minute per IP.\n- ``counterfactual_score`` is not cached publicly to prevent fingerprinting\n  the model's sensitivity surface.\n\nErrors\n------\n- **400** \u2014 invalid Stellar wallet address format.\n- **404** \u2014 no scores found for the wallet.\n- **422** \u2014 invalid ``feature_override`` format or value.\n- **429** \u2014 rate limit exceeded (10 req/min per IP).\n- **503** \u2014 causal model not available (insufficient training data, DoWhy\n  not installed, or refutation gate triggered).",
+        "operationId": "causal_explanation_scores__wallet__causal_explanation_get",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "feature_override",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional feature override in 'feature=value' format. Returns counterfactual_score with the override applied. Example: 'wash_ring_membership=0.0'",
+              "title": "Feature Override"
+            },
+            "description": "Optional feature override in 'feature=value' format. Returns counterfactual_score with the override applied. Example: 'wash_ring_membership=0.0'"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CausalExplanationResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Health check",
+        "description": "Returns 200 (ok/degraded) or 503. Checks DB, model files, and circuit breakers.",
+        "operationId": "health_v1_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/scores": {
+      "get": {
+        "tags": [
+          "Scores"
+        ],
+        "summary": "List risk scores",
+        "description": "Return latest wallet risk scores with optional filters for score threshold, Benford/ML flags, and sort order.",
+        "operationId": "list_scores_v1_scores_get",
+        "parameters": [
+          {
+            "name": "min_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Min Score"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "benford_flag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by the Benford detector flag when provided.",
+              "title": "Benford Flag"
+            },
+            "description": "Filter by the Benford detector flag when provided."
+          },
+          {
+            "name": "ml_flag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by the machine-learning detector flag when provided.",
+              "title": "Ml Flag"
+            },
+            "description": "Filter by the machine-learning detector flag when provided."
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(score|confidence|timestamp)$",
+              "description": "Sort descending by score, confidence, or timestamp.",
+              "default": "score",
+              "title": "Sort By"
+            },
+            "description": "Sort descending by score, confidence, or timestamp."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RiskScore"
+                  },
+                  "title": "Response List Scores V1 Scores Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/scores/{wallet}/explain": {
+      "get": {
+        "tags": [
+          "Scores"
+        ],
+        "summary": "SHAP feature explanations",
+        "description": "Return top-5 SHAP feature contributions for a wallet's risk score on an asset pair.",
+        "operationId": "explain_wallet_score_v1_scores__wallet__explain_get",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "asset_pair",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Asset pair to explain, e.g. XLM/USDC",
+              "title": "Asset Pair"
+            },
+            "description": "Asset pair to explain, e.g. XLM/USDC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Explain Wallet Score V1 Scores  Wallet  Explain Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/scores/{wallet}/counterfactual": {
+      "get": {
+        "tags": [
+          "Scores"
+        ],
+        "summary": "Counterfactual score scenarios",
+        "description": "Return minimal feature changes that would lower a wallet's risk score below the target threshold.",
+        "operationId": "wallet_counterfactual_v1_scores__wallet__counterfactual_get",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wallet"
+            }
+          },
+          {
+            "name": "asset_pair",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Asset pair to generate counterfactuals for, e.g. XLM/USDC",
+              "title": "Asset Pair"
+            },
+            "description": "Asset pair to generate counterfactuals for, e.g. XLM/USDC"
+          },
+          {
+            "name": "n",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5,
+              "minimum": 1,
+              "default": 3,
+              "title": "N"
+            }
+          },
+          {
+            "name": "target_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 99,
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Score"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Wallet Counterfactual V1 Scores  Wallet  Counterfactual Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/scores/{wallet}": {
+      "get": {
+        "tags": [
+          "Scores"
+        ],
+        "summary": "Get wallet risk score",
+        "description": "Return the latest risk score for a Stellar wallet. Allowlisted wallets return 0; denylisted wallets return 100.",
+        "operationId": "wallet_scores_v1_scores__wallet__get",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wallet"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Wallet Scores V1 Scores  Wallet  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/wallets/{wallet}/cross-chain": {
+      "get": {
+        "tags": [
+          "Wallets"
+        ],
+        "summary": "Cross-chain bridge history",
+        "description": "Return full EVM bridge transfer history for a Stellar wallet.",
+        "operationId": "wallet_cross_chain_v1_wallets__wallet__cross_chain_get",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Wallet"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Wallet Cross Chain V1 Wallets  Wallet  Cross Chain Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/alerts": {
+      "get": {
+        "tags": [
+          "Alerts"
+        ],
+        "summary": "List alerts",
+        "description": "Return manipulation alerts. Without alert_type, returns high-risk scores. With alert_type, returns typed alerts (e.g. SANDWICH_ATTACK).",
+        "operationId": "alerts_v1_alerts_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "alert_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter typed manipulation alerts (e.g. SANDWICH_ATTACK). When omitted, returns risk scores at or above the threshold.",
+              "title": "Alert Type"
+            },
+            "description": "Filter typed manipulation alerts (e.g. SANDWICH_ATTACK). When omitted, returns risk scores at or above the threshold."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/assets/risk-ranking": {
+      "get": {
+        "tags": [
+          "Assets"
+        ],
+        "summary": "Asset pair risk ranking",
+        "description": "Return each asset pair ranked by average wallet risk score, descending.",
+        "operationId": "asset_risk_ranking_v1_assets_risk_ranking_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response Asset Risk Ranking V1 Assets Risk Ranking Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/rings": {
+      "get": {
+        "tags": [
+          "Detection"
+        ],
+        "summary": "Wash-trading rings",
+        "description": "Return detected wash-trading rings from the latest pipeline run.",
+        "operationId": "list_rings_v1_rings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response List Rings V1 Rings Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/correlations": {
+      "get": {
+        "tags": [
+          "Detection"
+        ],
+        "summary": "Correlated asset pairs",
+        "description": "Return correlated asset pairs with Spearman coefficient, shared wallet count, and run timestamp.",
+        "operationId": "list_correlations_v1_correlations_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response List Correlations V1 Correlations Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/amm/pools/{pool_id}/risk": {
+      "get": {
+        "tags": [
+          "AMM"
+        ],
+        "summary": "AMM pool risk",
+        "description": "Return round-trip ratio and trader concentration risk metrics for an AMM liquidity pool.",
+        "operationId": "pool_risk_v1_amm_pools__pool_id__risk_get",
+        "parameters": [
+          {
+            "name": "pool_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pool Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Pool Risk V1 Amm Pools  Pool Id  Risk Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/path-payments/circular": {
+      "get": {
+        "tags": [
+          "Detection"
+        ],
+        "summary": "Circular path payments",
+        "description": "Return detected atomic circular path-payment routes, paginated.",
+        "operationId": "circular_path_payments_v1_path_payments_circular_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Circular Path Payments V1 Path Payments Circular Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/feedback": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Submit scoring feedback",
+        "description": "Record ground-truth feedback (confirmed wash / confirmed clean) for a previously scored wallet.",
+        "operationId": "submit_feedback_v1_feedback_post",
+        "parameters": [
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Submit Feedback V1 Feedback Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/drift-reports": {
+      "get": {
+        "summary": "Drift Reports",
+        "description": "Return the most recent drift checks recorded by `cli.py retrain-check`.",
+        "operationId": "drift_reports_v1_admin_drift_reports_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Drift Reports V1 Admin Drift Reports Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/robustness-report": {
+      "get": {
+        "summary": "Robustness Report",
+        "description": "Return the latest RobustnessReport from the database (admin only).",
+        "operationId": "robustness_report_v1_admin_robustness_report_get",
+        "parameters": [
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Robustness Report V1 Admin Robustness Report Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/robustness": {
+      "get": {
+        "summary": "Model Robustness",
+        "description": "Return live red team robustness metrics for the current model.\n\nSummarises the continuous adversarial loop (`detection.red_team`):\n``evasion_rate_24h``, ``mean_generations_to_evade``, and ``hardening_delta``\n(change in evasion rate before/after the most recent retrain).",
+        "operationId": "model_robustness_v1_model_robustness_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Model Robustness V1 Model Robustness Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/retrain-runs": {
+      "get": {
+        "summary": "Retrain Runs",
+        "description": "Return the most recent per-model retrain outcomes recorded by `cli.py retrain-check`.",
+        "operationId": "retrain_runs_v1_admin_retrain_runs_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "model_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by model, e.g. random_forest",
+              "title": "Model Name"
+            },
+            "description": "Filter by model, e.g. random_forest"
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Retrain Runs V1 Admin Retrain Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/federated/audit-log": {
+      "get": {
+        "summary": "Federated Audit Log",
+        "description": "Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).",
+        "operationId": "federated_audit_log_v1_admin_federated_audit_log_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Federated Audit Log V1 Admin Federated Audit Log Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/weights": {
+      "get": {
+        "summary": "Model Weights",
+        "description": "Return current ensemble classifier weights from the adaptive reweighter.",
+        "operationId": "model_weights_v1_model_weights_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks": {
+      "get": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "List webhooks",
+        "description": "Return all active webhook subscribers (secrets masked).",
+        "operationId": "list_webhooks_v1_webhooks_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response List Webhooks V1 Webhooks Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Register webhook subscriber",
+        "description": "Register a URL to receive risk score alert notifications above a configurable threshold.",
+        "operationId": "create_webhook_v1_webhooks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Create Webhook V1 Webhooks Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks/{subscriber_id}": {
+      "delete": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Delete webhook",
+        "description": "Permanently deactivate a webhook subscriber.",
+        "operationId": "delete_webhook_v1_webhooks__subscriber_id__delete",
+        "parameters": [
+          {
+            "name": "subscriber_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Subscriber Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Webhook V1 Webhooks  Subscriber Id  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks/dead-letters": {
+      "get": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Dead-letter webhooks",
+        "description": "Return webhook deliveries that permanently failed after all retry attempts.",
+        "operationId": "dead_letters_v1_webhooks_dead_letters_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response Dead Letters V1 Webhooks Dead Letters Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/disputes": {
+      "post": {
+        "tags": [
+          "Disputes"
+        ],
+        "summary": "Submit score dispute",
+        "description": "Submit a dispute for a scored wallet. Rate-limited to one dispute per wallet per 24h.",
+        "operationId": "create_dispute_v1_disputes_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisputeCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/disputes/{dispute_id}": {
+      "get": {
+        "tags": [
+          "Disputes"
+        ],
+        "summary": "Get dispute",
+        "description": "Return dispute details including committee vote counts (identities hidden).",
+        "operationId": "read_dispute_v1_disputes__dispute_id__get",
+        "parameters": [
+          {
+            "name": "dispute_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dispute Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/disputes/{dispute_id}/vote": {
+      "post": {
+        "tags": [
+          "Disputes"
+        ],
+        "summary": "Vote on dispute",
+        "description": "Cast an approve/reject vote on an open dispute (admin only).",
+        "operationId": "vote_dispute_v1_disputes__dispute_id__vote_post",
+        "parameters": [
+          {
+            "name": "dispute_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dispute Id"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoteBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/governance/proposals": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "List proposals",
+        "description": "Return all open governance proposals.",
+        "operationId": "get_proposals_v1_governance_proposals_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "Create proposal",
+        "description": "Create a new governance proposal (admin only).",
+        "operationId": "create_proposal_endpoint_v1_governance_proposals_post",
+        "parameters": [
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LegacyProposalCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/governance/proposals/{proposal_id}/vote": {
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "Vote on proposal",
+        "description": "Cast a vote on a governance proposal (admin only).",
+        "operationId": "vote_proposal_v1_governance_proposals__proposal_id__vote_post",
+        "parameters": [
+          {
+            "name": "proposal_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Proposal Id"
+            }
+          },
+          {
+            "name": "x-ledgerlens-admin-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Ledgerlens-Admin-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LegacyProposalVote"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AnalystFeedbackRequest": {
+        "properties": {
+          "verdict": {
+            "type": "string",
+            "title": "Verdict"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          },
+          "analyst_key_hash": {
+            "type": "string",
+            "title": "Analyst Key Hash",
+            "default": "anonymous"
+          },
+          "review_started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Started At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "verdict"
+        ],
+        "title": "AnalystFeedbackRequest"
+      },
+      "BatchJobQueued": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "estimated_seconds": {
+            "type": "integer",
+            "title": "Estimated Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "estimated_seconds"
+        ],
+        "title": "BatchJobQueued"
+      },
+      "BatchJobStatus": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "priority": {
+            "type": "string",
+            "title": "Priority"
+          },
+          "total_wallets": {
+            "type": "integer",
+            "title": "Total Wallets"
+          },
+          "completed_wallets": {
+            "type": "integer",
+            "title": "Completed Wallets"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "results": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Results"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "priority",
+          "total_wallets",
+          "completed_wallets",
+          "created_at",
+          "completed_at",
+          "results"
+        ],
+        "title": "BatchJobStatus"
+      },
+      "BatchRequest": {
+        "properties": {
+          "wallets": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Wallets"
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "normal",
+              "high"
+            ],
+            "title": "Priority",
+            "default": "normal"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wallets"
+        ],
+        "title": "BatchRequest"
+      },
+      "CausalExplanationResponse": {
+        "properties": {
+          "wallet": {
+            "type": "string",
+            "title": "Wallet"
+          },
+          "current_score": {
+            "type": "integer",
+            "title": "Current Score"
+          },
+          "feature_ate_table": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Feature Ate Table"
+          },
+          "top_causal_features": {
+            "items": {
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array",
+              "maxItems": 2,
+              "minItems": 2
+            },
+            "type": "array",
+            "title": "Top Causal Features"
+          },
+          "counterfactual_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterfactual Score"
+          },
+          "coverage_note": {
+            "type": "string",
+            "title": "Coverage Note"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wallet",
+          "current_score",
+          "feature_ate_table",
+          "top_causal_features",
+          "counterfactual_score",
+          "coverage_note"
+        ],
+        "title": "CausalExplanationResponse",
+        "description": "Response schema for GET /scores/{wallet}/causal-explanation."
+      },
+      "DisputeCreate": {
+        "properties": {
+          "wallet": {
+            "type": "string",
+            "title": "Wallet"
+          },
+          "asset_pair": {
+            "type": "string",
+            "title": "Asset Pair"
+          },
+          "evidence_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wallet",
+          "asset_pair"
+        ],
+        "title": "DisputeCreate"
+      },
+      "FeedbackRequest": {
+        "properties": {
+          "wallet": {
+            "type": "string",
+            "title": "Wallet"
+          },
+          "asset_pair": {
+            "type": "string",
+            "title": "Asset Pair"
+          },
+          "ground_truth": {
+            "type": "integer",
+            "title": "Ground Truth"
+          },
+          "scored_at": {
+            "type": "string",
+            "title": "Scored At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wallet",
+          "asset_pair",
+          "ground_truth",
+          "scored_at"
+        ],
+        "title": "FeedbackRequest"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "LegacyProposalCreate": {
+        "properties": {
+          "proposal_type": {
+            "type": "string",
+            "title": "Proposal Type"
+          },
+          "proposed_value": {
+            "type": "string",
+            "title": "Proposed Value"
+          },
+          "proposed_by_key_hash": {
+            "type": "string",
+            "title": "Proposed By Key Hash"
+          }
+        },
+        "type": "object",
+        "required": [
+          "proposal_type",
+          "proposed_value",
+          "proposed_by_key_hash"
+        ],
+        "title": "LegacyProposalCreate"
+      },
+      "LegacyProposalVote": {
+        "properties": {
+          "voter_key_hash": {
+            "type": "string",
+            "title": "Voter Key Hash"
+          },
+          "vote": {
+            "type": "string",
+            "title": "Vote"
+          }
+        },
+        "type": "object",
+        "required": [
+          "voter_key_hash",
+          "vote"
+        ],
+        "title": "LegacyProposalVote"
+      },
+      "RateLimiterStatus": {
+        "properties": {
+          "configured_rate": {
+            "type": "number",
+            "title": "Configured Rate"
+          },
+          "current_rate": {
+            "type": "number",
+            "title": "Current Rate"
+          },
+          "bucket_level": {
+            "type": "number",
+            "title": "Bucket Level"
+          },
+          "backpressure_active": {
+            "type": "boolean",
+            "title": "Backpressure Active"
+          },
+          "queue_size": {
+            "type": "integer",
+            "title": "Queue Size"
+          },
+          "last_429_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last 429 At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "configured_rate",
+          "current_rate",
+          "bucket_level",
+          "backpressure_active",
+          "queue_size"
+        ],
+        "title": "RateLimiterStatus"
+      },
+      "RiskScore": {
+        "properties": {
+          "wallet": {
+            "type": "string",
+            "title": "Wallet"
+          },
+          "asset_pair": {
+            "type": "string",
+            "title": "Asset Pair"
+          },
+          "score": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Score",
+            "description": "0-100; higher = more suspicious"
+          },
+          "benford_flag": {
+            "type": "boolean",
+            "title": "Benford Flag"
+          },
+          "ml_flag": {
+            "type": "boolean",
+            "title": "Ml Flag"
+          },
+          "confidence": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Confidence"
+          },
+          "disputed": {
+            "type": "boolean",
+            "title": "Disputed",
+            "default": false
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp"
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latency Ms",
+            "description": "End-to-end latency in milliseconds from trade receipt to score update"
+          },
+          "score_lower": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 100.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score Lower",
+            "description": "Lower bound of 90 % conformal prediction interval"
+          },
+          "score_upper": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 100.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score Upper",
+            "description": "Upper bound of 90 % conformal prediction interval"
+          },
+          "prediction_set": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prediction Set",
+            "description": "Class indices in the conformal prediction set"
+          },
+          "coverage_guarantee": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Guarantee",
+            "description": "Target coverage level (1 - alpha) of the prediction set"
+          }
+        },
+        "type": "object",
+        "required": [
+          "wallet",
+          "asset_pair",
+          "score",
+          "benford_flag",
+          "ml_flag",
+          "confidence",
+          "timestamp"
+        ],
+        "title": "RiskScore"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "VoteBody": {
+        "properties": {
+          "voter_key_hash": {
+            "type": "string",
+            "title": "Voter Key Hash"
+          },
+          "vote": {
+            "type": "string",
+            "title": "Vote"
+          }
+        },
+        "type": "object",
+        "required": [
+          "voter_key_hash",
+          "vote"
+        ],
+        "title": "VoteBody"
+      },
+      "WebhookCreate": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "secret": {
+            "type": "string",
+            "title": "Secret"
+          },
+          "min_score": {
+            "type": "integer",
+            "title": "Min Score",
+            "default": 70
+          },
+          "wallet_filter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wallet Filter"
+          },
+          "asset_pair_filter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Asset Pair Filter"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url",
+          "secret"
+        ],
+        "title": "WebhookCreate"
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ledgerlens-fl-client"
+version = "0.1.0"
+description = "Standalone federated learning client for LedgerLens exchange partners"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.4.0",
+    "xgboost>=2.0.0",
+    "lightgbm>=4.3.0",
+    "cryptography>=42.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "dp-accounting>=0.4.3",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Ledger-Lenz/Ledgerlens-core"
+Repository = "https://github.com/Ledger-Lenz/Ledgerlens-core"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ledgerlens_fl_client"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"src/ledgerlens_fl_client/data" = "ledgerlens_fl_client/data"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

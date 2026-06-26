@@ -6,6 +6,7 @@ error listing every problem at once.
 """
 
 import time
+from pathlib import Path
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,11 +28,29 @@ class Settings(BaseSettings):
     horizon_url: str = "https://horizon.stellar.org"
     horizon_stream_url: str = "https://horizon.stellar.org"
     network: str = "testnet"
+    horizon_default_cursor: str = "now"  # Used when no valid checkpoint exists.
+    data_dir: str = "./data"  # Root allowed to contain runtime data files.
+    cursor_checkpoint_path: str = "./data/horizon_cursor.json"  # Durable SSE offset.
+    cursor_flush_events: int = 100  # Persist after this many processed events.
+    cursor_flush_seconds: float = 10.0  # Persist after this many seconds.
+    horizon_rate_limit: float = 50.0
+    horizon_rate_bucket_capacity: float = 100.0
+    streamer_queue_maxsize: int = 1000  # Hard cap on buffered Horizon trades.
+    streamer_overflow_strategy: str = "drop_oldest"  # block/drop_newest/drop_oldest.
+    streamer_high_water_ratio: float = 0.8  # Begin producer throttling at 80%.
+    rate_restore_seconds: float = 60.0
+    stream_checkpoint_interval: int = 100
+    stream_score_delta_threshold: int = 5
 
     # ── Polling ───────────────────────────────────────────────────────────────
     poll_interval_seconds: int = 5
     trade_history_lookback_days: int = 30
     cursor_path: str = "./horizon_cursor.txt"
+    # Keep this below Horizon's per-IP request limit divided by average request duration.
+    historical_loader_concurrency: int = 4
+    historical_chunk_hours: float = 6.0
+    historical_progress_path: str = "./data/historical_progress.json"
+    historical_max_lookback_days: int = 365
 
     # ── Feature Store ─────────────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
@@ -77,6 +96,11 @@ class Settings(BaseSettings):
     ledgerlens_model_signing_key: str = ""
     ledgerlens_webhook_encryption_key: str = ""
 
+    # ── ED25519 model signing ────────────────────────────────────────────────
+    # Base64-encoded 32-byte ED25519 public key for model artifact signing.
+    # Generate with: python cli.py generate-signing-key
+    model_signing_public_key: str = ""
+
     # ── Federated learning ────────────────────────────────────────────────────
     federated_min_participants: int = 3
     federated_dp_epsilon: float = 1.0
@@ -87,6 +111,12 @@ class Settings(BaseSettings):
     federated_noise_multiplier: float = 0.0
     federated_server_host: str = "127.0.0.1"
     federated_server_port: int = 8001
+
+    # ── Cross-chain Bayesian linking ─────────────────────────────────────────
+    cross_chain_timing_sigma_seconds: float = 300.0
+    cross_chain_amount_tolerance: float = 0.005
+    cross_chain_min_confidence: float = 0.70
+    cross_chain_confirmed_confidence: float = 0.90
 
     # ── EVM cross-chain ───────────────────────────────────────────────────────
     evm_rpc_ethereum: str = "https://eth.llamarpc.com"
@@ -122,7 +152,10 @@ class Settings(BaseSettings):
                      "feature_store_ttl_hours", "feature_store_flush_interval_seconds",
                      "soroban_circuit_reset_seconds", "evm_lookback_blocks",
                      "committee_quorum", "committee_vote_deadline_days",
-                     "federated_min_participants", mode="before")
+                     "federated_min_participants", "cursor_flush_events",
+                     "stream_checkpoint_interval", "streamer_queue_maxsize",
+                     "historical_loader_concurrency", "historical_max_lookback_days",
+                     mode="before")
     @classmethod
     def must_be_positive(cls, v: object) -> object:
         if int(v) <= 0:
@@ -152,6 +185,21 @@ class Settings(BaseSettings):
             raise ValueError("SOROBAN_CIRCUIT_BREAKER_THRESHOLD must be >= 1")
         return v
 
+    @field_validator("compliance_sar_min_score", mode="before")
+    @classmethod
+    def valid_sar_min_score(cls, v: object) -> object:
+        val = int(v)
+        if not (0 <= val <= 100):
+            raise ValueError(f"COMPLIANCE_SAR_MIN_SCORE {val} must be 0-100")
+        return v
+
+    @field_validator("compliance_export_rate_limit_per_hour", mode="before")
+    @classmethod
+    def valid_export_rate_limit(cls, v: object) -> object:
+        if int(v) < 1:
+            raise ValueError("COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR must be >= 1")
+        return v
+
     @field_validator("benford_mad_threshold", "temporal_weight",
                      "sandwich_score_weight", "benford_copula_weight",
                      "pdc_discount_weight", mode="before")
@@ -160,6 +208,41 @@ class Settings(BaseSettings):
         if float(v) < 0:
             raise ValueError("must be >= 0")
         return v
+
+    @field_validator("cursor_flush_seconds", "historical_chunk_hours", mode="before")
+    @classmethod
+    def positive_cursor_flush_seconds(cls, v: object) -> object:
+        if float(v) <= 0:
+            raise ValueError("CURSOR_FLUSH_SECONDS must be positive")
+        return v
+
+    @field_validator("streamer_overflow_strategy", mode="before")
+    @classmethod
+    def valid_streamer_overflow_strategy(cls, v: object) -> object:
+        strategy = str(v).strip().lower()
+        if strategy not in {"block", "drop_newest", "drop_oldest"}:
+            raise ValueError(
+                "STREAMER_OVERFLOW_STRATEGY must be block, drop_newest, or drop_oldest"
+            )
+        return strategy
+
+    @field_validator("streamer_high_water_ratio", mode="before")
+    @classmethod
+    def valid_streamer_high_water_ratio(cls, v: object) -> object:
+        ratio = float(v)
+        if not 0 < ratio <= 1:
+            raise ValueError("STREAMER_HIGH_WATER_RATIO must be in (0, 1]")
+        return ratio
+
+    @field_validator("horizon_default_cursor", mode="before")
+    @classmethod
+    def valid_horizon_default_cursor(cls, v: object) -> object:
+        import re
+
+        cursor = str(v).strip()
+        if cursor != "now" and re.fullmatch(r"\d+-\d+", cursor) is None:
+            raise ValueError("HORIZON_DEFAULT_CURSOR must be 'now' or a paging token")
+        return cursor
 
     @field_validator("ensemble_weight_rf", "ensemble_weight_xgb", "ensemble_weight_lgbm",
                      mode="before")
@@ -204,6 +287,24 @@ class Settings(BaseSettings):
                 "LEDGERLENS_CORS_ALLOWED_ORIGINS must not contain '*'. "
                 "Specify an explicit origin list instead."
             )
+        return self
+
+    @model_validator(mode="after")
+    def checkpoint_path_is_inside_data_directory(self) -> "Settings":
+        data_root = Path(self.data_dir).expanduser().resolve()
+        for field_name, raw_path in (
+            ("CURSOR_CHECKPOINT_PATH", self.cursor_checkpoint_path),
+            ("HISTORICAL_PROGRESS_PATH", self.historical_progress_path),
+        ):
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = (Path.cwd() / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            try:
+                candidate.relative_to(data_root)
+            except ValueError as exc:
+                raise ValueError(f"{field_name} must remain inside DATA_DIR") from exc
         return self
 
     @model_validator(mode="after")

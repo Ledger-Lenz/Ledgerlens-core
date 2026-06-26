@@ -349,9 +349,24 @@ This scores each wallet/asset-pair combination and writes the resulting
 python cli.py serve --reload
 ```
 
-Exposes `/health`, `/scores`, `/scores/{wallet}`, `/alerts`, `/assets/risk-ranking`,
-`/correlations`, and `/rings` over the locally stored `RiskScore` records — a
-stand-in for `ledgerlens-api` during local development.
+Exposes `/health`, `/scores`, `/scores/{wallet}`, `/scores/{wallet}/explain`,
+`/alerts`, `/assets/risk-ranking`, `/correlations`, and `/rings` over the
+locally stored `RiskScore` records — a stand-in for `ledgerlens-api` during
+local development.
+
+##### SHAP Explanation Endpoint
+
+```bash
+# Get waterfall-style SHAP explanation (requires admin key)
+curl -H "X-LedgerLens-Admin-Key: your-admin-key" \
+  "http://localhost:8000/v1/scores/GABCD...XYZ/explain?asset_pair=XLM/USDC&model=random_forest"
+```
+
+Response returns base value, ranked feature contributions, and a
+human-readable summary sentence. Supports `model` query parameter:
+`random_forest` (default), `xgboost`, `lightgbm`. See
+[docs/shap_explanation.md](docs/shap_explanation.md) for the full caching
+strategy and TTL.
 
 #### CORS configuration
 
@@ -414,14 +429,25 @@ docker compose up --build
 python cli.py generate-data   # write synthetic trades/labels to CSV
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
+python cli.py historical-load --start 2026-05-01T00:00:00Z --end 2026-05-31T00:00:00Z \
+  --concurrency 8 --chunk-hours 6 --resume
+                              # parallel, restart-safe Horizon trade backfill
 python cli.py stream          # stream trades from Horizon SSE and score incrementally
                               #   --checkpoint-interval N  persist state every N trades (default: 100)
                               #   --score-delta N          min score change to emit alert (default: 5)
+                              #   --queue-depth N          cap buffered trades (default: 1000)
+                              #   --overflow-strategy S    block, drop_newest, or drop_oldest
+                              #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
+
+The Horizon stream position is stored atomically in
+`CURSOR_CHECKPOINT_PATH` (default `./data/horizon_cursor.json`). The path must
+remain inside `DATA_DIR`. Use `--reset-cursor` when an intentional fresh start
+or replay is required.
 
 ## Continuous Retraining
 
@@ -635,6 +661,20 @@ The response returns a `subscriber_id` (UUID) used for management.
 | `GET`    | `/webhooks`                 | List active subscribers            |
 | `DELETE` | `/webhooks/{subscriber_id}` | Deactivate a subscriber            |
 | `GET`    | `/webhooks/dead-letters`    | List permanently failed deliveries |
+
+### Analyst Feedback Endpoints
+
+| Method | Path                | Description                                         |
+| ------ | ------------------- | --------------------------------------------------- |
+| `POST` | `/v1/feedback`      | Submit analyst label correction (admin-key required) |
+| `GET`  | `/v1/feedback`      | Paginated correction history (admin-key required)    |
+
+### Cross-Chain Link Endpoints
+
+| Method | Path                                          | Description                                                |
+| ------ | --------------------------------------------- | ---------------------------------------------------------- |
+| `GET`  | `/cross-chain/links/{stellar_wallet}`         | Accepted Bayesian link hypotheses (sorted by confidence)   |
+| `GET`  | `/cross-chain/links/{stellar_wallet}/explain` | Evidence feature breakdown per hypothesis (admin-key only) |
 
 ### Payload Format
 

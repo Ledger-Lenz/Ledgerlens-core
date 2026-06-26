@@ -43,6 +43,7 @@ from detection.storage import (
     promote_cold_to_hot,
 )
 from detection.shap_explainer import explain_score, top_contributing_features
+from detection.gnn_model import load_gnn_engine, GNNInferenceEngine
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
 from ingestion.data_models import Trade, TradeType
 from ingestion.historical_loader import async_load_historical_trades, load_historical_trades
@@ -187,6 +188,17 @@ def run(
         graph = build_transaction_graph(trades)
         rings = find_wash_rings(graph)
         all_rings.extend(rings)
+        ring_membership = build_ring_membership_index(rings, trades=trades)
+        # GNN scoring — optional; degrades to 0.0 if torch_geometric not installed
+        _gnn_engine = load_gnn_engine(settings.model_dir)
+        if _gnn_engine is not None:
+            GNNInferenceEngine.set_instance(_gnn_engine)
+        gnn_scores: dict[str, float] = {}
+        try:
+            if _gnn_engine is not None:
+                gnn_scores = _gnn_engine.score_graph(graph)
+        except Exception:
+            logger.exception("GNN scoring failed; using 0.0 for gnn_wash_ring_prob")
         _ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
@@ -222,6 +234,7 @@ def run(
                 correlated_pairs=correlated_pairs if multi_pair else None,
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
                 path_payments=path_payments,
+                gnn_scores=gnn_scores,
                 path_cycles=path_cycles,
                 ring_membership=_ring_membership,
             )

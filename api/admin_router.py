@@ -3,19 +3,29 @@
 import glob
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from api.auth import require_admin_key
+from api.webhook_sender import list_dlq, get_dlq_entry
+from api.webhook_sender import WebhookRetryQueue
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
+from detection.storage import get_krum_aggregation_log
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
 _MODEL_NAMES = ["random_forest", "xgboost", "lightgbm"]
+
+# Rate limiter instance for the reset endpoint
+_limiter = Limiter(key_func=get_remote_address)
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +107,12 @@ def get_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
-class ConfigPatch(BaseModel):
+class RuntimeConfigPatch(BaseModel):
     updates: dict[str, str]
 
 
 @router.patch("/config", include_in_schema=False)
-def patch_config(body: ConfigPatch) -> dict:
+def patch_config(body: RuntimeConfigPatch) -> dict:
     """Persist config key/value updates to SQLite and invalidate the in-process cache."""
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(settings.db_path) as conn:
@@ -125,6 +135,25 @@ def patch_config(body: ConfigPatch) -> dict:
     _runtime_cache["config"] = {}
 
     return {"updated": list(body.updates.keys())}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/oracle/status
+# ---------------------------------------------------------------------------
+
+
+@router.get("/oracle/status", include_in_schema=False)
+def oracle_status() -> list[dict]:
+    """Return the status of the oracle nodes in the quorum."""
+    nodes = _get_oracle_nodes()
+    return [
+        {
+            "name": node.name,
+            "public_key": node.public_key_hex,
+            "last_seen": node.last_seen,
+        }
+        for node in nodes
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +201,81 @@ def _run_retrain(job_id: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# GET /admin/shadow/report
+# ---------------------------------------------------------------------------
+
+
+@router.get("/shadow/report", include_in_schema=False)
+def shadow_report() -> dict:
+    """Return shadow model scoring report: mean divergence, p95, high-divergence wallets."""
+    from detection.shadow_scoring import get_shadow_model_version, get_shadow_report
+
+    version = get_shadow_model_version()
+    if not version:
+        raise HTTPException(status_code=404, detail="Shadow mode not active (SHADOW_MODEL_VERSION not set)")
+
+    report = get_shadow_report(settings.db_path)
+    report["shadow_model_version"] = version
+    return report
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/retrain
+# ---------------------------------------------------------------------------
+
+
 @router.post("/retrain", include_in_schema=False)
 def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     """Enqueue an async retraining job and return its job ID."""
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# FL Privacy endpoint  (Issue #145)
+# ---------------------------------------------------------------------------
+
+import logging as _logging
+_logger = _logging.getLogger("ledgerlens.admin")
+
+
+class FLPrivacyStatus(BaseModel):
+    current_epsilon: float
+    target_epsilon: float
+    delta: float
+    noise_multiplier: float
+    clip_norm: float
+    budget_exhausted: bool
+    rounds_completed: int
+
+
+@router.get("/fl/privacy", response_model=FLPrivacyStatus, include_in_schema=False)
+def fl_privacy_status() -> FLPrivacyStatus:
+    """Return current FL differential privacy budget status (admin-key gated)."""
+    db_path = settings.db_path
+    try:
+        from detection.federated.privacy_utils import get_privacy_log
+        rows = get_privacy_log(db_path)
+    except Exception:
+        rows = []
+
+    target_epsilon = float(os.environ.get("FL_DP_TARGET_EPSILON", "1.0"))
+    delta = float(os.environ.get("FL_DP_DELTA", "1e-5"))
+    noise_multiplier = float(os.environ.get("FL_DP_NOISE_MULTIPLIER", "0.0")) or float(
+        getattr(settings, "federated_noise_multiplier", 0.0)
+    )
+    clip_norm = float(os.environ.get("FL_DP_CLIP_NORM", "1.0"))
+    current_epsilon = rows[-1]["epsilon"] if rows else 0.0
+    budget_exhausted = current_epsilon >= target_epsilon
+
+    return FLPrivacyStatus(
+        current_epsilon=current_epsilon,
+        target_epsilon=target_epsilon,
+        delta=delta,
+        noise_multiplier=noise_multiplier,
+        clip_norm=clip_norm,
+        budget_exhausted=budget_exhausted,
+        rounds_completed=len(rows),
+    )

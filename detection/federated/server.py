@@ -57,6 +57,8 @@ from dp_accounting import dp_event as _dp_event
 from dp_accounting.rdp import rdp_privacy_accountant as _rdp_pa
 
 from config.settings import settings
+from detection.federated.krum import KrumAggregator, KrumStrategy
+from detection.storage import log_krum_aggregation
 from detection.federated.audit import (
     build_record,
     get_cumulative_epsilon,
@@ -503,3 +505,75 @@ def http_global_model() -> dict:
 def http_server_pubkey() -> dict:
     der = get_server().get_server_public_key_der()
     return {"public_key_der_b64": base64.b64encode(der).decode()}
+
+
+# ---------------------------------------------------------------------------
+# SMPC share aggregation endpoints  (Issue-138)
+# ---------------------------------------------------------------------------
+
+
+class SMPCShareRequest(BaseModel):
+    aggregator_id: int
+    participant_id: str
+    share_b64: str
+    commitment: str | None = None
+
+
+_smpc_aggregators: dict[int, "SMPCAggregatorState"] = {}
+
+
+class SMPCAggregatorState:
+    def __init__(self, aggregator_id: int, n_aggregators: int = 3) -> None:
+        from detection.federated.smpc import SMPCAggregator
+        self._inner = SMPCAggregator(aggregator_id, n_aggregators)
+
+    def receive(self, share_bytes: bytes, commitment: str | None) -> None:
+        import numpy as np
+        share = np.frombuffer(share_bytes, dtype=np.float64)
+        self._inner.receive_share(share, commitment)
+
+    def finalize(self) -> bytes:
+        return self._inner.finalize().tobytes()
+
+    def reset(self) -> None:
+        self._inner.reset()
+
+
+def _get_smpc_aggregator(aggregator_id: int) -> SMPCAggregatorState:
+    if aggregator_id not in _smpc_aggregators:
+        _smpc_aggregators[aggregator_id] = SMPCAggregatorState(aggregator_id)
+    return _smpc_aggregators[aggregator_id]
+
+
+@federated_app.post("/federated/smpc/share")
+def smpc_receive_share(req: SMPCShareRequest) -> dict:
+    """Accept a gradient share from a client for SMPC aggregation."""
+    share_bytes = base64.b64decode(req.share_b64)
+    agg = _get_smpc_aggregator(req.aggregator_id)
+    try:
+        agg.receive(share_bytes, req.commitment)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "accepted", "aggregator_id": req.aggregator_id}
+
+
+@federated_app.get("/federated/smpc/partial-sum/{aggregator_id}")
+def smpc_get_partial_sum(aggregator_id: int) -> dict:
+    """Return the partial sum for this aggregator to be exchanged with peers."""
+    if aggregator_id not in _smpc_aggregators:
+        raise HTTPException(status_code=404, detail=f"Aggregator {aggregator_id} has no shares")
+    agg = _smpc_aggregators[aggregator_id]
+    partial_sum_bytes = agg.finalize()
+    return {"partial_sum_b64": base64.b64encode(partial_sum_bytes).decode()}
+
+
+@federated_app.post("/federated/smpc/reconstruct")
+def smpc_reconstruct(partial_sums_b64: list[str]) -> dict:
+    """Reconstruct gradient from partial sums (any 2 of 3 suffice)."""
+    import numpy as np
+    from detection.federated.smpc import reconstruct_gradient
+    if len(partial_sums_b64) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 partial sums required")
+    partial_sums = [np.frombuffer(base64.b64decode(s), dtype=np.float64) for s in partial_sums_b64]
+    gradient = reconstruct_gradient(partial_sums)
+    return {"gradient_b64": base64.b64encode(gradient.tobytes()).decode()}

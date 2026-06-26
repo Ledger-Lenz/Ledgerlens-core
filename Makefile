@@ -23,6 +23,12 @@ train:
 serve:
 	python3 cli.py serve --reload
 
+# ── End-to-end tests ────────────────────────────────────────────────────────
+# Runs the E2E test suite (SQLite + trained models, no external containers needed
+# for the base suite). Must complete in < 5 minutes.
+test-e2e:
+	pytest tests/e2e/ -m e2e -v --tb=short --timeout=300
+
 # ── Chaos engineering ────────────────────────────────────────────────────────
 # Requires Docker + Docker Compose. Starts Toxiproxy + Redis, runs chaos suite,
 # then tears down. Set LEDGERLENS_ADMIN_API_KEY before running.

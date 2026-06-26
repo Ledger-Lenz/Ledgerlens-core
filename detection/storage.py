@@ -25,7 +25,7 @@ import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from ingestion.data_models import BridgeTransfer, PathPayment
+from ingestion.data_models import BridgeTransfer, PathPayment, Trade
 
 logger = logging.getLogger("ledgerlens.storage")
 
@@ -382,44 +382,23 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         14,
-        "create analyst_feedback table for analyst review dashboard",
+        "add soroban_dead_letters table for DLQ",
         """
-        CREATE TABLE IF NOT EXISTS analyst_feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            wallet TEXT NOT NULL,
-            asset_pair TEXT NOT NULL DEFAULT 'XLM/USDC',
-            verdict TEXT NOT NULL,
-            notes TEXT,
-            analyst_key_hash TEXT,
-            submitted_at TEXT NOT NULL,
-            review_started_at TEXT
+        CREATE TABLE IF NOT EXISTS soroban_dead_letters (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet          TEXT NOT NULL,
+            asset_pair      TEXT NOT NULL,
+            score           INTEGER NOT NULL,
+            ledger_timestamp INTEGER NOT NULL,
+            error_message   TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending', 'replayed', 'failed')),
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            replayed_at     TIMESTAMP,
+            replay_tx_hash  TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_wallet
-            ON analyst_feedback (wallet, asset_pair);
-        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted_at
-            ON analyst_feedback (submitted_at);
-        """,
-    ),
-    (
-        15,
-        "create hop_payment_cycles table for path payment cycle detection",
-        """
-        CREATE TABLE IF NOT EXISTS hop_payment_cycles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            origin_wallet TEXT NOT NULL,
-            origin_asset TEXT NOT NULL,
-            path_length INTEGER NOT NULL DEFAULT 0,
-            recovery_ratio REAL NOT NULL DEFAULT 0.0,
-            cycle_duration_seconds REAL NOT NULL DEFAULT 0.0,
-            counterparty_overlap REAL NOT NULL DEFAULT 0.0,
-            cycle_score REAL NOT NULL DEFAULT 0.0,
-            hop_json TEXT NOT NULL DEFAULT '[]',
-            detected_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_hop_payment_cycles_wallet
-            ON hop_payment_cycles (origin_wallet);
-        CREATE INDEX IF NOT EXISTS idx_hop_payment_cycles_score
-            ON hop_payment_cycles (cycle_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_dlq_status ON soroban_dead_letters(status);
+        CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
         """,
     ),
 ]
@@ -550,6 +529,66 @@ def init_db(db_path: str | None = None) -> None:
     """Initialise or upgrade the database schema via the migration system."""
     with _connect(db_path) as conn:
         migrate_db(conn)
+
+
+class RiskScoreStore:
+    """SQLite store used by scoring and historical trade ingestion.
+
+    Historical trades are inserted in page-sized batches with
+    ``INSERT OR IGNORE`` so replayed pages and adjacent boundary duplicates
+    are harmless.
+    """
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path = db_path or settings.db_path
+        init_db(self.db_path)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 30000")
+
+    def upsert_trades(self, trades: list[Trade]) -> int:
+        """Insert validated trades, ignoring existing paging tokens."""
+        if not trades:
+            return 0
+        rows = [
+            (
+                trade.paging_token or trade.id,
+                trade.id,
+                trade.ledger_close_time.isoformat(),
+                trade.base_account,
+                trade.counter_account,
+                trade.base_asset.code,
+                trade.base_asset.issuer,
+                trade.counter_asset.code,
+                trade.counter_asset.issuer,
+                trade.base_amount,
+                trade.counter_amount,
+                trade.price,
+                int(trade.base_is_seller),
+                trade.trade_type.value,
+                trade.liquidity_pool_id,
+                trade.transaction_hash,
+                trade.path_payment_id,
+                trade.hop_index,
+            )
+            for trade in trades
+        ]
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO trades (
+                    paging_token, trade_id, ledger_close_time, base_account,
+                    counter_account, base_asset_code, base_asset_issuer,
+                    counter_asset_code, counter_asset_issuer, base_amount,
+                    counter_amount, price, base_is_seller, trade_type,
+                    liquidity_pool_id, transaction_hash, path_payment_id, hop_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return conn.total_changes - before
 
 
 def save_scores(scores: list[RiskScore], db_path: str | None = None) -> None:
@@ -1355,7 +1394,7 @@ def save_feature_state(state, db_path: str | None = None) -> None:
         db_path: Optional database path; uses settings.db_path if not provided.
     """
     init_db(db_path)
-    state_json = state.model_dump_json_compat()
+    state_json = state.model_dump_json()
     with _connect(db_path) as conn:
         conn.execute(
             """
@@ -1384,7 +1423,7 @@ def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
         return None
 
     from detection.feature_store import WalletFeatureState
-    return WalletFeatureState.model_validate_json_compat(row[0])
+    return WalletFeatureState.model_validate_json(row[0])
 
 
 def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | None = None) -> int:
@@ -1407,7 +1446,7 @@ def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | Non
     from detection.feature_store import WalletFeatureState
     for row in rows:
         try:
-            state = WalletFeatureState.model_validate_json_compat(row[0])
+            state = WalletFeatureState.model_validate_json(row[0])
             feature_store.set_state(state)
             count += 1
         except Exception as e:
@@ -1603,7 +1642,13 @@ def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
     Each alert dict must carry ``alert_type``, ``wallet``, ``asset_pair`` and a
     JSON-serialisable ``detail`` mapping; ``pool_id`` and ``timestamp`` (ISO 8601)
     are optional and default to ``None`` / now.
+
+    Suppressed wallets are silently dropped before persistence (Issue #178).
     """
+    if not alerts:
+        return
+    from detection.suppressions import filter_suppressed_alerts
+    alerts = filter_suppressed_alerts(alerts, db_path=db_path)
     if not alerts:
         return
     init_db(db_path)
@@ -1806,6 +1851,72 @@ def get_hop_payment_cycles(
             "cycle_score": r[7],
             "hops": json.loads(r[8]),
             "detected_at": r[9],
+        }
+        for r in rows
+    ]
+
+
+def log_krum_aggregation(
+    round_number: int,
+    n_clients: int,
+    f_tolerance: int,
+    m_selected: int,
+    selected_indices: list,
+    excluded_indices: list,
+    krum_scores: list,
+    db_path: str | None = None,
+) -> None:
+    """Persist one Krum aggregation round decision to fl_aggregation_log."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO fl_aggregation_log
+              (round_number, n_clients, f_tolerance, m_selected,
+               selected_indices, excluded_indices, krum_scores, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                round_number,
+                n_clients,
+                f_tolerance,
+                m_selected,
+                json.dumps(selected_indices),
+                json.dumps(excluded_indices),
+                json.dumps([float(s) for s in krum_scores]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def get_krum_aggregation_log(
+    limit: int = 10,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the most recent Krum aggregation rounds, newest first."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT round_number, n_clients, f_tolerance, m_selected,
+                   selected_indices, excluded_indices, krum_scores, recorded_at
+            FROM fl_aggregation_log
+            ORDER BY round_number DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "round_number": r[0],
+            "n_clients": r[1],
+            "f_tolerance": r[2],
+            "m_selected": r[3],
+            "selected_indices": json.loads(r[4]),
+            "excluded_indices": json.loads(r[5]),
+            "krum_scores": json.loads(r[6]),
+            "recorded_at": r[7],
         }
         for r in rows
     ]

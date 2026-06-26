@@ -11,22 +11,29 @@ import pytest
 from fastapi.testclient import TestClient
 
 from detection.compliance_exporter import (
+    ComplianceRateLimitExceeded,
+    ComplianceScoreTooLow,
     augment_ivms_payload,
     build_ivms_risk_field,
+    export_sar_package,
+    export_travel_rule,
     generate_sar_package,
     get_audit_trail,
+    hash_wallet,
 )
 from detection.risk_score import RiskScore
 from detection.sar_narrative import generate_sar_narrative
+from detection.storage import _connect as _connect_for_test
 from detection.storage import save_alerts, save_scores, save_submission
 
 WALLET = "G" + "A" * 55
+LOW_SCORE_WALLET = "G" + "B" * 55
 COMPLIANCE_KEY = "test-compliance-key"
 
 
-def _score(score, *, asset_pair="XLM/USDC", ts=None):
+def _score(score, *, wallet=WALLET, asset_pair="XLM/USDC", ts=None):
     return RiskScore(
-        wallet=WALLET,
+        wallet=wallet,
         asset_pair=asset_pair,
         score=score,
         benford_flag=score > 50,
@@ -237,3 +244,172 @@ def test_compliance_endpoints_excluded_from_openapi(client):
     schema = client.get("/openapi.json").json()
     paths = schema["paths"]
     assert not any(p.startswith("/compliance/") for p in paths)
+
+
+# ---------------------------------------------------------------------------
+# Compliance-gated export wrappers: rate limit, score gate, audit logging
+# ---------------------------------------------------------------------------
+
+
+def test_hash_wallet_does_not_leak_the_address():
+    digest = hash_wallet(WALLET)
+    assert digest != WALLET
+    assert len(digest) == 64
+    int(digest, 16)
+
+
+def test_export_sar_package_rejects_low_risk_score(db_path, tmp_path):
+    save_scores([_score(40, wallet=LOW_SCORE_WALLET)], db_path)
+    with pytest.raises(ComplianceScoreTooLow):
+        export_sar_package(
+            LOW_SCORE_WALLET,
+            "2026-06-01T00:00:00+00:00",
+            "2026-06-30T00:00:00+00:00",
+            str(tmp_path / "out"),
+            db_path=db_path,
+        )
+
+
+def test_export_sar_package_logs_audit_entry_with_wallet_hash(db_path, tmp_path):
+    _seed(db_path)
+    export_sar_package(
+        WALLET,
+        "2026-06-01T00:00:00+00:00",
+        "2026-06-30T00:00:00+00:00",
+        str(tmp_path / "out"),
+        db_path=db_path,
+    )
+
+    with _connect_for_test(db_path) as conn:
+        rows = conn.execute(
+            "SELECT export_type, wallet_hash, risk_score, dry_run FROM compliance_exports"
+        ).fetchall()
+
+    assert len(rows) == 1
+    export_type, wallet_hash, risk_score, dry_run = rows[0]
+    assert export_type == "sar"
+    assert wallet_hash == hash_wallet(WALLET)
+    assert WALLET not in wallet_hash
+    assert risk_score == 92
+    assert dry_run == 0
+
+
+def test_export_sar_package_dry_run_skips_audit_log(db_path, tmp_path):
+    _seed(db_path)
+    export_sar_package(
+        WALLET,
+        "2026-06-01T00:00:00+00:00",
+        "2026-06-30T00:00:00+00:00",
+        str(tmp_path / "out"),
+        dry_run=True,
+        db_path=db_path,
+    )
+
+    with _connect_for_test(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM compliance_exports").fetchone()[0]
+    assert count == 0
+
+
+def test_export_sar_package_rate_limit_exceeded(db_path, tmp_path):
+    _seed(db_path)
+    import config.settings as settings_module
+
+    original = settings_module.settings.compliance_export_rate_limit_per_hour
+    object.__setattr__(settings_module.settings, "compliance_export_rate_limit_per_hour", 1)
+    try:
+        export_sar_package(
+            WALLET,
+            "2026-06-01T00:00:00+00:00",
+            "2026-06-30T00:00:00+00:00",
+            str(tmp_path / "out1"),
+            db_path=db_path,
+        )
+        with pytest.raises(ComplianceRateLimitExceeded):
+            export_sar_package(
+                WALLET,
+                "2026-06-01T00:00:00+00:00",
+                "2026-06-30T00:00:00+00:00",
+                str(tmp_path / "out2"),
+                db_path=db_path,
+            )
+    finally:
+        object.__setattr__(settings_module.settings, "compliance_export_rate_limit_per_hour", original)
+
+
+def test_export_travel_rule_logs_audit_entry(db_path):
+    _seed(db_path)
+    export_travel_rule(WALLET, db_path=db_path)
+
+    with _connect_for_test(db_path) as conn:
+        rows = conn.execute(
+            "SELECT export_type, wallet_hash FROM compliance_exports"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "travel_rule"
+    assert rows[0][1] == hash_wallet(WALLET)
+
+
+def test_export_travel_rule_dry_run_skips_audit_log(db_path):
+    _seed(db_path)
+    export_travel_rule(WALLET, dry_run=True, db_path=db_path)
+
+    with _connect_for_test(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM compliance_exports").fetchone()[0]
+    assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# API endpoints: score gate, dry-run, rate limit
+# ---------------------------------------------------------------------------
+
+
+def test_sar_package_endpoint_rejects_low_score(client, db_path):
+    save_scores([_score(40, wallet=LOW_SCORE_WALLET)], db_path)
+    body = {
+        "wallet": LOW_SCORE_WALLET,
+        "start_date": "2026-06-01T00:00:00+00:00",
+        "end_date": "2026-06-30T00:00:00+00:00",
+    }
+    resp = client.post(
+        "/compliance/sar-package", json=body, headers={"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY}
+    )
+    assert resp.status_code == 400
+
+
+def test_sar_package_endpoint_dry_run_skips_audit_log(client, db_path):
+    body = {
+        "wallet": WALLET,
+        "start_date": "2026-06-01T00:00:00+00:00",
+        "end_date": "2026-06-30T00:00:00+00:00",
+    }
+    resp = client.post(
+        "/compliance/sar-package?dry_run=true",
+        json=body,
+        headers={"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY},
+    )
+    assert resp.status_code == 200
+
+    with _connect_for_test(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM compliance_exports").fetchone()[0]
+    assert count == 0
+
+
+def test_sar_package_endpoint_rate_limited(client, db_path):
+    import config.settings as settings_module
+
+    original = settings_module.settings.compliance_export_rate_limit_per_hour
+    object.__setattr__(settings_module.settings, "compliance_export_rate_limit_per_hour", 1)
+    try:
+        body = {
+            "wallet": WALLET,
+            "start_date": "2026-06-01T00:00:00+00:00",
+            "end_date": "2026-06-30T00:00:00+00:00",
+        }
+        headers = {"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY}
+        resp1 = client.post("/compliance/sar-package", json=body, headers=headers)
+        assert resp1.status_code == 200
+
+        resp2 = client.post("/compliance/sar-package", json=body, headers=headers)
+        assert resp2.status_code == 429
+    finally:
+        object.__setattr__(settings_module.settings, "compliance_export_rate_limit_per_hour", original)
