@@ -89,7 +89,7 @@ TokensSent(address indexed sender, bytes32 recipient, uint256 amount)
 
 Links Stellar wallets to their EVM counterparts and computes EVM-side trading statistics.
 
-**`CrossChainLinker(db_path=None)`**
+**`CrossChainLinker(db_path=None, min_confidence=0.70)`**
 
 - `link_wallets(stellar_wallet, lookback_days=90)` — returns EVM wallet addresses that bridged with the Stellar wallet within the lookback window
 - `get_evm_trade_pattern(evm_wallets, chain, evm_trades=None, db_path=None)` — returns a dict with:
@@ -97,6 +97,9 @@ Links Stellar wallets to their EVM counterparts and computes EVM-side trading st
   - `total_evm_volume` — total USD volume from the provided `evm_trades` list
   - `unique_counterparties` — distinct counterparty addresses seen
   - `benford_mad` — Benford MAD on the trade amounts
+- `score_hypothesis(stellar_wallet, evm_wallet, bridge_events)` — compute Bayesian confidence score for the link hypothesis (returns `WalletLinkHypothesis`)
+- `persist_hypothesis(hypothesis)` — persist accepted hypotheses (confidence >= 0.7) to SQLite
+- `get_accepted_links(stellar_wallet, min_confidence=None)` — retrieve accepted link hypotheses sorted by confidence descending
 
 ## Seven Cross-Chain Features
 

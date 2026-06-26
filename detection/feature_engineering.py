@@ -726,6 +726,17 @@ def sandwich_features(
     }
 
 
+def compute_cross_chain_link_confidence(wallet: str, linker: "CrossChainLinker") -> float:
+    """Returns max confidence across all accepted cross-chain links for this wallet.
+
+    Returns 0.0 if no accepted links exist.
+    """
+    links = linker.get_accepted_links(wallet)
+    if not links:
+        return 0.0
+    return max(h.confidence for h in links)
+
+
 def build_cross_chain_features(
     wallet: str,
     linker: "CrossChainLinker",  # noqa: F821

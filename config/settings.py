@@ -135,6 +135,12 @@ class Settings(BaseSettings):
     federated_server_host: str = "127.0.0.1"
     federated_server_port: int = 8001
 
+    # ── Cross-chain Bayesian linking ─────────────────────────────────────────
+    cross_chain_timing_sigma_seconds: float = 300.0
+    cross_chain_amount_tolerance: float = 0.005
+    cross_chain_min_confidence: float = 0.70
+    cross_chain_confirmed_confidence: float = 0.90
+
     # ── EVM cross-chain ───────────────────────────────────────────────────────
     evm_rpc_ethereum: str = "https://eth.llamarpc.com"
     evm_rpc_base: str = "https://mainnet.base.org"

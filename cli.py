@@ -1019,6 +1019,48 @@ def webhook_worker(
     asyncio.run(run_delivery_worker(interval_seconds=interval))
 
 
+backtest_app = typer.Typer(help="Backtesting framework for model evaluation")
+app.add_typer(backtest_app, name="backtest")
+
+
+@backtest_app.command("run")
+def backtest_run(
+    dataset: str = typer.Option("data/backtest/known_cases.csv", help="Path to labelled CSV dataset"),
+    threshold: int = typer.Option(70, help="Score threshold for classification (0-100)"),
+    output_dir: str = typer.Option(".", help="Directory to write the backtest report to"),
+    model_dir: str = typer.Option(None, help="Model directory (defaults to settings.model_dir)"),
+) -> None:
+    """Run the backtesting pipeline against a labelled historical dataset.
+
+    Loads the labelled CSV, runs feature extraction and model scoring,
+    and outputs precision/recall/F1/AUC-ROC at the specified threshold.
+    """
+    from backtesting.backtest_runner import run_backtest, save_report
+
+    report = run_backtest(
+        dataset_path=dataset,
+        threshold=threshold,
+        model_dir=model_dir,
+    )
+
+    output_path = save_report(report, output_dir=output_dir)
+
+    typer.echo(f"Backtest complete: {report.total_wallets} wallets evaluated")
+    typer.echo(f"  Threshold: {threshold}")
+    typer.echo(f"  Precision: {report.precision:.3f}")
+    typer.echo(f"  Recall:    {report.recall:.3f}")
+    typer.echo(f"  F1:        {report.f1:.3f}")
+    typer.echo(f"  AUC-ROC:   {report.auc_roc:.3f}")
+    typer.echo(f"  Avg Prec:  {report.average_precision:.3f}")
+    typer.echo(f"Report saved to {output_path}")
+
+    if report.thresholds_sweep:
+        header = f"{'Threshold':>10} {'Precision':>10} {'Recall':>8} {'F1':>6}"
+        typer.echo(header)
+        for t in report.thresholds_sweep:
+            typer.echo(f"{t['threshold']:>10} {t['precision']:>10.3f} {t['recall']:>8.3f} {t['f1']:>6.3f}")
+
+
 federated_app = typer.Typer(help="Federated Learning commands for exchange operators")
 app.add_typer(federated_app, name="federated")
 
