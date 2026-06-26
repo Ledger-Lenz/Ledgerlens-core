@@ -17,13 +17,14 @@ import asyncio
 import logging
 import time
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 import sseclient
 
 from config.settings import settings
 from ingestion.data_models import Asset, Trade, TradeType
+from ingestion.rate_limiter import AdaptiveRateController, BackpressureController, TokenBucket
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
 
 logger = logging.getLogger(__name__)

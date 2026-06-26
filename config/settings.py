@@ -99,6 +99,22 @@ class Settings(BaseSettings):
     # ── Runtime config cache TTL ──────────────────────────────────────────────
     runtime_config_ttl_seconds: int = 60
 
+    # ── MLflow integration ────────────────────────────────────────────────────
+    mlflow_tracking_uri: str = ""
+    mlflow_experiment_name: str = "ledgerlens-training"
+    mlflow_tracking_enabled: bool = False
+
+    # ── Performance monitoring ────────────────────────────────────────────────
+    performance_min_feedback_samples: int = 100
+    performance_monitoring_window_days: int = 30
+
+    # ── Bridge / cross-chain verification ────────────────────────────────────
+    bridge_verify_receipt_timeout_seconds: int = 30
+    bridge_verify_sample_rate: float = 1.0
+
+    # ── Path payment loader ───────────────────────────────────────────────────
+    path_payment_loader_enabled: bool = False
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -208,6 +224,10 @@ class Settings(BaseSettings):
     def db_path(self) -> str:
         return self.ledgerlens_db_path
 
+    @db_path.setter
+    def db_path(self, value: str) -> None:
+        object.__setattr__(self, "ledgerlens_db_path", value)
+
     @property
     def score_contract_id(self) -> str:
         return self.ledgerlens_score_contract_id
@@ -231,6 +251,10 @@ class Settings(BaseSettings):
     @property
     def model_signing_key(self) -> str:
         return self.ledgerlens_model_signing_key
+
+    @model_signing_key.setter
+    def model_signing_key(self, value: str) -> None:
+        object.__setattr__(self, "ledgerlens_model_signing_key", value)
 
     @property
     def _default_risk_score_threshold(self) -> int:
