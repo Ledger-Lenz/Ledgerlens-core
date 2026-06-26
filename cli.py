@@ -12,6 +12,7 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import time
 import tomllib
 from pathlib import Path
 
@@ -88,7 +89,12 @@ def train(
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
     experiment_name: str = typer.Option(None, "--experiment-name", help="MLflow experiment name for tracking"),
 ) -> None:
-    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
+    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`.
+
+    Use --optimize to run 100-trial Bayesian hyperparameter optimization (Optuna TPE)
+    before final training. Override trial budget with --n-trials and wall-clock cap
+    with --timeout.
+    """
     import os
 
     from config.settings import settings
@@ -318,6 +324,70 @@ def score(
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
 
 
+@app.command("historical-load")
+def historical_load(
+    start: str = typer.Option(..., "--start", help="Inclusive ISO-8601 start time"),
+    end: str = typer.Option(..., "--end", help="Exclusive ISO-8601 end time"),
+    concurrency: int | None = typer.Option(
+        None, "--concurrency", min=1, help="Maximum concurrent Horizon chunks"
+    ),
+    chunk_hours: float | None = typer.Option(
+        None, "--chunk-hours", min=0.01, help="Hours per independent chunk"
+    ),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Skip chunks already marked complete"
+    ),
+    asset_pair: str | None = typer.Option(
+        None, "--asset-pair", help="Optional BASE/COUNTER asset pair"
+    ),
+) -> None:
+    """Backfill historical Horizon trades with bounded parallel workers."""
+    import asyncio
+    from datetime import datetime
+
+    from config.settings import settings as cfg
+    from detection.storage import RiskScoreStore
+    from ingestion.historical_loader import ParallelHistoricalLoader
+    from ingestion.http_client import RetryingHorizonClient
+
+    def parse_datetime(value: str, option: str) -> datetime:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise typer.BadParameter("must be an ISO-8601 datetime", param_hint=option) from exc
+
+    start_time = parse_datetime(start, "--start")
+    end_time = parse_datetime(end, "--end")
+
+    async def run() -> None:
+        worker_count = concurrency or cfg.historical_loader_concurrency
+        hours = chunk_hours or cfg.historical_chunk_hours
+        async with RetryingHorizonClient(
+            cfg.horizon_url,
+            max_concurrency=worker_count,
+        ) as client:
+            loader = ParallelHistoricalLoader(
+                client=client,
+                storage=RiskScoreStore(cfg.db_path),
+                concurrency=worker_count,
+                chunk_hours=hours,
+                progress_path=Path(cfg.historical_progress_path),
+            )
+            result = await loader.load(
+                start_time,
+                end_time,
+                asset_pair=asset_pair,
+                resume=resume,
+            )
+            typer.echo(
+                f"completed={result.completed_chunks} failed={result.failed_chunks} "
+                f"skipped={result.skipped_chunks} records={result.total_records} "
+                f"records_per_second={result.records_per_second:.1f}"
+            )
+
+    asyncio.run(run())
+
+
 @app.command("eval-robustness")
 def eval_robustness(
     n_trials: int = typer.Option(5, help="Adversarial dataset repetitions per strategy (more = slower but stabler)"),
@@ -446,6 +516,24 @@ def stream(
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
     checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
     score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
+    queue_depth: int = typer.Option(
+        None,
+        "--queue-depth",
+        min=1,
+        envvar="STREAMER_QUEUE_MAXSIZE",
+        help="Maximum number of buffered Horizon trades (default from settings).",
+    ),
+    overflow_strategy: str = typer.Option(
+        None,
+        "--overflow-strategy",
+        envvar="STREAMER_OVERFLOW_STRATEGY",
+        help="Queue overflow policy: block, drop_newest, or drop_oldest.",
+    ),
+    reset_cursor: bool = typer.Option(
+        False,
+        "--reset-cursor",
+        help="Delete the Horizon cursor checkpoint before streaming.",
+    ),
 ) -> None:
     """Stream trades from Horizon SSE and score incrementally per wallet.
 
@@ -464,11 +552,39 @@ def stream(
     from detection.storage import init_db, save_scores
     from detection.webhook_queue import enqueue
     from detection.webhook_registry import get_matching_subscribers
-    from ingestion.horizon_streamer import stream_trades
+    from ingestion.checkpoint import CursorCheckpoint, FlushPolicy, resolve_checkpoint_path
+    from ingestion.horizon_streamer import stream_trades_with_cursor
     import api.main as api_main
 
     _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
     _score_delta = score_delta if score_delta is not None else cfg.stream_score_delta_threshold
+    _queue_depth = queue_depth if queue_depth is not None else cfg.streamer_queue_maxsize
+    _overflow_strategy = (
+        overflow_strategy
+        if overflow_strategy is not None
+        else cfg.streamer_overflow_strategy
+    )
+    if _overflow_strategy not in {"block", "drop_newest", "drop_oldest"}:
+        raise typer.BadParameter(
+            "must be block, drop_newest, or drop_oldest",
+            param_hint="--overflow-strategy",
+        )
+    cursor_checkpoint = CursorCheckpoint(
+        resolve_checkpoint_path(cfg.cursor_checkpoint_path, cfg.data_dir)
+    )
+    if reset_cursor:
+        cursor_checkpoint.delete()
+        logger.info("Reset Horizon cursor checkpoint")
+    stored_cursor = cursor_checkpoint.load()
+    cursor = stored_cursor or cfg.horizon_default_cursor
+    if stored_cursor:
+        logger.info("Resuming from cursor %s", cursor)
+    else:
+        logger.info("Starting fresh from cursor %s", cursor)
+    cursor_flush_policy = FlushPolicy(
+        max_events=cfg.cursor_flush_events,
+        max_seconds=cfg.cursor_flush_seconds,
+    )
 
     init_db()
     checkpoint_store = RollingWindowStore()
@@ -500,14 +616,22 @@ def stream(
     signal.signal(signal.SIGINT, _shutdown)
 
     trades_since_checkpoint = 0
+    cursor_events_since_flush = 0
+    last_cursor_flush = time.monotonic()
+    last_cursor = cursor
 
     logger.info(
-        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d)",
+        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d, "
+        "queue_depth=%d, overflow_strategy=%s)",
         _chk_interval,
         _score_delta,
+        _queue_depth,
+        _overflow_strategy,
     )
 
-    for trade in stream_trades():
+    for trade, event_cursor in stream_trades_with_cursor(
+        cursor=cursor, checkpoint=cursor_checkpoint
+    ):
         if stop_event.is_set():
             break
 
@@ -526,6 +650,16 @@ def stream(
             except Exception as exc:  # pragma: no cover
                 logger.warning("Webhook dispatch error: %s", exc)
 
+        last_cursor = event_cursor
+        cursor_events_since_flush += 1
+        now = time.monotonic()
+        if cursor_flush_policy.should_flush(
+            cursor_events_since_flush, last_cursor_flush, now
+        ):
+            cursor_checkpoint.save(last_cursor)
+            cursor_events_since_flush = 0
+            last_cursor_flush = now
+
         trades_since_checkpoint += 1
         if trades_since_checkpoint >= _chk_interval:
             checkpoint_store.save_all(scorer.window_state)
@@ -534,6 +668,8 @@ def stream(
 
     # Final checkpoint on clean exit
     checkpoint_store.save_all(scorer.window_state)
+    if cursor_events_since_flush:
+        cursor_checkpoint.save(last_cursor)
     logger.info("Stream stopped. Final checkpoint written.")
 
 
@@ -555,6 +691,90 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+
+@app.command("dlq-replay")
+def dlq_replay(
+    limit: int = typer.Option(100, help="Max dead letters to replay per run"),
+    dry_run: bool = typer.Option(False, help="Print DLQ contents without submitting"),
+) -> None:
+    """Replay pending Soroban dead-letter submissions.
+
+    Processes oldest-first. Marks each as 'replayed' on success or 'failed'
+    on persistent failure. Never removes rows from the DLQ.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from config.settings import settings
+    from detection.soroban_publisher import (
+        SorobanPublisher,
+        SorobanSubmissionError,
+        SorobanCircuitOpenError,
+        get_dlq_entries,
+        init_dlq_schema,
+    )
+    from detection.risk_score import RiskScore
+
+    secret_key = os.environ.get("LEDGERLENS_SERVICE_SECRET_KEY", "")
+    if not secret_key and not dry_run:
+        typer.echo("ERROR: LEDGERLENS_SERVICE_SECRET_KEY is not set. Cannot replay.", err=True)
+        raise typer.Exit(1)
+
+    init_dlq_schema()
+    items, total = get_dlq_entries(status="pending", page=1, page_size=limit)
+
+    if not items:
+        typer.echo("No pending DLQ entries.")
+        return
+
+    if dry_run:
+        typer.echo(f"DRY RUN — {len(items)} pending item(s):")
+        for item in items:
+            typer.echo(f"  [{item['id']}] {item['wallet']}:{item['asset_pair']} score={item['score']} error={item['error_message']}")
+        return
+
+    publisher = SorobanPublisher(
+        contract_id=os.environ.get("LEDGERLENS_SCORE_CONTRACT_ID", ""),
+        secret_key=secret_key,
+        soroban_rpc_url=os.environ.get("SOROBAN_RPC_URL", "https://soroban-testnet.stellar.org"),
+        network_passphrase=os.environ.get("NETWORK_PASSPHRASE", "Test SDF Network ; September 2015"),
+    )
+
+    db_path = settings.db_path
+    replayed = 0
+    failed = 0
+
+    for item in items:
+        score_obj = RiskScore(
+            wallet=item["wallet"],
+            asset_pair=item["asset_pair"],
+            score=item["score"],
+            benford_flag=False,
+            ml_flag=False,
+            confidence=0,
+            timestamp=datetime.fromtimestamp(item["ledger_timestamp"], tz=timezone.utc),
+        )
+        tx_hash = None
+        status = "failed"
+        try:
+            tx_hash = publisher.submit_score(score_obj)
+            status = "replayed"
+            replayed += 1
+            logger.info("DLQ item %d replayed: tx=%s", item["id"], tx_hash)
+        except (SorobanSubmissionError, SorobanCircuitOpenError, Exception) as exc:
+            logger.warning("DLQ item %d replay failed: %s", item["id"], exc)
+            failed += 1
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE soroban_dead_letters SET status=?, replayed_at=?, replay_tx_hash=? WHERE id=?",
+                (status, now_iso, tx_hash, item["id"]),
+            )
+            conn.commit()
+
+    typer.echo(f"DLQ replay complete: {replayed} replayed, {failed} failed out of {len(items)} items.")
 
 
 @app.command("governance-close-expired")
@@ -813,6 +1033,41 @@ def federated_join(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
+db_app = typer.Typer(help="Database maintenance commands")
+app.add_typer(db_app, name="db")
+
+
+@db_app.command("retention")
+def db_retention(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would be archived without making changes"),
+    archive_root: str = typer.Option("./data/archive", "--archive-root", help="Root directory for Parquet archives"),
+    db_path: str = typer.Option(None, "--db-path", help="Path to SQLite database (defaults to LEDGERLENS_DB_PATH)"),
+) -> None:
+    """Archive records older than their TTL to Parquet and purge from SQLite.
+
+    Default TTLs: risk_scores=365d, feature_vectors=90d, alerts=730d.
+    Use --dry-run to preview the archival plan without modifying the database.
+    """
+    from config.settings import settings as cfg
+    from storage.retention import RetentionEngine
+
+    engine = RetentionEngine(db_path=db_path or cfg.db_path, archive_root=archive_root)
+    report = engine.run(dry_run=dry_run)
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    for table, info in report.items():
+        archived = info.get("rows_archived", 0)
+        cutoff = info.get("cutoff_date", "")
+        if info.get("skipped"):
+            typer.echo(f"{prefix}{table}: table not found — skipped")
+        elif archived == 0:
+            typer.echo(f"{prefix}{table}: no rows older than {cutoff}")
+        elif dry_run:
+            typer.echo(f"{prefix}{table}: would archive {archived} rows older than {cutoff}")
+        else:
+            path = info.get("archive_path", "")
+            typer.echo(f"{prefix}{table}: archived {archived} rows → {path}")
+
 
 @config_app.command("validate")
 def config_validate() -> None:
@@ -841,230 +1096,38 @@ def config_validate() -> None:
         typer.echo(f"  {name}={value}")
 
 
-score_app = typer.Typer(help="Scoring commands")
-app.add_typer(score_app, name="score")
+db_app = typer.Typer(help="Database migration commands (Alembic-backed)")
+app.add_typer(db_app, name="db")
 
 
-# ---------------------------------------------------------------------------
-# Stellar address validation
-# ---------------------------------------------------------------------------
-
-def _is_valid_stellar_address(addr: str) -> bool:
-    """Return True if addr looks like a Stellar G-address (56 base32 chars)."""
-    if not addr or not addr.startswith("G"):
-        return False
-    if len(addr) != 56:
-        return False
-    _B32_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
-    return all(c in _B32_CHARS for c in addr)
-
-
-def _score_one_wallet(
-    wallet: str,
-    models: dict,
-    feature_names: list[str],
-    calibrators: dict,
-) -> dict:
-    """Score a single wallet using loaded models. Returns a result dict."""
-    import json
-    from datetime import datetime, timezone
-
-    from detection.model_inference import score_with_uncertainty
-
-    # Try feature store cache first; fall back to zero vector
-    fv: dict = {name: 0.0 for name in feature_names}
-    try:
-        from detection.feature_store import FeatureStore
-        fs = FeatureStore()
-        cached = fs.get(wallet)
-        if cached:
-            fv.update(cached)
-    except Exception:
-        pass
-
-    uncertainty = score_with_uncertainty(models, fv, calibrators=calibrators or None)
-
-    top_features: list[str] = []
-    try:
-        from detection.shap_explainer import top_contributing_features
-        top_features = top_contributing_features(models, fv, n=5)
-    except Exception:
-        pass
-
-    return {
-        "wallet": wallet,
-        "score": round(uncertainty["score"], 2),
-        "confidence_lower": round(uncertainty.get("score_lower", 0.0), 2),
-        "confidence_upper": round(uncertainty.get("score_upper", 100.0), 2),
-        "top_features": json.dumps(top_features),
-        "scored_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@score_app.command("bulk")
-def score_bulk(
-    input_file: str = typer.Option(..., "--input", "-i", help="CSV file with wallet addresses (one per row)"),
-    output_file: str = typer.Option(..., "--output", "-o", help="CSV file to write scoring results to"),
-    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=16, help="Parallel worker count (1–16)"),
-    min_score: float = typer.Option(None, "--min-score", help="Only include wallets with score >= min_score"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Validate input file without scoring"),
+@db_app.command("migrate")
+def db_migrate_alembic(
+    revision: str = typer.Option("head", "--revision", "-r", help="Target revision (default: head)"),
 ) -> None:
-    """Score a list of wallets from a CSV file and write results to another CSV.
-
-    Input CSV must have at least one column with the wallet address.  If the
-    column header is ``wallet`` it is used directly; otherwise the first column
-    is assumed to be wallet addresses.  An optional ``label`` column is passed
-    through to the output.
-
-    Examples:
-
-      python cli.py score bulk --input wallets.csv --output results.csv
-
-      python cli.py score bulk --input wallets.csv --output results.csv \\
-        --concurrency 8 --min-score 50
-    """
-    import csv
+    """Apply pending Alembic migrations (equivalent to `alembic upgrade head`)."""
+    import subprocess
     import sys
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from datetime import datetime, timezone
 
-    import pandas as pd
-
-    try:
-        from rich.progress import (
-            BarColumn,
-            MofNCompleteColumn,
-            Progress,
-            SpinnerColumn,
-            TaskProgressColumn,
-            TextColumn,
-            TimeElapsedColumn,
-            TimeRemainingColumn,
-        )
-        _has_rich = True
-    except ImportError:
-        _has_rich = False
-
-    # ── Load input CSV ────────────────────────────────────────────────────────
-    try:
-        df = pd.read_csv(input_file)
-    except Exception as exc:
-        typer.echo(f"ERROR: cannot read {input_file}: {exc}", err=True)
-        raise typer.Exit(1)
-
-    if df.empty:
-        typer.echo("Input file is empty — nothing to score.", err=True)
-        raise typer.Exit(0)
-
-    wallet_col = "wallet" if "wallet" in df.columns else df.columns[0]
-    label_col = "label" if "label" in df.columns else None
-
-    raw_wallets = df[wallet_col].astype(str).tolist()
-
-    # ── Validate addresses ────────────────────────────────────────────────────
-    valid_rows: list[dict] = []
-    skipped = 0
-    for i, row in df.iterrows():
-        addr = str(row[wallet_col]).strip()
-        if not _is_valid_stellar_address(addr):
-            typer.echo(f"WARNING: skipping malformed address on row {i + 2}: {addr!r}", err=True)
-            skipped += 1
-        else:
-            entry = {"wallet": addr}
-            if label_col:
-                entry["label"] = row[label_col]
-            valid_rows.append(entry)
-
-    typer.echo(
-        f"Input: {len(raw_wallets)} rows — {len(valid_rows)} valid, {skipped} skipped",
-        err=True,
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", revision],
+        cwd=str(Path(__file__).resolve().parent),
     )
+    raise typer.Exit(result.returncode)
 
-    if dry_run:
-        typer.echo(f"Dry run complete. {len(valid_rows)} addresses would be scored.", err=True)
-        raise typer.Exit(0)
 
-    if not valid_rows:
-        typer.echo("All addresses are malformed — nothing to score.", err=True)
-        raise typer.Exit(1)
+@db_app.command("rollback")
+def db_rollback(
+    revision: str = typer.Option("-1", "--revision", "-r", help="Target revision (default: -1, one step back)"),
+) -> None:
+    """Roll back the most recent Alembic migration (equivalent to `alembic downgrade -1`)."""
+    import subprocess
+    import sys
 
-    # ── Load models ───────────────────────────────────────────────────────────
-    from config.settings import settings as cfg
-    from detection.model_inference import load_calibration, load_models
-    from detection.feature_engineering import FEATURE_NAMES
-
-    try:
-        models = load_models(cfg.model_dir)
-    except FileNotFoundError:
-        typer.echo(
-            f"ERROR: No trained models found in {cfg.model_dir}. Run `python cli.py train` first.",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    calibrators = {}
-    try:
-        calibrators = load_calibration(model_dir=cfg.model_dir) or {}
-    except Exception:
-        pass
-
-    feature_names = list(FEATURE_NAMES)
-
-    # ── Score in parallel with progress bar ───────────────────────────────────
-    results: list[dict] = []
-    wallets = [r["wallet"] for r in valid_rows]
-
-    if _has_rich:
-        progress_ctx = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TaskProgressColumn(),
-            TextColumn("·"),
-            TimeElapsedColumn(),
-            TextColumn("ETA"),
-            TimeRemainingColumn(),
-            refresh_per_second=4,
-        )
-    else:
-        import contextlib
-        progress_ctx = contextlib.nullcontext()
-
-    with progress_ctx as progress:
-        if _has_rich:
-            task = progress.add_task("Scoring wallets", total=len(wallets))
-
-        with ThreadPoolExecutor(max_workers=min(concurrency, 16)) as pool:
-            future_to_wallet = {
-                pool.submit(_score_one_wallet, w, models, feature_names, calibrators): w
-                for w in wallets
-            }
-            for future in as_completed(future_to_wallet):
-                try:
-                    result = future.result()
-                    if min_score is None or result["score"] >= min_score:
-                        results.append(result)
-                except Exception as exc:
-                    w = future_to_wallet[future]
-                    typer.echo(f"WARNING: scoring failed for {w}: {exc}", err=True)
-                finally:
-                    if _has_rich:
-                        progress.advance(task)
-
-    # ── Write output CSV ──────────────────────────────────────────────────────
-    if not results:
-        typer.echo("No results to write (all wallets filtered or failed).", err=True)
-        raise typer.Exit(0)
-
-    out_df = pd.DataFrame(results, columns=["wallet", "score", "confidence_lower", "confidence_upper", "top_features", "scored_at"])
-    out_df.to_csv(output_file, index=False)
-
-    typer.echo(
-        f"Scored {len(results)} wallets → {output_file} "
-        f"({'filtered by min-score=' + str(min_score) if min_score is not None else 'all included'})",
-        err=True,
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", revision],
+        cwd=str(Path(__file__).resolve().parent),
     )
+    raise typer.Exit(result.returncode)
 
 
 if __name__ == "__main__":
