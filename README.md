@@ -438,6 +438,12 @@ docker compose up --build
 
 ```bash
 python cli.py generate-data   # write synthetic trades/labels to CSV
+python cli.py generate-adversarial --strategy benford_camouflage \
+  --n-wallets 200 --n-trades 1000
+                              # write adversarial feature CSV (label=1 for wash)
+                              #   --label-wash/--label-clean  mark wash or zero all labels
+                              #   strategies: benford_camouflage | timing_jitter |
+                              #               graph_fragmentation | cross_pair_rotation
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
 python cli.py historical-load --start 2026-05-01T00:00:00Z --end 2026-05-31T00:00:00Z \

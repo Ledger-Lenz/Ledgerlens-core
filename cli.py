@@ -91,6 +91,55 @@ def generate_data(
     logger.info("Wrote %d trades, %d events, %d labelled accounts to %s", len(trades), len(events), len(labels), out_dir)
 
 
+@app.command("generate-adversarial")
+def generate_adversarial(
+    strategy: str = typer.Option(
+        ...,
+        help="Evasion strategy: benford_camouflage | timing_jitter | graph_fragmentation | cross_pair_rotation",
+    ),
+    out_dir: str = typer.Option("./data/adversarial", help="Directory to write the adversarial CSV to"),
+    n_wallets: int = typer.Option(50, help="Number of adversarial wash wallets to generate"),
+    n_trades: int = typer.Option(200, help="Number of adversarial trades to generate"),
+    seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    label_wash: bool = typer.Option(
+        True,
+        "--label-wash/--label-clean",
+        help="Label adversarial trades as wash (1) or override all labels to 0 (--label-clean). "
+             "Unlabelled adversarial data must not silently enter training datasets.",
+    ),
+) -> None:
+    """Generate a labelled adversarial feature dataset with a specific evasion strategy.
+
+    Writes a CSV to OUT_DIR/adversarial_{STRATEGY}.csv with FEATURE_NAMES columns
+    and a 'label' column (1 = wash, 0 = clean). Use --label-clean to produce a
+    baseline dataset with all labels zeroed for false-positive rate benchmarking.
+    """
+    import os
+
+    from ingestion.adversarial_data import AdversarialDataset
+
+    dataset = AdversarialDataset().build(
+        strategy=strategy, n_wallets=n_wallets, n_trades=n_trades, seed=seed
+    )
+
+    if not label_wash:
+        dataset = dataset.copy()
+        dataset["label"] = 0
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"adversarial_{strategy}.csv")
+    dataset.to_csv(out_path, index=False)
+
+    n_wash = int((dataset["label"] == 1).sum())
+    logger.info(
+        "Wrote %d accounts (%d wash-labelled, %d normal) to %s",
+        len(dataset),
+        n_wash,
+        len(dataset) - n_wash,
+        out_path,
+    )
+
+
 @app.command("train")
 def train(
     n_normal_accounts: int = typer.Option(60, help="Number of normal (non-wash) accounts"),
