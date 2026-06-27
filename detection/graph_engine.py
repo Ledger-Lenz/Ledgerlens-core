@@ -710,7 +710,6 @@ class TradeGraph:
             if wallet not in accounts:
                 continue
 
-            account_set = set(accounts)
             ring_size = len(accounts)
             cycle_volume = float(ring.get("cycle_volume", 0.0))
             timing_tightness = float(ring.get("timing_tightness", 0.0))

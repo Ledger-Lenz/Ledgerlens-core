@@ -10,12 +10,10 @@ Covers:
 - cli.py archive-features command
 """
 
-import os
 import sqlite3
 import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -489,7 +487,7 @@ class TestLoadProductionFeatures:
         store.query.return_value = pd.DataFrame(
             columns=["wallet", "asset_pair", "feature_name", "feature_value", "recorded_at"]
         )
-        result = load_production_features(store, since_days=30)
+        load_production_features(store, since_days=30)
 
         assert store.query.called
         call_kwargs = store.query.call_args

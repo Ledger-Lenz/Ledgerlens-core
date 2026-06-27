@@ -11,8 +11,6 @@ import networkx as nx
 import pytest
 
 from detection.graph_engine import (
-    GRAPH_MMAP_THRESHOLD,
-    MAX_GRAPH_NODES,
     GraphTooLargeError,
     IterativeTarjanSCC,
     NodeIndex,
