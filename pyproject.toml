@@ -24,6 +24,7 @@ asyncio_mode = "auto"
 addopts = "--continue-on-collection-errors"
 markers = [
     "benchmark: performance benchmarks (excluded from standard CI; run with -m benchmark)",
+    "slow: long-running tests such as 100K-node graph performance (excluded from standard CI; run with -m slow)",
 ]
 filterwarnings = [
     "ignore::UserWarning:sklearn.utils.parallel",

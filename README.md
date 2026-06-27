@@ -147,7 +147,18 @@ Benford signals alone are insufficient (legitimate market makers can also be non
 
 `detection/graph_engine.py` builds a directed weighted trade graph where nodes are Stellar accounts and edges point from seller/base account to buyer/counter account. Each edge stores aggregate `total_volume` and `trade_count`, and preserves trade timestamps for timing analysis.
 
-Wash-ring discovery uses Tarjan's strongly connected components (SCCs) rather than pairwise thresholds. Any SCC with at least three accounts is treated as a candidate wash ring. For SCCs up to `max_ring_size`, the detector evaluates simple cycles and reports the highest bottleneck cycle volume. Larger SCCs are not enumerated; they are returned as one `truncated=True` descriptor with a conservative `cycle_volume = total_volume * 0.5` estimate so operators still see the risk without risking Johnson-style exponential cycle enumeration.
+Wash-ring discovery uses **iterative Tarjan's SCC algorithm** (`IterativeTarjanSCC`) rather than pairwise thresholds. The iterative implementation uses an explicit work-stack instead of Python recursion, so it handles arbitrarily large graphs without hitting Python's default recursion limit of ~1 000 frames. Any SCC with at least three accounts is treated as a candidate wash ring. For SCCs up to `max_ring_size`, the detector evaluates simple cycles and reports the highest bottleneck cycle volume. Larger SCCs are not enumerated; they are returned as one `truncated=True` descriptor with a conservative `cycle_volume = total_volume * 0.5` estimate so operators still see the risk without risking Johnson-style exponential cycle enumeration.
+
+For graphs exceeding `GRAPH_MMAP_THRESHOLD` nodes (default 50 000), the adjacency list is represented as a `scipy.sparse.csr_matrix` (Compressed Sparse Row), which stores edges contiguously in memory and has lower per-object overhead than a Python dict. The threshold and a hard cap (`MAX_GRAPH_NODES`, default 1 000 000) are configurable via environment variables (see `.env.example`).
+
+**Scale targets** (single CPU core, measured on synthetic random graphs — see [docs/performance.md](docs/performance.md)):
+
+| Graph size          | Time    | Peak RAM |
+| ------------------- | ------- | -------- |
+| 10 K nodes, 50 K edges  | < 1 s   | < 25 MB  |
+| 100 K nodes, 500 K edges | ~27 s  | ~63 MB   |
+
+The `TradeGraph` class provides an incremental public API (`add_trade`, `find_wash_rings`, `get_ring_members`) that selects the CSR or dict representation automatically based on graph size.
 
 The four graph-structural ML features are:
 
