@@ -279,3 +279,51 @@ def fl_privacy_status() -> FLPrivacyStatus:
         budget_exhausted=budget_exhausted,
         rounds_completed=len(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/webhooks/dlq  (Issue #179)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/webhooks/dlq", include_in_schema=False)
+def list_webhook_dlq() -> list[dict]:
+    """List all dead-lettered webhook deliveries."""
+    entries = list_dlq()
+    return [
+        {
+            "id": e.id,
+            "subscriber_id": e.subscriber_id,
+            "url": e.url,
+            "payload": e.payload_json,
+            "attempt_count": e.attempt_count,
+            "last_error": e.last_error,
+            "dead_lettered_at": e.dead_lettered_at,
+        }
+        for e in entries
+    ]
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/webhooks/dlq/{id}/retry  (Issue #179)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/webhooks/dlq/{entry_id}/retry", include_in_schema=False)
+async def retry_webhook_dlq_entry(entry_id: int) -> dict:
+    """Manually retry a dead-lettered webhook delivery."""
+    from detection.webhook_registry import get_subscriber
+
+    entry = get_dlq_entry(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"DLQ entry {entry_id} not found")
+
+    subscriber = get_subscriber(entry.subscriber_id)
+    secret = subscriber.secret if subscriber else os.environ.get("WEBHOOK_HMAC_SECRET", "")
+
+    queue = WebhookRetryQueue()
+    success = await queue.retry_dlq_entry(entry_id, secret=secret)
+    if not success:
+        raise HTTPException(status_code=502, detail="Retry delivery failed; entry remains in DLQ")
+
+    return {"id": entry_id, "status": "delivered"}
