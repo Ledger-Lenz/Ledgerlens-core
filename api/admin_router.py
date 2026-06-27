@@ -178,3 +178,31 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# Alert deduplication state endpoints (Issue #177)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/alerts/dedup/active",
+    summary="List active deduplicated alerts",
+    description="Return all wallets currently in alert.opened state (score above threshold for at least one cycle).",
+)
+def list_active_dedup_alerts() -> list[dict]:
+    from detection.alert_engine import get_deduplicator
+    return get_deduplicator().list_active_alerts()
+
+
+@router.get(
+    "/alerts/dedup/{wallet}",
+    summary="Get dedup state for a wallet",
+    description="Return the current alert deduplication state for the given wallet.",
+)
+def get_dedup_state(wallet: str) -> dict:
+    from detection.alert_engine import get_deduplicator
+    state = get_deduplicator().get_state(wallet)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"No dedup state found for wallet {wallet}")
+    return state
