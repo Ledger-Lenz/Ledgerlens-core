@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
+from api.api_key_router import router as api_key_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.namespace import list_namespaces
@@ -179,7 +180,7 @@ from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
 app.include_router(admin_router)
-
+app.include_router(api_key_router)
 
 app.include_router(batch_router)
 
