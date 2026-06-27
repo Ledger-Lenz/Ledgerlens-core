@@ -12,6 +12,29 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 ## [Unreleased]
 
 ### Added
+- **Feature Store cold-tier archival to Parquet** (`detection/feature_store.py`):
+  `FeatureStoreArchiver.archive_old_features(cutoff_days=30)` moves rows older than
+  the cutoff from `feature_distribution_snapshots` (SQLite) to date-partitioned Parquet
+  files under `FEATURE_ARCHIVE_DIR`, eliminating the previous hard cap of 500 000 rows
+  while preserving full history for 60–90 day drift analysis.
+- `ParquetFeatureColdTier` class: reads archived Parquet data with PyArrow filter pushdown.
+- `DualTierFeatureStore` class: unified `query()` interface over both SQLite hot tier and
+  Parquet cold tier; deduplicates by `(wallet, feature_name, recorded_at)` and logs a
+  WARNING when duplicates are detected (indicates a previously failed archive run).
+- `FeatureStore.query()` method: filter-capable read from `feature_distribution_snapshots`.
+- `load_production_features(store, since_days)` in `detection/drift_monitor.py`: replaces
+  direct SQLite reads so drift-analysis callers receive data from both storage tiers
+  transparently.
+- `cli.py archive-features` command: manually trigger cold-tier archival.
+- Archival integrated into `cli.py retrain-check`: runs at the start of each check.
+- `GET /admin/feature-store/stats` endpoint: returns hot-tier row count, cold-tier row
+  count, oldest record timestamps, and archive directory size in MB.
+- `FEATURE_ARCHIVE_DIR` and `FEATURE_ARCHIVE_CUTOFF_DAYS` configuration variables
+  documented in `.env.example`.
+- `docs/feature_store_archival.md`: tiered storage architecture, Parquet partition layout,
+  archival schedule, and recovery procedure for failed archives.
+
+### Added
 - **Iterative Tarjan SCC ring detector** (`detection/graph_engine.py`): `IterativeTarjanSCC` replaces the implicit recursive Tarjan inside `networkx.strongly_connected_components` with an explicit work-stack, eliminating Python's `RecursionError` for graphs with more than ~1 000 nodes in a single SCC.
 - `NodeIndex` class: O(1) bijective `str↔int` mapping for Stellar account identifiers, used by `IterativeTarjanSCC` and `SparseTradeGraph`.
 - `SparseTradeGraph` class: `scipy.sparse.csr_matrix`-backed adjacency for graphs with `n_nodes >= GRAPH_MMAP_THRESHOLD` (default 50 000). `build_from_trades(trades)` constructs the CSR matrix from a list of `Trade` records; `to_adjacency_dict()` converts it back to an adjacency dict for Tarjan traversal.

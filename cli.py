@@ -186,6 +186,34 @@ def train(
     logger.info("Saved models to %s", settings.model_dir)
 
 
+@app.command("archive-features")
+def archive_features(
+    cutoff_days: int = typer.Option(
+        0, help="Archive rows older than this many days (0 = use FEATURE_ARCHIVE_CUTOFF_DAYS setting)"
+    ),
+) -> None:
+    """Archive feature distribution snapshots older than cutoff_days to Parquet cold tier.
+
+    Reads qualifying rows from the ``feature_distribution_snapshots`` SQLite table,
+    writes them to date-partitioned Parquet files under FEATURE_ARCHIVE_DIR, then
+    deletes them from SQLite. Safe to interrupt: Parquet is written before SQLite
+    delete, so no data is lost on failure.
+    """
+    from pathlib import Path
+
+    from config.settings import settings
+    from detection.feature_store import FeatureStoreArchiver
+
+    effective_cutoff = cutoff_days if cutoff_days > 0 else settings.feature_archive_cutoff_days
+    archive_dir = Path(settings.feature_archive_dir)
+    archiver = FeatureStoreArchiver(db_path=settings.db_path, archive_dir=archive_dir)
+    n = archiver.archive_old_features(cutoff_days=effective_cutoff)
+    if n:
+        typer.echo(f"Archived {n} rows (cutoff={effective_cutoff} days) → {archive_dir}")
+    else:
+        typer.echo(f"No rows older than {effective_cutoff} days found; nothing to archive.")
+
+
 @app.command("retrain-check")
 def retrain_check(
     psi_threshold: float = typer.Option(0.20, help="PSI threshold for drift detection"),
@@ -209,6 +237,7 @@ def retrain_check(
     import json
     import os
     from datetime import datetime
+    from pathlib import Path
 
     from config.settings import settings
     from detection.dataset import build_training_dataset
@@ -226,6 +255,20 @@ def retrain_check(
     from detection.model_training import save_models, train_ensemble
     from detection.storage import save_drift_report, save_retrain_run
     from ingestion.synthetic_data import generate_synthetic_dataset
+
+    # Run archival before drift check to keep hot tier lean
+    try:
+        from detection.feature_store import FeatureStoreArchiver
+
+        _archiver = FeatureStoreArchiver(
+            db_path=settings.db_path,
+            archive_dir=Path(settings.feature_archive_dir),
+        )
+        _archived = _archiver.archive_old_features(cutoff_days=settings.feature_archive_cutoff_days)
+        if _archived:
+            logger.info("retrain-check: archived %d feature snapshot rows before drift check", _archived)
+    except Exception as _exc:
+        logger.warning("retrain-check: archival step failed (%s); continuing without archival", _exc)
 
     # Read training metadata
     metadata_path = os.path.join(settings.model_dir, "training_metadata.json")
