@@ -138,6 +138,10 @@ class Settings(BaseSettings):
     performance_min_feedback_samples: int = 20
     performance_monitoring_window_days: int = 30
 
+    # ── Feature Store Archival ────────────────────────────────────────────────
+    feature_archive_dir: str = "./feature_archive"
+    feature_archive_cutoff_days: int = 30
+
     # ── Bridge / cross-chain verification ────────────────────────────────────
     bridge_verify_receipt_timeout_seconds: int = 30
     bridge_verify_sample_rate: float = 1.0
@@ -287,6 +291,29 @@ class Settings(BaseSettings):
                 "LEDGERLENS_CORS_ALLOWED_ORIGINS must not contain '*'. "
                 "Specify an explicit origin list instead."
             )
+        return self
+
+    @field_validator("feature_archive_cutoff_days", mode="before")
+    @classmethod
+    def valid_archive_cutoff(cls, v: object) -> object:
+        if int(v) < 1:
+            raise ValueError("FEATURE_ARCHIVE_CUTOFF_DAYS must be >= 1")
+        return v
+
+    @model_validator(mode="after")
+    def feature_archive_dir_no_traversal(self) -> "Settings":
+        cwd = Path.cwd().resolve()
+        candidate = Path(self.feature_archive_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = (cwd / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        try:
+            candidate.relative_to(cwd)
+        except ValueError as exc:
+            raise ValueError(
+                "FEATURE_ARCHIVE_DIR must be within the application working directory"
+            ) from exc
         return self
 
     @model_validator(mode="after")

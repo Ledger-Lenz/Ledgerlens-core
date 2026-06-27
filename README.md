@@ -550,7 +550,14 @@ CREATE TABLE feature_distribution_snapshots (
 );
 ```
 
-**Storage budget**: At 1,000 wallets/run × 4 runs/day × 30 days × 26 features × ~8 bytes/float ≈ 25 MB. Hard cap: **500,000 rows**; oldest rows are pruned to 450,000 when exceeded.
+**Storage budget**: At 1,000 wallets/run × 4 runs/day × 30 days × 26 features × ~8 bytes/float ≈ 25 MB for 30 days of history in the hot tier.
+
+LedgerLens uses a **two-tier archival pipeline** to retain full history beyond 30 days without unbounded SQLite growth:
+
+- **Hot tier (SQLite)**: recent snapshots (< `FEATURE_ARCHIVE_CUTOFF_DAYS`, default 30 days), optimised for fast writes and ad-hoc queries.
+- **Cold tier (Parquet)**: archived snapshots (≥ cutoff), stored as columnar Parquet files under `FEATURE_ARCHIVE_DIR`, partitioned by date (`YYYY/MM/DD`).
+
+Archival runs automatically at the start of each `retrain-check`, or manually via `python cli.py archive-features`. The `DualTierFeatureStore` class provides a unified query interface across both tiers — drift analysis code never needs to know which tier holds a particular record. See [docs/feature_store_archival.md](docs/feature_store_archival.md) for the full architecture and recovery procedure.
 
 ### Scheduling Retrain Checks
 
