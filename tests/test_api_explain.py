@@ -1,6 +1,5 @@
 """Integration tests for GET /v1/scores/{wallet}/explain (SHAP waterfall endpoint)."""
 
-import json
 import os
 from datetime import datetime, timezone
 
@@ -103,7 +102,7 @@ def test_explain_422_invalid_model(client_with_data):
     assert resp.status_code == 422
 
 
-def test_explain_200_with_xgboost_model_param(client_with_data, tmp_path):
+def test_explain_200_with_xgboost_model_param(client_with_data, tmp_path, monkeypatch):
     """GET /v1/scores/{wallet}/explain?model=xgboost returns 200 when xgboost loaded."""
     # Add xgboost model to the model directory
     import config.settings as settings_module
@@ -116,7 +115,6 @@ def test_explain_200_with_xgboost_model_param(client_with_data, tmp_path):
     joblib.dump(model, model_dir / "xgboost.joblib")
     (model_dir / "xgboost_latest.txt").write_text("test0002")
 
-    import os
     os.environ["LEDGERLENS_MODEL_DIR"] = str(model_dir)
     monkeypatch.setattr(settings_module.settings, "model_dir", str(model_dir))
 

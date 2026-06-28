@@ -14,7 +14,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict
 
 from detection.benford_engine import compute_benford_metrics
 from detection.storage import get_bridge_transfers

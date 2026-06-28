@@ -15,14 +15,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pandas as pd
-import pytest
 from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
 
 from detection.benford_engine import (
     compute_benford_metrics,
-    mean_absolute_deviation,
-    chi_square_statistic,
     digit_distribution,
     first_digit,
 )
@@ -32,7 +29,6 @@ from detection.feature_engineering import (
     intra_minute_clustering_coefficient,
     off_hours_activity_ratio,
     round_trip_trade_frequency,
-    volume_to_unique_counterparty_ratio,
 )
 
 

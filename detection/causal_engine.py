@@ -64,9 +64,11 @@ Each edge below encodes a domain-knowledge causal claim:
 
 from __future__ import annotations
 
+import itertools
 import logging
 import sqlite3
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import networkx as nx
 import numpy as np

@@ -1,11 +1,10 @@
 """Unit tests for FLClient with mocked HTTP transport."""
 
-import pytest
 import numpy as np
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 
 from ledgerlens_fl_client.client import FLClient
-from ledgerlens_fl_client.models import RoundResult, ClientStatus
+from ledgerlens_fl_client.models import RoundResult
 from ledgerlens_fl_client.adapter import DataAdapter
 import pandas as pd
 

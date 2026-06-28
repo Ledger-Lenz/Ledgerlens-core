@@ -15,7 +15,6 @@ from detection.soroban_publisher import (
     SorobanCircuitOpenError,
     SorobanHealthStatus,
     SorobanPublisher,
-    SorobanSubmissionError,
     get_dlq_entries,
     get_dlq_pending_count,
     init_dlq_schema,

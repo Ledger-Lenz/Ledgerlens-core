@@ -1,6 +1,5 @@
 """Tests for graceful shutdown behaviour in api/main.py."""
 
-import pytest
 
 
 class TestHealthReady:
