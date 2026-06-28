@@ -3,9 +3,8 @@
 import os
 from unittest.mock import patch
 
-import pytest
 
-from ingestion.uniswap_adapter import UniswapV3Adapter, Trade, _is_enabled
+from ingestion.uniswap_adapter import UniswapV3Adapter, _is_enabled
 
 
 class TestFeatureFlag:

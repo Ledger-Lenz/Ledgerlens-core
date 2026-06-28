@@ -7,12 +7,10 @@ Also provides waterfall-style explanations via :class:`ShapExplainer` with
 TTL-based caching keyed on (wallet, model_version) in the feature store.
 """
 
-import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 import numpy as np
 import shap

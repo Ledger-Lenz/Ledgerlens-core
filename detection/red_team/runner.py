@@ -121,7 +121,7 @@ class RedTeamRunner:
 
     def _build_seed_vectors(self, n: int) -> list[np.ndarray]:
         """Build synthetic wash-trade feature vectors for seeding attacks."""
-        feature_names = list(self.feature_constraints.keys())
+        list(self.feature_constraints.keys())
         seeds = []
         for _ in range(n):
             vec = np.array(

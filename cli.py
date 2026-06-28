@@ -12,9 +12,18 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import sys
 import time
 import tomllib
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomllib  # type: ignore[no-redef]
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
 
 import typer
 
@@ -79,6 +88,55 @@ def generate_data(
     logger.info("Wrote %d trades, %d events, %d labelled accounts to %s", len(trades), len(events), len(labels), out_dir)
 
 
+@app.command("generate-adversarial")
+def generate_adversarial(
+    strategy: str = typer.Option(
+        ...,
+        help="Evasion strategy: benford_camouflage | timing_jitter | graph_fragmentation | cross_pair_rotation",
+    ),
+    out_dir: str = typer.Option("./data/adversarial", help="Directory to write the adversarial CSV to"),
+    n_wallets: int = typer.Option(50, help="Number of adversarial wash wallets to generate"),
+    n_trades: int = typer.Option(200, help="Number of adversarial trades to generate"),
+    seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    label_wash: bool = typer.Option(
+        True,
+        "--label-wash/--label-clean",
+        help="Label adversarial trades as wash (1) or override all labels to 0 (--label-clean). "
+             "Unlabelled adversarial data must not silently enter training datasets.",
+    ),
+) -> None:
+    """Generate a labelled adversarial feature dataset with a specific evasion strategy.
+
+    Writes a CSV to OUT_DIR/adversarial_{STRATEGY}.csv with FEATURE_NAMES columns
+    and a 'label' column (1 = wash, 0 = clean). Use --label-clean to produce a
+    baseline dataset with all labels zeroed for false-positive rate benchmarking.
+    """
+    import os
+
+    from ingestion.adversarial_data import AdversarialDataset
+
+    dataset = AdversarialDataset().build(
+        strategy=strategy, n_wallets=n_wallets, n_trades=n_trades, seed=seed
+    )
+
+    if not label_wash:
+        dataset = dataset.copy()
+        dataset["label"] = 0
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"adversarial_{strategy}.csv")
+    dataset.to_csv(out_path, index=False)
+
+    n_wash = int((dataset["label"] == 1).sum())
+    logger.info(
+        "Wrote %d accounts (%d wash-labelled, %d normal) to %s",
+        len(dataset),
+        n_wash,
+        len(dataset) - n_wash,
+        out_path,
+    )
+
+
 @app.command("train")
 def train(
     n_normal_accounts: int = typer.Option(60, help="Number of normal (non-wash) accounts"),
@@ -114,7 +172,7 @@ def train(
 
     results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
-        if name == "_calib":
+        if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
             continue
         logger.info("%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
@@ -123,6 +181,34 @@ def train(
         coverage = results["_calib"].get("coverage_avg", 0.0)
         logger.info("Conformal calibration complete (avg coverage=%.4f)", coverage)
     logger.info("Saved models to %s", settings.model_dir)
+
+
+@app.command("archive-features")
+def archive_features(
+    cutoff_days: int = typer.Option(
+        0, help="Archive rows older than this many days (0 = use FEATURE_ARCHIVE_CUTOFF_DAYS setting)"
+    ),
+) -> None:
+    """Archive feature distribution snapshots older than cutoff_days to Parquet cold tier.
+
+    Reads qualifying rows from the ``feature_distribution_snapshots`` SQLite table,
+    writes them to date-partitioned Parquet files under FEATURE_ARCHIVE_DIR, then
+    deletes them from SQLite. Safe to interrupt: Parquet is written before SQLite
+    delete, so no data is lost on failure.
+    """
+    from pathlib import Path
+
+    from config.settings import settings
+    from detection.feature_store import FeatureStoreArchiver
+
+    effective_cutoff = cutoff_days if cutoff_days > 0 else settings.feature_archive_cutoff_days
+    archive_dir = Path(settings.feature_archive_dir)
+    archiver = FeatureStoreArchiver(db_path=settings.db_path, archive_dir=archive_dir)
+    n = archiver.archive_old_features(cutoff_days=effective_cutoff)
+    if n:
+        typer.echo(f"Archived {n} rows (cutoff={effective_cutoff} days) → {archive_dir}")
+    else:
+        typer.echo(f"No rows older than {effective_cutoff} days found; nothing to archive.")
 
 
 @app.command("retrain-check")
@@ -148,6 +234,7 @@ def retrain_check(
     import json
     import os
     from datetime import datetime
+    from pathlib import Path
 
     from config.settings import settings
     from detection.dataset import build_training_dataset
@@ -165,6 +252,20 @@ def retrain_check(
     from detection.model_training import save_models, train_ensemble
     from detection.storage import save_drift_report, save_retrain_run
     from ingestion.synthetic_data import generate_synthetic_dataset
+
+    # Run archival before drift check to keep hot tier lean
+    try:
+        from detection.feature_store import FeatureStoreArchiver
+
+        _archiver = FeatureStoreArchiver(
+            db_path=settings.db_path,
+            archive_dir=Path(settings.feature_archive_dir),
+        )
+        _archived = _archiver.archive_old_features(cutoff_days=settings.feature_archive_cutoff_days)
+        if _archived:
+            logger.info("retrain-check: archived %d feature snapshot rows before drift check", _archived)
+    except Exception as _exc:
+        logger.warning("retrain-check: archival step failed (%s); continuing without archival", _exc)
 
     # Read training metadata
     metadata_path = os.path.join(settings.model_dir, "training_metadata.json")
@@ -244,7 +345,7 @@ def retrain_check(
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     new_results = train_ensemble(df)
-    model_names = [k for k in new_results if k != "_calib"]
+    model_names = [k for k in new_results if not k.startswith("_") and isinstance(new_results[k], dict) and "auc_roc" in new_results[k]]
     for name in model_names:
         result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
@@ -376,6 +477,16 @@ def score(
     ctx: typer.Context,
     no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
     use_async: bool = typer.Option(False, "--async", help="Use async pipeline for concurrent I/O and batched inference"),
+    bootstrap_threshold: int = typer.Option(
+        None,
+        "--bootstrap-threshold",
+        help="Override BENFORD_BOOTSTRAP_THRESHOLD: wallets with fewer transactions than this use Monte Carlo bootstrap p-values instead of asymptotic chi-square.",
+    ),
+    bootstrap_samples: int = typer.Option(
+        None,
+        "--bootstrap-samples",
+        help="Override BENFORD_BOOTSTRAP_SAMPLES: number of bootstrap replicates for small-sample p-value estimation.",
+    ),
 ) -> None:
     """Run the detection pipeline against live Horizon data and store the resulting scores."""
     if ctx.invoked_subcommand is not None:
@@ -383,6 +494,16 @@ def score(
     import asyncio
 
     import run_pipeline
+
+    if bootstrap_threshold is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_THRESHOLD = bootstrap_threshold
+        logger.info("Bootstrap threshold overridden to %d", bootstrap_threshold)
+
+    if bootstrap_samples is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_SAMPLES = bootstrap_samples
+        logger.info("Bootstrap samples overridden to %d", bootstrap_samples)
 
     if use_async:
         scores = asyncio.run(run_pipeline.async_run())
@@ -633,7 +754,7 @@ def eval_robustness(
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
     baseline_results = train_ensemble(df, adversarial_augment=False, calibrate=False)
-    baseline_models = {k: v["model"] for k, v in baseline_results.items()}
+    baseline_models = {k: v["model"] for k, v in baseline_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of baseline model…")
     robustness = evaluate_robustness(baseline_models, n_trials=n_trials, seed=seed)
@@ -641,7 +762,7 @@ def eval_robustness(
     # Train an adversarially-augmented model
     logger.info("Training adversarially-augmented model…")
     adv_results = train_ensemble(df, adversarial_augment=adversarial_augment, calibrate=False)
-    adv_models = {k: v["model"] for k, v in adv_results.items()}
+    adv_models = {k: v["model"] for k, v in adv_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of augmented model…")
     adv_robustness = evaluate_robustness(adv_models, n_trials=n_trials, seed=seed)
@@ -708,7 +829,7 @@ def robustness_eval(
 
         logger.info("No trained models found; training temporary ensemble for robustness evaluation")
         results = train_ensemble(df, adversarial_augment=False)
-        models = {k: v["model"] for k, v in results.items()}
+        models = {k: v["model"] for k, v in results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
     typer.echo(report.model_dump_json(indent=2))

@@ -3,7 +3,6 @@
 import pytest
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 from ledgerlens_fl_client.adapter import DataAdapter
 

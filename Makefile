@@ -43,3 +43,8 @@ docs:
 
 docs-serve:
 	mkdocs serve
+
+.PHONY: benchmark-check
+
+benchmark-check:
+	pytest -m benchmark -q --no-header 2>&1 || true

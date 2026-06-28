@@ -8,7 +8,6 @@ and database for end-to-end testing.
 import os
 import shutil
 import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -40,7 +39,6 @@ def e2e_model_dir(e2e_tmpdir):
 def e2e_settings(e2e_db_path, e2e_model_dir):
     """Patch settings for the E2E session."""
     from unittest.mock import patch
-    from types import SimpleNamespace
 
     env_overrides = {
         "LEDGERLENS_DB_PATH": e2e_db_path,

@@ -80,7 +80,6 @@ def test_quorum_not_reached(mock_nodes):
 def test_submit_with_quorum_returns_false_on_failure(mock_nodes):
     coordinator = OracleCoordinator(mock_nodes, threshold=3)
     
-    original_sign = OracleNode.sign_score_submission
     def mock_sign_fail(self, wallet, asset, score, timestamp):
         raise Exception("Failed to sign")
     
