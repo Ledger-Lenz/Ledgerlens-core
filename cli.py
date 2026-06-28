@@ -26,7 +26,6 @@ except Exception:
     __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
 
 
