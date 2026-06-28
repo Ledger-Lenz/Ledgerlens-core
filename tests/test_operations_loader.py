@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 
 import httpx
+import pytest
 
 import config.settings as settings_module
 from ingestion.data_models import OrderBookEvent
-from ingestion.operations_loader import load_order_book_events_for_pair
+from ingestion.operations_loader import _parse_event, load_order_book_events_for_pair
 
 
 def test_load_order_book_events_for_pair_maps_offer_operations(monkeypatch):
@@ -145,3 +146,20 @@ def test_load_order_book_events_for_pair_filters_by_since_and_pair(monkeypatch):
         assert events == []
     finally:
         object.__setattr__(settings_module.settings, "horizon_url", old_horizon_url)
+
+
+def test_parse_event_rejects_non_positive_offer_id():
+    record = {
+        "id": "1",
+        "type": "manage_sell_offer",
+        "created_at": "2026-06-12T00:00:00Z",
+        "source_account": "GACCOUNT",
+        "selling_asset_type": "native",
+        "buying_asset_code": "USDC",
+        "buying_asset_issuer": "GISSUER",
+        "amount": "1",
+        "offer_id": "-1",
+        "price": "0.1",
+    }
+    with pytest.raises(ValueError, match="positive integer"):
+        _parse_event(record)

@@ -9,6 +9,7 @@ LedgerLens provides a `ledgerlens` CLI built with [Typer](https://typer.tiangolo
 | `generate-data` | Generate synthetic trades/labels to CSV |
 | `train` | Train RF/XGBoost/LightGBM ensemble on synthetic data |
 | `score` | Run detection pipeline against live Horizon data |
+| `historical-load` | Backfill Horizon trades concurrently with resumable progress |
 | `serve` | Serve local FastAPI app |
 | `stream` | Stream trades from Horizon SSE and score in rolling batches |
 | `report` | Generate a compliance audit report for a wallet |
@@ -49,3 +50,33 @@ ledgerlens completion --shell fish | source
 - Subcommand names (e.g. `score`, `stream`, `report`, `completion`)
 - Common flags (e.g. `--output`, `--concurrency`, `--date`)
 - `--shell` enum values (`bash`, `zsh`, `fish`)
+
+`stream --reset-cursor` deletes the durable Horizon paging-token checkpoint
+before connecting. The checkpoint location is configured with
+`CURSOR_CHECKPOINT_PATH` and must be inside `DATA_DIR`.
+
+The stream command also accepts:
+
+- `--queue-depth N`: maximum buffered trade count (default
+  `STREAMER_QUEUE_MAXSIZE=1000`).
+- `--overflow-strategy block|drop_newest|drop_oldest`: behavior when the queue
+  is full (default `STREAMER_OVERFLOW_STRATEGY=drop_oldest`).
+
+See [Ingestion](ingestion.md#flow-control-and-backpressure) for policy
+trade-offs and recovery guidance.
+
+## Historical loading
+
+```bash
+python cli.py historical-load \
+  --start 2026-05-01T00:00:00Z \
+  --end 2026-05-31T00:00:00Z \
+  --asset-pair XLM/USDC \
+  --concurrency 8 \
+  --chunk-hours 6 \
+  --resume
+```
+
+`--start` is inclusive and `--end` is exclusive. Use `--no-resume` to
+re-fetch every chunk; duplicate paging tokens remain harmless because trade
+writes are idempotent.

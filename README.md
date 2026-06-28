@@ -126,6 +126,8 @@ Benford's Law predicts that the leading digit of naturally occurring transaction
 | Metric                            | What it measures                                                                                      |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | **Chi-square statistic**          | Whether the overall digit distribution deviates significantly from Benford's expected distribution    |
+| **Chi-square p-value**            | Statistical significance of the chi-square deviation. Uses **Monte Carlo bootstrap** (10,000 multinomial samples) when N < 100 transactions, asymptotic chi-square(df=8) otherwise — see [docs/benford_analysis.md](docs/benford_analysis.md) |
+| **`chi_square_pvalue_method`**    | `"bootstrap"` or `"asymptotic"` — logged alongside every flagging decision for audit reproducibility |
 | **Z-score (per digit)**           | Whether any individual digit (1–9) appears with significantly higher or lower frequency than expected |
 | **Mean Absolute Deviation (MAD)** | Composite divergence measure; values above 0.015 indicate non-conformity                              |
 
@@ -145,7 +147,18 @@ Benford signals alone are insufficient (legitimate market makers can also be non
 
 `detection/graph_engine.py` builds a directed weighted trade graph where nodes are Stellar accounts and edges point from seller/base account to buyer/counter account. Each edge stores aggregate `total_volume` and `trade_count`, and preserves trade timestamps for timing analysis.
 
-Wash-ring discovery uses Tarjan's strongly connected components (SCCs) rather than pairwise thresholds. Any SCC with at least three accounts is treated as a candidate wash ring. For SCCs up to `max_ring_size`, the detector evaluates simple cycles and reports the highest bottleneck cycle volume. Larger SCCs are not enumerated; they are returned as one `truncated=True` descriptor with a conservative `cycle_volume = total_volume * 0.5` estimate so operators still see the risk without risking Johnson-style exponential cycle enumeration.
+Wash-ring discovery uses **iterative Tarjan's SCC algorithm** (`IterativeTarjanSCC`) rather than pairwise thresholds. The iterative implementation uses an explicit work-stack instead of Python recursion, so it handles arbitrarily large graphs without hitting Python's default recursion limit of ~1 000 frames. Any SCC with at least three accounts is treated as a candidate wash ring. For SCCs up to `max_ring_size`, the detector evaluates simple cycles and reports the highest bottleneck cycle volume. Larger SCCs are not enumerated; they are returned as one `truncated=True` descriptor with a conservative `cycle_volume = total_volume * 0.5` estimate so operators still see the risk without risking Johnson-style exponential cycle enumeration.
+
+For graphs exceeding `GRAPH_MMAP_THRESHOLD` nodes (default 50 000), the adjacency list is represented as a `scipy.sparse.csr_matrix` (Compressed Sparse Row), which stores edges contiguously in memory and has lower per-object overhead than a Python dict. The threshold and a hard cap (`MAX_GRAPH_NODES`, default 1 000 000) are configurable via environment variables (see `.env.example`).
+
+**Scale targets** (single CPU core, measured on synthetic random graphs — see [docs/performance.md](docs/performance.md)):
+
+| Graph size          | Time    | Peak RAM |
+| ------------------- | ------- | -------- |
+| 10 K nodes, 50 K edges  | < 1 s   | < 25 MB  |
+| 100 K nodes, 500 K edges | ~27 s  | ~63 MB   |
+
+The `TradeGraph` class provides an incremental public API (`add_trade`, `find_wash_rings`, `get_ring_members`) that selects the CSR or dict representation automatically based on graph size.
 
 The four graph-structural ML features are:
 
@@ -347,9 +360,24 @@ This scores each wallet/asset-pair combination and writes the resulting
 python cli.py serve --reload
 ```
 
-Exposes `/health`, `/scores`, `/scores/{wallet}`, `/alerts`, `/assets/risk-ranking`,
-`/correlations`, and `/rings` over the locally stored `RiskScore` records — a
-stand-in for `ledgerlens-api` during local development.
+Exposes `/health`, `/scores`, `/scores/{wallet}`, `/scores/{wallet}/explain`,
+`/alerts`, `/assets/risk-ranking`, `/correlations`, and `/rings` over the
+locally stored `RiskScore` records — a stand-in for `ledgerlens-api` during
+local development.
+
+##### SHAP Explanation Endpoint
+
+```bash
+# Get waterfall-style SHAP explanation (requires admin key)
+curl -H "X-LedgerLens-Admin-Key: your-admin-key" \
+  "http://localhost:8000/v1/scores/GABCD...XYZ/explain?asset_pair=XLM/USDC&model=random_forest"
+```
+
+Response returns base value, ranked feature contributions, and a
+human-readable summary sentence. Supports `model` query parameter:
+`random_forest` (default), `xgboost`, `lightgbm`. See
+[docs/shap_explanation.md](docs/shap_explanation.md) for the full caching
+strategy and TTL.
 
 #### CORS configuration
 
@@ -410,16 +438,33 @@ docker compose up --build
 
 ```bash
 python cli.py generate-data   # write synthetic trades/labels to CSV
+python cli.py generate-adversarial --strategy benford_camouflage \
+  --n-wallets 200 --n-trades 1000
+                              # write adversarial feature CSV (label=1 for wash)
+                              #   --label-wash/--label-clean  mark wash or zero all labels
+                              #   strategies: benford_camouflage | timing_jitter |
+                              #               graph_fragmentation | cross_pair_rotation
 python cli.py train           # train the ensemble on synthetic data
 python cli.py score           # run the pipeline against live Horizon data
+python cli.py historical-load --start 2026-05-01T00:00:00Z --end 2026-05-31T00:00:00Z \
+  --concurrency 8 --chunk-hours 6 --resume
+                              # parallel, restart-safe Horizon trade backfill
 python cli.py stream          # stream trades from Horizon SSE and score incrementally
                               #   --checkpoint-interval N  persist state every N trades (default: 100)
                               #   --score-delta N          min score change to emit alert (default: 5)
+                              #   --queue-depth N          cap buffered trades (default: 1000)
+                              #   --overflow-strategy S    block, drop_newest, or drop_oldest
+                              #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
+
+The Horizon stream position is stored atomically in
+`CURSOR_CHECKPOINT_PATH` (default `./data/horizon_cursor.json`). The path must
+remain inside `DATA_DIR`. Use `--reset-cursor` when an intentional fresh start
+or replay is required.
 
 ## Continuous Retraining
 
@@ -505,7 +550,14 @@ CREATE TABLE feature_distribution_snapshots (
 );
 ```
 
-**Storage budget**: At 1,000 wallets/run × 4 runs/day × 30 days × 26 features × ~8 bytes/float ≈ 25 MB. Hard cap: **500,000 rows**; oldest rows are pruned to 450,000 when exceeded.
+**Storage budget**: At 1,000 wallets/run × 4 runs/day × 30 days × 26 features × ~8 bytes/float ≈ 25 MB for 30 days of history in the hot tier.
+
+LedgerLens uses a **two-tier archival pipeline** to retain full history beyond 30 days without unbounded SQLite growth:
+
+- **Hot tier (SQLite)**: recent snapshots (< `FEATURE_ARCHIVE_CUTOFF_DAYS`, default 30 days), optimised for fast writes and ad-hoc queries.
+- **Cold tier (Parquet)**: archived snapshots (≥ cutoff), stored as columnar Parquet files under `FEATURE_ARCHIVE_DIR`, partitioned by date (`YYYY/MM/DD`).
+
+Archival runs automatically at the start of each `retrain-check`, or manually via `python cli.py archive-features`. The `DualTierFeatureStore` class provides a unified query interface across both tiers — drift analysis code never needs to know which tier holds a particular record. See [docs/feature_store_archival.md](docs/feature_store_archival.md) for the full architecture and recovery procedure.
 
 ### Scheduling Retrain Checks
 
@@ -634,6 +686,20 @@ The response returns a `subscriber_id` (UUID) used for management.
 | `DELETE` | `/webhooks/{subscriber_id}` | Deactivate a subscriber            |
 | `GET`    | `/webhooks/dead-letters`    | List permanently failed deliveries |
 
+### Analyst Feedback Endpoints
+
+| Method | Path                | Description                                         |
+| ------ | ------------------- | --------------------------------------------------- |
+| `POST` | `/v1/feedback`      | Submit analyst label correction (admin-key required) |
+| `GET`  | `/v1/feedback`      | Paginated correction history (admin-key required)    |
+
+### Cross-Chain Link Endpoints
+
+| Method | Path                                          | Description                                                |
+| ------ | --------------------------------------------- | ---------------------------------------------------------- |
+| `GET`  | `/cross-chain/links/{stellar_wallet}`         | Accepted Bayesian link hypotheses (sorted by confidence)   |
+| `GET`  | `/cross-chain/links/{stellar_wallet}/explain` | Evidence feature breakdown per hypothesis (admin-key only) |
+
 ### Payload Format
 
 Every webhook POST carries this JSON body:
@@ -710,6 +776,17 @@ Run as a long-lived foreground process (e.g., under systemd or supervisor).
 - Raw secrets never appear in API responses, logs, or error messages.
 - The response body from the webhook receiver is discarded entirely to
   prevent log injection.
+
+## Observability
+
+LedgerLens ships a production-grade observability stack. See [docs/observability.md](docs/observability.md) for full details.
+
+- **Structured JSON logging** — every log record is valid JSON with `timestamp`, `level`, `correlation_id`, and `trace_id` fields (via [structlog](https://www.structlog.org/))
+- **Correlation IDs** — each pipeline pass and API request is assigned a UUID4 that threads through all log lines and spans; the `X-Correlation-ID` header is propagated in API responses
+- **OpenTelemetry tracing** — spans for `pipeline.run`, `model.score_batch`, `soroban.submit_score`, and `webhook.deliver`; FastAPI routes are auto-instrumented; export via OTLP gRPC or console fallback
+- **Prometheus metrics** — 10 metrics covering scoring throughput, latency, Soroban submissions, circuit breaker state, webhook delivery health, drift events, and model AUC-ROC; scraped at `GET /metrics`
+- **Alerting rules** — 5 Prometheus alert rules in `monitoring/alerts.yml` for circuit-breaker open, dead-letter backlog, feature drift, high scoring latency, and pipeline stall
+- **Wallet masking** — Stellar wallet addresses are truncated to `GABC1234...WXYZ` in all log output; no PII in metric labels
 
 ## Testing
 

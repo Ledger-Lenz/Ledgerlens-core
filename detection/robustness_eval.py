@@ -265,7 +265,7 @@ def compute_robustness_report(models: dict, df, n_samples: int = 200, epsilon: f
     # persist
     try:
         from detection.storage import save_robustness_report
-        save_robustness_report(report.dict())
+        save_robustness_report(report.model_dump())
     except Exception:
         # best-effort persist; failures should not crash reporting
         pass

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "LedgerLens API",
-    "description": "REST API for the LedgerLens wash-trading detection engine. Provides real-time wallet risk scores, SHAP/causal explanations, manipulation alerts, and admin controls.",
+    "description": "LedgerLens REST API for Stellar wallet risk scoring, alert management, AMM pool risk, cross-chain linking, and compliance exports. See [ReDoc](/redoc) for an alternative documentation view.",
     "version": "1.0.0"
   },
   "paths": {
@@ -582,8 +582,11 @@
     },
     "/stream/rate-limiter": {
       "get": {
-        "summary": "Rate Limiter Status",
-        "description": "Return current rate limiter and backpressure state.\n\nRequires the ``X-LedgerLens-Admin-Key`` header.  Returns 503 if no\nstreamer is currently registered.",
+        "tags": [
+          "System"
+        ],
+        "summary": "Stream rate-limiter status",
+        "description": "Return current Horizon stream rate limiter and backpressure state (admin only).",
         "operationId": "rate_limiter_status_stream_rate_limiter_get",
         "parameters": [
           {
@@ -803,10 +806,10 @@
     "/v1/health": {
       "get": {
         "tags": [
-          "Admin"
+          "System"
         ],
         "summary": "Health check",
-        "description": "Returns 200 when all components are healthy, 503 on hard failure.",
+        "description": "Returns 200 (ok/degraded) or 503. Checks DB, model files, and circuit breakers.",
         "operationId": "health_v1_health_get",
         "responses": {
           "200": {
@@ -826,7 +829,7 @@
           "Scores"
         ],
         "summary": "List risk scores",
-        "description": "Return latest wallet risk scores with optional filters for score range, flag types, and sort order.",
+        "description": "Return latest wallet risk scores with optional filters for score threshold, Benford/ML flags, and sort order.",
         "operationId": "list_scores_v1_scores_get",
         "parameters": [
           {
@@ -945,8 +948,8 @@
         "tags": [
           "Scores"
         ],
-        "summary": "SHAP feature explanation",
-        "description": "Return the top-5 SHAP feature contributions for a wallet on a given asset pair.",
+        "summary": "SHAP feature explanations",
+        "description": "Return top-5 SHAP feature contributions for a wallet's risk score on an asset pair.",
         "operationId": "explain_wallet_score_v1_scores__wallet__explain_get",
         "parameters": [
           {
@@ -1004,8 +1007,8 @@
         "tags": [
           "Scores"
         ],
-        "summary": "Counterfactual score explanation",
-        "description": "Return minimal feature changes that would drop the wallet's risk score below a target threshold.",
+        "summary": "Counterfactual score scenarios",
+        "description": "Return minimal feature changes that would lower a wallet's risk score below the target threshold.",
         "operationId": "wallet_counterfactual_v1_scores__wallet__counterfactual_get",
         "parameters": [
           {
@@ -1090,8 +1093,8 @@
         "tags": [
           "Scores"
         ],
-        "summary": "Get wallet scores",
-        "description": "Return the latest risk score for a wallet on each asset pair, including cross-chain bridge links.",
+        "summary": "Get wallet risk score",
+        "description": "Return the latest risk score for a Stellar wallet. Allowlisted wallets return 0; denylisted wallets return 100.",
         "operationId": "wallet_scores_v1_scores__wallet__get",
         "parameters": [
           {
@@ -1133,10 +1136,10 @@
     "/v1/wallets/{wallet}/cross-chain": {
       "get": {
         "tags": [
-          "Scores"
+          "Wallets"
         ],
         "summary": "Cross-chain bridge history",
-        "description": "Return the full EVM bridge transfer history for a Stellar wallet.",
+        "description": "Return full EVM bridge transfer history for a Stellar wallet.",
         "operationId": "wallet_cross_chain_v1_wallets__wallet__cross_chain_get",
         "parameters": [
           {
@@ -1183,8 +1186,8 @@
         "tags": [
           "Alerts"
         ],
-        "summary": "List manipulation alerts",
-        "description": "Return risk scores above the alert threshold, or typed manipulation alerts filtered by alert_type.",
+        "summary": "List alerts",
+        "description": "Return manipulation alerts. Without alert_type, returns high-risk scores. With alert_type, returns typed alerts (e.g. SANDWICH_ATTACK).",
         "operationId": "alerts_v1_alerts_get",
         "parameters": [
           {
@@ -1254,10 +1257,10 @@
     "/v1/assets/risk-ranking": {
       "get": {
         "tags": [
-          "Scores"
+          "Assets"
         ],
         "summary": "Asset pair risk ranking",
-        "description": "Return each asset pair ranked by its average wallet risk score, descending.",
+        "description": "Return each asset pair ranked by average wallet risk score, descending.",
         "operationId": "asset_risk_ranking_v1_assets_risk_ranking_get",
         "responses": {
           "200": {
@@ -1281,9 +1284,9 @@
     "/v1/rings": {
       "get": {
         "tags": [
-          "Alerts"
+          "Detection"
         ],
-        "summary": "List wash-trading rings",
+        "summary": "Wash-trading rings",
         "description": "Return detected wash-trading rings from the latest pipeline run.",
         "operationId": "list_rings_v1_rings_get",
         "responses": {
@@ -1308,10 +1311,10 @@
     "/v1/correlations": {
       "get": {
         "tags": [
-          "Alerts"
+          "Detection"
         ],
         "summary": "Correlated asset pairs",
-        "description": "Return the most recent set of correlated asset pairs with Spearman coefficients and shared wallet counts.",
+        "description": "Return correlated asset pairs with Spearman coefficient, shared wallet count, and run timestamp.",
         "operationId": "list_correlations_v1_correlations_get",
         "responses": {
           "200": {
@@ -1338,7 +1341,7 @@
           "AMM"
         ],
         "summary": "AMM pool risk",
-        "description": "Return pool-level round-trip ratio and trader concentration for a given pool ID.",
+        "description": "Return round-trip ratio and trader concentration risk metrics for an AMM liquidity pool.",
         "operationId": "pool_risk_v1_amm_pools__pool_id__risk_get",
         "parameters": [
           {
@@ -1380,7 +1383,7 @@
     "/v1/path-payments/circular": {
       "get": {
         "tags": [
-          "Alerts"
+          "Detection"
         ],
         "summary": "Circular path payments",
         "description": "Return detected atomic circular path-payment routes, paginated.",
@@ -1442,7 +1445,7 @@
     "/v1/feedback": {
       "post": {
         "tags": [
-          "Feedback"
+          "Admin"
         ],
         "summary": "Submit scoring feedback",
         "description": "Record ground-truth feedback (confirmed wash / confirmed clean) for a previously scored wallet.",
@@ -1497,10 +1500,7 @@
     },
     "/v1/admin/drift-reports": {
       "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Model drift reports",
+        "summary": "Drift Reports",
         "description": "Return the most recent drift checks recorded by `cli.py retrain-check`.",
         "operationId": "drift_reports_v1_admin_drift_reports_get",
         "parameters": [
@@ -1558,11 +1558,8 @@
     },
     "/v1/admin/robustness-report": {
       "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Latest robustness report",
-        "description": "Return the latest adversarial robustness evaluation report (admin only).",
+        "summary": "Robustness Report",
+        "description": "Return the latest RobustnessReport from the database (admin only).",
         "operationId": "robustness_report_v1_admin_robustness_report_get",
         "parameters": [
           {
@@ -1604,11 +1601,8 @@
     },
     "/v1/model/robustness": {
       "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Live robustness metrics",
-        "description": "Return live red-team robustness metrics: evasion rate, mean generations to evade, and hardening delta.",
+        "summary": "Model Robustness",
+        "description": "Return live red team robustness metrics for the current model.\n\nSummarises the continuous adversarial loop (`detection.red_team`):\n``evasion_rate_24h``, ``mean_generations_to_evade``, and ``hardening_delta``\n(change in evasion rate before/after the most recent retrain).",
         "operationId": "model_robustness_v1_model_robustness_get",
         "responses": {
           "200": {
@@ -1628,11 +1622,8 @@
     },
     "/v1/admin/retrain-runs": {
       "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Retrain run history",
-        "description": "Return the most recent per-model retrain outcomes.",
+        "summary": "Retrain Runs",
+        "description": "Return the most recent per-model retrain outcomes recorded by `cli.py retrain-check`.",
         "operationId": "retrain_runs_v1_admin_retrain_runs_get",
         "parameters": [
           {
@@ -1707,10 +1698,7 @@
     },
     "/v1/admin/federated/audit-log": {
       "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Federated learning audit log",
+        "summary": "Federated Audit Log",
         "description": "Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).",
         "operationId": "federated_audit_log_v1_admin_federated_audit_log_get",
         "parameters": [
@@ -1768,11 +1756,8 @@
     },
     "/v1/model/weights": {
       "get": {
-        "tags": [
-          "Admin"
-        ],
-        "summary": "Ensemble model weights",
-        "description": "Return current ensemble classifier weights from the Thompson-sampling adaptive reweighter.",
+        "summary": "Model Weights",
+        "description": "Return current ensemble classifier weights from the adaptive reweighter.",
         "operationId": "model_weights_v1_model_weights_get",
         "responses": {
           "200": {
@@ -1792,7 +1777,7 @@
           "Webhooks"
         ],
         "summary": "List webhooks",
-        "description": "Return all active webhook subscribers with masked secrets.",
+        "description": "Return all active webhook subscribers (secrets masked).",
         "operationId": "list_webhooks_v1_webhooks_get",
         "responses": {
           "200": {
@@ -1816,8 +1801,8 @@
         "tags": [
           "Webhooks"
         ],
-        "summary": "Register webhook",
-        "description": "Register a new webhook subscriber to receive real-time risk score alerts.",
+        "summary": "Register webhook subscriber",
+        "description": "Register a URL to receive risk score alert notifications above a configurable threshold.",
         "operationId": "create_webhook_v1_webhooks_post",
         "requestBody": {
           "content": {
@@ -1861,7 +1846,7 @@
           "Webhooks"
         ],
         "summary": "Delete webhook",
-        "description": "Deactivate a webhook subscriber by ID.",
+        "description": "Permanently deactivate a webhook subscriber.",
         "operationId": "delete_webhook_v1_webhooks__subscriber_id__delete",
         "parameters": [
           {
@@ -1905,8 +1890,8 @@
         "tags": [
           "Webhooks"
         ],
-        "summary": "Dead letter queue",
-        "description": "Return all webhook deliveries that have permanently failed after max retries.",
+        "summary": "Dead-letter webhooks",
+        "description": "Return webhook deliveries that permanently failed after all retry attempts.",
         "operationId": "dead_letters_v1_webhooks_dead_letters_get",
         "responses": {
           "200": {
@@ -1933,7 +1918,7 @@
           "Disputes"
         ],
         "summary": "Submit score dispute",
-        "description": "Submit a dispute for a wallet's risk score. Rate-limited per wallet.",
+        "description": "Submit a dispute for a scored wallet. Rate-limited to one dispute per wallet per 24h.",
         "operationId": "create_dispute_v1_disputes_post",
         "requestBody": {
           "content": {
@@ -1973,7 +1958,7 @@
           "Disputes"
         ],
         "summary": "Get dispute",
-        "description": "Return a dispute record by ID with anonymous vote counts.",
+        "description": "Return dispute details including committee vote counts (identities hidden).",
         "operationId": "read_dispute_v1_disputes__dispute_id__get",
         "parameters": [
           {
@@ -2013,8 +1998,8 @@
         "tags": [
           "Disputes"
         ],
-        "summary": "Cast dispute vote",
-        "description": "Cast a committee member's approve/reject vote on a dispute.",
+        "summary": "Vote on dispute",
+        "description": "Cast an approve/reject vote on an open dispute (admin only).",
         "operationId": "vote_dispute_v1_disputes__dispute_id__vote_post",
         "parameters": [
           {
@@ -2074,8 +2059,8 @@
         "tags": [
           "Governance"
         ],
-        "summary": "List governance proposals",
-        "description": "Return all open on-chain governance proposals.",
+        "summary": "List proposals",
+        "description": "Return all open governance proposals.",
         "operationId": "get_proposals_v1_governance_proposals_get",
         "responses": {
           "200": {
@@ -2092,8 +2077,8 @@
         "tags": [
           "Governance"
         ],
-        "summary": "Create governance proposal",
-        "description": "Create a new on-chain parameter governance proposal.",
+        "summary": "Create proposal",
+        "description": "Create a new governance proposal (admin only).",
         "operationId": "create_proposal_endpoint_v1_governance_proposals_post",
         "parameters": [
           {
@@ -2112,7 +2097,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ProposalCreate"
+                "$ref": "#/components/schemas/LegacyProposalCreate"
               }
             }
           }
@@ -2144,8 +2129,8 @@
         "tags": [
           "Governance"
         ],
-        "summary": "Vote on governance proposal",
-        "description": "Cast an approve/reject vote on an open governance proposal.",
+        "summary": "Vote on proposal",
+        "description": "Cast a vote on a governance proposal (admin only).",
         "operationId": "vote_proposal_v1_governance_proposals__proposal_id__vote_post",
         "parameters": [
           {
@@ -2173,7 +2158,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ProposalVote"
+                "$ref": "#/components/schemas/LegacyProposalVote"
               }
             }
           }
@@ -2488,7 +2473,7 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
-      "ProposalCreate": {
+      "LegacyProposalCreate": {
         "properties": {
           "proposal_type": {
             "type": "string",
@@ -2509,9 +2494,9 @@
           "proposed_value",
           "proposed_by_key_hash"
         ],
-        "title": "ProposalCreate"
+        "title": "LegacyProposalCreate"
       },
-      "ProposalVote": {
+      "LegacyProposalVote": {
         "properties": {
           "voter_key_hash": {
             "type": "string",
@@ -2527,7 +2512,7 @@
           "voter_key_hash",
           "vote"
         ],
-        "title": "ProposalVote"
+        "title": "LegacyProposalVote"
       },
       "RateLimiterStatus": {
         "properties": {
@@ -2801,51 +2786,5 @@
         "title": "WebhookCreate"
       }
     }
-  },
-  "tags": [
-    {
-      "name": "Scores",
-      "description": "Wallet risk score retrieval and explanation endpoints."
-    },
-    {
-      "name": "Alerts",
-      "description": "Manipulation alert listing and deduplication state."
-    },
-    {
-      "name": "Webhooks",
-      "description": "Webhook subscriber management."
-    },
-    {
-      "name": "Feedback",
-      "description": "Ground-truth feedback ingestion for model improvement."
-    },
-    {
-      "name": "AMM",
-      "description": "Automated Market Maker pool risk metrics."
-    },
-    {
-      "name": "Disputes",
-      "description": "Score dispute submission and committee voting."
-    },
-    {
-      "name": "Governance",
-      "description": "On-chain parameter governance proposals."
-    },
-    {
-      "name": "Admin",
-      "description": "Admin-only model lifecycle, config, and observability endpoints."
-    },
-    {
-      "name": "Allowlist / Denylist",
-      "description": "Wallet allowlist and denylist management with audit trail."
-    },
-    {
-      "name": "export",
-      "description": "CSV / Parquet bulk export of risk score data."
-    },
-    {
-      "name": "batch",
-      "description": "Async batch wallet scoring jobs."
-    }
-  ]
+  }
 }

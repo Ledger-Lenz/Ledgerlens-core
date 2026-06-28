@@ -53,7 +53,7 @@ def get_benford_stats(wallet: str, window: int):
 
 _WEIGHTS_FILENAME = "ensemble_weights.json"
 _REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib", "meta_learner", "sequence_model"})
 _weights_mtime: float | None = None
 _runtime_weights: dict[str, float] | None = None
 
@@ -119,11 +119,20 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
         logger.warning("ensemble_weights.json unreadable: %s — falling back to settings", exc)
         return None
 
+    allowed_keys = _REQUIRED_KEYS | {"updated_at"}
+    unknown_keys = set(data.keys()) - allowed_keys
+    if unknown_keys:
+        logger.warning(
+            "ensemble_weights.json has unknown keys %s — falling back to settings",
+            unknown_keys,
+        )
+        return None
+
     model_keys = {k: data[k] for k in _REQUIRED_KEYS if k in data}
     if set(model_keys) != _REQUIRED_KEYS:
         logger.warning(
-            "ensemble_weights.json has unexpected keys %s — falling back to settings",
-            set(data.keys()) - {"updated_at"},
+            "ensemble_weights.json missing required keys %s — falling back to settings",
+            _REQUIRED_KEYS - set(model_keys),
         )
         return None
 
@@ -398,7 +407,7 @@ _MODEL_FILENAMES["gnn"] = "gnn_model.pt"
 _MODEL_FILENAMES["sequence_model"] = "temporal_model.pt"
 
 # Models excluded from the tabular ensemble probability vote.
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model", "meta_learner"})
 
 
 def load_models(model_dir: str | None = None, *args, **kwargs) -> dict:
@@ -456,6 +465,25 @@ def fuse_sequence_score(
     return (1.0 - w) * tabular_prob + w * seq_prob
 
 
+def fuse_gnn_score(
+    tabular_prob: float,
+    gnn_prob: float,
+    w_gnn: float = 0.2,
+) -> float:
+    """Fuse tabular ensemble probability with WashRingGNN probability.
+
+    Args:
+        tabular_prob: Ensemble tabular probability (0-1).
+        gnn_prob: WashRingGNN output probability (0-1).
+        w_gnn: Learned fusion weight in [0.0, 0.5].
+
+    Returns:
+        Blended probability in [0, 1].
+    """
+    w = max(0.0, min(0.5, w_gnn))
+    return (1.0 - w) * tabular_prob + w * gnn_prob
+
+
 def score_feature_matrix(batch, models: dict, *args, **kwargs):
     """Wraps the base scorer, computing GNN features per-batch first.
 
@@ -497,7 +525,7 @@ def _gnn_forward_pass(model, snapshots) -> dict:
     return results
 
 
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "meta_learner", "sequence_model"})
 
 
 class ModelInference:
@@ -505,15 +533,37 @@ class ModelInference:
 
     Provides a single :meth:`score` method that returns a :class:`~detection.risk_score.RiskScore`
     given a pre-built feature dict, making it easy to inject in tests.
+
+    When a WashRingGNN model is loaded and graph data is available, the GNN
+    output is fused with the tabular ensemble probability using a learned
+    fusion weight (default 0.2). Falls back gracefully when gnn_model.pt is
+    absent.
     """
 
-    def __init__(self, models: dict) -> None:
+    def __init__(self, models: dict, w_gnn: float = 0.2) -> None:
         self._models = models
+        self.w_gnn = w_gnn
+        self.gnn_model = models.get("wash_ring_gnn")
+        if self.gnn_model is None and "gnn" not in models:
+            logger.info("GNN model not available; using tabular ensemble only")
 
-    def score(self, wallet: str, asset_pair: str, features: dict):
+    def score(self, wallet: str, asset_pair: str, features: dict, graph_data=None):
         from detection.risk_score import RiskScore
 
         prob, confidence = score_feature_vector(self._models, features)
+
+        if self.gnn_model is not None and graph_data is not None and _HAS_PYG:
+            try:
+                import torch
+                self.gnn_model.eval()
+                with torch.no_grad():
+                    gnn_proba = self.gnn_model(graph_data.x, graph_data.edge_index)
+                    wallet_node_idx = graph_data.wallet_index.get(wallet, 0) if hasattr(graph_data, "wallet_index") else 0
+                    gnn_p = float(gnn_proba[wallet_node_idx].item())
+                    prob = fuse_gnn_score(prob, gnn_p, self.w_gnn)
+            except Exception as exc:
+                logger.debug("GNN fusion skipped: %s", exc)
+
         benford_mad = features.get("benford_mad_24h", 0.0)
         from config.settings import settings as _settings
         return RiskScore.combine(

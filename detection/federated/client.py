@@ -174,6 +174,23 @@ class FederatedClient:
             delta = delta * (self.gradient_clip_threshold / norm)
         return delta
 
+    def split_gradient_for_smpc(
+        self,
+        gradient: np.ndarray,
+        n_shares: int = 3,
+        seed: int | None = None,
+    ) -> tuple[list[np.ndarray], list[str]]:
+        """Split ``gradient`` into additive SMPC shares and return (shares, commitments).
+
+        Returns a list of ``n_shares`` gradient arrays whose sum equals the
+        original gradient, plus a parallel list of SHA-256 commitment strings
+        that aggregators can use to verify share inclusion.
+        """
+        from detection.federated.smpc import commit_share, split_gradient
+        shares = split_gradient(gradient, n_shares=n_shares, seed=seed)
+        commitments = [commit_share(s) for s in shares]
+        return shares, commitments
+
     def inject_dp_noise(self, delta: np.ndarray) -> np.ndarray:
         """Add Gaussian DP noise to `delta` (client-side privacy guarantee)."""
         if self.noise_multiplier > 0.0:

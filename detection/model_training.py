@@ -42,6 +42,136 @@ from detection.feature_engineering import FEATURE_NAMES
 logger = logging.getLogger("ledgerlens.model_training")
 
 
+# ---------------------------------------------------------------------------
+# Stacking / OOF helpers (Issue-111)
+# ---------------------------------------------------------------------------
+
+def _walk_forward_cv(
+    X: np.ndarray,
+    timestamps: np.ndarray,
+    n_splits: int = 5,
+    gap_days: float = 7.0,
+):
+    """Yield (train_idx, val_idx) using walk-forward temporal splits.
+
+    Each split trains on all data before the validation window and validates
+    on the next chunk.  A *gap* of ``gap_days`` is excluded between train and
+    val to prevent look-ahead leakage (the gap is defined in the same units as
+    ``timestamps``).
+    """
+    n = len(X)
+    fold_size = n // (n_splits + 1)
+    for fold in range(n_splits):
+        train_end = fold_size * (fold + 1)
+        val_start = int(train_end + gap_days)
+        val_end = min(val_start + fold_size, n)
+        if val_start >= n or val_end <= val_start:
+            continue
+        train_idx = np.arange(train_end)
+        val_idx = np.arange(val_start, val_end)
+        if len(train_idx) < 2 or len(val_idx) < 2:
+            continue
+        yield train_idx, val_idx
+
+
+def _build_meta_features(oof_proba: np.ndarray, use_disagreement: bool = False) -> np.ndarray:
+    """Build the meta-feature matrix from base model OOF probabilities.
+
+    Parameters
+    ----------
+    oof_proba:
+        Array of shape ``(n_samples, n_base_models)`` with positive-class probs.
+    use_disagreement:
+        When True, append two extra columns: (max-min) spread and mean.
+
+    Returns
+    -------
+    np.ndarray of shape ``(n_samples, n_base_models)`` or
+    ``(n_samples, n_base_models + 2)`` when ``use_disagreement=True``.
+    """
+    if not use_disagreement:
+        return oof_proba
+    spread = oof_proba.max(axis=1, keepdims=True) - oof_proba.min(axis=1, keepdims=True)
+    mean = oof_proba.mean(axis=1, keepdims=True)
+    return np.hstack([oof_proba, spread, mean])
+
+
+def generate_oof_predictions(
+    X: np.ndarray,
+    y: np.ndarray,
+    timestamps: np.ndarray,
+    models: dict,
+    n_splits: int = 5,
+    gap_days: float = 7.0,
+):
+    """Generate out-of-fold predictions for all base models using walk-forward CV.
+
+    Parameters
+    ----------
+    X, y:
+        Feature matrix and binary labels.
+    timestamps:
+        1-D array of numeric timestamps (same units as ``gap_days``).
+    models:
+        Dict of ``{name: unfitted_estimator}``.
+    n_splits:
+        Number of walk-forward folds.
+    gap_days:
+        Gap between train end and val start (same units as timestamps).
+
+    Returns
+    -------
+    oof_proba : np.ndarray of shape (n_oof_samples, n_models)
+    oof_labels : np.ndarray of shape (n_oof_samples,)
+    """
+    from sklearn.linear_model import LogisticRegression  # noqa (local import for speed)
+
+    n_models = len(models)
+    model_names = list(models.keys())
+    all_proba = []
+    all_labels = []
+
+    for train_idx, val_idx in _walk_forward_cv(X, timestamps, n_splits=n_splits, gap_days=gap_days):
+        X_tr, X_val = X[train_idx], X[val_idx]
+        y_tr, y_val = y[train_idx], y[val_idx]
+        if len(np.unique(y_tr)) < 2:
+            continue
+        fold_proba = np.zeros((len(val_idx), n_models))
+        for col, name in enumerate(model_names):
+            m = clone(models[name])
+            try:
+                m.fit(X_tr, y_tr)
+                fold_proba[:, col] = m.predict_proba(X_val)[:, 1]
+            except Exception as exc:
+                raise ValueError(f"Model '{name}' failed during OOF fold fit: {exc}") from exc
+        all_proba.append(fold_proba)
+        all_labels.append(y_val)
+
+    if not all_proba:
+        return np.empty((0, n_models)), np.empty(0, dtype=int)
+    return np.vstack(all_proba), np.concatenate(all_labels)
+
+
+def train_meta_learner(
+    oof_proba: np.ndarray,
+    oof_labels: np.ndarray,
+    use_disagreement_features: bool = False,
+):
+    """Fit a LogisticRegression meta-learner on OOF base model predictions.
+
+    Returns ``None`` when the OOF set has fewer than 2 distinct labels
+    (meta-learner would be degenerate).
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    if len(oof_labels) == 0 or len(np.unique(oof_labels)) < 2:
+        return None
+    meta_X = _build_meta_features(oof_proba, use_disagreement=use_disagreement_features)
+    meta = LogisticRegression(C=1.0, max_iter=500, random_state=42, solver="lbfgs")
+    meta.fit(meta_X, oof_labels)
+    return meta
+
+
 def _get_oversampler(strategy: str, random_state: int = 42) -> BaseOverSampler | None:
     """Factory function returning the requested over-sampling object.
 
@@ -89,6 +219,38 @@ def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
+def _extract_timestamps(df: pd.DataFrame) -> np.ndarray | None:
+    """Extract Unix epoch timestamps from training DataFrame.
+
+    Looks for a ``timestamp`` or ``ledger_close_time`` column. Returns None
+    if neither is present (caller falls back to random split).
+    """
+    for col in ("timestamp", "ledger_close_time"):
+        if col in df.columns:
+            ts = pd.to_datetime(df[col], errors="coerce")
+            epoch = ts.astype("int64") / 1e9
+            if epoch.notna().all():
+                return epoch.values
+    return None
+
+
+def _extract_timestamps_from_array(
+    original_ts: np.ndarray,
+    original_X: np.ndarray,
+    subset_X: np.ndarray,
+) -> np.ndarray | None:
+    """Recover timestamps for a subset of X after a temporal split.
+
+    Matches rows by position in the sorted timestamp order.
+    """
+    if original_ts is None or len(subset_X) == 0:
+        return None
+    sort_idx = np.argsort(original_ts)
+    sorted_ts = original_ts[sort_idx]
+    n_subset = len(subset_X)
+    return sorted_ts[:n_subset]
+
+
 def _train_ensemble_base(
     df: pd.DataFrame,
     random_state: int = 42,
@@ -96,6 +258,7 @@ def _train_ensemble_base(
     calibrate: bool = True,
     adversarial_hardening: bool = False,
     imbalance_strategy: str = "smote",
+    sample_weights: np.ndarray | None = None,
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -138,30 +301,91 @@ def _train_ensemble_base(
 
     X, y = _split_features_labels(df)
 
+    # Temporal splitting: use timestamps when available, otherwise fall back
+    # to random splitting.  SMOTE is applied AFTER the split, on training only.
+    assert "timestamp" not in FEATURE_NAMES, "timestamp must not be a training feature"
+
+    timestamps = _extract_timestamps(df)
+    use_temporal = timestamps is not None
+
     if calibrate:
-        X_remaining, X_cal, y_remaining, y_cal = train_test_split(
-            X, y, test_size=0.10, random_state=random_state, stratify=y
-        )
+        if use_temporal:
+            from detection.dataset import temporal_train_val_split, data_leakage_audit
+            X_remaining, X_cal, y_remaining, y_cal = temporal_train_val_split(
+                X.values, y.values, timestamps, val_ratio=0.10,
+            )
+            X_remaining = pd.DataFrame(X_remaining, columns=X.columns)
+            X_cal = pd.DataFrame(X_cal, columns=X.columns)
+            y_remaining = pd.Series(y_remaining, name="label")
+            y_cal = pd.Series(y_cal, name="label")
+        else:
+            X_remaining, X_cal, y_remaining, y_cal = train_test_split(
+                X, y, test_size=0.10, random_state=random_state, stratify=y
+            )
         cal_split_info = {
             "X_cal": X_cal,
             "y_cal": y_cal,
-            "cal_index_start": X_cal.index.min(),
-            "cal_index_end": X_cal.index.max(),
+            "cal_index_start": X_cal.index.min() if hasattr(X_cal.index, "min") else 0,
+            "cal_index_end": X_cal.index.max() if hasattr(X_cal.index, "max") else 0,
         }
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
-        )
+        if use_temporal:
+            ts_remaining = _extract_timestamps_from_array(timestamps, X.values, X_remaining.values)
+            if ts_remaining is not None:
+                X_train, X_test, y_train, y_test = temporal_train_val_split(
+                    X_remaining.values, y_remaining.values, ts_remaining, val_ratio=0.2,
+                )
+            else:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+                )
+            X_train = pd.DataFrame(X_train, columns=X.columns)
+            X_test = pd.DataFrame(X_test, columns=X.columns)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_remaining, y_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+            )
     else:
         cal_split_info = {}
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=random_state, stratify=y
-        )
+        if use_temporal:
+            from detection.dataset import temporal_train_val_split
+            X_train, X_test, y_train, y_test = temporal_train_val_split(
+                X.values, y.values, timestamps, val_ratio=0.2,
+            )
+            X_train = pd.DataFrame(X_train, columns=X.columns)
+            X_test = pd.DataFrame(X_test, columns=X.columns)
+            y_train = pd.Series(y_train, name="label")
+            y_test = pd.Series(y_test, name="label")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=random_state, stratify=y
+            )
+
+    # Propagate sample weights through train/test split
+    _train_weights = None
+    if sample_weights is not None:
+        if calibrate:
+            _, _, w_remaining, _ = train_test_split(
+                sample_weights, sample_weights, test_size=0.10, random_state=random_state, stratify=y
+            )
+            w_train, _ = train_test_split(
+                w_remaining, test_size=0.2, random_state=random_state, stratify=y_remaining
+            )[:2] if len(w_remaining) > 0 else (w_remaining, np.array([]))
+        else:
+            w_train, _ = train_test_split(
+                sample_weights, test_size=0.2, random_state=random_state, stratify=y
+            )[:2]
+    else:
+        w_train = None
 
     oversampler = _get_oversampler(imbalance_strategy, random_state=random_state)
     if oversampler is not None:
         X_train_res, y_train_res = oversampler.fit_resample(X_train, y_train)
+        _train_weights = None  # SMOTE generates new samples; weights don't apply cleanly
     else:
         X_train_res, y_train_res = X_train, y_train
+        _train_weights = w_train
     _applied_imbalance_strategy = imbalance_strategy
 
     # Log hyperparameters
@@ -170,6 +394,7 @@ def _train_ensemble_base(
     mlflow.log_param("calibrate", calibrate)
     mlflow.log_param("adversarial_hardening", adversarial_hardening)
     mlflow.log_param("smote_k_neighbors", getattr(oversampler, "k_neighbors", None))
+    mlflow.log_param("has_sample_weights", sample_weights is not None)
 
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
@@ -177,13 +402,17 @@ def _train_ensemble_base(
         "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1),
     }
 
-    for mname, m in models.items():
-        for key, value in m.get_params().items():
-            mlflow.log_param(f"{mname}_{key}", value)
+    if _active_run:
+        for mname, m in models.items():
+            for key, value in m.get_params().items():
+                mlflow.log_param(f"{mname}_{key}", value)
 
     results = {}
     for name, model in models.items():
-        model.fit(X_train_res, y_train_res)
+        fit_kwargs = {}
+        if _train_weights is not None and len(_train_weights) == len(y_train_res):
+            fit_kwargs["sample_weight"] = _train_weights
+        model.fit(X_train_res, y_train_res, **fit_kwargs)
         y_proba = model.predict_proba(X_test)[:, 1]
         y_pred = model.predict(X_test)
 
@@ -193,13 +422,17 @@ def _train_ensemble_base(
         prec = precision_score(y_test, y_pred, zero_division=0.0)
         rec = recall_score(y_test, y_pred, zero_division=0.0)
 
-        mlflow.log_metric(f"{name}_auc_roc", auc_roc)
-        mlflow.log_metric(f"{name}_pr_auc", pr_auc)
-        mlflow.log_metric(f"{name}_f1", f1)
-        mlflow.log_metric(f"{name}_precision", prec)
-        mlflow.log_metric(f"{name}_recall", rec)
-
-        mlflow.sklearn.log_model(model, artifact_path=name, registered_model_name=None)
+        if _active_run:
+            mlflow.log_metric(f"{name}_auc_roc", auc_roc)
+            mlflow.log_metric(f"{name}_pr_auc", pr_auc)
+            mlflow.log_metric(f"{name}_f1", f1)
+            mlflow.log_metric(f"{name}_precision", prec)
+            mlflow.log_metric(f"{name}_recall", rec)
+            import tempfile as _tf
+            with _tf.TemporaryDirectory() as _tmpdir:
+                _mpath = os.path.join(_tmpdir, "model.joblib")
+                joblib.dump(model, _mpath)
+                mlflow.log_artifact(_mpath, artifact_path=name)
 
         results[name] = {
             "model": model,
@@ -256,7 +489,7 @@ def _train_ensemble_base(
                     roc_auc_score(oof_labels, oof_meta_proba)
                 )
                 stacking_metrics["meta_learner_coef"] = meta_learner.coef_[0].tolist()
-                _logger.info(
+                logger.info(
                     "Meta-learner AUC-PR: %.3f (vs. equal-weight average: %.3f)",
                     stacking_metrics["meta_learner_auc_pr"],
                     stacking_metrics["avg_baseline_auc_pr"],
@@ -265,7 +498,7 @@ def _train_ensemble_base(
                 pass
         results["_stacking"] = {"meta_learner": meta_learner, **stacking_metrics}
     except Exception as exc:
-        _logger.warning("Stacking meta-learner training failed (best-effort): %s", exc)
+        logger.warning("Stacking meta-learner training failed (best-effort): %s", exc)
 
     # --- Adversarial hardening: generate PGD adversarial examples from
     # training true positives and retrain once on the augmented set.
@@ -343,6 +576,8 @@ def _train_ensemble_base(
 
     # Store the applied imbalance strategy so save_models can persist it.
     results["_imbalance_strategy"] = _applied_imbalance_strategy
+    if _causal_features is not None:
+        results["_causal_selected_features"] = _causal_features
     return results
 
 
@@ -450,7 +685,7 @@ def save_models(
 
     signing_key = settings.model_signing_key.encode()
     for name, result in results.items():
-        if name in ("_calib", "_imbalance_strategy"):
+        if name.startswith("_") or not isinstance(result, dict) or "model" not in result:
             continue
         path = os.path.join(model_dir, f"{name}.joblib")
         joblib.dump(result["model"], path)
@@ -481,6 +716,8 @@ def save_models(
         "training_row_count": training_row_count,
         "column_hash": column_hash,
         "imbalance_strategy": results.get("_imbalance_strategy", "smote"),
+        "causal_feature_selection": _causal_selected is not None,
+        "causal_selected_features": _causal_selected or [],
         "model_metrics": {
             name: {
                 "auc_roc": result.get("auc_roc", 0.0),
@@ -488,7 +725,7 @@ def save_models(
                 "f1": result.get("f1", 0.0),
             }
             for name, result in results.items()
-            if name not in ("_calib", "_imbalance_strategy")
+            if not name.startswith("_") and isinstance(result, dict) and "model" in result
         },
     }
 
@@ -496,7 +733,7 @@ def save_models(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    _logger.info("Wrote training metadata to %s", metadata_path)
+    logger.info("Wrote training metadata to %s", metadata_path)
 
     # ------------------------------------------------------------------
     # Calibration artifacts
@@ -532,7 +769,7 @@ def save_models(
         existing.update(metrics)
         with open(metrics_path, "w") as f:
             json.dump(existing, f, indent=2)
-        _logger.info(
+        logger.info(
             "Wrote calibration metrics (coverage=%.4f) to %s",
             metrics.get("conformal_empirical_coverage", 0.0),
             metrics_path,
@@ -546,7 +783,7 @@ def save_models(
         meta_path = os.path.join(model_dir, "meta_learner.joblib")
         joblib.dump(stacking_info["meta_learner"], meta_path)
         sign_model_file(meta_path, signing_key)
-        _logger.info("Saved meta-learner to %s", meta_path)
+        logger.info("Saved meta-learner to %s", meta_path)
 
         # Persist meta-learner metrics into training_metadata.json
         try:
@@ -558,7 +795,7 @@ def save_models(
             with open(metadata_path, "w") as f:
                 json.dump(meta_md, f, indent=2)
         except Exception as exc:
-            _logger.warning("Failed to update training_metadata.json with meta-learner metrics: %s", exc)
+            logger.warning("Failed to update training_metadata.json with meta-learner metrics: %s", exc)
 
 
 if __name__ == "__main__":
@@ -676,7 +913,7 @@ def _collect_aggregate_metrics(results: dict) -> dict:
         "avg_f1": [],
     }
     for name, result in results.items():
-        if name == "_calib":
+        if name.startswith("_") or not isinstance(result, dict):
             continue
         model_scores["avg_auc_roc"].append(result.get("auc_roc", 0.0))
         model_scores["avg_pr_auc"].append(result.get("pr_auc", 0.0))

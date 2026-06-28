@@ -86,6 +86,25 @@ All require `X-LedgerLens-Admin-Key`.
 | `GET /admin/robustness-report` | Latest adversarial robustness report |
 | `GET /admin/federated/audit-log` | Federated learning round audit records |
 
+## Compliance Endpoints
+
+All require `X-LedgerLens-Compliance-Key` and are excluded from the public
+OpenAPI schema. See [compliance_export.md](compliance_export.md) for full
+details, regulatory context, and a legal disclaimer.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /compliance/ivms/{wallet}` | IVMS 101 Travel-Rule risk-augmentation block |
+| `POST /compliance/sar-package` | SAR evidence ZIP (narrative + supporting evidence) |
+| `GET /compliance/audit-trail/{wallet}` | Full chronological event log for a wallet |
+
+Both export endpoints accept `?dry_run=true` to skip writing to the
+`compliance_exports` audit table (the response itself is unaffected).
+`POST /compliance/sar-package` additionally requires the wallet's current
+risk score to be at least `COMPLIANCE_SAR_MIN_SCORE` (400 otherwise) and is
+rate-limited to `COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR` exports/hour (429
+otherwise).
+
 ## OpenAPI / Swagger UI
 
 The full interactive OpenAPI spec is available at `/docs` when the server is running.
