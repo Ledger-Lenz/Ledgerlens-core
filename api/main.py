@@ -139,6 +139,28 @@ _inflight_requests: int = 0
 _inflight_lock = __import__("threading").Lock()
 
 
+async def _nightly_retention_task() -> None:
+    """Async background task: run the data retention job once per night at midnight UTC."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    while True:
+        now = datetime.now(timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        sleep_seconds = (next_midnight - now).total_seconds()
+        await asyncio.sleep(sleep_seconds)
+        try:
+            from storage.retention import RetentionEngine
+            engine = RetentionEngine(db_path=settings.db_path)
+            report = engine.run(dry_run=False)
+            for table, info in report.items():
+                archived = info.get("rows_archived", 0)
+                if archived:
+                    logger.info("[retention] %s: archived %d row(s) to %s", table, archived, info.get("archive_path"))
+        except Exception as exc:
+            logger.error("[retention] Nightly job failed: %s", exc)
+
+
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; drain requests and clean up on shutdown."""
@@ -151,10 +173,15 @@ async def _lifespan(application: FastAPI):
     except (FileNotFoundError, RuntimeError) as e:
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
+
+    import asyncio as _asyncio
+    _retention_task = _asyncio.create_task(_nightly_retention_task())
     yield
 
     # ── Shutdown sequence ────────────────────────────────────────────────
     import asyncio
+
+    _retention_task.cancel()
 
     _shutting_down = True
     logger.info("[shutdown] Stopping new requests (returning 503)")

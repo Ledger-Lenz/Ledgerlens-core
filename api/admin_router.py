@@ -251,6 +251,14 @@ class FLPrivacyStatus(BaseModel):
     rounds_completed: int
 
 
+@router.get("/storage", include_in_schema=False)
+def storage_stats() -> dict:
+    """Return current database size, per-table row counts, and next archival date."""
+    from storage.retention import RetentionEngine
+    engine = RetentionEngine(db_path=settings.db_path)
+    return engine.storage_stats()
+
+
 @router.get("/fl/privacy", response_model=FLPrivacyStatus, include_in_schema=False)
 def fl_privacy_status() -> FLPrivacyStatus:
     """Return current FL differential privacy budget status (admin-key gated)."""
