@@ -3,15 +3,28 @@
 Provides incremental per-trade feature updates for wallet/asset-pair tuples.
 Supports efficient rolling-window aggregation and in-memory caching with
 automatic fallback to in-process dict when Redis is unavailable.
+
+Archival (dual-tier storage):
+  :class:`FeatureStoreArchiver` moves rows older than N days from the
+  ``feature_distribution_snapshots`` SQLite table to date-partitioned Parquet
+  files on disk.  :class:`ParquetFeatureColdTier` reads those files with
+  partition pruning.  :class:`DualTierFeatureStore` wraps both hot (SQLite) and
+  cold (Parquet) tiers behind a single :meth:`~DualTierFeatureStore.query`
+  interface used by ``drift_monitor.py``.
 """
 
 import hashlib
-import json
 import logging
+import os
+import sqlite3
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pydantic import BaseModel
 
 from config.settings import settings
@@ -50,37 +63,6 @@ class WalletFeatureState(BaseModel):
 
     # Hashed counterparty wallet IDs (32-bit integers)
     counterparty_hashes_30d: list[int] = []
-
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat(),
-        }
-
-    def model_dump_json_compat(self) -> str:
-        """Serialize to JSON for Redis storage."""
-        return json.dumps(
-            {
-                "wallet": self.wallet,
-                "asset_pair": self.asset_pair,
-                "last_updated": self.last_updated.isoformat(),
-                "trade_count": self.trade_count,
-                "trade_ring_1h": self.trade_ring_1h,
-                "trade_ring_4h": self.trade_ring_4h,
-                "trade_ring_24h": self.trade_ring_24h,
-                "trade_ring_7d": self.trade_ring_7d,
-                "trade_ring_30d": self.trade_ring_30d,
-                "benford_digit_counts_30d": self.benford_digit_counts_30d,
-                "counterparty_hashes_30d": self.counterparty_hashes_30d,
-            }
-        )
-
-    @classmethod
-    def model_validate_json_compat(cls, data: str) -> "WalletFeatureState":
-        """Deserialize from JSON loaded from Redis."""
-        d = json.loads(data)
-        d["last_updated"] = datetime.fromisoformat(d["last_updated"])
-        return cls(**d)
-
 
 # Ring buffer size caps (max entries per ring)
 RING_BUFFER_CAPS = {
@@ -388,7 +370,7 @@ class FeatureStore:
                 data = self.redis_client.get(key)
                 self._circuit.record_success()
                 if data:
-                    return WalletFeatureState.model_validate_json_compat(data.decode())
+                    return WalletFeatureState.model_validate_json(data)
             except Exception as e:
                 self._circuit.record_failure()
                 logger.warning("FeatureStore.get_state: Redis error (%s), falling back", e)
@@ -404,7 +386,7 @@ class FeatureStore:
             try:
                 ttl_hours = getattr(settings, "feature_store_ttl_hours", 48)
                 ttl_seconds = ttl_hours * 3600
-                serialized = state.model_dump_json_compat()
+                serialized = state.model_dump_json()
                 self.redis_client.setex(key, ttl_seconds, serialized)
                 self._circuit.record_success()
                 return
@@ -460,3 +442,319 @@ class FeatureStore:
     def is_using_redis(self) -> bool:
         """Check if Redis is active (vs. fallback mode)."""
         return self._using_redis
+
+    def query(
+        self,
+        wallet: Optional[str] = None,
+        feature_name: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        db_path: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Query feature distribution snapshots from the SQLite hot tier.
+
+        Reads rows from ``feature_distribution_snapshots`` with optional
+        filters on wallet, feature name, and time range.
+
+        Args:
+            wallet: Filter to a specific wallet address.
+            feature_name: Filter to a specific feature name.
+            since: Lower bound on ``recorded_at`` (inclusive).
+            until: Upper bound on ``recorded_at`` (inclusive).
+            db_path: SQLite path; defaults to ``settings.db_path``.
+
+        Returns:
+            DataFrame with columns: wallet, asset_pair, feature_name,
+            feature_value, recorded_at.
+        """
+        db_path = db_path or settings.db_path
+        clauses: list[str] = []
+        params: list = []
+
+        if wallet:
+            clauses.append("wallet = ?")
+            params.append(wallet)
+        if feature_name:
+            clauses.append("feature_name = ?")
+            params.append(feature_name)
+        if since:
+            clauses.append("recorded_at >= ?")
+            params.append(since.isoformat() if isinstance(since, datetime) else since)
+        if until:
+            clauses.append("recorded_at <= ?")
+            params.append(until.isoformat() if isinstance(until, datetime) else until)
+
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            f"SELECT wallet, asset_pair, feature_name, feature_value, recorded_at "
+            f"FROM feature_distribution_snapshots {where}"
+        )
+        try:
+            with sqlite3.connect(db_path) as conn:
+                df = pd.read_sql(sql, conn, params=params if params else None)
+            if not df.empty and "recorded_at" in df.columns:
+                df["recorded_at"] = pd.to_datetime(df["recorded_at"], utc=True, errors="coerce")
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+
+class FeatureStoreArchiver:
+    """Archives feature distribution snapshots from SQLite to Parquet cold tier.
+
+    Moves rows older than ``cutoff_days`` from ``feature_distribution_snapshots``
+    to date-partitioned Parquet files under ``archive_dir``.  The Parquet write
+    is performed *before* the SQLite delete so that a mid-flight crash leaves
+    data in both tiers rather than in neither.
+
+    The archive directory is created with mode 0o700 (owner-read-only) to
+    protect the sensitive feature vectors it contains.
+
+    Usage::
+
+        archiver = FeatureStoreArchiver(db_path="./ledgerlens.db",
+                                        archive_dir=Path("./feature_archive"))
+        n_archived = archiver.archive_old_features(cutoff_days=30)
+    """
+
+    PARQUET_SCHEMA = pa.schema(
+        [
+            pa.field("wallet", pa.string()),
+            pa.field("asset_pair", pa.string()),
+            pa.field("feature_name", pa.string()),
+            pa.field("feature_value", pa.float64()),
+            pa.field("recorded_at", pa.timestamp("us")),
+            pa.field("year", pa.int32()),
+            pa.field("month", pa.int32()),
+            pa.field("day", pa.int32()),
+        ]
+    )
+
+    def __init__(self, db_path: str, archive_dir: Path) -> None:
+        self.db_path = db_path
+        self.archive_dir = Path(archive_dir)
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.archive_dir, 0o700)
+
+    def archive_old_features(self, cutoff_days: int = 30) -> int:
+        """Archive rows older than ``cutoff_days`` to the Parquet cold tier.
+
+        Reads qualifying rows from SQLite, writes them to Parquet (appending to
+        any existing partition), then deletes them from SQLite only on success.
+        Returns the number of rows archived.
+        """
+        cutoff = datetime.utcnow() - timedelta(days=cutoff_days)
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql(
+                "SELECT wallet, asset_pair, feature_name, feature_value, recorded_at "
+                "FROM feature_distribution_snapshots WHERE recorded_at < ?",
+                conn,
+                params=[cutoff.isoformat()],
+            )
+
+        if df.empty:
+            return 0
+
+        df["recorded_at"] = pd.to_datetime(df["recorded_at"], utc=True, errors="coerce")
+        df = df.dropna(subset=["recorded_at"])
+        df["year"] = df["recorded_at"].dt.year.astype("int32")
+        df["month"] = df["recorded_at"].dt.month.astype("int32")
+        df["day"] = df["recorded_at"].dt.day.astype("int32")
+
+        table = pa.Table.from_pandas(df, schema=self.PARQUET_SCHEMA, preserve_index=False)
+        pq.write_to_dataset(
+            table,
+            root_path=str(self.archive_dir),
+            partition_cols=["year", "month", "day"],
+            existing_data_behavior="overwrite_or_ignore",
+        )
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM feature_distribution_snapshots WHERE recorded_at < ?",
+                [cutoff.isoformat()],
+            )
+
+        logger.info("Archived %d feature snapshot rows (cutoff=%s)", len(df), cutoff.date())
+        return len(df)
+
+
+class ParquetFeatureColdTier:
+    """Reads feature distribution snapshots from the Parquet cold tier.
+
+    Applies PyArrow filter expressions to the partitioned dataset for efficient
+    partition pruning.  Returns an empty DataFrame when the archive directory
+    does not exist or the dataset is empty.
+
+    Usage::
+
+        cold = ParquetFeatureColdTier(archive_dir=Path("./feature_archive"))
+        df = cold.query(since=datetime(2025, 1, 1))
+    """
+
+    def __init__(self, archive_dir: Path) -> None:
+        self.archive_dir = Path(archive_dir)
+
+    def query(
+        self,
+        wallet: Optional[str] = None,
+        feature_name: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> pd.DataFrame:
+        """Read from the Parquet cold tier with optional filter pushdown.
+
+        Args:
+            wallet: Filter to a specific wallet address.
+            feature_name: Filter to a specific feature name.
+            since: Lower bound on ``recorded_at`` (inclusive).
+            until: Upper bound on ``recorded_at`` (inclusive).
+
+        Returns:
+            DataFrame with columns: wallet, asset_pair, feature_name,
+            feature_value, recorded_at.
+        """
+        if not self.archive_dir.exists():
+            return pd.DataFrame()
+
+        filters = self._build_parquet_filters(since, until, wallet, feature_name)
+        try:
+            table = pq.read_table(
+                str(self.archive_dir),
+                filters=filters,
+                columns=[
+                    "wallet",
+                    "asset_pair",
+                    "feature_name",
+                    "feature_value",
+                    "recorded_at",
+                ],
+            )
+            df = table.to_pandas()
+            if not df.empty and "recorded_at" in df.columns:
+                df["recorded_at"] = pd.to_datetime(df["recorded_at"], utc=True, errors="coerce")
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    def _build_parquet_filters(
+        self,
+        since: Optional[datetime],
+        until: Optional[datetime],
+        wallet: Optional[str],
+        feature_name: Optional[str],
+    ) -> Optional[list]:
+        """Build PyArrow partition filter expressions for efficient pruning."""
+        def _to_utc_ts(dt: datetime) -> pd.Timestamp:
+            ts = pd.Timestamp(dt)
+            return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+        filters: list = []
+        if since:
+            filters.append(("recorded_at", ">=", _to_utc_ts(since)))
+        if until:
+            filters.append(("recorded_at", "<=", _to_utc_ts(until)))
+        if wallet:
+            filters.append(("wallet", "=", wallet))
+        if feature_name:
+            filters.append(("feature_name", "=", feature_name))
+        return filters if filters else None
+
+    def row_count(self) -> int:
+        """Return total number of rows across all cold-tier Parquet partitions."""
+        if not self.archive_dir.exists():
+            return 0
+        try:
+            ds = pq.read_table(str(self.archive_dir), columns=["wallet"])
+            return len(ds)
+        except Exception:
+            return 0
+
+    def oldest_record(self) -> Optional[datetime]:
+        """Return the timestamp of the oldest record in the cold tier."""
+        if not self.archive_dir.exists():
+            return None
+        try:
+            table = pq.read_table(str(self.archive_dir), columns=["recorded_at"])
+            if len(table) == 0:
+                return None
+            ts = pd.to_datetime(table["recorded_at"].to_pandas(), utc=True, errors="coerce").min()
+            return ts.to_pydatetime() if not pd.isna(ts) else None
+        except Exception:
+            return None
+
+
+class DualTierFeatureStore:
+    """Unified query interface over SQLite hot tier and Parquet cold tier.
+
+    Wraps a :class:`FeatureStore` (hot) and :class:`ParquetFeatureColdTier`
+    (cold) and exposes a single :meth:`query` method that transparently merges
+    results from both tiers.
+
+    Deduplication by ``(wallet, feature_name, recorded_at)`` handles the window
+    where a concurrent archival run has written data to Parquet but not yet
+    deleted it from SQLite.  A WARNING is logged when deduplication removes rows,
+    indicating a previously failed archive.
+
+    Usage::
+
+        hot  = FeatureStore()
+        cold = ParquetFeatureColdTier(Path("./feature_archive"))
+        store = DualTierFeatureStore(hot, cold)
+        df = store.query(since=datetime.utcnow() - timedelta(days=60))
+    """
+
+    def __init__(self, hot: FeatureStore, cold: ParquetFeatureColdTier) -> None:
+        self._hot = hot
+        self._cold = cold
+
+    def query(
+        self,
+        wallet: Optional[str] = None,
+        feature_name: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        db_path: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Return feature snapshots from both tiers, deduplicated.
+
+        Args:
+            wallet: Filter to a specific wallet address.
+            feature_name: Filter to a specific feature name.
+            since: Lower bound on ``recorded_at`` (inclusive).
+            until: Upper bound on ``recorded_at`` (inclusive).
+            db_path: Override SQLite path for the hot-tier query.
+
+        Returns:
+            DataFrame with columns: wallet, asset_pair, feature_name,
+            feature_value, recorded_at.  Rows are deduplicated by
+            (wallet, feature_name, recorded_at).
+        """
+        hot_df = self._hot.query(
+            wallet=wallet,
+            feature_name=feature_name,
+            since=since,
+            until=until,
+            db_path=db_path,
+        )
+        cold_df = self._cold.query(
+            wallet=wallet,
+            feature_name=feature_name,
+            since=since,
+            until=until,
+        )
+        combined = pd.concat([hot_df, cold_df], ignore_index=True)
+        if combined.empty:
+            return combined
+
+        dedup_keys = ["wallet", "feature_name", "recorded_at"]
+        before = len(combined)
+        combined = combined.drop_duplicates(subset=dedup_keys)
+        removed = before - len(combined)
+        if removed > 0:
+            logger.warning(
+                "DualTierFeatureStore: removed %d duplicate rows across hot/cold boundary "
+                "(indicates a previously failed archive run)",
+                removed,
+            )
+        return combined.reset_index(drop=True)

@@ -1,0 +1,20 @@
+{
+  "id": "123456789",
+  "paging_token": "123456789-0",
+  "ledger_close_time": "2026-06-25T12:30:00Z",
+  "base_account": "GBASEACCOUNT",
+  "counter_account": "GCOUNTERACCOUNT",
+  "base_asset_type": "native",
+  "counter_asset_type": "credit_alphanum4",
+  "counter_asset_code": "USDC",
+  "counter_asset_issuer": "GISSUER",
+  "base_amount": "1.5e-7",
+  "counter_amount": "0.0000003",
+  "price": {
+    "n": 2,
+    "d": 1
+  },
+  "base_is_seller": true,
+  "trade_type": "orderbook",
+  "future_horizon_field": "ignored"
+}

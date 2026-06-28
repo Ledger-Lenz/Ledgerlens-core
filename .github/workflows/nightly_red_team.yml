@@ -1,0 +1,44 @@
+name: Nightly Red-Team Campaign
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  red-team:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" --quiet
+
+      - name: Train models (if not cached)
+        run: python cli.py train --n-normal 200 --n-wash-rings 30
+        continue-on-error: true
+
+      - name: Run red-team campaigns
+        id: red_team
+        run: python cli.py red-team --report-dir ./red_team_reports --n-samples 200
+        continue-on-error: true
+
+      - name: Upload campaign report
+        uses: actions/upload-artifact@v4
+        with:
+          name: red-team-report
+          path: red_team_reports/
+
+      - name: Alert on evasion gate failure
+        if: steps.red_team.outcome == 'failure'
+        run: |
+          echo "::error::Red-team evasion gate failed — one or more attack types exceeded 5% evasion rate."
+          exit 1

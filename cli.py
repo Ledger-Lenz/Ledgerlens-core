@@ -12,8 +12,18 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import sys
+import time
 import tomllib
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomllib  # type: ignore[no-redef]
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
 
 import typer
 
@@ -25,7 +35,6 @@ except Exception:
     __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
 
 
@@ -79,6 +88,55 @@ def generate_data(
     logger.info("Wrote %d trades, %d events, %d labelled accounts to %s", len(trades), len(events), len(labels), out_dir)
 
 
+@app.command("generate-adversarial")
+def generate_adversarial(
+    strategy: str = typer.Option(
+        ...,
+        help="Evasion strategy: benford_camouflage | timing_jitter | graph_fragmentation | cross_pair_rotation",
+    ),
+    out_dir: str = typer.Option("./data/adversarial", help="Directory to write the adversarial CSV to"),
+    n_wallets: int = typer.Option(50, help="Number of adversarial wash wallets to generate"),
+    n_trades: int = typer.Option(200, help="Number of adversarial trades to generate"),
+    seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    label_wash: bool = typer.Option(
+        True,
+        "--label-wash/--label-clean",
+        help="Label adversarial trades as wash (1) or override all labels to 0 (--label-clean). "
+             "Unlabelled adversarial data must not silently enter training datasets.",
+    ),
+) -> None:
+    """Generate a labelled adversarial feature dataset with a specific evasion strategy.
+
+    Writes a CSV to OUT_DIR/adversarial_{STRATEGY}.csv with FEATURE_NAMES columns
+    and a 'label' column (1 = wash, 0 = clean). Use --label-clean to produce a
+    baseline dataset with all labels zeroed for false-positive rate benchmarking.
+    """
+    import os
+
+    from ingestion.adversarial_data import AdversarialDataset
+
+    dataset = AdversarialDataset().build(
+        strategy=strategy, n_wallets=n_wallets, n_trades=n_trades, seed=seed
+    )
+
+    if not label_wash:
+        dataset = dataset.copy()
+        dataset["label"] = 0
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"adversarial_{strategy}.csv")
+    dataset.to_csv(out_path, index=False)
+
+    n_wash = int((dataset["label"] == 1).sum())
+    logger.info(
+        "Wrote %d accounts (%d wash-labelled, %d normal) to %s",
+        len(dataset),
+        n_wash,
+        len(dataset) - n_wash,
+        out_path,
+    )
+
+
 @app.command("train")
 def train(
     n_normal_accounts: int = typer.Option(60, help="Number of normal (non-wash) accounts"),
@@ -88,7 +146,12 @@ def train(
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
     experiment_name: str = typer.Option(None, "--experiment-name", help="MLflow experiment name for tracking"),
 ) -> None:
-    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
+    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`.
+
+    Use --optimize to run 100-trial Bayesian hyperparameter optimization (Optuna TPE)
+    before final training. Override trial budget with --n-trials and wall-clock cap
+    with --timeout.
+    """
     import os
 
     from config.settings import settings
@@ -109,7 +172,7 @@ def train(
 
     results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
-        if name == "_calib":
+        if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
             continue
         logger.info("%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
@@ -120,11 +183,40 @@ def train(
     logger.info("Saved models to %s", settings.model_dir)
 
 
+@app.command("archive-features")
+def archive_features(
+    cutoff_days: int = typer.Option(
+        0, help="Archive rows older than this many days (0 = use FEATURE_ARCHIVE_CUTOFF_DAYS setting)"
+    ),
+) -> None:
+    """Archive feature distribution snapshots older than cutoff_days to Parquet cold tier.
+
+    Reads qualifying rows from the ``feature_distribution_snapshots`` SQLite table,
+    writes them to date-partitioned Parquet files under FEATURE_ARCHIVE_DIR, then
+    deletes them from SQLite. Safe to interrupt: Parquet is written before SQLite
+    delete, so no data is lost on failure.
+    """
+    from pathlib import Path
+
+    from config.settings import settings
+    from detection.feature_store import FeatureStoreArchiver
+
+    effective_cutoff = cutoff_days if cutoff_days > 0 else settings.feature_archive_cutoff_days
+    archive_dir = Path(settings.feature_archive_dir)
+    archiver = FeatureStoreArchiver(db_path=settings.db_path, archive_dir=archive_dir)
+    n = archiver.archive_old_features(cutoff_days=effective_cutoff)
+    if n:
+        typer.echo(f"Archived {n} rows (cutoff={effective_cutoff} days) → {archive_dir}")
+    else:
+        typer.echo(f"No rows older than {effective_cutoff} days found; nothing to archive.")
+
+
 @app.command("retrain-check")
 def retrain_check(
     psi_threshold: float = typer.Option(0.20, help="PSI threshold for drift detection"),
     min_drifted_features: int = typer.Option(3, help="Minimum number of drifted features to trigger retraining"),
     force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
+    force_promote: bool = typer.Option(False, "--force-promote", help="Override SHAP stability check and promote models anyway"),
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
 
@@ -142,10 +234,17 @@ def retrain_check(
     import json
     import os
     from datetime import datetime
+    from pathlib import Path
 
     from config.settings import settings
     from detection.dataset import build_training_dataset
-    from detection.drift_monitor import is_drift_detected, run_drift_report
+    from detection.drift_monitor import (
+        check_psi_and_alert,
+        compute_per_feature_psi,
+        is_drift_detected,
+        record_psi_snapshot,
+        run_drift_report,
+    )
     from detection.model_registry import (
         get_current_version,
         rollback_model,
@@ -153,6 +252,20 @@ def retrain_check(
     from detection.model_training import save_models, train_ensemble
     from detection.storage import save_drift_report, save_retrain_run
     from ingestion.synthetic_data import generate_synthetic_dataset
+
+    # Run archival before drift check to keep hot tier lean
+    try:
+        from detection.feature_store import FeatureStoreArchiver
+
+        _archiver = FeatureStoreArchiver(
+            db_path=settings.db_path,
+            archive_dir=Path(settings.feature_archive_dir),
+        )
+        _archived = _archiver.archive_old_features(cutoff_days=settings.feature_archive_cutoff_days)
+        if _archived:
+            logger.info("retrain-check: archived %d feature snapshot rows before drift check", _archived)
+    except Exception as _exc:
+        logger.warning("retrain-check: archival step failed (%s); continuing without archival", _exc)
 
     # Read training metadata
     metadata_path = os.path.join(settings.model_dir, "training_metadata.json")
@@ -172,6 +285,17 @@ def retrain_check(
         return
 
     logger.info("Drift report: %s", report)
+
+    # Per-feature PSI tracking
+    try:
+        psi_dict = compute_per_feature_psi(training_dataset_path)
+        record_psi_snapshot(psi_dict)
+        check_psi_and_alert(psi_dict, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
+        logger.info("Per-feature PSI: %d features computed", len(psi_dict))
+    except FileNotFoundError as exc:
+        logger.warning("Per-feature PSI skipped: %s", exc)
+    except Exception as exc:
+        logger.warning("Per-feature PSI computation failed: %s", exc)
 
     # Check if drift detected
     drift_detected = is_drift_detected(report, psi_threshold=psi_threshold, min_drifted_features=min_drifted_features)
@@ -221,10 +345,44 @@ def retrain_check(
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     new_results = train_ensemble(df)
-    model_names = [k for k in new_results if k != "_calib"]
+    model_names = [k for k in new_results if not k.startswith("_") and isinstance(new_results[k], dict) and "auc_roc" in new_results[k]]
     for name in model_names:
         result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
+
+    # Compute SHAP importance summaries for new models
+    from detection.feature_engineering import FEATURE_NAMES as _feat_names
+    from detection.model_registry import (
+        compare_importance_stability,
+        compute_shap_summary,
+        save_shap_importances,
+    )
+
+    new_shap: dict[str, list[dict]] = {}
+    feature_cols = [c for c in df.columns if c in _feat_names]
+    X_train = df[feature_cols].fillna(0.0).values
+    for name in model_names:
+        model_obj = new_results[name].get("model")
+        if model_obj is not None:
+            try:
+                new_shap[name] = compute_shap_summary(model_obj, X_train, feature_cols)
+            except Exception as shap_exc:
+                logger.warning("SHAP summary for %s failed: %s", name, shap_exc)
+
+    new_metadata_for_stability = {"version": "new", "shap_importances": new_shap}
+    old_metadata_for_stability = {"version": metadata.get("version", "old"), "shap_importances": metadata.get("shap_importances", {})}
+
+    stability = compare_importance_stability(old_metadata_for_stability, new_metadata_for_stability)
+    if not stability.stable:
+        logger.warning(
+            "Feature importance stability check FAILED: min Spearman rho = %.3f "
+            "(threshold: %.3f). Models NOT auto-promoted. "
+            "Rerun with --force-promote to override.",
+            min(stability.spearman_rho.values()) if stability.spearman_rho else 0.0,
+            0.70,
+        )
+        if not force_promote:
+            logger.info("Skipping promotion due to stability check failure")
 
     # Compare new models with previous models
     previous_metrics = metadata.get("model_metrics", {})
@@ -254,12 +412,18 @@ def retrain_check(
                 new_auc,
             )
 
+    # Block promotion if stability check failed and --force-promote not set
+    if not stability.stable and not force_promote:
+        promoted = False
+
     # Save models and metadata
     training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
     df.to_csv(training_dataset_path, index=False)
 
     if promoted:
         save_models(new_results, training_dataset_path=training_dataset_path)
+        if new_shap:
+            save_shap_importances(new_shap, settings.model_dir)
         logger.info("Promoted new models to production")
     else:
         logger.info("New models not promoted; keeping previous versions")
@@ -285,12 +449,16 @@ def retrain_check(
     os.makedirs(drift_report_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     report_path = os.path.join(drift_report_dir, f"{timestamp}.json")
+    drifted_features = [f for f, v in report.items() if v > psi_threshold]
     with open(report_path, "w") as f:
         json.dump(
             {
                 "timestamp": timestamp,
                 "drift_detected": drift_detected,
+                "n_drifted_features": len(drifted_features),
                 "psi_report": report,
+                "per_feature_psi": report,
+                "drifted_features": drifted_features,
                 "promoted": promoted,
                 "new_model_metrics": {k: v.get("auc_roc") for k, v in new_results.items()},
             },
@@ -300,15 +468,42 @@ def retrain_check(
     logger.info("Wrote drift report to %s", report_path)
 
 
-@app.command("score")
+score_app = typer.Typer(help="Scoring commands")
+app.add_typer(score_app, name="score")
+
+
+@score_app.callback(invoke_without_command=True)
 def score(
+    ctx: typer.Context,
     no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
     use_async: bool = typer.Option(False, "--async", help="Use async pipeline for concurrent I/O and batched inference"),
+    bootstrap_threshold: int = typer.Option(
+        None,
+        "--bootstrap-threshold",
+        help="Override BENFORD_BOOTSTRAP_THRESHOLD: wallets with fewer transactions than this use Monte Carlo bootstrap p-values instead of asymptotic chi-square.",
+    ),
+    bootstrap_samples: int = typer.Option(
+        None,
+        "--bootstrap-samples",
+        help="Override BENFORD_BOOTSTRAP_SAMPLES: number of bootstrap replicates for small-sample p-value estimation.",
+    ),
 ) -> None:
     """Run the detection pipeline against live Horizon data and store the resulting scores."""
+    if ctx.invoked_subcommand is not None:
+        return
     import asyncio
 
     import run_pipeline
+
+    if bootstrap_threshold is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_THRESHOLD = bootstrap_threshold
+        logger.info("Bootstrap threshold overridden to %d", bootstrap_threshold)
+
+    if bootstrap_samples is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_SAMPLES = bootstrap_samples
+        logger.info("Bootstrap samples overridden to %d", bootstrap_samples)
 
     if use_async:
         scores = asyncio.run(run_pipeline.async_run())
@@ -316,6 +511,218 @@ def score(
         scores = run_pipeline.run(no_submit=no_submit)
     for s in scores:
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
+
+
+_STELLAR_RE = __import__("re").compile(r"^G[A-Z2-7]{55}$")
+
+
+@score_app.command("bulk")
+def score_bulk(
+    input: Path = typer.Option(..., "--input", "-i", help="Input CSV: one Stellar wallet per row (wallet column required)"),
+    output: Path = typer.Option(..., "--output", "-o", help="Output CSV for scored results"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=16, help="Parallel workers (max 16)"),
+    min_score: int = typer.Option(0, "--min-score", help="Exclude results with score below this value"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate input file and report wallet count without scoring"),
+) -> None:
+    """Score a CSV list of Stellar wallets against the local detection pipeline.
+
+    Input CSV must have a 'wallet' column (one address per row). An optional
+    'label' column is passed through to the output unchanged.  Malformed
+    addresses are skipped with a warning written to stderr.
+
+    Output columns: wallet, score, confidence_lower, confidence_upper,
+    top_features, scored_at, label (if present).
+    """
+    import csv
+    import json
+    import sys
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime, timezone
+
+    import pandas as pd
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
+
+    from config.settings import settings as cfg
+    from detection.model_inference import load_models, score_with_uncertainty
+    from detection.storage import get_feature_vector, init_db
+
+    # ── 1. Read input CSV ────────────────────────────────────────────────
+    if not input.exists():
+        typer.echo(f"Error: input file not found: {input}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        df_in = pd.read_csv(input)
+    except Exception as exc:
+        typer.echo(f"Error reading CSV: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if "wallet" not in df_in.columns:
+        typer.echo("Error: input CSV must have a 'wallet' column", err=True)
+        raise typer.Exit(1)
+
+    has_label = "label" in df_in.columns
+    raw_rows = df_in.to_dict("records")
+
+    # ── 2. Validate addresses ────────────────────────────────────────────
+    valid: list[dict] = []
+    skipped = 0
+    for row in raw_rows:
+        wallet = str(row.get("wallet", "")).strip()
+        if not _STELLAR_RE.match(wallet):
+            typer.echo(f"WARNING: skipping malformed address: {wallet!r}", err=True)
+            skipped += 1
+        else:
+            valid.append(row)
+
+    typer.echo(f"Loaded {len(valid)} valid wallet(s) ({skipped} skipped).")
+
+    if dry_run:
+        typer.echo("[dry-run] Input validation complete — no scoring performed.")
+        return
+
+    if not valid:
+        typer.echo("No valid wallets to score.", err=True)
+        raise typer.Exit(1)
+
+    # ── 3. Load models once ──────────────────────────────────────────────
+    try:
+        models = load_models(cfg.model_dir)
+    except Exception as exc:
+        typer.echo(f"Error loading models: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # ── 4. Initialise DB ─────────────────────────────────────────────────
+    init_db(cfg.db_path)
+
+    # ── 5. Scoring worker ────────────────────────────────────────────────
+    asset_pair = "XLM/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    scored_at = datetime.now(timezone.utc).isoformat()
+
+    def _score_wallet(row: dict) -> dict | None:
+        wallet = str(row["wallet"]).strip()
+        fv = get_feature_vector(wallet, asset_pair, db_path=cfg.db_path)
+        if fv is None:
+            from detection.feature_engineering import FEATURE_NAMES
+            fv = {name: 0.0 for name in FEATURE_NAMES}
+        try:
+            result = score_with_uncertainty(models, fv)
+        except Exception as exc:
+            logger.warning("Scoring failed for %s: %s", wallet, exc)
+            return None
+        score_val = int(round(result["score"]))
+        out: dict = {
+            "wallet": wallet,
+            "score": score_val,
+            "confidence_lower": round(result.get("score_lower", 0.0), 2),
+            "confidence_upper": round(result.get("score_upper", 100.0), 2),
+            "top_features": json.dumps(result.get("shap_values", [])),
+            "scored_at": scored_at,
+        }
+        if has_label:
+            out["label"] = row.get("label", "")
+        return out
+
+    # ── 6. Run with progress bar ─────────────────────────────────────────
+    results: list[dict] = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        refresh_per_second=2,
+    ) as progress:
+        task = progress.add_task("Scoring wallets", total=len(valid))
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_score_wallet, row): row for row in valid}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is not None and result["score"] >= min_score:
+                    results.append(result)
+                progress.advance(task)
+
+    # ── 7. Write output CSV ──────────────────────────────────────────────
+    if not results:
+        typer.echo("No results to write (all wallets filtered or failed).")
+        return
+
+    fieldnames = ["wallet", "score", "confidence_lower", "confidence_upper", "top_features", "scored_at"]
+    if has_label:
+        fieldnames.append("label")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    typer.echo(f"Scored {len(results)} wallet(s) → {output}")
+
+
+@app.command("historical-load")
+def historical_load(
+    start: str = typer.Option(..., "--start", help="Inclusive ISO-8601 start time"),
+    end: str = typer.Option(..., "--end", help="Exclusive ISO-8601 end time"),
+    concurrency: int | None = typer.Option(
+        None, "--concurrency", min=1, help="Maximum concurrent Horizon chunks"
+    ),
+    chunk_hours: float | None = typer.Option(
+        None, "--chunk-hours", min=0.01, help="Hours per independent chunk"
+    ),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Skip chunks already marked complete"
+    ),
+    asset_pair: str | None = typer.Option(
+        None, "--asset-pair", help="Optional BASE/COUNTER asset pair"
+    ),
+) -> None:
+    """Backfill historical Horizon trades with bounded parallel workers."""
+    import asyncio
+    from datetime import datetime
+
+    from config.settings import settings as cfg
+    from detection.storage import RiskScoreStore
+    from ingestion.historical_loader import ParallelHistoricalLoader
+    from ingestion.http_client import RetryingHorizonClient
+
+    def parse_datetime(value: str, option: str) -> datetime:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise typer.BadParameter("must be an ISO-8601 datetime", param_hint=option) from exc
+
+    start_time = parse_datetime(start, "--start")
+    end_time = parse_datetime(end, "--end")
+
+    async def run() -> None:
+        worker_count = concurrency or cfg.historical_loader_concurrency
+        hours = chunk_hours or cfg.historical_chunk_hours
+        async with RetryingHorizonClient(
+            cfg.horizon_url,
+            max_concurrency=worker_count,
+        ) as client:
+            loader = ParallelHistoricalLoader(
+                client=client,
+                storage=RiskScoreStore(cfg.db_path),
+                concurrency=worker_count,
+                chunk_hours=hours,
+                progress_path=Path(cfg.historical_progress_path),
+            )
+            result = await loader.load(
+                start_time,
+                end_time,
+                asset_pair=asset_pair,
+                resume=resume,
+            )
+            typer.echo(
+                f"completed={result.completed_chunks} failed={result.failed_chunks} "
+                f"skipped={result.skipped_chunks} records={result.total_records} "
+                f"records_per_second={result.records_per_second:.1f}"
+            )
+
+    asyncio.run(run())
 
 
 @app.command("eval-robustness")
@@ -347,7 +754,7 @@ def eval_robustness(
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
     baseline_results = train_ensemble(df, adversarial_augment=False, calibrate=False)
-    baseline_models = {k: v["model"] for k, v in baseline_results.items()}
+    baseline_models = {k: v["model"] for k, v in baseline_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of baseline model…")
     robustness = evaluate_robustness(baseline_models, n_trials=n_trials, seed=seed)
@@ -355,7 +762,7 @@ def eval_robustness(
     # Train an adversarially-augmented model
     logger.info("Training adversarially-augmented model…")
     adv_results = train_ensemble(df, adversarial_augment=adversarial_augment, calibrate=False)
-    adv_models = {k: v["model"] for k, v in adv_results.items()}
+    adv_models = {k: v["model"] for k, v in adv_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of augmented model…")
     adv_robustness = evaluate_robustness(adv_models, n_trials=n_trials, seed=seed)
@@ -422,7 +829,7 @@ def robustness_eval(
 
         logger.info("No trained models found; training temporary ensemble for robustness evaluation")
         results = train_ensemble(df, adversarial_augment=False)
-        models = {k: v["model"] for k, v in results.items()}
+        models = {k: v["model"] for k, v in results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
     typer.echo(report.model_dump_json(indent=2))
@@ -446,6 +853,24 @@ def stream(
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
     checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
     score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
+    queue_depth: int = typer.Option(
+        None,
+        "--queue-depth",
+        min=1,
+        envvar="STREAMER_QUEUE_MAXSIZE",
+        help="Maximum number of buffered Horizon trades (default from settings).",
+    ),
+    overflow_strategy: str = typer.Option(
+        None,
+        "--overflow-strategy",
+        envvar="STREAMER_OVERFLOW_STRATEGY",
+        help="Queue overflow policy: block, drop_newest, or drop_oldest.",
+    ),
+    reset_cursor: bool = typer.Option(
+        False,
+        "--reset-cursor",
+        help="Delete the Horizon cursor checkpoint before streaming.",
+    ),
 ) -> None:
     """Stream trades from Horizon SSE and score incrementally per wallet.
 
@@ -464,11 +889,39 @@ def stream(
     from detection.storage import init_db, save_scores
     from detection.webhook_queue import enqueue
     from detection.webhook_registry import get_matching_subscribers
-    from ingestion.horizon_streamer import stream_trades
+    from ingestion.checkpoint import CursorCheckpoint, FlushPolicy, resolve_checkpoint_path
+    from ingestion.horizon_streamer import stream_trades_with_cursor
     import api.main as api_main
 
     _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
     _score_delta = score_delta if score_delta is not None else cfg.stream_score_delta_threshold
+    _queue_depth = queue_depth if queue_depth is not None else cfg.streamer_queue_maxsize
+    _overflow_strategy = (
+        overflow_strategy
+        if overflow_strategy is not None
+        else cfg.streamer_overflow_strategy
+    )
+    if _overflow_strategy not in {"block", "drop_newest", "drop_oldest"}:
+        raise typer.BadParameter(
+            "must be block, drop_newest, or drop_oldest",
+            param_hint="--overflow-strategy",
+        )
+    cursor_checkpoint = CursorCheckpoint(
+        resolve_checkpoint_path(cfg.cursor_checkpoint_path, cfg.data_dir)
+    )
+    if reset_cursor:
+        cursor_checkpoint.delete()
+        logger.info("Reset Horizon cursor checkpoint")
+    stored_cursor = cursor_checkpoint.load()
+    cursor = stored_cursor or cfg.horizon_default_cursor
+    if stored_cursor:
+        logger.info("Resuming from cursor %s", cursor)
+    else:
+        logger.info("Starting fresh from cursor %s", cursor)
+    cursor_flush_policy = FlushPolicy(
+        max_events=cfg.cursor_flush_events,
+        max_seconds=cfg.cursor_flush_seconds,
+    )
 
     init_db()
     checkpoint_store = RollingWindowStore()
@@ -500,14 +953,22 @@ def stream(
     signal.signal(signal.SIGINT, _shutdown)
 
     trades_since_checkpoint = 0
+    cursor_events_since_flush = 0
+    last_cursor_flush = time.monotonic()
+    last_cursor = cursor
 
     logger.info(
-        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d)",
+        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d, "
+        "queue_depth=%d, overflow_strategy=%s)",
         _chk_interval,
         _score_delta,
+        _queue_depth,
+        _overflow_strategy,
     )
 
-    for trade in stream_trades():
+    for trade, event_cursor in stream_trades_with_cursor(
+        cursor=cursor, checkpoint=cursor_checkpoint
+    ):
         if stop_event.is_set():
             break
 
@@ -526,6 +987,16 @@ def stream(
             except Exception as exc:  # pragma: no cover
                 logger.warning("Webhook dispatch error: %s", exc)
 
+        last_cursor = event_cursor
+        cursor_events_since_flush += 1
+        now = time.monotonic()
+        if cursor_flush_policy.should_flush(
+            cursor_events_since_flush, last_cursor_flush, now
+        ):
+            cursor_checkpoint.save(last_cursor)
+            cursor_events_since_flush = 0
+            last_cursor_flush = now
+
         trades_since_checkpoint += 1
         if trades_since_checkpoint >= _chk_interval:
             checkpoint_store.save_all(scorer.window_state)
@@ -534,6 +1005,8 @@ def stream(
 
     # Final checkpoint on clean exit
     checkpoint_store.save_all(scorer.window_state)
+    if cursor_events_since_flush:
+        cursor_checkpoint.save(last_cursor)
     logger.info("Stream stopped. Final checkpoint written.")
 
 
@@ -555,6 +1028,90 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+
+@app.command("dlq-replay")
+def dlq_replay(
+    limit: int = typer.Option(100, help="Max dead letters to replay per run"),
+    dry_run: bool = typer.Option(False, help="Print DLQ contents without submitting"),
+) -> None:
+    """Replay pending Soroban dead-letter submissions.
+
+    Processes oldest-first. Marks each as 'replayed' on success or 'failed'
+    on persistent failure. Never removes rows from the DLQ.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from config.settings import settings
+    from detection.soroban_publisher import (
+        SorobanPublisher,
+        SorobanSubmissionError,
+        SorobanCircuitOpenError,
+        get_dlq_entries,
+        init_dlq_schema,
+    )
+    from detection.risk_score import RiskScore
+
+    secret_key = os.environ.get("LEDGERLENS_SERVICE_SECRET_KEY", "")
+    if not secret_key and not dry_run:
+        typer.echo("ERROR: LEDGERLENS_SERVICE_SECRET_KEY is not set. Cannot replay.", err=True)
+        raise typer.Exit(1)
+
+    init_dlq_schema()
+    items, total = get_dlq_entries(status="pending", page=1, page_size=limit)
+
+    if not items:
+        typer.echo("No pending DLQ entries.")
+        return
+
+    if dry_run:
+        typer.echo(f"DRY RUN — {len(items)} pending item(s):")
+        for item in items:
+            typer.echo(f"  [{item['id']}] {item['wallet']}:{item['asset_pair']} score={item['score']} error={item['error_message']}")
+        return
+
+    publisher = SorobanPublisher(
+        contract_id=os.environ.get("LEDGERLENS_SCORE_CONTRACT_ID", ""),
+        secret_key=secret_key,
+        soroban_rpc_url=os.environ.get("SOROBAN_RPC_URL", "https://soroban-testnet.stellar.org"),
+        network_passphrase=os.environ.get("NETWORK_PASSPHRASE", "Test SDF Network ; September 2015"),
+    )
+
+    db_path = settings.db_path
+    replayed = 0
+    failed = 0
+
+    for item in items:
+        score_obj = RiskScore(
+            wallet=item["wallet"],
+            asset_pair=item["asset_pair"],
+            score=item["score"],
+            benford_flag=False,
+            ml_flag=False,
+            confidence=0,
+            timestamp=datetime.fromtimestamp(item["ledger_timestamp"], tz=timezone.utc),
+        )
+        tx_hash = None
+        status = "failed"
+        try:
+            tx_hash = publisher.submit_score(score_obj)
+            status = "replayed"
+            replayed += 1
+            logger.info("DLQ item %d replayed: tx=%s", item["id"], tx_hash)
+        except (SorobanSubmissionError, SorobanCircuitOpenError, Exception) as exc:
+            logger.warning("DLQ item %d replay failed: %s", item["id"], exc)
+            failed += 1
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE soroban_dead_letters SET status=?, replayed_at=?, replay_tx_hash=? WHERE id=?",
+                (status, now_iso, tx_hash, item["id"]),
+            )
+            conn.commit()
+
+    typer.echo(f"DLQ replay complete: {replayed} replayed, {failed} failed out of {len(items)} items.")
 
 
 @app.command("governance-close-expired")
@@ -667,6 +1224,64 @@ def sign_models(
     typer.echo(f"Signed {len(signed)} file(s), skipped {len(skipped)} already-valid file(s).")
 
 
+@app.command("generate-signing-key")
+def generate_signing_key() -> None:
+    """Generate a new ED25519 keypair for model signing.
+
+    Prints public key (for settings.py) and private key (for environment).
+    ONLY run this during initial setup or key rotation.
+    """
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    priv_b64 = base64.b64encode(
+        priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    ).decode()
+    pub_b64 = base64.b64encode(
+        pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ).decode()
+    typer.echo(
+        f"Public key (embed in config/settings.py as MODEL_SIGNING_PUBLIC_KEY):\n{pub_b64}"
+    )
+    typer.echo(
+        f"\nPrivate key (set as MODEL_SIGNING_PRIVATE_KEY env variable):\n{priv_b64}"
+    )
+    typer.echo("\nWARNING: Store the private key securely. It cannot be recovered.")
+
+
+@app.command("verify-models")
+def verify_models(
+    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+) -> None:
+    """Verify all model artifacts in MODEL_DIR using ED25519 signatures. Exits non-zero if any fail."""
+    from config.settings import settings
+    from detection.model_signing import ModelIntegrityError, get_model_signer
+
+    target_dir = model_dir or settings.model_dir
+    signer = get_model_signer()
+    failures = []
+    for model_file in sorted(Path(target_dir).glob("*.joblib")):
+        try:
+            signer.verify(model_file)
+            typer.echo(f"OK: {model_file.name}")
+        except ModelIntegrityError as e:
+            typer.echo(f"FAIL: {e}", err=True)
+            failures.append(model_file.name)
+    if failures:
+        raise typer.Exit(code=1)
+    if not list(Path(target_dir).glob("*.joblib")):
+        typer.echo(f"No .joblib files found in {target_dir}")
+
+
 @app.command("webhook-worker")
 def webhook_worker(
     interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
@@ -677,6 +1292,48 @@ def webhook_worker(
     from detection.webhook_worker import run_delivery_worker
 
     asyncio.run(run_delivery_worker(interval_seconds=interval))
+
+
+backtest_app = typer.Typer(help="Backtesting framework for model evaluation")
+app.add_typer(backtest_app, name="backtest")
+
+
+@backtest_app.command("run")
+def backtest_run(
+    dataset: str = typer.Option("data/backtest/known_cases.csv", help="Path to labelled CSV dataset"),
+    threshold: int = typer.Option(70, help="Score threshold for classification (0-100)"),
+    output_dir: str = typer.Option(".", help="Directory to write the backtest report to"),
+    model_dir: str = typer.Option(None, help="Model directory (defaults to settings.model_dir)"),
+) -> None:
+    """Run the backtesting pipeline against a labelled historical dataset.
+
+    Loads the labelled CSV, runs feature extraction and model scoring,
+    and outputs precision/recall/F1/AUC-ROC at the specified threshold.
+    """
+    from backtesting.backtest_runner import run_backtest, save_report
+
+    report = run_backtest(
+        dataset_path=dataset,
+        threshold=threshold,
+        model_dir=model_dir,
+    )
+
+    output_path = save_report(report, output_dir=output_dir)
+
+    typer.echo(f"Backtest complete: {report.total_wallets} wallets evaluated")
+    typer.echo(f"  Threshold: {threshold}")
+    typer.echo(f"  Precision: {report.precision:.3f}")
+    typer.echo(f"  Recall:    {report.recall:.3f}")
+    typer.echo(f"  F1:        {report.f1:.3f}")
+    typer.echo(f"  AUC-ROC:   {report.auc_roc:.3f}")
+    typer.echo(f"  Avg Prec:  {report.average_precision:.3f}")
+    typer.echo(f"Report saved to {output_path}")
+
+    if report.thresholds_sweep:
+        header = f"{'Threshold':>10} {'Precision':>10} {'Recall':>8} {'F1':>6}"
+        typer.echo(header)
+        for t in report.thresholds_sweep:
+            typer.echo(f"{t['threshold']:>10} {t['precision']:>10.3f} {t['recall']:>8.3f} {t['f1']:>6.3f}")
 
 
 federated_app = typer.Typer(help="Federated Learning commands for exchange operators")
@@ -810,8 +1467,80 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+@app.command("red-team")
+def red_team(
+    model_dir: str = typer.Option("models", help="Directory containing trained model files"),
+    n_samples: int = typer.Option(100, help="Number of seed samples per attack campaign"),
+    evasion_threshold: float = typer.Option(0.05, help="Maximum allowed evasion rate (5%)"),
+    report_dir: str = typer.Option("./red_team_reports", help="Directory to write campaign reports"),
+    seed: int = typer.Option(42, help="Random seed for reproducibility"),
+) -> None:
+    """Run automated red-team attack campaigns and exit 1 if any campaign fails (CI gate)."""
+    from detection.model_inference import load_models
+    from detection.red_team.runner import RedTeamRunner
+
+    logger.info("Loading models from %s", model_dir)
+    models = load_models(model_dir=model_dir)
+
+    # Build generic feature constraints from model feature list
+    from detection.feature_engineering import FEATURE_NAMES
+    feature_constraints = {f: {"min": 0.0, "max": 1.0, "mutable": True} for f in FEATURE_NAMES}
+
+    runner = RedTeamRunner(
+        model=models,
+        feature_constraints=feature_constraints,
+        evasion_threshold=evasion_threshold,
+        report_dir=report_dir,
+        seed=seed,
+    )
+    summary = runner.run_all_campaigns(n_samples=n_samples)
+    path = runner.write_report(summary)
+    typer.echo(f"Campaign report written to {path}")
+    typer.echo(f"Overall result: {'PASSED' if summary.passed else 'FAILED'}")
+    for c in summary.campaigns:
+        typer.echo(f"  {c.attack_type.value}: evasion_rate={c.evasion_rate:.3f} {'OK' if c.passed else 'FAIL'}")
+
+    if not summary.passed:
+        raise typer.Exit(1)
+
+
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
+
+db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
+app.add_typer(db_app, name="db")
+
+
+@db_app.command("retention")
+def db_retention(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would be archived without making changes"),
+    archive_root: str = typer.Option("./data/archive", "--archive-root", help="Root directory for Parquet archives"),
+    db_path: str = typer.Option(None, "--db-path", help="Path to SQLite database (defaults to LEDGERLENS_DB_PATH)"),
+) -> None:
+    """Archive records older than their TTL to Parquet and purge from SQLite.
+
+    Default TTLs: risk_scores=365d, feature_vectors=90d, alerts=730d.
+    Use --dry-run to preview the archival plan without modifying the database.
+    """
+    from config.settings import settings as cfg
+    from storage.retention import RetentionEngine
+
+    engine = RetentionEngine(db_path=db_path or cfg.db_path, archive_root=archive_root)
+    report = engine.run(dry_run=dry_run)
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    for table, info in report.items():
+        archived = info.get("rows_archived", 0)
+        cutoff = info.get("cutoff_date", "")
+        if info.get("skipped"):
+            typer.echo(f"{prefix}{table}: table not found — skipped")
+        elif archived == 0:
+            typer.echo(f"{prefix}{table}: no rows older than {cutoff}")
+        elif dry_run:
+            typer.echo(f"{prefix}{table}: would archive {archived} rows older than {cutoff}")
+        else:
+            path = info.get("archive_path", "")
+            typer.echo(f"{prefix}{table}: archived {archived} rows → {path}")
 
 
 @config_app.command("validate")
@@ -839,6 +1568,36 @@ def config_validate() -> None:
         raw = getattr(s, name)
         value = "***" if name in _SECRETS and raw else raw
         typer.echo(f"  {name}={value}")
+
+
+@db_app.command("migrate")
+def db_migrate_alembic(
+    revision: str = typer.Option("head", "--revision", "-r", help="Target revision (default: head)"),
+) -> None:
+    """Apply pending Alembic migrations (equivalent to `alembic upgrade head`)."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", revision],
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    raise typer.Exit(result.returncode)
+
+
+@db_app.command("rollback")
+def db_rollback(
+    revision: str = typer.Option("-1", "--revision", "-r", help="Target revision (default: -1, one step back)"),
+) -> None:
+    """Roll back the most recent Alembic migration (equivalent to `alembic downgrade -1`)."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", revision],
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    raise typer.Exit(result.returncode)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ the other repos in the org.
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Optional
 import pandas as pd
 
 from config.settings import settings
+from config.correlation import set_correlation_id
+from config.telemetry import get_tracer
 from detection.cross_pair_engine import (
     build_volume_time_series,
     find_correlated_pairs,
@@ -43,6 +46,7 @@ from detection.storage import (
     promote_cold_to_hot,
 )
 from detection.shap_explainer import explain_score, top_contributing_features
+from detection.gnn_model import load_gnn_engine, GNNInferenceEngine
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
 from ingestion.data_models import Trade, TradeType
 from ingestion.historical_loader import async_load_historical_trades, load_historical_trades
@@ -149,30 +153,13 @@ def run(
     cross_pair_wallets_map: dict[str, list[str]] = {}
     all_rings: list[dict] = []
 
-    if multi_pair:
         for base_asset, counter_asset in asset_pairs:
             pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
-            trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
-            if not trades.empty:
-                trades_by_pair[pair_key] = trades
 
-        if trades_by_pair:
-            volume_matrix = build_volume_time_series(trades_by_pair)
-            correlated_pairs = find_correlated_pairs(volume_matrix)
-            cross_pair_wallets_map = find_cross_pair_wallets(trades_by_pair, correlated_pairs)
-
-            shared_counts: dict[tuple[str, str], int] = {}
-            for pa, pb, _ in correlated_pairs:
-                count = sum(
-                    1 for w_pairs in cross_pair_wallets_map.values()
-                    if pa in w_pairs and pb in w_pairs
-                )
-                shared_counts[(pa, pb)] = count
-            save_pair_correlations(correlated_pairs, "spearman", shared_counts)
-            logger.info("Found %d correlated pair combinations", len(correlated_pairs))
-
-    for base_asset, counter_asset in asset_pairs:
-        pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
+            if multi_pair:
+                trades = trades_by_pair.get(pair_key, pd.DataFrame())
+            else:
+                trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
 
         if multi_pair:
             trades = trades_by_pair.get(pair_key, pd.DataFrame())
@@ -187,6 +174,17 @@ def run(
         graph = build_transaction_graph(trades)
         rings = find_wash_rings(graph)
         all_rings.extend(rings)
+        ring_membership = build_ring_membership_index(rings, trades=trades)
+        # GNN scoring — optional; degrades to 0.0 if torch_geometric not installed
+        _gnn_engine = load_gnn_engine(settings.model_dir)
+        if _gnn_engine is not None:
+            GNNInferenceEngine.set_instance(_gnn_engine)
+        gnn_scores: dict[str, float] = {}
+        try:
+            if _gnn_engine is not None:
+                gnn_scores = _gnn_engine.score_graph(graph)
+        except Exception:
+            logger.exception("GNN scoring failed; using 0.0 for gnn_wash_ring_prob")
         _ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
@@ -222,6 +220,7 @@ def run(
                 correlated_pairs=correlated_pairs if multi_pair else None,
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
                 path_payments=path_payments,
+                gnn_scores=gnn_scores,
                 path_cycles=path_cycles,
                 ring_membership=_ring_membership,
             )
@@ -261,45 +260,76 @@ def run(
             scored_wallets.append(account)
             scored_pairs.append(pair_key)
 
-    logger.info("Computed %d risk scores", len(scores))
+            if "trade_type" in trades.columns:
+                pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+                save_liquidity_pool_trades(pool_trades)
 
-    # Record scored features for drift detection
-    if scored_features:
-        try:
-            record_scored_features(scored_features, scored_wallets, scored_pairs)
-        except Exception:
-            logger.exception("Failed to record scored features for drift detection")
+            path_payments = load_path_payments_for_accounts(list(accounts), since)
+            save_path_payments(path_payments)
+            circular_routes = detect_atomic_circular_routes(path_payments)
+            save_circular_routes(circular_routes)
 
     save_scores(scores)
     save_rings(all_rings)
 
-    # Persist feature vectors and compute+cache SHAP values using XGBoost model.
-    if scored_features:
-        feature_vec_rows = [
-            {"wallet": w, "asset_pair": p, "features": f}
-            for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
-        ]
-        save_feature_vectors(feature_vec_rows)
-        xgb_model = models.get("xgboost")
-        if xgb_model is not None:
-            from detection.storage import save_shap_values
+                score = RiskScore.combine(
+                    wallet=account,
+                    asset_pair=pair_key,
+                    benford_mad=features.get("benford_mad_24h", 0.0),
+                    benford_mad_threshold=settings.benford_mad_threshold,
+                    ml_probability=probability,
+                    ml_confidence=confidence,
+                )
+                scores.append(score)
+                scored_features.append(features)
+                scored_wallets.append(account)
+                scored_pairs.append(pair_key)
 
-            for row in feature_vec_rows:
-                try:
-                    explanation = explain_score(xgb_model, row["features"])
-                    top = top_contributing_features(explanation, n=5)
-                    shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
-                    save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
-                except Exception:
-                    logger.exception(
-                        "Failed to compute SHAP for wallet=%s pair=%s",
-                        row["wallet"],
-                        row["asset_pair"],
-                    )
+                _elapsed = time.monotonic() - _t_acct
+                scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
+                _result = "above_threshold" if score.score >= settings.risk_score_threshold else "below_threshold"
+                wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
 
-    _enqueue_webhook_alerts(scores)
+        logger.info("Computed %d risk scores", len(scores))
 
-    _submit_on_chain(scores, no_submit=no_submit)
+        # Record scored features for drift detection
+        if scored_features:
+            try:
+                record_scored_features(scored_features, scored_wallets, scored_pairs)
+            except Exception:
+                logger.exception("Failed to record scored features for drift detection")
+
+        save_scores(scores)
+
+        # Persist feature vectors and compute+cache SHAP values using XGBoost model.
+        if scored_features:
+            feature_vec_rows = [
+                {"wallet": w, "asset_pair": p, "features": f}
+                for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
+            ]
+            save_feature_vectors(feature_vec_rows)
+            xgb_model = models.get("xgboost")
+            if xgb_model is not None:
+                from detection.storage import save_shap_values
+
+                for row in feature_vec_rows:
+                    try:
+                        explanation = explain_score(xgb_model, row["features"])
+                        top = top_contributing_features(explanation, n=5)
+                        shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
+                        save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
+                    except Exception:
+                        logger.exception(
+                            "Failed to compute SHAP for wallet=%s pair=%s",
+                            row["wallet"],
+                            row["asset_pair"],
+                        )
+
+        _enqueue_webhook_alerts(scores)
+
+        _submit_on_chain(scores, no_submit=no_submit)
+
+        pipeline_run_duration_seconds.observe(time.monotonic() - _t_start)
 
     return scores
 

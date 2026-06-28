@@ -140,6 +140,7 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _decreasable("atomic_self_payment_ratio"),
     _decreasable("avg_path_hop_count"),
     _decreasable("path_cycle_volume_ratio"),
+    _decreasable("path_payment_frequency"),
 
     # --- Multi-hop path-payment cycle features (6) --------------------------
     # All six rise with cyclic self-dealing routed across separate path
@@ -217,6 +218,9 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # neighbours; a wallet lowers it by trading with lower-risk counterparties.
     _decreasable("gnn_wash_ring_probability"),
     _decreasable("gnn_neighbor_avg_score"),
+    # cross_chain_round_trip_score: lowering this reduces cross-chain
+    # round-trip detection signal.
+    _decreasable("cross_chain_round_trip_score"),
 ]
 
 _missing = set(FEATURE_NAMES) - {c.feature_name for c in FEATURE_CONSTRAINTS}
