@@ -30,6 +30,7 @@ from typing import Optional
 from stellar_sdk import Keypair, SorobanServer, TransactionBuilder
 from stellar_sdk import scval
 
+from detection.oracle_coordinator import QuorumSignature
 from detection.risk_score import RiskScore
 from detection.storage import save_submission, init_db, _connect
 from detection.zk_commitment import (

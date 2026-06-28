@@ -197,7 +197,7 @@ def client(db_path, monkeypatch):
     )
     import config.settings as settings_module
 
-    object.__setattr__(settings_module.settings, "compliance_api_key", COMPLIANCE_KEY)
+    object.__setattr__(settings_module.settings, "ledgerlens_compliance_api_key", COMPLIANCE_KEY)
 
     _seed(db_path)
     from api.main import app

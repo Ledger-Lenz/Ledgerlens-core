@@ -18,7 +18,6 @@ is verifiable after each run.
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone

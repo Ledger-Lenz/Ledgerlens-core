@@ -1,7 +1,5 @@
 """E2E: federated training round completes without error (using mock exchange client)."""
 
-import base64
-from unittest.mock import patch, MagicMock
 
 import numpy as np
 import pytest

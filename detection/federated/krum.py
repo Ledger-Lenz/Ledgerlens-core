@@ -16,11 +16,8 @@ FedAvg (m=n, lower variance).
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-import sqlite3
-from datetime import datetime, timezone
 from typing import List, Tuple
 
 import numpy as np

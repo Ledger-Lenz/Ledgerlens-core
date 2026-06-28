@@ -677,6 +677,9 @@ def explain_wallet_score(
     )
 
 
+_stream_rate_limiter_state: dict = {}
+
+
 class RateLimiterStatus(BaseModel):
     configured_rate: float
     current_rate: float
@@ -722,6 +725,42 @@ def rate_limiter_status() -> RateLimiterStatus:
 
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
 _counterfactual_executor = ThreadPoolExecutor(max_workers=4)
+
+# ---------------------------------------------------------------------------
+# Stream status — lightweight ingestion telemetry.
+# ---------------------------------------------------------------------------
+_stream_status: dict = {
+    "last_trade_at": None,
+    "trades_per_second": 0.0,
+    "active_wallets": 0,
+    "_recent_timestamps": [],
+}
+
+
+def _stream_status_update(trade) -> None:
+    """Update in-memory stream status after each ingested trade."""
+    now = time.time()
+    _stream_status["last_trade_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    recent = [t for t in _stream_status["_recent_timestamps"] if now - t < 10.0]
+    recent.append(now)
+    _stream_status["_recent_timestamps"] = recent
+    _stream_status["trades_per_second"] = len(recent) / 10.0
+    wallet = getattr(trade, "base_account", None) or ""
+    if wallet:
+        wallets = _stream_status.get("_active_wallets") or set()
+        wallets.add(wallet)
+        _stream_status["_active_wallets"] = wallets
+        _stream_status["active_wallets"] = len(wallets)
+
+
+@app.get("/stream/status")
+def stream_status() -> dict:
+    """Return real-time ingestion statistics (trades/s, active wallets, last trade time)."""
+    return {
+        "trades_per_second": _stream_status["trades_per_second"],
+        "active_wallets": _stream_status["active_wallets"],
+        "last_trade_at": _stream_status["last_trade_at"],
+    }
 
 
 @v1_router.get(
@@ -1866,7 +1905,11 @@ for _path in _LEGACY_REDIRECTS:
             # Preserve query string
             qs = request.url.query
             target = f"/v1{p}" + (f"?{qs}" if qs else "")
-            return RedirectResponse(url=target, status_code=302)
+            response = RedirectResponse(url=target, status_code=302)
+            response.headers["Deprecation"] = "true"
+            response.headers["Sunset"] = "Sat, 01 Jan 2028 00:00:00 GMT"
+            response.headers["Link"] = f'</v1{p}>; rel="successor-version"'
+            return response
         _redirect.__name__ = f"legacy_redirect_{p.replace('/', '_').strip('_')}"
         return _redirect
 
@@ -1963,6 +2006,37 @@ def legacy_dispute_get(dispute_id: str, request: Request):
 @app.post("/disputes/{dispute_id}/vote", include_in_schema=False)
 def legacy_dispute_vote(dispute_id: str, request: Request):
     return RedirectResponse(url=f"/v1/disputes/{dispute_id}/vote", status_code=302)
+
+
+@app.get("/compliance/ivms/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_ivms(wallet: str) -> dict:
+    from dataclasses import asdict
+    from detection.compliance_exporter import build_ivms_risk_field
+    validate_stellar_address(wallet)
+    return asdict(build_ivms_risk_field(wallet))
+
+
+@app.post("/compliance/sar-package", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_sar_package(body: SARPackageRequest) -> FileResponse:
+    import os
+    import tempfile
+    from detection.compliance_exporter import generate_sar_package
+    from fastapi.responses import FileResponse as _FileResponse
+    output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
+    pkg_path = generate_sar_package(
+        wallet=body.wallet,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        output_dir=output_dir,
+    )
+    return _FileResponse(pkg_path, media_type="application/zip", filename=os.path.basename(pkg_path))
+
+
+@app.get("/compliance/audit-trail/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_audit_trail(wallet: str) -> list[dict]:
+    from detection.compliance_exporter import get_audit_trail
+    validate_stellar_address(wallet)
+    return get_audit_trail(wallet)
 
 
 @app.post("/governance/proposals", include_in_schema=False)

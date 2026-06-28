@@ -207,6 +207,10 @@ FEATURE_NAMES = FEATURE_NAMES + MULTIVARIATE_BENFORD_FEATURE_NAMES + CAUSAL_FEAT
 # Hop-graph cycle features (issue #121) appended for checkpoint compatibility.
 FEATURE_NAMES = FEATURE_NAMES + HOP_CYCLE_FEATURE_NAMES  # type: ignore[assignment]
 
+# Remove duplicates introduced by features being added in both the base list and
+# the checkpoint-compatibility appends, while preserving insertion order.
+FEATURE_NAMES = list(dict.fromkeys(FEATURE_NAMES))
+
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
     start = as_of - window
@@ -578,7 +582,6 @@ def amm_features(
     `0.0` for that feature. `amm_tenure_ratio` and `amm_volume_concentration`
     come from the AMMEngine session tracker when available.
     """
-    from detection.amm_engine import AMMEngine as _AMMEngine
     zero = {name: 0.0 for name in AMM_FEATURE_NAMES}
     if trades.empty or "trade_type" not in trades.columns:
         return zero
@@ -920,6 +923,8 @@ def _build_feature_vector_base(
 
     features.update(multivariate_benford_features(account, trades_by_pair))
     features.update(causal_features(trades, account, prices, pair))
+    features.setdefault("path_cycle_count", 0.0)
+    features.setdefault("path_cycle_recovery_ratio", 0.0)
 
     return features
 
@@ -940,8 +945,8 @@ def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None
     """Wraps the base feature vector builder, optionally appending GNN features.
 
     Args:
-        use_gnn: If True, appends gnn_wash_ring_probability and
-            gnn_neighbor_avg_score (default 0.0 if not found in gnn_features).
+        use_gnn: If True, uses gnn_features lookup to populate GNN scores;
+            otherwise defaults both to 0.0.
         gnn_features: Optional {wallet: {feature_name: value}} lookup.
         adaptive_benford_window: Optional AdaptiveBenfordWindow instance. When
             provided, Benford windows are expanded as needed to meet the
@@ -949,13 +954,12 @@ def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None
             set accordingly.
     """
     vector = _build_feature_vector_base(*args, **kwargs)
-    if use_gnn:
-        wallet = kwargs.get("wallet") or (args[0] if args else None)
-        feats = (gnn_features or {}).get(wallet, {})
-        vector = list(vector) + [
-            float(feats.get("gnn_wash_ring_probability", 0.0)),
-            float(feats.get("gnn_neighbor_avg_score", 0.0)),
-        ]
+    wallet = kwargs.get("wallet") or (args[0] if args else None)
+    feats = (gnn_features or {}).get(wallet, {}) if use_gnn else {}
+    vector.update({
+        "gnn_wash_ring_probability": float(feats.get("gnn_wash_ring_probability", 0.0)),
+        "gnn_neighbor_avg_score": float(feats.get("gnn_neighbor_avg_score", 0.0)),
+    })
     return vector
 
 

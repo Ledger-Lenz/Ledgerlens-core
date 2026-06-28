@@ -292,7 +292,7 @@ class TestSecretRotation:
 
     def test_old_subscriber_deactivated_gets_no_delivery(self, db_path):
         """After deactivation the old subscriber receives no deliveries."""
-        from detection.webhook_queue import enqueue, get_due_deliveries
+        from detection.webhook_queue import enqueue
         from detection.webhook_registry import get_subscriber, deactivate_subscriber
 
         sub_id = _register(db_path=db_path)
@@ -421,7 +421,7 @@ class TestDeadLetterBehaviour:
 
         before = datetime.now(timezone.utc)
         mark_failed(delivery_id, "test error", db_path=db_path)
-        after = datetime.now(timezone.utc)
+        datetime.now(timezone.utc)
 
         with sqlite3.connect(db_path) as conn:
             row = conn.execute(
@@ -455,7 +455,7 @@ class TestDeadLetterBehaviour:
 
     def test_dead_letters_endpoint_returns_dead_items(self, db_path):
         """get_dead_letters only returns 'dead' items."""
-        from detection.webhook_queue import enqueue, get_dead_letters, mark_failed, _connect
+        from detection.webhook_queue import enqueue, get_dead_letters, _connect
 
         sub_id = _register(db_path=db_path)
         enqueue(sub_id, _sample_payload(), db_path)

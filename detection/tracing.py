@@ -35,9 +35,7 @@ _OTEL_AVAILABLE = False
 try:
     from opentelemetry import context as otel_context
     from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.propagate import extract, inject
-    from opentelemetry.propagators.b3 import B3MultiFormat  # noqa: F401 (optional)
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
@@ -81,6 +79,7 @@ def configure_tracing(
 
     # OTLP → Jaeger (or any collector)
     try:
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
         otlp_exporter = OTLPSpanExporter(endpoint=endpoint, insecure=True)
         provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
         logger.info("OpenTelemetry OTLP exporter configured → %s", endpoint)

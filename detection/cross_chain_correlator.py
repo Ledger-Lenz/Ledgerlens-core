@@ -7,7 +7,6 @@ correlation score that feeds into the risk model as an additional feature.
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from ingestion.data_models import BridgeTransfer
 
