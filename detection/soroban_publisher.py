@@ -20,20 +20,127 @@ the raw score or any feature value.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
 
 from stellar_sdk import Keypair, SorobanServer, TransactionBuilder
 from stellar_sdk import scval
 
+from detection.oracle_coordinator import QuorumSignature
 from detection.risk_score import RiskScore
-from detection.storage import save_submission
+from detection.storage import save_submission, init_db, _connect
 from detection.zk_commitment import (
     generate_salt,
 )
 from detection.zk_prover import generate_threshold_proof
+from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.soroban")
+
+_DLQ_MAX_ROWS_DEFAULT = 10000
+
+# ---------------------------------------------------------------------------
+# DLQ SQLite schema (created via db-migrate migration 14)
+# ---------------------------------------------------------------------------
+_DLQ_SCHEMA = """
+CREATE TABLE IF NOT EXISTS soroban_dead_letters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet          TEXT NOT NULL,
+    asset_pair      TEXT NOT NULL,
+    score           INTEGER NOT NULL,
+    ledger_timestamp INTEGER NOT NULL,
+    error_message   TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'replayed', 'failed')),
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    replayed_at     TIMESTAMP,
+    replay_tx_hash  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dlq_status ON soroban_dead_letters(status);
+CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
+"""
+
+
+def init_dlq_schema(db_path: str | None = None) -> None:
+    """Ensure the soroban_dead_letters table exists."""
+    path = db_path or settings.db_path
+    with sqlite3.connect(path) as conn:
+        conn.executescript(_DLQ_SCHEMA)
+        conn.commit()
+
+
+def get_dlq_pending_count(db_path: str | None = None) -> int:
+    """Return the number of pending DLQ rows."""
+    try:
+        init_dlq_schema(db_path)
+        path = db_path or settings.db_path
+        with sqlite3.connect(path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM soroban_dead_letters WHERE status = 'pending'"
+            ).fetchone()
+            return row[0] if row else 0
+    except Exception:
+        return 0
+
+
+def get_dlq_entries(
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    db_path: str | None = None,
+) -> tuple[list[dict], int]:
+    """Return paginated DLQ entries and total count."""
+    init_dlq_schema(db_path)
+    path = db_path or settings.db_path
+    where = ""
+    params: list = []
+    if status is not None:
+        where = "WHERE status = ?"
+        params.append(status)
+    offset = (page - 1) * page_size
+
+    with sqlite3.connect(path) as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM soroban_dead_letters {where}", tuple(params)
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT id, wallet, asset_pair, score, ledger_timestamp, error_message, "
+            f"status, created_at, replayed_at, replay_tx_hash "
+            f"FROM soroban_dead_letters {where} ORDER BY created_at ASC LIMIT ? OFFSET ?",
+            tuple(params) + (page_size, offset),
+        ).fetchall()
+
+    entries = [
+        {
+            "id": r[0],
+            "wallet": r[1],
+            "asset_pair": r[2],
+            "score": r[3],
+            "ledger_timestamp": r[4],
+            "error_message": r[5],
+            "status": r[6],
+            "created_at": r[7],
+            "replayed_at": r[8],
+            "replay_tx_hash": r[9],
+        }
+        for r in rows
+    ]
+    return entries, total
+
+
+@dataclass
+class SorobanHealthStatus:
+    """Snapshot of the Soroban circuit breaker state."""
+    circuit_state: str            # "closed" | "open" | "half-open"
+    consecutive_failures: int
+    last_error: Optional[str]     # None if no failure yet
+    circuit_opened_at: Optional[datetime]
+    seconds_until_reset: Optional[float]   # None when closed
+    dlq_pending_count: int
 
 
 class SorobanSubmissionError(Exception):
@@ -51,6 +158,11 @@ class SorobanPublisher:
     sequence-number management with tx_bad_seq retry, INSUFFICIENT_FEE retry,
     and a circuit breaker to prevent submission storms on contract failures.
 
+    Circuit breaker states:
+      closed    → normal operation
+      open      → blocking submissions; DLQ writes instead
+      half-open → probe mode after reset timeout; one probe attempt
+
     When *features* are provided, a SHA-256 commitment and a BN254 Pedersen
     commitment are generated and published alongside the score, enabling
     zero-knowledge threshold verification on-chain.
@@ -66,6 +178,7 @@ class SorobanPublisher:
         circuit_breaker_window: int = 60,
         circuit_reset_seconds: int = 300,
         default_threshold: int = 70,
+        db_path: str | None = None,
     ):
         self._contract_id = contract_id
         self._soroban_rpc_url = soroban_rpc_url
@@ -74,9 +187,18 @@ class SorobanPublisher:
         self._circuit_breaker_threshold = circuit_breaker_threshold
         self._circuit_breaker_window = circuit_breaker_window
         self._circuit_reset_seconds = circuit_reset_seconds
-        self._failure_timestamps: list[float] = []
         self._lock = threading.Lock()
         self._default_threshold = default_threshold
+        self._db_path = db_path
+
+        # --- Extended circuit breaker state ---
+        self._circuit_state: str = "closed"       # closed | open | half-open
+        self._consecutive_failures: int = 0
+        self._last_error: Optional[str] = None
+        self._circuit_opened_at: Optional[float] = None  # monotonic timestamp
+
+        # Legacy: kept for backward compat but superseded by new state machine
+        self._failure_timestamps: list[float] = []
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -88,29 +210,152 @@ class SorobanPublisher:
         return f"<SorobanPublisher contract_id={cid}...>"
 
     # ------------------------------------------------------------------
-    # Circuit breaker
+    # Health / manual reset
+    # ------------------------------------------------------------------
+
+    def health(self) -> SorobanHealthStatus:
+        """Thread-safe snapshot of circuit breaker state."""
+        with self._lock:
+            state = self._circuit_state
+            opened_at = self._circuit_opened_at
+            secs_until_reset: Optional[float] = None
+            opened_at_dt: Optional[datetime] = None
+
+            if state in ("open", "half-open") and opened_at is not None:
+                elapsed = time.monotonic() - opened_at
+                remaining = self._circuit_reset_seconds - elapsed
+                secs_until_reset = max(0.0, remaining)
+                opened_at_dt = datetime.fromtimestamp(
+                    time.time() - (time.monotonic() - opened_at), tz=timezone.utc
+                )
+
+        dlq_count = get_dlq_pending_count(self._db_path)
+        return SorobanHealthStatus(
+            circuit_state=state,
+            consecutive_failures=self._consecutive_failures,
+            last_error=self._last_error,
+            circuit_opened_at=opened_at_dt,
+            seconds_until_reset=secs_until_reset,
+            dlq_pending_count=dlq_count,
+        )
+
+    def reset_circuit(self) -> SorobanHealthStatus:
+        """Immediately close the circuit, clear failure counters and last_error.
+
+        Logs at WARNING level with the event type so resets are auditable.
+        Returns new health snapshot.
+        """
+        with self._lock:
+            self._circuit_state = "closed"
+            self._consecutive_failures = 0
+            self._last_error = None
+            self._circuit_opened_at = None
+            self._failure_timestamps.clear()
+        logger.warning("Circuit manually reset by operator.")
+        return self.health()
+
+    # ------------------------------------------------------------------
+    # Circuit breaker state machine
     # ------------------------------------------------------------------
 
     def _check_circuit(self) -> None:
-        """Raise SorobanCircuitOpenError if the circuit is open."""
-        now = time.time()
-        with self._lock:
-            cutoff = now - self._circuit_breaker_window
-            self._failure_timestamps = [t for t in self._failure_timestamps if t > cutoff]
+        """Raise SorobanCircuitOpenError if the circuit is open.
 
-            if len(self._failure_timestamps) >= self._circuit_breaker_threshold:
-                if self._failure_timestamps and (now - self._failure_timestamps[0]) >= self._circuit_reset_seconds:
-                    self._failure_timestamps.clear()
-                    logger.info("Soroban circuit breaker reset after cooldown period")
-                    return
-                raise SorobanCircuitOpenError(
-                    f"Circuit breaker open: {len(self._failure_timestamps)} failures "
-                    f"within {self._circuit_breaker_window}s window"
+        Transitions open → half-open when the reset timeout has elapsed.
+        """
+        now_mono = time.monotonic()
+        with self._lock:
+            state = self._circuit_state
+
+            if state == "closed":
+                return
+
+            if state == "open" and self._circuit_opened_at is not None:
+                elapsed = now_mono - self._circuit_opened_at
+                if elapsed >= self._circuit_reset_seconds:
+                    self._circuit_state = "half-open"
+                    logger.info(
+                        "Soroban circuit breaker transitioning open → half-open (probe mode)."
+                    )
+                    return  # allow the probe through
+
+            if self._circuit_state == "half-open":
+                return  # allow the single probe through
+
+            # Still open
+            raise SorobanCircuitOpenError(
+                f"Circuit breaker open: {self._consecutive_failures} consecutive failures"
+            )
+
+    def _record_failure(self, error: str = "") -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_error = error or self._last_error
+            self._failure_timestamps.append(time.time())
+
+            if self._circuit_state == "half-open":
+                # Probe failed → back to open, reset timer
+                self._circuit_state = "open"
+                self._circuit_opened_at = time.monotonic()
+                logger.warning(
+                    "Half-open probe failed; circuit re-opened. Error: %s", error
+                )
+            elif self._consecutive_failures >= self._circuit_breaker_threshold:
+                self._circuit_state = "open"
+                self._circuit_opened_at = time.monotonic()
+                logger.error(
+                    "Soroban circuit breaker opened after %d consecutive failures.",
+                    self._consecutive_failures,
                 )
 
-    def _record_failure(self) -> None:
+    def _record_success(self) -> None:
         with self._lock:
-            self._failure_timestamps.append(time.time())
+            if self._circuit_state == "half-open":
+                self._circuit_state = "closed"
+                logger.info("Half-open probe succeeded; circuit closed.")
+            self._consecutive_failures = 0
+            self._last_error = None
+            self._circuit_opened_at = None
+
+    # ------------------------------------------------------------------
+    # Dead-letter queue
+    # ------------------------------------------------------------------
+
+    def _write_dead_letter(
+        self,
+        wallet: str,
+        asset_pair: str,
+        score: int,
+        timestamp: int,
+        error: str,
+    ) -> None:
+        """Write a failed submission to soroban_dead_letters with status='pending'."""
+        try:
+            init_dlq_schema(self._db_path)
+            db_path = self._db_path or settings.db_path
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "INSERT INTO soroban_dead_letters "
+                    "(wallet, asset_pair, score, ledger_timestamp, error_message, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending')",
+                    (wallet, asset_pair, score, timestamp, error),
+                )
+                conn.commit()
+
+            # Prune if over cap
+            max_rows = int(getattr(settings, "soroban_dlq_max_rows", _DLQ_MAX_ROWS_DEFAULT))
+            with sqlite3.connect(db_path) as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM soroban_dead_letters"
+                ).fetchone()[0]
+                if count > max_rows:
+                    conn.execute(
+                        f"DELETE FROM soroban_dead_letters WHERE id IN ("
+                        f"SELECT id FROM soroban_dead_letters ORDER BY created_at ASC LIMIT {count - max_rows})"
+                    )
+                    conn.commit()
+        except Exception as exc:
+            logger.error("Failed to write DLQ entry: %s", exc)
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,8 +382,15 @@ class SorobanPublisher:
         """
         try:
             self._check_circuit()
-        except SorobanCircuitOpenError:
+        except SorobanCircuitOpenError as exc:
             save_submission(score.wallet, score.asset_pair, score.score, "skipped", error_message="Circuit breaker open")
+            self._write_dead_letter(
+                wallet=score.wallet,
+                asset_pair=score.asset_pair,
+                score=score.score,
+                timestamp=int(score.timestamp.timestamp()),
+                error=str(exc),
+            )
             raise
 
         # Build cryptographic commitment / ZK proof bundle ---------------------------------
@@ -151,6 +403,7 @@ class SorobanPublisher:
         server = SorobanServer(self._soroban_rpc_url)
         try:
             tx_hash = self._execute_with_retries(server, score, zk_bundle=zk_bundle)
+            self._record_success()
             save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash)
             return tx_hash
         except SorobanSubmissionError:
@@ -159,6 +412,91 @@ class SorobanPublisher:
         except Exception:
             save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error")
             raise
+        finally:
+            server.close()
+
+    def submit_with_quorum(
+        self,
+        wallet: str,
+        asset_pair: str,
+        score: int,
+        timestamp: int,
+        quorum: QuorumSignature,
+    ) -> bool:
+        """Submit a multi-signature quorum for on-chain verification."""
+        try:
+            self._check_circuit()
+        except SorobanCircuitOpenError:
+            save_submission(wallet, asset_pair, score, "skipped", error_message="Circuit breaker open")
+            return False
+
+        server = SorobanServer(self._soroban_rpc_url)
+        try:
+            source_account = server.load_account(self._keypair.public_key)
+
+            # Convert signatures to Soroban Vector of pairs
+            sig_pairs = []
+            for pub, sig in quorum.signatures:
+                sig_pairs.append(
+                    scval.to_vec([
+                        scval.to_bytes(bytes.fromhex(pub)),
+                        scval.to_bytes(bytes.fromhex(sig)),
+                    ])
+                )
+
+            params = [
+                scval.to_address(wallet),
+                scval.to_symbol(asset_pair),
+                scval.to_uint32(max(0, min(100, score))),
+                scval.to_uint64(timestamp),
+                scval.to_vec(sig_pairs),
+            ]
+
+            tx = (
+                TransactionBuilder(
+                    source_account=source_account,
+                    network_passphrase=self._network_passphrase,
+                    base_fee=100,
+                )
+                .append_invoke_contract_function_op(
+                    contract_id=self._contract_id,
+                    function_name="submit_with_quorum",
+                    parameters=params,
+                )
+                .build()
+            )
+
+            sim_result = server.simulate_transaction(tx)
+            if sim_result.error:
+                logger.error("Simulation failed for submit_with_quorum: %s", sim_result.error)
+                return False
+
+            fee = int(int(sim_result.min_resource_fee) * 1.0)
+            tx.set_transaction_fee(fee)
+            tx.sign(self._keypair)
+
+            send_result = server.send_transaction(tx)
+            if send_result.status == "ERROR":
+                logger.error("Send failed for submit_with_quorum: %s", send_result.error)
+                return False
+
+            tx_hash = send_result.hash
+
+            for _ in range(30):
+                get_result = server.get_transaction(tx_hash)
+                if get_result.status == "SUCCESS":
+                    save_submission(wallet, asset_pair, score, "submitted", tx_hash=tx_hash)
+                    return True
+                if get_result.status == "FAILED":
+                    logger.error("Transaction failed: %s", get_result)
+                    return False
+                time.sleep(1)
+
+            logger.error("Transaction polling timeout")
+            return False
+        except Exception as e:
+            logger.error("Unexpected error in submit_with_quorum: %s", e)
+            return False
         finally:
             server.close()
 
@@ -238,7 +576,7 @@ class SorobanPublisher:
 
             # Auth failures are unrecoverable — never retry
             if "auth" in error_lower and "failed" in error_lower:
-                self._record_failure()
+                self._record_failure(error)
                 logger.error("Soroban auth failed - check service_secret_key configuration")
                 raise SorobanSubmissionError(error)
 
@@ -258,7 +596,7 @@ class SorobanPublisher:
 
             break
 
-        self._record_failure()
+        self._record_failure(error or "Submission failed after retries")
         raise SorobanSubmissionError(error or "Submission failed after retries")
 
     def _submit_once(

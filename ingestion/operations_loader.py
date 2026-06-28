@@ -99,6 +99,18 @@ def _event_type(record: dict) -> str:
     return "updated"
 
 
+def _parse_offer_id(value: object) -> int | None:
+    """Convert Horizon's zero create sentinel and reject malformed offer IDs."""
+    if value in (None, "", 0, "0"):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("offer_id must be a positive integer")
+    text = str(value)
+    if not text.isdigit():
+        raise ValueError("offer_id must be a positive integer")
+    return int(text)
+
+
 def _is_offer_operation(record: dict) -> bool:
     return record.get("type") in OFFER_OPERATION_TYPES
 
@@ -118,6 +130,7 @@ def _parse_event(record: dict) -> OrderBookEvent:
         amount=_parse_float(record.get("amount")),
         price=_parse_price(record),
         event_type=_event_type(record),
+        offer_id=_parse_offer_id(record.get("offer_id")),
     )
 
 

@@ -63,7 +63,7 @@ def test_mean_absolute_deviation_extreme_deviation():
     extreme[1] = 1.0
     mad = mean_absolute_deviation(extreme)
     assert mad > 0.0
-    assert mad > 0.5
+    assert mad > 0.10  # max achievable MAD for first-digit analysis is ~0.155
 
 
 def test_chi_square_statistic_zero_when_perfect_match():

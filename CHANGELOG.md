@@ -9,9 +9,55 @@ Releases are automated via [release-please](https://github.com/google-github-act
 merging a release PR (created by the `release-please` GitHub Action) tags the
 commit, generates this file, and publishes a tagged Docker image to GHCR.
 
-## Unreleased
+## [Unreleased]
 
 ### Added
+- **Feature Store cold-tier archival to Parquet** (`detection/feature_store.py`):
+  `FeatureStoreArchiver.archive_old_features(cutoff_days=30)` moves rows older than
+  the cutoff from `feature_distribution_snapshots` (SQLite) to date-partitioned Parquet
+  files under `FEATURE_ARCHIVE_DIR`, eliminating the previous hard cap of 500 000 rows
+  while preserving full history for 60–90 day drift analysis.
+- `ParquetFeatureColdTier` class: reads archived Parquet data with PyArrow filter pushdown.
+- `DualTierFeatureStore` class: unified `query()` interface over both SQLite hot tier and
+  Parquet cold tier; deduplicates by `(wallet, feature_name, recorded_at)` and logs a
+  WARNING when duplicates are detected (indicates a previously failed archive run).
+- `FeatureStore.query()` method: filter-capable read from `feature_distribution_snapshots`.
+- `load_production_features(store, since_days)` in `detection/drift_monitor.py`: replaces
+  direct SQLite reads so drift-analysis callers receive data from both storage tiers
+  transparently.
+- `cli.py archive-features` command: manually trigger cold-tier archival.
+- Archival integrated into `cli.py retrain-check`: runs at the start of each check.
+- `GET /admin/feature-store/stats` endpoint: returns hot-tier row count, cold-tier row
+  count, oldest record timestamps, and archive directory size in MB.
+- `FEATURE_ARCHIVE_DIR` and `FEATURE_ARCHIVE_CUTOFF_DAYS` configuration variables
+  documented in `.env.example`.
+- `docs/feature_store_archival.md`: tiered storage architecture, Parquet partition layout,
+  archival schedule, and recovery procedure for failed archives.
+
+### Added
+- **Iterative Tarjan SCC ring detector** (`detection/graph_engine.py`): `IterativeTarjanSCC` replaces the implicit recursive Tarjan inside `networkx.strongly_connected_components` with an explicit work-stack, eliminating Python's `RecursionError` for graphs with more than ~1 000 nodes in a single SCC.
+- `NodeIndex` class: O(1) bijective `str↔int` mapping for Stellar account identifiers, used by `IterativeTarjanSCC` and `SparseTradeGraph`.
+- `SparseTradeGraph` class: `scipy.sparse.csr_matrix`-backed adjacency for graphs with `n_nodes >= GRAPH_MMAP_THRESHOLD` (default 50 000). `build_from_trades(trades)` constructs the CSR matrix from a list of `Trade` records; `to_adjacency_dict()` converts it back to an adjacency dict for Tarjan traversal.
+- `TradeGraph` class: public incremental API (`add_trade`, `find_wash_rings`, `get_ring_members`) that selects CSR or dict adjacency automatically based on node count. Produces identical ring output to the existing module-level `find_wash_rings` function.
+- `GraphTooLargeError`: raised by `TradeGraph.add_trade` and `SparseTradeGraph.build_from_trades` when the node count exceeds `MAX_GRAPH_NODES` (default 1 000 000) to prevent runaway memory allocation.
+- `GRAPH_MMAP_THRESHOLD` and `MAX_GRAPH_NODES` configuration variables (overridable via environment variables; documented in `.env.example`).
+- `docs/performance.md`: profiling results table for 10 K / 100 K node graphs. Measured result: **100 K nodes + 500 K edges in ~27 s, 62 MB peak RAM** on a single CPU core (target: < 30 s, < 500 MB).
+- `tests/test_iterative_tarjan.py`: 27 new tests covering SCC correctness, recursion-limit elimination (2 000-node chain), self-loop safety, disconnected graphs, `NodeIndex` bijection, `SparseTradeGraph.to_adjacency_dict`, `GraphTooLargeError`, `TradeGraph` public API, output equivalence with the module-level function, and a `@pytest.mark.slow` performance test.
+- Fixed pre-existing `PydanticUserError` in `config/settings.py` (`valid_sar_min_score`, `valid_export_rate_limit` validators referenced fields not present in the model; added `check_fields=False`).
+- `slow` pytest mark registered in `pyproject.toml` for the 100 K-node performance test.
+- Multi-signature Oracle Quorum for tamper-resistant on-chain risk score publication using a 3-of-5 ED25519 threshold.
+- `GET /admin/oracle/status` endpoint to monitor oracle node health and keys.
+- Rust `oracle_aggregator` Soroban contract for robust on-chain threshold verification.
+
+### Added
+- **Adversarial trade data generators** (`ingestion/adversarial_data.py`): four specialist wash-trade generators that simulate sophisticated evasion strategies — `BenfordCamouflageGenerator` (Benford-conforming amounts via leading-digit sampling), `TimingJitterGenerator` (Poisson-process inter-arrival times), `GraphFragmentationGenerator` (isolated 3-node SCCs with GFRAG-prefixed synthetic wallets), `CrossPairRotationGenerator` (volume rotation across XLM/USDC, XLM/yXLM, USDC/yUSDC, XLM/AQUA, USDC/AQUA).
+- `AdversarialDataset` class in `ingestion/adversarial_data.py`: combines any evasion generator with normal background trades and runs the full feature pipeline to produce a labelled `FEATURE_NAMES + label` DataFrame for recall evaluation.
+- `BENFORD_PROBS` and `ASSET_PAIRS` constants; `_resolve_pair()` helper for multi-asset-pair trade construction.
+- `cli.py generate-adversarial` command: writes adversarial feature CSVs to disk with `--label-wash/--label-clean` safety flag; supports all four evasion strategies.
+- `tests/test_adversarial_detection.py`: 16 tests covering Benford conformity (chi-square p > 0.05), timing jitter distribution (CoV ≈ 1.0, mean within 20 %), graph fragmentation SCC size (≤ 3 nodes), cross-pair coverage (all 5 pairs present), positive-amount guards, feature completeness assertions, and parameterised recall tests asserting ≥ 60/65/55/60 % recall on each evasion strategy.
+- `docs/adversarial_testing.md`: strategy descriptions, recall threshold table, nightly CI integration guide, CLI usage examples, adversarial retraining instructions, and how to add new evasion strategies.
+- **#144** `tests/test_webhook_security.py`: exhaustive webhook HMAC and security test suite — `TestHMACVerification`, `TestTimestampReplayPrevention` (freezegun), `TestSecretRotation`, `TestDeadLetterBehaviour` (exactly 8 failures, exponential backoff), `TestConcurrency`, `TestSSRFProtection`, and AST static-analysis test for `hmac.compare_digest`.
+- **#144** `docs/webhook_security_model.md`: HMAC signing, replay prevention, secret rotation, dead-letter recovery, and SSRF protection documentation.
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
 - **#147** API endpoints `POST /scores/{wallet}/commit` and `POST /scores/verify-threshold` for ZK threshold proofs.
 - **#150** Full governance proposal engine (`detection/governance.py`): `GovernanceEngine` with `submit_proposal`, `cast_vote`, `tally_proposal`, `close_proposal`, `execute_proposal`, `close_expired`; `SettingsReloader` with compile-time allowlist and atomic `.env` write.
@@ -19,8 +65,28 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 - **#150** Governance REST endpoints: `POST/GET /governance/proposals`, `GET /governance/proposals/{id}`, `POST /governance/proposals/{id}/vote`, `POST /governance/proposals/{id}/execute` (admin-key gated).
 - **#150** `cli.py governance-close-expired` command.
 - `docs/governance_protocol.md` updated to reflect full implemented lifecycle.
-
-### Added
+- **Monte Carlo bootstrap p-values for Benford chi-square** (`detection/benford_engine.py`):
+  wallets with fewer than `BENFORD_BOOTSTRAP_THRESHOLD` (default 100) transactions
+  in a window now use an empirical p-value derived from 10,000 multinomial samples
+  drawn from the theoretical Benford distribution, eliminating false positives caused
+  by asymptotic chi-square approximation failures in small-sample regimes common on
+  SDEX short time windows (1h, 4h).
+- `bootstrap_chi_square_pvalue` function with fully vectorised NumPy implementation
+  (single `rng.multinomial` call; < 500 ms for N = 50, n = 10,000).
+- `BENFORD_PROBS` numpy array constant (normalised Benford probabilities for digits 1–9).
+- `BENFORD_BOOTSTRAP_THRESHOLD` and `BENFORD_BOOTSTRAP_SAMPLES` module constants,
+  overridable via environment variables.
+- `compute_chi_square_pvalue(counts, N) -> (p_value, method)` function that dispatches
+  to bootstrap or asymptotic computation based on sample size.
+- LRU cache (`maxsize=512`) on `_cached_bootstrap_pvalue` to avoid recomputing p-values
+  for repeated wallet-window evaluations with the same digit counts.
+- `BenfordWindowFeatures` dataclass with `chi_square_pvalue_method` field so callers and
+  audit logs know whether a flagging decision used bootstrap or asymptotic estimates.
+- `chi_square_pvalue` and `pvalue_method` keys added to the dict returned by
+  `compute_benford_metrics` (backward-compatible; existing keys unchanged).
+- `--bootstrap-threshold` and `--bootstrap-samples` CLI flags on `ledgerlens score`.
+- `BENFORD_BOOTSTRAP_THRESHOLD` and `BENFORD_BOOTSTRAP_SAMPLES` documented in `.env.example`.
+- `docs/benford_analysis.md` with "Small-Sample P-Value Estimation" methodology section.
 - Synthetic SDEX trade generator (`ingestion/synthetic_data.py`) with
   labelled wash-trading rings for local training and testing.
 - Labelled training dataset builder (`detection/dataset.py`).
