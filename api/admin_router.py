@@ -279,3 +279,57 @@ def fl_privacy_status() -> FLPrivacyStatus:
         budget_exhausted=budget_exhausted,
         rounds_completed=len(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# Alert suppression rules  (Issue #178)
+# ---------------------------------------------------------------------------
+
+
+class SuppressionCreate(BaseModel):
+    wallet: str
+    reason: str
+    expires_at: Optional[str] = None
+
+
+@router.post("/suppressions", status_code=201, include_in_schema=False)
+def add_suppression(body: SuppressionCreate) -> dict:
+    """Add an alert suppression rule for a wallet.
+
+    The wallet will generate no alert events while an active rule exists.
+    Rules expire automatically at ``expires_at`` (ISO-8601 UTC); omit to
+    create a permanent rule.
+    """
+    from detection.suppressions import get_store
+    store = get_store()
+    return store.add(wallet=body.wallet, reason=body.reason, expires_at=body.expires_at)
+
+
+@router.get("/suppressions", include_in_schema=False)
+def list_suppressions() -> list[dict]:
+    """Return all currently active (non-expired) suppression rules."""
+    from detection.suppressions import get_store
+    return get_store().list_active()
+
+
+@router.delete("/suppressions/{rule_id}", include_in_schema=False)
+def delete_suppression(rule_id: int) -> dict:
+    """Remove a suppression rule by ID."""
+    from detection.suppressions import get_store
+    deleted = get_store().delete(rule_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
+    return {"deleted": rule_id}
+
+
+# ---------------------------------------------------------------------------
+# Database storage stats  (Issue #180)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/storage", include_in_schema=False)
+def storage_stats() -> dict:
+    """Return current database size, per-table row counts, and next archival date."""
+    from storage.retention import RetentionEngine
+    engine = RetentionEngine(db_path=settings.db_path)
+    return engine.storage_stats()
