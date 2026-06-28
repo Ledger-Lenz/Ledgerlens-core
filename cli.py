@@ -1543,6 +1543,27 @@ def db_retention(
             typer.echo(f"{prefix}{table}: archived {archived} rows → {path}")
 
 
+api_app = typer.Typer(help="API utility commands")
+app.add_typer(api_app, name="api")
+
+
+@api_app.command("export-schema")
+def api_export_schema(
+    output: str = typer.Option("docs/openapi.json", "--output", "-o", help="Path to write the OpenAPI JSON schema"),
+) -> None:
+    """Export the auto-generated OpenAPI 3.1 schema to a JSON file."""
+    import json
+    import os
+
+    from api.main import app as fastapi_app
+
+    schema = fastapi_app.openapi()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(schema, f, indent=2)
+    typer.echo(f"OpenAPI schema written to {output}")
+
+
 @config_app.command("validate")
 def config_validate() -> None:
     """Load and validate configuration, printing all settings (secrets masked)."""
