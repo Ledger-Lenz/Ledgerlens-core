@@ -367,7 +367,11 @@ def volume_to_unique_counterparty_ratio(trades: pd.DataFrame, account: str) -> f
     counterparties = _counterparties(account_trades, account)
     unique_counterparties = counterparties.nunique()
     total_volume = account_trades["base_amount"].sum()
-    return float(total_volume / unique_counterparties) if unique_counterparties else 0.0
+    if not unique_counterparties:
+        return 0.0
+    # Clamp to 0.0: negative base_amount from erroneous ingestion produces a
+    # negative ratio which is nonsensical for a volume metric.
+    return max(0.0, float(total_volume / unique_counterparties))
 
 
 def intra_minute_clustering_coefficient(trades: pd.DataFrame) -> float:
