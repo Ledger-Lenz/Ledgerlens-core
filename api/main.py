@@ -314,8 +314,8 @@ def health() -> JSONResponse:
       service is still serving traffic in a reduced-functionality state,
       not failed) — only DB/model failures return 503.
 
-    The response body names every component but never leaks local filesystem
-    paths — errors are logged server-side at ERROR level.
+    Returns 503 when any check fails or when soroban_circuit_status=="open",
+    drift_status=="drifted", or webhook_dead_letter_count > 0.
     """
     from detection.model_inference import _MODEL_FILENAMES
     from detection.storage import _connect
