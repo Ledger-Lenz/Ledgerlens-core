@@ -61,6 +61,45 @@ from ingestion.path_payment_loader import async_load_path_payments, load_path_pa
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.pipeline")
 
+
+def _ingest_solana_trades(stellar_accounts: list[str]) -> pd.DataFrame:
+    """Fetch Solana SPL swap trades for any Stellar accounts that have a
+    Wormhole-linked Solana address.  Returns an empty DataFrame when
+    SOLANA_RPC_URL is not configured or no links are found.
+    """
+    import os
+
+    rpc_url = os.environ.get("SOLANA_RPC_URL", "")
+    if not rpc_url:
+        return pd.DataFrame()
+
+    try:
+        from ingestion.solana_adapter import SolanaAdapter
+
+        adapter = SolanaAdapter(rpc_url=rpc_url)
+        all_trades: list[Trade] = []
+
+        for stellar_addr in stellar_accounts:
+            try:
+                solana_trades = adapter.ingest(stellar_addr)
+                all_trades.extend(solana_trades)
+            except Exception:
+                logger.debug(
+                    "solana.ingest skipped for stellar_addr=%s", stellar_addr, exc_info=True
+                )
+
+        if not all_trades:
+            return pd.DataFrame()
+
+        rows = [t.model_dump() for t in all_trades]
+        df = pd.DataFrame(rows)
+        df["ledger_close_time"] = pd.to_datetime(df["ledger_close_time"], utc=True)
+        logger.info("solana.ingest total_trades=%d stellar_wallets=%d", len(df), len(stellar_accounts))
+        return df
+    except Exception:
+        logger.warning("solana.ingest failed", exc_info=True)
+        return pd.DataFrame()
+
 # Global feature store instance
 _feature_store: Optional[FeatureStore] = None
 _last_cold_flush_time = 0.0
@@ -169,6 +208,16 @@ def run(
         if trades.empty:
             logger.info("No trades found for %s/%s", base_asset, counter_asset)
             continue
+
+        # Merge Solana SPL swap trades (when SOLANA_RPC_URL is configured) so
+        # cross-chain Stellar↔Solana wallets flow through the same feature store.
+        stellar_accounts_list = list(
+            pd.unique(trades[["base_account", "counter_account"]].values.ravel())
+        )
+        stellar_accounts_list = [a for a in stellar_accounts_list if a is not None and pd.notna(a)]
+        solana_df = _ingest_solana_trades(stellar_accounts_list)
+        if not solana_df.empty:
+            trades = pd.concat([trades, solana_df], ignore_index=True)
 
         as_of = pd.Timestamp(trades["ledger_close_time"].max())
         graph = build_transaction_graph(trades)

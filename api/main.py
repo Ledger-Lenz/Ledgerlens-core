@@ -36,7 +36,7 @@ from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
-from api.allowlist_router import router as allowlist_router
+from api.analyst import router as analyst_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
@@ -229,6 +229,20 @@ async def _lifespan(application: FastAPI):
     logger.info("[shutdown] Shutdown sequence complete")
 
 
+_OPENAPI_TAGS = [
+    {"name": "Scores", "description": "Wallet risk score retrieval and explanation endpoints."},
+    {"name": "Alerts", "description": "Manipulation alert listing and deduplication state."},
+    {"name": "Webhooks", "description": "Webhook subscriber management."},
+    {"name": "Feedback", "description": "Ground-truth feedback ingestion for model improvement."},
+    {"name": "AMM", "description": "Automated Market Maker pool risk metrics."},
+    {"name": "Disputes", "description": "Score dispute submission and committee voting."},
+    {"name": "Governance", "description": "On-chain parameter governance proposals."},
+    {"name": "Admin", "description": "Admin-only model lifecycle, config, and observability endpoints."},
+    {"name": "Allowlist / Denylist", "description": "Wallet allowlist and denylist management with audit trail."},
+    {"name": "export", "description": "CSV / Parquet bulk export of risk score data."},
+    {"name": "batch", "description": "Async batch wallet scoring jobs."},
+]
+
 app = FastAPI(
     title="LedgerLens API",
     description=(
@@ -290,7 +304,7 @@ from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
 app.include_router(admin_router)
-app.include_router(allowlist_router)
+app.include_router(api_key_router)
 
 app.include_router(batch_router)
 
@@ -1152,13 +1166,13 @@ def submit_feedback(body: FeedbackRequest) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@v1_router.get("/admin/drift-reports", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/drift-reports", tags=["Admin"], summary="Model drift reports", description="Return the most recent drift checks recorded by `cli.py retrain-check`.", dependencies=[Depends(require_admin_key)])
 def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     """Return the most recent drift checks recorded by `cli.py retrain-check`."""
     return get_drift_reports(limit=limit)
 
 
-@v1_router.get("/admin/robustness-report", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/robustness-report", tags=["Admin"], summary="Latest robustness report", description="Return the latest adversarial robustness evaluation report (admin only).", dependencies=[Depends(require_admin_key)])
 def robustness_report() -> dict:
     """Return the latest RobustnessReport from the database (admin only)."""
     from detection.storage import get_latest_robustness_report
@@ -1169,7 +1183,7 @@ def robustness_report() -> dict:
     return report
 
 
-@v1_router.get("/model/robustness")
+@v1_router.get("/model/robustness", tags=["Admin"], summary="Live robustness metrics", description="Return live red-team robustness metrics: evasion rate, mean generations to evade, and hardening delta.")
 def model_robustness() -> dict:
     """Return live red team robustness metrics for the current model.
 
@@ -1182,7 +1196,7 @@ def model_robustness() -> dict:
     return live_robustness_metrics()
 
 
-@v1_router.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/retrain-runs", tags=["Admin"], summary="Retrain run history", description="Return the most recent per-model retrain outcomes.", dependencies=[Depends(require_admin_key)])
 def retrain_runs(
     limit: int = Query(default=50, ge=1, le=1000),
     model_name: str | None = Query(default=None, description="Filter by model, e.g. random_forest"),
@@ -1191,7 +1205,7 @@ def retrain_runs(
     return get_retrain_runs(limit=limit, model_name=model_name)
 
 
-@v1_router.get("/admin/federated/audit-log", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),
 ) -> list[dict]:
@@ -1216,7 +1230,7 @@ def admin_namespaces() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@v1_router.get("/model/weights")
+@v1_router.get("/model/weights", tags=["Admin"], summary="Ensemble model weights", description="Return current ensemble classifier weights from the Thompson-sampling adaptive reweighter.")
 def model_weights() -> JSONResponse:
     """Return current ensemble classifier weights from the adaptive reweighter."""
     from detection.adaptive_reweighter import (
@@ -1439,7 +1453,7 @@ def get_proposals():
     return [p.model_dump() for p in list_open_proposals()]
 
 
-class LegacyProposalCreate(BaseModel):
+class ProposalCreate(BaseModel):
     proposal_type: str
     proposed_value: str
     proposed_by_key_hash: str
@@ -1456,7 +1470,7 @@ def create_proposal_endpoint(body: ProposalCreate):
     return p.model_dump()
 
 
-class LegacyProposalVote(BaseModel):
+class ProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
