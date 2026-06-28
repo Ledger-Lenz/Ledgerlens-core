@@ -813,6 +813,9 @@ def federated_join(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
+api_app = typer.Typer(help="API management commands")
+app.add_typer(api_app, name="api")
+
 
 @config_app.command("validate")
 def config_validate() -> None:
@@ -839,6 +842,31 @@ def config_validate() -> None:
         raw = getattr(s, name)
         value = "***" if name in _SECRETS and raw else raw
         typer.echo(f"  {name}={value}")
+
+
+@api_app.command("export-schema")
+def export_schema(
+    output: str = typer.Option("docs/openapi.json", "--output", "-o", help="Path to write the OpenAPI JSON schema"),
+) -> None:
+    """Export the OpenAPI 3.1 schema to a JSON file.
+
+    Starts the FastAPI application in a minimal context (no lifespan events)
+    and writes the auto-generated OpenAPI spec to ``output``.  The committed
+    ``docs/openapi.json`` is used by CI to detect schema drift.
+    """
+    import json
+    import os
+
+    from api.main import app as _app
+
+    schema = _app.openapi()
+    out_path = os.path.abspath(output)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(schema, f, indent=2)
+        f.write("\n")
+    logger.info("OpenAPI schema written to %s", out_path)
+    typer.echo(f"Schema exported to {out_path}")
 
 
 if __name__ == "__main__":
