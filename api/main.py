@@ -54,6 +54,7 @@ from detection.risk_score import RiskScore
 from detection.counterfactual_engine import generate_counterfactuals
 from detection.counterfactual_translator import translate_counterfactual
 from detection.storage import (
+    get_active_wallet_override,
     get_alerts,
     get_bridge_transfer_history,
     get_bridge_transfers,
@@ -256,6 +257,18 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=_lifespan,
+    openapi_tags=[
+        {"name": "Scores", "description": "Wallet risk score retrieval and explanation."},
+        {"name": "Alerts", "description": "Typed manipulation alerts (sandwich, wash-trading, etc.)."},
+        {"name": "AMM / Pools", "description": "Automated market maker pool risk metrics."},
+        {"name": "Governance", "description": "On-chain governance proposals and voting."},
+        {"name": "Webhooks", "description": "Webhook subscriber management and dead-letter queue."},
+        {"name": "Disputes", "description": "Score dispute submission and committee voting."},
+        {"name": "Admin", "description": "Model governance, drift monitoring, and runtime config (admin-key gated)."},
+        {"name": "Allowlist / Denylist", "description": "Wallet override management with full audit trail."},
+        {"name": "API Key Management", "description": "Scoped API key lifecycle (create, list, revoke)."},
+        {"name": "Compliance", "description": "FATF / SAR regulatory exports (compliance-key gated)."},
+    ],
 )
 
 
@@ -307,7 +320,6 @@ app.include_router(admin_router)
 app.include_router(api_key_router)
 
 app.include_router(batch_router)
-
 
 app.include_router(export_router)
 app.include_router(api_keys_router)
@@ -853,6 +865,7 @@ def wallet_counterfactual(
 def wallet_scores(wallet: str) -> dict:
     """Return the latest score for `wallet` on each asset pair.
 
+    Applies allowlist / denylist overrides from the ``wallet_overrides`` table.
     When the wallet has known EVM counterparts (bridge transfer records in the
     database), the response includes a ``"cross_chain_links"`` field listing
     the linked EVM wallets and the chain they were last seen on.  EVM RPC
