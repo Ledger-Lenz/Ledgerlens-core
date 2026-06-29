@@ -22,6 +22,7 @@ from detection.benford_engine import BenfordStreamCounter
 from detection.feature_engineering import FEATURE_NAMES
 from detection.gnn_model import _HAS_PYG, safe_load_gnn_checkpoint
 from detection.model_signing import assert_within_model_dir, safe_joblib_load
+from detection.adversarial_features import apply_adversarial_boost
 
 logger = logging.getLogger("ledgerlens.model_inference")
 
@@ -281,6 +282,10 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
         weighted_prob = sum(probabilities[n] * weights.get(n, 0.0) for n in probabilities) / total_weight
 
     confidence = 1.0 - float(np.std(list(probabilities.values()))) if probabilities else 0.0
+    weighted_prob = apply_adversarial_boost(
+        int(round(weighted_prob * 100)),
+        float(feature_vector.get("adversarial_feature_score", 0.0)),
+    ) / 100.0
     return float(weighted_prob), max(0.0, min(1.0, confidence))
 
 

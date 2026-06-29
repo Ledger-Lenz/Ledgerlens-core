@@ -196,6 +196,10 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_ADVERSARIAL = False
 
+# Add the composite adversarial feature used by downstream boosting.
+if _HAS_ADVERSARIAL:
+    FEATURE_NAMES = FEATURE_NAMES + ["adversarial_feature_score"]  # type: ignore[assignment]
+
 # Cross-chain features are appended last so existing model checkpoints remain
 # loadable — old models see 0.0 for these features during inference.
 FEATURE_NAMES = FEATURE_NAMES + CROSS_CHAIN_FEATURE_NAMES  # type: ignore[assignment]
@@ -918,6 +922,7 @@ def _build_feature_vector_base(
     features.update(sandwich_features(trades, account, as_of))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
+        features["adversarial_feature_score"] = features.get("evasion_composite_score", 0.0)
 
     if cross_chain_linker is not None:
         sdex_volume = float(_account_trades(trades, account)["base_amount"].sum()) if not trades.empty else 0.0

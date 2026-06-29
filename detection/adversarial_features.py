@@ -1,15 +1,24 @@
-"""Evasion meta-features for detecting adversarially-crafted wash trades.
+"""Adversarial feature defense layer for wash-trading detection.
 
-Each feature targets the residual signature that an evasion strategy
-leaves behind even after it suppresses primary detection signals.
-
-Designed to be appended to the base ``FEATURE_NAMES`` list and computed
-as an extension inside ``build_feature_vector``.
+This module implements a lightweight anomaly detector for feature-space
+manipulation (e.g. amount camouflage, timing jitter, and graph
+fragmentation). It uses an Isolation Forest trained on confirmed-clean
+wallet features and a set of hand-crafted consistency rules that flag
+internally contradictory feature profiles. The resulting composite score is
+used as a conservative risk boost for suspicious wallets.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from scipy.stats import entropy
+from sklearn.ensemble import IsolationForest
 
 ADVERSARIAL_FEATURE_NAMES = [
     "benford_conformity_suspicion",
@@ -22,6 +31,104 @@ ADVERSARIAL_FEATURE_NAMES = [
 
 # Expected Benford digit probabilities for digits 1-9
 _BENFORD_PROBS = np.array([np.log10(1 + 1 / d) for d in range(1, 10)])
+
+
+class AdversarialAlertType(str, Enum):
+    ISOLATION_FOREST = "isolation_forest"
+    CONSISTENCY_FAIL = "consistency_fail"
+    HIGH_VOLUME_CLEAN = "high_volume_clean"
+
+
+@dataclass
+class AdversarialAlert:
+    wallet: str
+    alert_type: AdversarialAlertType
+    isolation_score: float
+    inconsistency_flags: list[str]
+    adversarial_feature_score: float
+    detected_at: datetime = field(default_factory=datetime.utcnow)
+
+
+class AdversarialFeatureDetector:
+    """Isolation Forest detector over the clean-wallet feature distribution."""
+
+    def __init__(self, contamination: float = 0.05, n_estimators: int = 200, random_state: int = 42):
+        self.contamination = contamination
+        self.n_estimators = n_estimators
+        self.random_state = random_state
+        self._forest: Optional[IsolationForest] = None
+        self._fitted = False
+
+    def fit(self, clean_feature_matrix: np.ndarray) -> None:
+        self._forest = IsolationForest(
+            contamination=self.contamination,
+            n_estimators=self.n_estimators,
+            random_state=self.random_state,
+        )
+        self._forest.fit(clean_feature_matrix)
+        self._fitted = True
+
+    def score(self, feature_vector: np.ndarray) -> float:
+        if not self._fitted or self._forest is None:
+            return 0.0
+        raw = self._forest.score_samples(feature_vector.reshape(1, -1))[0]
+        return float(max(0.0, min(1.0, 1.0 + raw)))
+
+
+CONSISTENCY_RULES = [
+    lambda fv: "high_volume_low_counterparty" if (
+        fv.get("volume_to_unique_counterparty_ratio", 0.0) > 100
+        and fv.get("counterparty_concentration_ratio", 0.0) < 0.05
+    ) else None,
+    lambda fv: "ring_member_no_round_trips" if (
+        fv.get("wash_ring_membership", 0.0) > 0.5
+        and fv.get("round_trip_trade_frequency", 0.0) < 0.01
+    ) else None,
+    lambda fv: "chi_sq_mad_contradiction" if (
+        fv.get("chi_sq_24h", 0.0) > 50
+        and fv.get("mad_24h", 0.0) < 0.001
+    ) else None,
+    lambda fv: "new_account_high_centrality" if (
+        fv.get("account_age_days", 999.0) < 7
+        and fv.get("network_centrality", 0.0) > 0.3
+    ) else None,
+]
+
+
+class FeatureConsistencyChecker:
+    """Validate internally contradictory feature combinations."""
+
+    def check(self, feature_dict: dict[str, float]) -> list[str]:
+        flags = []
+        for rule in CONSISTENCY_RULES:
+            flag = rule(feature_dict)
+            if flag is not None:
+                flags.append(flag)
+        return flags
+
+
+def compute_adversarial_feature_score(
+    isolation_score: float,
+    n_consistency_flags: int,
+    base_risk_score: int,
+) -> float:
+    score = 0.5 * isolation_score
+    score += 0.3 * min(n_consistency_flags / 3.0, 1.0)
+    if base_risk_score < 30 and isolation_score > 0.7:
+        score += 0.2
+    return float(max(0.0, min(1.0, score)))
+
+
+def apply_adversarial_boost(
+    base_score: int,
+    adversarial_score: float,
+    boost_threshold: float = 0.6,
+    max_boost: int = 20,
+) -> int:
+    if adversarial_score < boost_threshold:
+        return int(base_score)
+    boost = int(max_boost * (adversarial_score - boost_threshold) / (1 - boost_threshold))
+    return int(max(0, min(100, base_score + boost)))
 
 
 def _account_trades(trades: pd.DataFrame, account: str) -> pd.DataFrame:
