@@ -401,6 +401,25 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
         """,
     ),
+    (
+        15,
+        "add account_metadata_cache table for enriched wallet metadata",
+        """
+        CREATE TABLE IF NOT EXISTS account_metadata_cache (
+            account_id TEXT PRIMARY KEY,
+            funding_source TEXT,
+            created_at TEXT,
+            home_domain TEXT,
+            num_signers INTEGER NOT NULL DEFAULT 1,
+            low_threshold INTEGER NOT NULL DEFAULT 0,
+            med_threshold INTEGER NOT NULL DEFAULT 0,
+            high_threshold INTEGER NOT NULL DEFAULT 0,
+            signer_keys_json TEXT NOT NULL DEFAULT '[]',
+            fetched_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_account_metadata_fetched ON account_metadata_cache (fetched_at);
+        """,
+    ),
 ]
 
 
