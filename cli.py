@@ -368,8 +368,12 @@ def retrain_check(
     logger.info("Wrote drift report to %s", report_path)
 
 
-@app.command("score")
-def score(
+score_app = typer.Typer(help="Scoring commands")
+app.add_typer(score_app, name="score")
+
+
+@score_app.command("run")
+def score_run(
     no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
     use_async: bool = typer.Option(False, "--async", help="Use async pipeline for concurrent I/O and batched inference"),
 ) -> None:
@@ -384,6 +388,171 @@ def score(
         scores = run_pipeline.run(no_submit=no_submit)
     for s in scores:
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
+
+
+@score_app.command("bulk")
+def score_bulk(
+    input_file: Path = typer.Option(..., "--input", "-i", help="Input CSV file (one wallet per row, optional 'label' column)"),
+    output_file: Path = typer.Option(..., "--output", "-o", help="Output CSV path"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=16, help="Parallel workers (default 4, max 16)"),
+    min_score: int = typer.Option(None, "--min-score", help="Only include wallets scoring >= this value"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate input file without scoring"),
+) -> None:
+    """Score a CSV list of Stellar wallets locally using the trained ensemble.
+
+    Input CSV must have a 'wallet' column (or one wallet address per row).
+    Malformed Stellar addresses are skipped with a warning logged to stderr.
+    Output CSV columns: wallet, score, confidence_lower, confidence_upper, top_features, scored_at.
+    """
+    import csv
+    import json
+    import re
+    import sqlite3
+    import sys
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime, timezone
+
+    import pandas as pd
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
+
+    from config.settings import settings as cfg
+
+    _STELLAR_RE = re.compile(r"^G[A-Z2-7]{55}$")
+
+    def _is_valid_stellar(addr: str) -> bool:
+        return bool(_STELLAR_RE.match(addr))
+
+    # ── Read input ────────────────────────────────────────────────────────────
+    try:
+        df_in = pd.read_csv(input_file, header=0)
+        if "wallet" in df_in.columns:
+            wallets_raw = df_in["wallet"].astype(str).tolist()
+            labels = df_in.get("label", pd.Series([None] * len(wallets_raw))).tolist()
+        else:
+            # Treat first column as wallets
+            wallets_raw = df_in.iloc[:, 0].astype(str).tolist()
+            labels = [None] * len(wallets_raw)
+    except Exception as exc:
+        typer.echo(f"ERROR: could not read {input_file}: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if not wallets_raw:
+        typer.echo("WARNING: input file is empty — no wallets to process.", err=True)
+        raise typer.Exit(0)
+
+    # ── Validate addresses ─────────────────────────────────────────────────
+    valid_entries: list[tuple[str, object]] = []
+    for wallet, label in zip(wallets_raw, labels):
+        wallet = wallet.strip()
+        if not _is_valid_stellar(wallet):
+            typer.echo(f"WARNING: skipping malformed address: {wallet!r}", err=True)
+            continue
+        valid_entries.append((wallet, label))
+
+    if not valid_entries:
+        typer.echo("ERROR: no valid Stellar addresses found in input.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Validated {len(valid_entries)} of {len(wallets_raw)} wallet(s).")
+
+    if dry_run:
+        typer.echo("Dry-run complete — no scoring performed.")
+        raise typer.Exit(0)
+
+    # ── Load models ────────────────────────────────────────────────────────
+    try:
+        from detection.model_inference import load_calibration, load_models, score_with_uncertainty
+        models = load_models(cfg.model_dir)
+        calibrators = load_calibration(model_dir=cfg.model_dir)
+    except Exception as exc:
+        typer.echo(f"ERROR: could not load models from {cfg.model_dir}: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # ── Feature lookup helper ──────────────────────────────────────────────
+    def _lookup_features(wallet: str) -> dict:
+        try:
+            with sqlite3.connect(cfg.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT features_json FROM feature_vectors WHERE wallet = ? ORDER BY timestamp DESC LIMIT 1",
+                    (wallet,),
+                ).fetchone()
+            if row and row["features_json"]:
+                return json.loads(row["features_json"])
+        except Exception:
+            pass
+        return {}
+
+    # ── Score a single wallet ──────────────────────────────────────────────
+    def _score_wallet(entry: tuple[str, object]) -> dict | None:
+        wallet, label = entry
+        features = _lookup_features(wallet)
+        try:
+            result = score_with_uncertainty(models, features, calibrators=calibrators)
+        except Exception as exc:
+            typer.echo(f"WARNING: scoring failed for {wallet}: {exc}", err=True)
+            return None
+
+        top = sorted(features.items(), key=lambda kv: abs(kv[1]) if isinstance(kv[1], (int, float)) else 0, reverse=True)[:5]
+        top_features_str = ",".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in top)
+
+        row = {
+            "wallet": wallet,
+            "score": round(result["score"], 2),
+            "confidence_lower": round(result["score_lower"], 2),
+            "confidence_upper": round(result["score_upper"], 2),
+            "top_features": top_features_str or "n/a",
+            "scored_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if label is not None:
+            row["label"] = label
+        return row
+
+    # ── Run with progress bar ─────────────────────────────────────────────
+    results: list[dict] = []
+    skipped = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("{task.completed}/{task.total} wallets"),
+        TimeRemainingColumn(),
+        refresh_per_second=4,
+    ) as progress:
+        task_id = progress.add_task("Scoring wallets…", total=len(valid_entries))
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_score_wallet, entry): entry for entry in valid_entries}
+            for future in as_completed(futures):
+                row = future.result()
+                progress.advance(task_id)
+                if row is None:
+                    skipped += 1
+                    continue
+                if min_score is not None and row["score"] < min_score:
+                    continue
+                results.append(row)
+
+    typer.echo(f"Scored {len(results)} wallet(s); {skipped} failed.")
+
+    if not results:
+        typer.echo("No results to write.")
+        raise typer.Exit(0)
+
+    # ── Write output ───────────────────────────────────────────────────────
+    fieldnames = ["wallet", "score", "confidence_lower", "confidence_upper", "top_features", "scored_at"]
+    if any("label" in r for r in results):
+        fieldnames.insert(1, "label")
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(results)
+
+    typer.echo(f"Results written to {output_file}")
 
 
 @app.command("historical-load")
@@ -1232,7 +1401,7 @@ def red_team(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
-db_app = typer.Typer(help="Database maintenance commands")
+db_app = typer.Typer(help="Database maintenance and migration commands")
 app.add_typer(db_app, name="db")
 
 
@@ -1293,10 +1462,6 @@ def config_validate() -> None:
         raw = getattr(s, name)
         value = "***" if name in _SECRETS and raw else raw
         typer.echo(f"  {name}={value}")
-
-
-db_app = typer.Typer(help="Database migration commands (Alembic-backed)")
-app.add_typer(db_app, name="db")
 
 
 @db_app.command("migrate")

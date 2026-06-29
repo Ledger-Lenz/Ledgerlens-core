@@ -84,6 +84,18 @@ class AlertDeduplicator:
 
     def process(self, wallet: str, score: float) -> list[dict]:
         """Process a new score observation for wallet. Returns list of emitted events."""
+        from detection.suppressions import SuppressionsStore
+        store = SuppressionsStore(db_path=self._db_path)
+        rule = store.is_suppressed(wallet)
+        if rule:
+            logger.info(
+                "Alert suppressed: wallet=%s rule_id=%d reason=%s",
+                wallet,
+                rule["id"],
+                rule["reason"],
+            )
+            return []
+
         events: list[dict] = []
         now = datetime.now(timezone.utc).isoformat()
 

@@ -279,3 +279,61 @@ def fl_privacy_status() -> FLPrivacyStatus:
         budget_exhausted=budget_exhausted,
         rounds_completed=len(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/storage  (Issue #180)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/storage", include_in_schema=False)
+def get_storage_stats() -> dict:
+    """Return current database size, row counts, and next archival date."""
+    from storage.retention import RetentionEngine
+
+    engine = RetentionEngine(db_path=settings.db_path)
+    return engine.storage_stats()
+
+
+# ---------------------------------------------------------------------------
+# Alert suppression CRUD  (Issue #178)
+# ---------------------------------------------------------------------------
+
+
+class SuppressionCreate(BaseModel):
+    wallet: str
+    reason: str
+    expires_at: Optional[str] = None
+
+
+@router.post("/suppressions", include_in_schema=False)
+def create_suppression(body: SuppressionCreate) -> dict:
+    """Add an alert suppression rule for a wallet."""
+    from detection.suppressions import SuppressionsStore
+
+    store = SuppressionsStore(db_path=settings.db_path)
+    rule = store.add(wallet=body.wallet, reason=body.reason, expires_at=body.expires_at)
+    _logger.info("Suppression rule created via admin API: %s", rule)
+    return rule
+
+
+@router.get("/suppressions", include_in_schema=False)
+def list_suppressions() -> list[dict]:
+    """List all active (non-expired) alert suppression rules."""
+    from detection.suppressions import SuppressionsStore
+
+    store = SuppressionsStore(db_path=settings.db_path)
+    return store.list_active()
+
+
+@router.delete("/suppressions/{rule_id}", include_in_schema=False)
+def delete_suppression(rule_id: int) -> dict:
+    """Remove an alert suppression rule by ID."""
+    from detection.suppressions import SuppressionsStore
+
+    store = SuppressionsStore(db_path=settings.db_path)
+    deleted = store.delete(rule_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
+    _logger.info("Suppression rule %d deleted via admin API", rule_id)
+    return {"deleted": rule_id}
