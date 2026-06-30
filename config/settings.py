@@ -28,6 +28,46 @@ class Settings(BaseSettings):
     horizon_url: str = "https://horizon.stellar.org"
     horizon_stream_url: str = "https://horizon.stellar.org"
     network: str = "testnet"
+
+    # ── Horizon API version guard ─────────────────────────────────────────────
+    # The Stellar Horizon API evolves over time; breaking schema changes
+    # (field renames, type changes, new required fields) can silently corrupt
+    # ingested data if the client is written against a different version.
+    #
+    # VersionGuard reads the ``X-Stellar-Horizon-Version`` response header and
+    # raises ``HorizonVersionError`` when the server version falls outside the
+    # ``[HORIZON_MIN_VERSION, HORIZON_MAX_VERSION)`` range.
+    #
+    # How to update after a Horizon upgrade
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # 1. Review the Horizon changelog for the new version:
+    #    https://github.com/stellar/go/blob/master/services/horizon/CHANGELOG.md
+    # 2. Verify schema compatibility with the current ``data_models.py``.
+    # 3. Update HORIZON_TESTED_VERSION to the new version string.
+    # 4. Widen HORIZON_MIN_VERSION / HORIZON_MAX_VERSION if the new version
+    #    introduces a new supported major version.
+    # 5. If a breaking change requires a data-model update, do that in the same
+    #    change set and bump HORIZON_TESTED_VERSION to the first version that
+    #    carries the new schema.
+    #
+    # Setting HORIZON_VERSION_CHECK_ENABLED=false is an escape hatch for
+    # private or custom Horizon nodes that strip the version header.  It MUST
+    # NOT be used in production without understanding the schema compatibility
+    # implications; a WARNING is logged at startup when disabled.
+    horizon_min_version: str = "2.0.0"
+    """Inclusive lower bound of the supported Horizon server version range."""
+
+    horizon_max_version: str = "4.0.0"
+    """Exclusive upper bound of the supported Horizon server version range."""
+
+    horizon_tested_version: str = "2.28.0"
+    """The specific Horizon version against which the current data models were validated.
+    A WARNING is emitted when the live server reports a different (but in-range) version."""
+
+    horizon_version_check_enabled: bool = True
+    """Set to False to disable Horizon version header validation.
+    Useful for private or custom Horizon nodes that omit the header.
+    A WARNING is logged at startup when this is False."""
     horizon_default_cursor: str = "now"  # Used when no valid checkpoint exists.
     data_dir: str = "./data"  # Root allowed to contain runtime data files.
     cursor_checkpoint_path: str = "./data/horizon_cursor.json"  # Durable SSE offset.
