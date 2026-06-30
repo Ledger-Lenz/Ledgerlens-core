@@ -166,6 +166,20 @@ class Settings(BaseSettings):
     # Store as raw string; parsed tuple exposed via .evm_pool_addresses property
     evm_pool_addresses: str = ""
 
+    # ── EVM bridge event deduplication ────────────────────────────────────────
+    # Events whose block_number is older than current_chain_head minus this value
+    # are classified as REPLAY_REJECTED by BridgeEventDeduplicator.  This prevents
+    # an adversary from submitting stale bridge events to artificially inflate
+    # cross-chain volume metrics.  Default: 1000 blocks (≈ 3–4 h on Ethereum,
+    # ≈ 30 min on Polygon).
+    evm_dedup_replay_window_blocks: int = 1000
+
+    # Dedup table maintenance: entries for blocks older than
+    # current_chain_head - EVM_DEDUP_PRUNE_KEEP_BLOCKS are deleted during each
+    # prune_old_entries() call to prevent unbounded table growth.
+    # Default: 10,000 blocks (≈ 33 h on Ethereum at ~12 s/block).
+    evm_dedup_prune_keep_blocks: int = 10_000
+
     # ── Runtime config cache TTL ──────────────────────────────────────────────
     runtime_config_ttl_seconds: int = 60
 
