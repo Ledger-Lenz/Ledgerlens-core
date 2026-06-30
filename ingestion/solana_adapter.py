@@ -99,7 +99,7 @@ def _extract_spl_token_changes(
     pre: list[dict] = tx.get("meta", {}).get("preTokenBalances", []) or []
     post: list[dict] = tx.get("meta", {}).get("postTokenBalances", []) or []
 
-    account_keys: list[str] = (
+    (
         tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
     )
 
@@ -287,7 +287,7 @@ def _extract_stellar_address_from_vaa(tx: dict) -> str | None:
         offset = 1  # skip instruction discriminator
         if len(raw) < offset + 5:
             continue
-        vaa_version = raw[offset]
+        raw[offset]
         num_sigs = raw[offset + 5]
         body_start = offset + 6 + 66 * num_sigs
 

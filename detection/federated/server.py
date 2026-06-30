@@ -57,8 +57,6 @@ from dp_accounting import dp_event as _dp_event
 from dp_accounting.rdp import rdp_privacy_accountant as _rdp_pa
 
 from config.settings import settings
-from detection.federated.krum import KrumAggregator, KrumStrategy
-from detection.storage import log_krum_aggregation
 from detection.federated.audit import (
     build_record,
     get_cumulative_epsilon,

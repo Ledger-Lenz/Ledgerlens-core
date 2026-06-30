@@ -2,7 +2,6 @@
 
 import base64
 import os
-from pathlib import Path
 from unittest.mock import patch
 
 import joblib
@@ -16,7 +15,7 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from sklearn.ensemble import RandomForestClassifier
 
-from detection.model_signing import ModelIntegrityError, ModelSigner, get_model_signer
+from detection.model_signing import ModelIntegrityError, ModelSigner
 
 
 def _generate_keypair():
@@ -121,8 +120,8 @@ class TestGenerateSigningKeyCLI:
         assert result.exit_code == 0
         assert "Public key" in result.output
         assert "Private key" in result.output
-        lines = [l.strip() for l in result.output.strip().split("\n") if l.strip()]
-        b64_lines = [l for l in lines if len(l) >= 44 and not l.startswith(("Public", "Private", "WARNING"))]
+        lines = [ln.strip() for ln in result.output.strip().split("\n") if ln.strip()]
+        b64_lines = [ln for ln in lines if len(ln) >= 44 and not ln.startswith(("Public", "Private", "WARNING"))]
         assert len(b64_lines) >= 2
 
 

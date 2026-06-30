@@ -1,15 +1,11 @@
 """Tests for AnalystFeedbackStore in detection/feedback_store.py."""
 
-import math
-import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from detection.feedback_store import (
-    FEEDBACK_DECAY_LAMBDA,
     AnalystFeedbackStore,
-    FeedbackRecord,
 )
 
 
@@ -48,7 +44,6 @@ class TestAddCorrection:
 
 class TestGetWeightedCorrections:
     def test_weights_decrease_with_age(self, tmp_path):
-        import sqlite3
 
         db = str(tmp_path / "test.db")
         store = AnalystFeedbackStore(db_path=db)
@@ -75,7 +70,6 @@ class TestGetWeightedCorrections:
         assert all(w > 0 for w in weights)
 
     def test_zero_decay_lambda_all_equal(self, tmp_path):
-        import sqlite3
 
         db = str(tmp_path / "test.db")
         store = AnalystFeedbackStore(db_path=db)
@@ -100,7 +94,6 @@ class TestGetWeightedCorrections:
         assert all(w == pytest.approx(1.0, abs=0.01) for w in weights)
 
     def test_excludes_no_feature_vector(self, tmp_path):
-        import sqlite3
 
         db = str(tmp_path / "test.db")
         store = AnalystFeedbackStore(db_path=db)

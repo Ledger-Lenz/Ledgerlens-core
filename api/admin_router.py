@@ -145,12 +145,14 @@ def patch_config(body: RuntimeConfigPatch) -> dict:
 @router.get("/oracle/status", include_in_schema=False)
 def oracle_status() -> list[dict]:
     """Return the status of the oracle nodes in the quorum."""
-    nodes = _get_oracle_nodes()
+    from detection.oracle_node import OracleNode
+    from config.settings import settings as _settings
+    nodes = [OracleNode(name, key) for name, key in getattr(_settings, "oracle_nodes", {}).items()]
     return [
         {
             "name": node.name,
             "public_key": node.public_key_hex,
-            "last_seen": node.last_seen,
+            "last_seen": getattr(node, "last_seen", None),
         }
         for node in nodes
     ]
@@ -241,6 +243,67 @@ import logging as _logging
 _logger = _logging.getLogger("ledgerlens.admin")
 
 
+# ---------------------------------------------------------------------------
+# GET /admin/feature-store/stats
+# ---------------------------------------------------------------------------
+
+
+class FeatureStoreStats(BaseModel):
+    hot_tier_rows: int
+    cold_tier_rows: int
+    oldest_hot_record: Optional[datetime]
+    oldest_cold_record: Optional[datetime]
+    archive_dir_size_mb: float
+
+
+@router.get("/feature-store/stats", response_model=FeatureStoreStats, include_in_schema=False)
+def feature_store_stats() -> FeatureStoreStats:
+    """Return hot-tier row count, cold-tier row count, oldest timestamps, and archive size."""
+    from pathlib import Path
+
+    from detection.feature_store import ParquetFeatureColdTier
+
+    # Hot tier: count rows and find oldest record in SQLite
+    hot_rows = 0
+    oldest_hot: Optional[datetime] = None
+    try:
+        with sqlite3.connect(settings.db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), MIN(recorded_at) FROM feature_distribution_snapshots"
+            ).fetchone()
+            if row:
+                hot_rows = row[0] or 0
+                if row[1]:
+                    oldest_hot = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+    except Exception:
+        pass
+
+    # Cold tier: count rows and find oldest record in Parquet
+    archive_dir = Path(settings.feature_archive_dir)
+    cold = ParquetFeatureColdTier(archive_dir)
+    cold_rows = cold.row_count()
+    oldest_cold = cold.oldest_record()
+
+    # Archive directory size on disk
+    archive_size_mb = 0.0
+    try:
+        if archive_dir.exists():
+            total_bytes = sum(
+                f.stat().st_size for f in archive_dir.rglob("*") if f.is_file()
+            )
+            archive_size_mb = round(total_bytes / (1024 * 1024), 3)
+    except Exception:
+        pass
+
+    return FeatureStoreStats(
+        hot_tier_rows=hot_rows,
+        cold_tier_rows=cold_rows,
+        oldest_hot_record=oldest_hot,
+        oldest_cold_record=oldest_cold,
+        archive_dir_size_mb=archive_size_mb,
+    )
+
+
 class FLPrivacyStatus(BaseModel):
     current_epsilon: float
     target_epsilon: float
@@ -249,6 +312,14 @@ class FLPrivacyStatus(BaseModel):
     clip_norm: float
     budget_exhausted: bool
     rounds_completed: int
+
+
+@router.get("/storage", include_in_schema=False)
+def storage_stats() -> dict:
+    """Return current database size, per-table row counts, and next archival date."""
+    from storage.retention import RetentionEngine
+    engine = RetentionEngine(db_path=settings.db_path)
+    return engine.storage_stats()
 
 
 @router.get("/fl/privacy", response_model=FLPrivacyStatus, include_in_schema=False)
@@ -279,3 +350,57 @@ def fl_privacy_status() -> FLPrivacyStatus:
         budget_exhausted=budget_exhausted,
         rounds_completed=len(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# Alert suppression rules  (Issue #178)
+# ---------------------------------------------------------------------------
+
+
+class SuppressionCreate(BaseModel):
+    wallet: str
+    reason: str
+    expires_at: Optional[str] = None
+
+
+@router.post("/suppressions", status_code=201, include_in_schema=False)
+def add_suppression(body: SuppressionCreate) -> dict:
+    """Add an alert suppression rule for a wallet.
+
+    The wallet will generate no alert events while an active rule exists.
+    Rules expire automatically at ``expires_at`` (ISO-8601 UTC); omit to
+    create a permanent rule.
+    """
+    from detection.suppressions import get_store
+    store = get_store()
+    return store.add(wallet=body.wallet, reason=body.reason, expires_at=body.expires_at)
+
+
+@router.get("/suppressions", include_in_schema=False)
+def list_suppressions() -> list[dict]:
+    """Return all currently active (non-expired) suppression rules."""
+    from detection.suppressions import get_store
+    return get_store().list_active()
+
+
+@router.delete("/suppressions/{rule_id}", include_in_schema=False)
+def delete_suppression(rule_id: int) -> dict:
+    """Remove a suppression rule by ID."""
+    from detection.suppressions import get_store
+    deleted = get_store().delete(rule_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
+    return {"deleted": rule_id}
+
+
+# ---------------------------------------------------------------------------
+# Database storage stats  (Issue #180)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/storage", include_in_schema=False)
+def storage_stats() -> dict:
+    """Return current database size, per-table row counts, and next archival date."""
+    from storage.retention import RetentionEngine
+    engine = RetentionEngine(db_path=settings.db_path)
+    return engine.storage_stats()

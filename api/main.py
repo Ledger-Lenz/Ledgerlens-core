@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
+from api.analyst import router as analyst_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
@@ -53,6 +54,7 @@ from detection.risk_score import RiskScore
 from detection.counterfactual_engine import generate_counterfactuals
 from detection.counterfactual_translator import translate_counterfactual
 from detection.storage import (
+    get_active_wallet_override,
     get_alerts,
     get_bridge_transfer_history,
     get_bridge_transfers,
@@ -139,6 +141,28 @@ _inflight_requests: int = 0
 _inflight_lock = __import__("threading").Lock()
 
 
+async def _nightly_retention_task() -> None:
+    """Async background task: run the data retention job once per night at midnight UTC."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    while True:
+        now = datetime.now(timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        sleep_seconds = (next_midnight - now).total_seconds()
+        await asyncio.sleep(sleep_seconds)
+        try:
+            from storage.retention import RetentionEngine
+            engine = RetentionEngine(db_path=settings.db_path)
+            report = engine.run(dry_run=False)
+            for table, info in report.items():
+                archived = info.get("rows_archived", 0)
+                if archived:
+                    logger.info("[retention] %s: archived %d row(s) to %s", table, archived, info.get("archive_path"))
+        except Exception as exc:
+            logger.error("[retention] Nightly job failed: %s", exc)
+
+
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; drain requests and clean up on shutdown."""
@@ -151,10 +175,15 @@ async def _lifespan(application: FastAPI):
     except (FileNotFoundError, RuntimeError) as e:
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
+
+    import asyncio as _asyncio
+    _retention_task = _asyncio.create_task(_nightly_retention_task())
     yield
 
     # ── Shutdown sequence ────────────────────────────────────────────────
     import asyncio
+
+    _retention_task.cancel()
 
     _shutting_down = True
     logger.info("[shutdown] Stopping new requests (returning 503)")
@@ -201,6 +230,20 @@ async def _lifespan(application: FastAPI):
     logger.info("[shutdown] Shutdown sequence complete")
 
 
+_OPENAPI_TAGS = [
+    {"name": "Scores", "description": "Wallet risk score retrieval and explanation endpoints."},
+    {"name": "Alerts", "description": "Manipulation alert listing and deduplication state."},
+    {"name": "Webhooks", "description": "Webhook subscriber management."},
+    {"name": "Feedback", "description": "Ground-truth feedback ingestion for model improvement."},
+    {"name": "AMM", "description": "Automated Market Maker pool risk metrics."},
+    {"name": "Disputes", "description": "Score dispute submission and committee voting."},
+    {"name": "Governance", "description": "On-chain parameter governance proposals."},
+    {"name": "Admin", "description": "Admin-only model lifecycle, config, and observability endpoints."},
+    {"name": "Allowlist / Denylist", "description": "Wallet allowlist and denylist management with audit trail."},
+    {"name": "export", "description": "CSV / Parquet bulk export of risk score data."},
+    {"name": "batch", "description": "Async batch wallet scoring jobs."},
+]
+
 app = FastAPI(
     title="LedgerLens API",
     description=(
@@ -214,6 +257,18 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=_lifespan,
+    openapi_tags=[
+        {"name": "Scores", "description": "Wallet risk score retrieval and explanation."},
+        {"name": "Alerts", "description": "Typed manipulation alerts (sandwich, wash-trading, etc.)."},
+        {"name": "AMM / Pools", "description": "Automated market maker pool risk metrics."},
+        {"name": "Governance", "description": "On-chain governance proposals and voting."},
+        {"name": "Webhooks", "description": "Webhook subscriber management and dead-letter queue."},
+        {"name": "Disputes", "description": "Score dispute submission and committee voting."},
+        {"name": "Admin", "description": "Model governance, drift monitoring, and runtime config (admin-key gated)."},
+        {"name": "Allowlist / Denylist", "description": "Wallet override management with full audit trail."},
+        {"name": "API Key Management", "description": "Scoped API key lifecycle (create, list, revoke)."},
+        {"name": "Compliance", "description": "FATF / SAR regulatory exports (compliance-key gated)."},
+    ],
 )
 
 
@@ -262,10 +317,9 @@ from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
 app.include_router(admin_router)
-
+app.include_router(api_key_router)
 
 app.include_router(batch_router)
-
 
 app.include_router(export_router)
 app.include_router(api_keys_router)
@@ -314,8 +368,8 @@ def health() -> JSONResponse:
       service is still serving traffic in a reduced-functionality state,
       not failed) — only DB/model failures return 503.
 
-    The response body names every component but never leaks local filesystem
-    paths — errors are logged server-side at ERROR level.
+    Returns 503 when any check fails or when soroban_circuit_status=="open",
+    drift_status=="drifted", or webhook_dead_letter_count > 0.
     """
     from detection.model_inference import _MODEL_FILENAMES
     from detection.storage import _connect
@@ -650,6 +704,9 @@ def explain_wallet_score(
     )
 
 
+_stream_rate_limiter_state: dict = {}
+
+
 class RateLimiterStatus(BaseModel):
     configured_rate: float
     current_rate: float
@@ -695,6 +752,42 @@ def rate_limiter_status() -> RateLimiterStatus:
 
 _COUNTERFACTUAL_TIMEOUT_SECONDS = 5
 _counterfactual_executor = ThreadPoolExecutor(max_workers=4)
+
+# ---------------------------------------------------------------------------
+# Stream status — lightweight ingestion telemetry.
+# ---------------------------------------------------------------------------
+_stream_status: dict = {
+    "last_trade_at": None,
+    "trades_per_second": 0.0,
+    "active_wallets": 0,
+    "_recent_timestamps": [],
+}
+
+
+def _stream_status_update(trade) -> None:
+    """Update in-memory stream status after each ingested trade."""
+    now = time.time()
+    _stream_status["last_trade_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    recent = [t for t in _stream_status["_recent_timestamps"] if now - t < 10.0]
+    recent.append(now)
+    _stream_status["_recent_timestamps"] = recent
+    _stream_status["trades_per_second"] = len(recent) / 10.0
+    wallet = getattr(trade, "base_account", None) or ""
+    if wallet:
+        wallets = _stream_status.get("_active_wallets") or set()
+        wallets.add(wallet)
+        _stream_status["_active_wallets"] = wallets
+        _stream_status["active_wallets"] = len(wallets)
+
+
+@app.get("/stream/status")
+def stream_status() -> dict:
+    """Return real-time ingestion statistics (trades/s, active wallets, last trade time)."""
+    return {
+        "trades_per_second": _stream_status["trades_per_second"],
+        "active_wallets": _stream_status["active_wallets"],
+        "last_trade_at": _stream_status["last_trade_at"],
+    }
 
 
 @v1_router.get(
@@ -772,6 +865,7 @@ def wallet_counterfactual(
 def wallet_scores(wallet: str) -> dict:
     """Return the latest score for `wallet` on each asset pair.
 
+    Applies allowlist / denylist overrides from the ``wallet_overrides`` table.
     When the wallet has known EVM counterparts (bridge transfer records in the
     database), the response includes a ``"cross_chain_links"`` field listing
     the linked EVM wallets and the chain they were last seen on.  EVM RPC
@@ -780,6 +874,8 @@ def wallet_scores(wallet: str) -> dict:
     If the wallet is allowlisted, all scores are overridden to 0.
     If denylisted, all scores are overridden to 100.
     """
+    from detection.wallet_override_store import get_active_override
+
     validate_stellar_address(wallet)
 
     # Check for manual override before hitting the score store
@@ -1083,13 +1179,13 @@ def submit_feedback(body: FeedbackRequest) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@v1_router.get("/admin/drift-reports", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/drift-reports", tags=["Admin"], summary="Model drift reports", description="Return the most recent drift checks recorded by `cli.py retrain-check`.", dependencies=[Depends(require_admin_key)])
 def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     """Return the most recent drift checks recorded by `cli.py retrain-check`."""
     return get_drift_reports(limit=limit)
 
 
-@v1_router.get("/admin/robustness-report", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/robustness-report", tags=["Admin"], summary="Latest robustness report", description="Return the latest adversarial robustness evaluation report (admin only).", dependencies=[Depends(require_admin_key)])
 def robustness_report() -> dict:
     """Return the latest RobustnessReport from the database (admin only)."""
     from detection.storage import get_latest_robustness_report
@@ -1100,7 +1196,7 @@ def robustness_report() -> dict:
     return report
 
 
-@v1_router.get("/model/robustness")
+@v1_router.get("/model/robustness", tags=["Admin"], summary="Live robustness metrics", description="Return live red-team robustness metrics: evasion rate, mean generations to evade, and hardening delta.")
 def model_robustness() -> dict:
     """Return live red team robustness metrics for the current model.
 
@@ -1113,7 +1209,7 @@ def model_robustness() -> dict:
     return live_robustness_metrics()
 
 
-@v1_router.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/retrain-runs", tags=["Admin"], summary="Retrain run history", description="Return the most recent per-model retrain outcomes.", dependencies=[Depends(require_admin_key)])
 def retrain_runs(
     limit: int = Query(default=50, ge=1, le=1000),
     model_name: str | None = Query(default=None, description="Filter by model, e.g. random_forest"),
@@ -1122,7 +1218,7 @@ def retrain_runs(
     return get_retrain_runs(limit=limit, model_name=model_name)
 
 
-@v1_router.get("/admin/federated/audit-log", dependencies=[Depends(require_admin_key)])
+@v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),
 ) -> list[dict]:
@@ -1147,7 +1243,7 @@ def admin_namespaces() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@v1_router.get("/model/weights")
+@v1_router.get("/model/weights", tags=["Admin"], summary="Ensemble model weights", description="Return current ensemble classifier weights from the Thompson-sampling adaptive reweighter.")
 def model_weights() -> JSONResponse:
     """Return current ensemble classifier weights from the adaptive reweighter."""
     from detection.adaptive_reweighter import (
@@ -1370,7 +1466,7 @@ def get_proposals():
     return [p.model_dump() for p in list_open_proposals()]
 
 
-class LegacyProposalCreate(BaseModel):
+class ProposalCreate(BaseModel):
     proposal_type: str
     proposed_value: str
     proposed_by_key_hash: str
@@ -1387,7 +1483,7 @@ def create_proposal_endpoint(body: ProposalCreate):
     return p.model_dump()
 
 
-class LegacyProposalVote(BaseModel):
+class ProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
@@ -1839,7 +1935,11 @@ for _path in _LEGACY_REDIRECTS:
             # Preserve query string
             qs = request.url.query
             target = f"/v1{p}" + (f"?{qs}" if qs else "")
-            return RedirectResponse(url=target, status_code=302)
+            response = RedirectResponse(url=target, status_code=302)
+            response.headers["Deprecation"] = "true"
+            response.headers["Sunset"] = "Sat, 01 Jan 2028 00:00:00 GMT"
+            response.headers["Link"] = f'</v1{p}>; rel="successor-version"'
+            return response
         _redirect.__name__ = f"legacy_redirect_{p.replace('/', '_').strip('_')}"
         return _redirect
 
@@ -1936,6 +2036,37 @@ def legacy_dispute_get(dispute_id: str, request: Request):
 @app.post("/disputes/{dispute_id}/vote", include_in_schema=False)
 def legacy_dispute_vote(dispute_id: str, request: Request):
     return RedirectResponse(url=f"/v1/disputes/{dispute_id}/vote", status_code=302)
+
+
+@app.get("/compliance/ivms/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_ivms(wallet: str) -> dict:
+    from dataclasses import asdict
+    from detection.compliance_exporter import build_ivms_risk_field
+    validate_stellar_address(wallet)
+    return asdict(build_ivms_risk_field(wallet))
+
+
+@app.post("/compliance/sar-package", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_sar_package(body: SARPackageRequest) -> FileResponse:
+    import os
+    import tempfile
+    from detection.compliance_exporter import generate_sar_package
+    from fastapi.responses import FileResponse as _FileResponse
+    output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
+    pkg_path = generate_sar_package(
+        wallet=body.wallet,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        output_dir=output_dir,
+    )
+    return _FileResponse(pkg_path, media_type="application/zip", filename=os.path.basename(pkg_path))
+
+
+@app.get("/compliance/audit-trail/{wallet}", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
+def root_compliance_audit_trail(wallet: str) -> list[dict]:
+    from detection.compliance_exporter import get_audit_trail
+    validate_stellar_address(wallet)
+    return get_audit_trail(wallet)
 
 
 @app.post("/governance/proposals", include_in_schema=False)

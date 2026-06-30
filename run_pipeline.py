@@ -10,6 +10,7 @@ the other repos in the org.
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Optional
 import pandas as pd
 
 from config.settings import settings
+from config.correlation import set_correlation_id
+from config.telemetry import get_tracer
 from detection.cross_pair_engine import (
     build_volume_time_series,
     find_correlated_pairs,
@@ -57,6 +60,45 @@ from ingestion.path_payment_loader import async_load_path_payments, load_path_pa
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.pipeline")
+
+
+def _ingest_solana_trades(stellar_accounts: list[str]) -> pd.DataFrame:
+    """Fetch Solana SPL swap trades for any Stellar accounts that have a
+    Wormhole-linked Solana address.  Returns an empty DataFrame when
+    SOLANA_RPC_URL is not configured or no links are found.
+    """
+    import os
+
+    rpc_url = os.environ.get("SOLANA_RPC_URL", "")
+    if not rpc_url:
+        return pd.DataFrame()
+
+    try:
+        from ingestion.solana_adapter import SolanaAdapter
+
+        adapter = SolanaAdapter(rpc_url=rpc_url)
+        all_trades: list[Trade] = []
+
+        for stellar_addr in stellar_accounts:
+            try:
+                solana_trades = adapter.ingest(stellar_addr)
+                all_trades.extend(solana_trades)
+            except Exception:
+                logger.debug(
+                    "solana.ingest skipped for stellar_addr=%s", stellar_addr, exc_info=True
+                )
+
+        if not all_trades:
+            return pd.DataFrame()
+
+        rows = [t.model_dump() for t in all_trades]
+        df = pd.DataFrame(rows)
+        df["ledger_close_time"] = pd.to_datetime(df["ledger_close_time"], utc=True)
+        logger.info("solana.ingest total_trades=%d stellar_wallets=%d", len(df), len(stellar_accounts))
+        return df
+    except Exception:
+        logger.warning("solana.ingest failed", exc_info=True)
+        return pd.DataFrame()
 
 # Global feature store instance
 _feature_store: Optional[FeatureStore] = None
@@ -150,30 +192,13 @@ def run(
     cross_pair_wallets_map: dict[str, list[str]] = {}
     all_rings: list[dict] = []
 
-    if multi_pair:
         for base_asset, counter_asset in asset_pairs:
             pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
-            trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
-            if not trades.empty:
-                trades_by_pair[pair_key] = trades
 
-        if trades_by_pair:
-            volume_matrix = build_volume_time_series(trades_by_pair)
-            correlated_pairs = find_correlated_pairs(volume_matrix)
-            cross_pair_wallets_map = find_cross_pair_wallets(trades_by_pair, correlated_pairs)
-
-            shared_counts: dict[tuple[str, str], int] = {}
-            for pa, pb, _ in correlated_pairs:
-                count = sum(
-                    1 for w_pairs in cross_pair_wallets_map.values()
-                    if pa in w_pairs and pb in w_pairs
-                )
-                shared_counts[(pa, pb)] = count
-            save_pair_correlations(correlated_pairs, "spearman", shared_counts)
-            logger.info("Found %d correlated pair combinations", len(correlated_pairs))
-
-    for base_asset, counter_asset in asset_pairs:
-        pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
+            if multi_pair:
+                trades = trades_by_pair.get(pair_key, pd.DataFrame())
+            else:
+                trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
 
         if multi_pair:
             trades = trades_by_pair.get(pair_key, pd.DataFrame())
@@ -183,6 +208,16 @@ def run(
         if trades.empty:
             logger.info("No trades found for %s/%s", base_asset, counter_asset)
             continue
+
+        # Merge Solana SPL swap trades (when SOLANA_RPC_URL is configured) so
+        # cross-chain Stellar↔Solana wallets flow through the same feature store.
+        stellar_accounts_list = list(
+            pd.unique(trades[["base_account", "counter_account"]].values.ravel())
+        )
+        stellar_accounts_list = [a for a in stellar_accounts_list if a is not None and pd.notna(a)]
+        solana_df = _ingest_solana_trades(stellar_accounts_list)
+        if not solana_df.empty:
+            trades = pd.concat([trades, solana_df], ignore_index=True)
 
         as_of = pd.Timestamp(trades["ledger_close_time"].max())
         graph = build_transaction_graph(trades)
@@ -274,45 +309,76 @@ def run(
             scored_wallets.append(account)
             scored_pairs.append(pair_key)
 
-    logger.info("Computed %d risk scores", len(scores))
+            if "trade_type" in trades.columns:
+                pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+                save_liquidity_pool_trades(pool_trades)
 
-    # Record scored features for drift detection
-    if scored_features:
-        try:
-            record_scored_features(scored_features, scored_wallets, scored_pairs)
-        except Exception:
-            logger.exception("Failed to record scored features for drift detection")
+            path_payments = load_path_payments_for_accounts(list(accounts), since)
+            save_path_payments(path_payments)
+            circular_routes = detect_atomic_circular_routes(path_payments)
+            save_circular_routes(circular_routes)
 
     save_scores(scores)
     save_rings(all_rings)
 
-    # Persist feature vectors and compute+cache SHAP values using XGBoost model.
-    if scored_features:
-        feature_vec_rows = [
-            {"wallet": w, "asset_pair": p, "features": f}
-            for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
-        ]
-        save_feature_vectors(feature_vec_rows)
-        xgb_model = models.get("xgboost")
-        if xgb_model is not None:
-            from detection.storage import save_shap_values
+                score = RiskScore.combine(
+                    wallet=account,
+                    asset_pair=pair_key,
+                    benford_mad=features.get("benford_mad_24h", 0.0),
+                    benford_mad_threshold=settings.benford_mad_threshold,
+                    ml_probability=probability,
+                    ml_confidence=confidence,
+                )
+                scores.append(score)
+                scored_features.append(features)
+                scored_wallets.append(account)
+                scored_pairs.append(pair_key)
 
-            for row in feature_vec_rows:
-                try:
-                    explanation = explain_score(xgb_model, row["features"])
-                    top = top_contributing_features(explanation, n=5)
-                    shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
-                    save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
-                except Exception:
-                    logger.exception(
-                        "Failed to compute SHAP for wallet=%s pair=%s",
-                        row["wallet"],
-                        row["asset_pair"],
-                    )
+                _elapsed = time.monotonic() - _t_acct
+                scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
+                _result = "above_threshold" if score.score >= settings.risk_score_threshold else "below_threshold"
+                wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
 
-    _enqueue_webhook_alerts(scores)
+        logger.info("Computed %d risk scores", len(scores))
 
-    _submit_on_chain(scores, no_submit=no_submit)
+        # Record scored features for drift detection
+        if scored_features:
+            try:
+                record_scored_features(scored_features, scored_wallets, scored_pairs)
+            except Exception:
+                logger.exception("Failed to record scored features for drift detection")
+
+        save_scores(scores)
+
+        # Persist feature vectors and compute+cache SHAP values using XGBoost model.
+        if scored_features:
+            feature_vec_rows = [
+                {"wallet": w, "asset_pair": p, "features": f}
+                for w, p, f in zip(scored_wallets, scored_pairs, scored_features)
+            ]
+            save_feature_vectors(feature_vec_rows)
+            xgb_model = models.get("xgboost")
+            if xgb_model is not None:
+                from detection.storage import save_shap_values
+
+                for row in feature_vec_rows:
+                    try:
+                        explanation = explain_score(xgb_model, row["features"])
+                        top = top_contributing_features(explanation, n=5)
+                        shap_payload = [{"feature": f, "shap_value": v} for f, v in top]
+                        save_shap_values(row["wallet"], row["asset_pair"], shap_payload)
+                    except Exception:
+                        logger.exception(
+                            "Failed to compute SHAP for wallet=%s pair=%s",
+                            row["wallet"],
+                            row["asset_pair"],
+                        )
+
+        _enqueue_webhook_alerts(scores)
+
+        _submit_on_chain(scores, no_submit=no_submit)
+
+        pipeline_run_duration_seconds.observe(time.monotonic() - _t_start)
 
     return scores
 

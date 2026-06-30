@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger("ledgerlens.federated.privacy")

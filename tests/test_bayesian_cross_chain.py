@@ -1,18 +1,14 @@
 """Tests for Bayesian cross-chain link scoring in detection/cross_chain_linker.py."""
 
-import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from detection.cross_chain_linker import (
-    AMOUNT_TOLERANCE,
     CONFIDENCE_THRESHOLD,
-    CONFIRMED_THRESHOLD,
     CrossChainLinker,
     LinkStatus,
     WalletLinkHypothesis,
-    _validate_evm_address,
 )
 from ingestion.data_models import BridgeTransfer
 

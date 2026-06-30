@@ -113,8 +113,8 @@ def test_submit_batch_called_for_high_risk_scores(model_dir, monkeypatch):
 
     import config.settings as settings_module
 
-    object.__setattr__(settings_module.settings, "score_contract_id", "CA3CQ7C6YHK6K6C6J6C6K6C6K6C6K6C6K6")
-    object.__setattr__(settings_module.settings, "service_secret_key", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    object.__setattr__(settings_module.settings, "ledgerlens_score_contract_id", "CA3CQ7C6YHK6K6C6J6C6K6C6K6C6K6C6K6")
+    object.__setattr__(settings_module.settings, "ledgerlens_service_secret_key", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     object.__setattr__(settings_module.settings, "risk_score_threshold", 70)
 
     mock_publisher = MagicMock()
@@ -141,8 +141,8 @@ def test_no_submit_flag_skips_on_chain(model_dir, monkeypatch):
 
     import config.settings as settings_module
 
-    object.__setattr__(settings_module.settings, "score_contract_id", "CA3CQ7C6YHK6K6C6J6C6K6C6K6C6K6C6K6")
-    object.__setattr__(settings_module.settings, "service_secret_key", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    object.__setattr__(settings_module.settings, "ledgerlens_score_contract_id", "CA3CQ7C6YHK6K6C6J6C6K6C6K6C6K6C6K6")
+    object.__setattr__(settings_module.settings, "ledgerlens_service_secret_key", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 
     mock_publisher = MagicMock()
     with patch("detection.soroban_publisher.SorobanPublisher", return_value=mock_publisher):
@@ -165,8 +165,8 @@ def test_submit_skipped_when_not_configured(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "load_path_payments_for_accounts", lambda accounts, since: [])
 
     # Ensure Soroban settings are empty (reset from any earlier test)
-    object.__setattr__(settings_module.settings, "score_contract_id", "")
-    object.__setattr__(settings_module.settings, "service_secret_key", "")
+    object.__setattr__(settings_module.settings, "ledgerlens_score_contract_id", "")
+    object.__setattr__(settings_module.settings, "ledgerlens_service_secret_key", "")
 
     mock_publisher = MagicMock()
     with patch("detection.soroban_publisher.SorobanPublisher", return_value=mock_publisher):
@@ -264,7 +264,7 @@ def test_run_streaming_flushes_on_batch_size(model_dir, monkeypatch, tmp_path):
 
     flush_args: list[int] = []
 
-    def mock_flush(buffer, models, pair_key, asset_pair, cursor):
+    def mock_flush(buffer, models, pair_key, asset_pair, cursor, calibrators=None):
         flush_args.append(len(buffer))
 
     monkeypatch.setattr(run_pipeline, "_flush_streaming_buffer", mock_flush)
@@ -300,7 +300,7 @@ def test_run_streaming_flushes_on_time_interval(model_dir, monkeypatch, tmp_path
 
     flush_calls: list[float] = []
 
-    def track_flush(buffer, models, pair_key, asset_pair, cursor):
+    def track_flush(buffer, models, pair_key, asset_pair, cursor, calibrators=None):
         flush_calls.append(len(buffer))
 
     monkeypatch.setattr(run_pipeline, "_flush_streaming_buffer", track_flush)
@@ -413,7 +413,7 @@ def test_run_streaming_keyboard_interrupt_flushes(model_dir, monkeypatch, tmp_pa
 
     flush_calls: list[int] = []
 
-    def mock_flush(buffer, models, pair_key, asset_pair, cursor):
+    def mock_flush(buffer, models, pair_key, asset_pair, cursor, calibrators=None):
         flush_calls.append(len(buffer))
 
     monkeypatch.setattr(run_pipeline, "_flush_streaming_buffer", mock_flush)

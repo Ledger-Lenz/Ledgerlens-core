@@ -50,8 +50,9 @@ class ScoringFeedback(BaseModel):
 
 @contextmanager
 def _connect(db_path: str | None = None):
-    conn = sqlite3.connect(db_path or settings.db_path, check_same_thread=False)
+    conn = sqlite3.connect(db_path or settings.db_path, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
     finally:

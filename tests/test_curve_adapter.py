@@ -3,9 +3,8 @@
 import os
 from unittest.mock import patch
 
-import pytest
 
-from ingestion.curve_adapter import CurveAdapter, Trade, _is_enabled
+from ingestion.curve_adapter import CurveAdapter, _is_enabled
 
 
 class TestFeatureFlag:

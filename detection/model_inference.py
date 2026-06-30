@@ -22,6 +22,7 @@ from detection.benford_engine import BenfordStreamCounter
 from detection.feature_engineering import FEATURE_NAMES
 from detection.gnn_model import _HAS_PYG, safe_load_gnn_checkpoint
 from detection.model_signing import assert_within_model_dir, safe_joblib_load
+from detection.adversarial_features import apply_adversarial_boost
 
 logger = logging.getLogger("ledgerlens.model_inference")
 
@@ -53,7 +54,7 @@ def get_benford_stats(wallet: str, window: int):
 
 _WEIGHTS_FILENAME = "ensemble_weights.json"
 _REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "calib", "meta_learner", "sequence_model"})
 _weights_mtime: float | None = None
 _runtime_weights: dict[str, float] | None = None
 
@@ -119,11 +120,20 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
         logger.warning("ensemble_weights.json unreadable: %s — falling back to settings", exc)
         return None
 
+    allowed_keys = _REQUIRED_KEYS | {"updated_at"}
+    unknown_keys = set(data.keys()) - allowed_keys
+    if unknown_keys:
+        logger.warning(
+            "ensemble_weights.json has unknown keys %s — falling back to settings",
+            unknown_keys,
+        )
+        return None
+
     model_keys = {k: data[k] for k in _REQUIRED_KEYS if k in data}
     if set(model_keys) != _REQUIRED_KEYS:
         logger.warning(
-            "ensemble_weights.json has unexpected keys %s — falling back to settings",
-            set(data.keys()) - {"updated_at"},
+            "ensemble_weights.json missing required keys %s — falling back to settings",
+            _REQUIRED_KEYS - set(model_keys),
         )
         return None
 
@@ -272,6 +282,10 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
         weighted_prob = sum(probabilities[n] * weights.get(n, 0.0) for n in probabilities) / total_weight
 
     confidence = 1.0 - float(np.std(list(probabilities.values()))) if probabilities else 0.0
+    weighted_prob = apply_adversarial_boost(
+        int(round(weighted_prob * 100)),
+        float(feature_vector.get("adversarial_feature_score", 0.0)),
+    ) / 100.0
     return float(weighted_prob), max(0.0, min(1.0, confidence))
 
 
@@ -398,7 +412,7 @@ _MODEL_FILENAMES["gnn"] = "gnn_model.pt"
 _MODEL_FILENAMES["sequence_model"] = "temporal_model.pt"
 
 # Models excluded from the tabular ensemble probability vote.
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "sequence_model", "meta_learner"})
 
 
 def load_models(model_dir: str | None = None, *args, **kwargs) -> dict:
@@ -516,7 +530,7 @@ def _gnn_forward_pass(model, snapshots) -> dict:
     return results
 
 
-_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm"})
+_NON_VOTING_MODELS = frozenset({"gnn", "temporal_lstm", "meta_learner", "sequence_model"})
 
 
 class ModelInference:

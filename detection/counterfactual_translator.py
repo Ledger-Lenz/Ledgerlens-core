@@ -82,6 +82,7 @@ _TRANSLATIONS.update(
         "atomic_self_payment_ratio": "Stop sending path payments where you are both the source and the destination.",
         "avg_path_hop_count": "Use simpler, more direct payment paths with fewer intermediate hops.",
         "path_cycle_volume_ratio": "Reduce the volume routed through path payments that cycle back to the same asset.",
+        "path_payment_frequency": "Reduce how often you issue path payments; a high rate relative to direct trades is a layering signal.",
         "path_cycle_count_24h": "Stop routing funds through closed loops of path payments that return to your own (or associated) accounts.",
         "path_cycle_xlm_volume_24h": "Reduce the XLM value routed through multi-hop path-payment cycles that return to the originating account.",
         "max_cycle_length": "Stop chaining path payments across multiple intermediary accounts to obscure round-trip self-dealing.",
@@ -120,6 +121,7 @@ _TRANSLATIONS.update(
         "pdc_1h": "Make trades that genuinely move and improve the mid-price over a 1-hour horizon, rather than trades with no causal price impact.",
         "gnn_wash_ring_probability": "Change your trading-graph neighbourhood and behaviour so it no longer resembles a detected wash-ring pattern.",
         "gnn_neighbor_avg_score": "Trade with counterparties that themselves have lower risk scores.",
+        "path_payment_frequency": "Reduce the proportion of your trades executed as path payments to lower the wash-trading signal.",
     }
 )
 
