@@ -126,6 +126,30 @@ class Settings(BaseSettings):
     # Store as raw string; parsed tuple exposed via .evm_pool_addresses property
     evm_pool_addresses: str = ""
 
+    # Multi-provider failover pool (ISSUE-013)
+    # JSON-encoded list of provider objects.  Each object must have:
+    #   chain_id (int), rpc_url (str, https:// only), name (str),
+    #   priority (int, optional), max_requests_per_second (float, optional)
+    # Example:
+    #   EVM_PROVIDERS=[
+    #     {"chain_id": 1, "rpc_url": "https://mainnet.infura.io/v3/KEY",
+    #      "name": "infura", "priority": 0},
+    #     {"chain_id": 1, "rpc_url": "https://eth-mainnet.alchemyapi.io/v2/KEY",
+    #      "name": "alchemy", "priority": 1}
+    #   ]
+    # Leave empty ("[]") to rely solely on the legacy evm_rpc_* settings.
+    evm_providers: str = "[]"
+
+    # Maximum blocks behind the chain head before a provider's health is
+    # considered degraded (also triggers lag alerts when ALL providers lag).
+    evm_max_block_lag: int = 10
+
+    # Seconds between health probe cycles (eth_blockNumber polls).
+    evm_probe_interval_seconds: float = 15.0
+
+    # Consecutive failures before a provider's circuit breaker opens.
+    evm_circuit_breaker_threshold: int = 5
+
     # ── Runtime config cache TTL ──────────────────────────────────────────────
     runtime_config_ttl_seconds: int = 60
 
@@ -149,6 +173,40 @@ class Settings(BaseSettings):
     # ── Path payment loader ───────────────────────────────────────────────────
     path_payment_loader_enabled: bool = True
     path_payment_fetch_effects: bool = True
+
+    # ── Prometheus metrics ────────────────────────────────────────────────────
+    # Set to False to disable all prometheus_client metric collection.  When
+    # disabled, ingestion/metrics.py returns a _NoOpCollector and GET /metrics
+    # returns HTTP 503.  Useful in lightweight environments where prometheus_client
+    # is not installed.
+    metrics_enabled: bool = True
+    # URL path at which the Prometheus text metrics are served by the local API.
+    # Must start with "/" and contain no dynamic segments.
+    metrics_endpoint: str = "/metrics"
+
+    # ── Parquet export (ledgerlens-data integration) ──────────────────────────
+    # Default root directory for `cli.py export-parquet` output.
+    # Resolved relative to the working directory; must remain inside the project.
+    parquet_export_dir: str = "./data/parquet_export"
+    # Default Parquet compression codec: snappy | zstd | gzip | none
+    parquet_compression: str = "snappy"
+    # Rows per Parquet row group — larger = faster scans, higher write memory.
+    parquet_row_group_size: int = 100_000
+
+    # ── Trade filter pipeline ─────────────────────────────────────────────────
+    # Path to the YAML file that configures the ingestion filter pipeline.
+    # See config/filter_config.yaml.example for the full schema.
+    filter_config_path: str = "./config/filter_config.yaml"
+    # How often (seconds) FilterConfigLoader polls filter_config.yaml for changes.
+    # Set to 0 to disable hot-reload (not recommended in production).
+    filter_config_reload_interval_seconds: int = 60
+    # When True, rejected trades are persisted to the `filtered_trades` SQLite
+    # table so operators can review and tune filter rules without losing data.
+    filter_store_rejected_trades: bool = True
+    # Maximum rows in the `filtered_trades` table before pruning.
+    # When exceeded, the oldest rows are deleted until the count reaches
+    # 90 % of this limit (450 000 rows at the default).
+    filter_rejected_trades_max_rows: int = 500_000
 
     # ── Validators ────────────────────────────────────────────────────────────
 
@@ -300,6 +358,67 @@ class Settings(BaseSettings):
             raise ValueError("FEATURE_ARCHIVE_CUTOFF_DAYS must be >= 1")
         return v
 
+    @field_validator("metrics_endpoint", mode="before")
+    @classmethod
+    def valid_metrics_endpoint(cls, v: object) -> object:
+        s = str(v).strip()
+        if not s.startswith("/"):
+            raise ValueError("METRICS_ENDPOINT must start with '/'")
+        if "{" in s or "}" in s:
+            raise ValueError("METRICS_ENDPOINT must not contain dynamic path segments")
+        return s
+
+    @field_validator("parquet_compression", mode="before")
+    @classmethod
+    def valid_parquet_compression(cls, v: object) -> object:
+        val = str(v).strip().lower()
+        allowed = {"snappy", "zstd", "gzip", "none"}
+        if val not in allowed:
+            raise ValueError(
+                f"PARQUET_COMPRESSION must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return val
+
+    @field_validator("parquet_row_group_size", mode="before")
+    @classmethod
+    def valid_parquet_row_group_size(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("PARQUET_ROW_GROUP_SIZE must be >= 1")
+        return val
+
+    @field_validator("filter_config_reload_interval_seconds", mode="before")
+    @classmethod
+    def valid_filter_reload_interval(cls, v: object) -> object:
+        val = int(v)
+        if val < 0:
+            raise ValueError("FILTER_CONFIG_RELOAD_INTERVAL_SECONDS must be >= 0")
+        return val
+
+    @field_validator("filter_rejected_trades_max_rows", mode="before")
+    @classmethod
+    def valid_filter_max_rows(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("FILTER_REJECTED_TRADES_MAX_ROWS must be >= 1")
+        return val
+
+    @model_validator(mode="after")
+    def parquet_export_dir_no_traversal(self) -> "Settings":
+        cwd = Path.cwd().resolve()
+        candidate = Path(self.parquet_export_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = (cwd / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        try:
+            candidate.relative_to(cwd)
+        except ValueError as exc:
+            raise ValueError(
+                "PARQUET_EXPORT_DIR must be within the application working directory"
+            ) from exc
+        return self
+
     @model_validator(mode="after")
     def feature_archive_dir_no_traversal(self) -> "Settings":
         cwd = Path.cwd().resolve()
@@ -345,6 +464,99 @@ class Settings(BaseSettings):
                 raise ValueError(f"EVM_POOL_ADDRESSES malformed address: {addr!r}")
             if not Web3.is_checksum_address(addr):
                 raise ValueError(f"EVM_POOL_ADDRESSES non-checksummed address: {addr!r}")
+        return self
+
+    @field_validator("evm_max_block_lag", mode="before")
+    @classmethod
+    def valid_evm_max_block_lag(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("EVM_MAX_BLOCK_LAG must be >= 1")
+        return val
+
+    @field_validator("evm_probe_interval_seconds", mode="before")
+    @classmethod
+    def valid_evm_probe_interval(cls, v: object) -> object:
+        val = float(v)
+        if val <= 0:
+            raise ValueError("EVM_PROBE_INTERVAL_SECONDS must be positive")
+        return val
+
+    @field_validator("evm_circuit_breaker_threshold", mode="before")
+    @classmethod
+    def valid_evm_circuit_breaker_threshold(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("EVM_CIRCUIT_BREAKER_THRESHOLD must be >= 1")
+        return val
+
+    @model_validator(mode="after")
+    def valid_evm_providers_json(self) -> "Settings":
+        """Validate EVM_PROVIDERS is a well-formed JSON list of provider objects.
+
+        Each entry must have:
+          - ``chain_id``: positive integer
+          - ``rpc_url``: https:// URL (API keys in plaintext over http:// are rejected)
+          - ``name``: non-empty string
+
+        Optional fields: ``priority`` (int), ``max_requests_per_second`` (float > 0).
+        """
+        import json
+
+        raw = self.evm_providers.strip()
+        if not raw or raw == "[]":
+            return self
+
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"EVM_PROVIDERS is not valid JSON: {exc}") from exc
+
+        if not isinstance(entries, list):
+            raise ValueError("EVM_PROVIDERS must be a JSON array")
+
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ValueError(f"EVM_PROVIDERS[{i}] must be a JSON object")
+
+            # chain_id
+            chain_id = entry.get("chain_id")
+            if not isinstance(chain_id, int) or chain_id <= 0:
+                raise ValueError(
+                    f"EVM_PROVIDERS[{i}].chain_id must be a positive integer, "
+                    f"got {chain_id!r}"
+                )
+
+            # rpc_url — must be https:// to protect embedded API keys
+            rpc_url = entry.get("rpc_url", "")
+            if not isinstance(rpc_url, str) or not rpc_url:
+                raise ValueError(f"EVM_PROVIDERS[{i}].rpc_url must be a non-empty string")
+            if not rpc_url.startswith("https://"):
+                raise ValueError(
+                    f"EVM_PROVIDERS[{i}].rpc_url must use https:// scheme. "
+                    f"HTTP endpoints transmit API keys in plaintext."
+                )
+
+            # name
+            name = entry.get("name", "")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"EVM_PROVIDERS[{i}].name must be a non-empty string"
+                )
+
+            # optional priority
+            if "priority" in entry:
+                if not isinstance(entry["priority"], int):
+                    raise ValueError(f"EVM_PROVIDERS[{i}].priority must be an integer")
+
+            # optional max_requests_per_second
+            if "max_requests_per_second" in entry:
+                mrps = entry["max_requests_per_second"]
+                if not isinstance(mrps, (int, float)) or float(mrps) <= 0:
+                    raise ValueError(
+                        f"EVM_PROVIDERS[{i}].max_requests_per_second must be > 0"
+                    )
+
         return self
 
     # ── Backward-compat properties ────────────────────────────────────────────

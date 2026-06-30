@@ -607,6 +607,103 @@ class RiskScoreStore:
             return conn.total_changes - before
 
 
+def store_filtered_trade(
+    trade: Trade,
+    rejection_reason: str,
+    db_path: str | None = None,
+) -> None:
+    """Persist a rejected trade to ``filtered_trades`` for post-hoc review.
+
+    Only the primary-key fields and rejection reason are stored — not the full
+    trade record — to keep the table small.  Duplicate ``paging_token`` values
+    are silently ignored (``INSERT OR IGNORE``).
+
+    After insertion, :func:`prune_filtered_trades` is called to enforce the
+    ``FILTER_REJECTED_TRADES_MAX_ROWS`` limit.
+
+    Parameters
+    ----------
+    trade:
+        The :class:`~ingestion.data_models.Trade` that was rejected.
+    rejection_reason:
+        Human-readable reason string, typically ``"filter_name: detail"``.
+    db_path:
+        Override the default SQLite path (uses ``settings.db_path`` if omitted).
+    """
+    init_db(db_path)
+    paging_token = trade.paging_token or trade.id
+    filtered_at = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO filtered_trades
+                (id, paging_token, ledger_close_time, rejection_reason, filtered_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                trade.id,
+                paging_token,
+                trade.ledger_close_time.isoformat(),
+                rejection_reason,
+                filtered_at,
+            ),
+        )
+        conn.commit()
+    prune_filtered_trades(db_path=db_path)
+
+
+def prune_filtered_trades(
+    max_rows: int | None = None,
+    db_path: str | None = None,
+) -> int:
+    """Delete the oldest ``filtered_trades`` rows when the table exceeds *max_rows*.
+
+    Pruning targets 90 % of *max_rows* so the table stays well below the
+    limit between prune cycles.
+
+    Parameters
+    ----------
+    max_rows:
+        Row limit.  Defaults to
+        :attr:`~config.settings.Settings.filter_rejected_trades_max_rows`.
+    db_path:
+        SQLite path override.
+
+    Returns
+    -------
+    int
+        Number of rows deleted (0 if no pruning was needed).
+    """
+    if max_rows is None:
+        max_rows = settings.filter_rejected_trades_max_rows
+    target_rows = int(max_rows * 0.9)
+    with _connect(db_path) as conn:
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM filtered_trades"
+        ).fetchone()
+        if count <= max_rows:
+            return 0
+        excess = count - target_rows
+        conn.execute(
+            """
+            DELETE FROM filtered_trades
+            WHERE paging_token IN (
+                SELECT paging_token FROM filtered_trades
+                ORDER BY filtered_at ASC
+                LIMIT ?
+            )
+            """,
+            (excess,),
+        )
+        conn.commit()
+        deleted = conn.total_changes
+    logger.debug(
+        "filtered_trades pruned",
+        extra={"deleted": deleted, "remaining": count - deleted},
+    )
+    return deleted
+
+
 def save_scores(scores: list[RiskScore], db_path: str | None = None) -> None:
     """Insert `scores` into the store, creating the schema first if needed."""
     if not scores:
