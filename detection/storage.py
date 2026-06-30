@@ -401,6 +401,22 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
         """,
     ),
+    (
+        15,
+        "add benford_baselines table for market-wide calibration",
+        """
+        CREATE TABLE IF NOT EXISTS benford_baselines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_pair TEXT NOT NULL,
+            digit_freqs_json TEXT NOT NULL,
+            trade_count INTEGER NOT NULL,
+            computed_at TEXT NOT NULL,
+            window_days INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_benford_baselines_pair
+            ON benford_baselines (asset_pair);
+        """,
+    ),
 ]
 
 
