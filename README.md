@@ -105,6 +105,7 @@ graph TB
 - **ingestion/historical_loader.py**: Bulk historical trade ingestion
 - **ingestion/operations_loader.py**: Order-book event ingestion (offer create/update/cancel) from Horizon operations
 - **ingestion/account_loader.py**: Account funding-source and creation-time metadata for wallet-graph features
+- **ingestion/filters.py**: Configurable filter pipeline — asset pair whitelist/blacklist, minimum volume, asset type, and account exclusion filters with hot-reload and SQLite rejection storage (see [docs/filter-pipeline.md](docs/filter-pipeline.md))
 - **ingestion/data_models.py**: Pydantic schemas for trade, asset, and order-book records
 - **detection/benford_engine.py**: Benford's Law feature computation (chi-square, Z-score, MAD)
 - **detection/graph_engine.py**: Directed trade graph construction, SCC wash-ring discovery, and ring membership indexing
@@ -244,6 +245,28 @@ After each pipeline run, all `RiskScore` records above `RISK_SCORE_THRESHOLD` ar
 | `SOROBAN_CIRCUIT_BREAKER_THRESHOLD` | Consecutive failures before the circuit opens (default: 5)                          |
 | `SOROBAN_CIRCUIT_RESET_SECONDS`     | Seconds until the circuit resets (default: 300)                                     |
 
+#### EVM Multi-Provider Configuration
+
+| Variable                          | Default  | Purpose                                                                                      |
+| --------------------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `EVM_PROVIDERS`                   | `[]`     | JSON array of provider objects for multi-chain failover (see format below)                   |
+| `EVM_MAX_BLOCK_LAG`               | `10`     | Blocks behind chain head before a provider's health score is penalised; triggers lag alerts when _all_ providers exceed this on a chain |
+| `EVM_PROBE_INTERVAL_SECONDS`      | `15.0`   | Seconds between `eth_blockNumber` health probe cycles                                        |
+| `EVM_CIRCUIT_BREAKER_THRESHOLD`   | `5`      | Consecutive failures before a provider's circuit opens and it is skipped                     |
+
+`EVM_PROVIDERS` format — a JSON array where each entry must have `chain_id` (int), `rpc_url` (**https:// only**), and `name` (string). Optional fields: `priority` (int, lower = tried first; default 0) and `max_requests_per_second` (float; default 10.0).
+
+```bash
+EVM_PROVIDERS=[
+  {"chain_id": 1, "rpc_url": "https://mainnet.infura.io/v3/YOUR_KEY", "name": "infura", "priority": 0},
+  {"chain_id": 1, "rpc_url": "https://eth-mainnet.alchemyapi.io/v2/YOUR_KEY", "name": "alchemy", "priority": 1},
+  {"chain_id": 8453, "rpc_url": "https://base-mainnet.infura.io/v3/YOUR_KEY", "name": "infura-base", "priority": 0},
+  {"chain_id": 137, "rpc_url": "https://polygon-mainnet.infura.io/v3/YOUR_KEY", "name": "infura-polygon", "priority": 0}
+]
+```
+
+> **Security**: `rpc_url` must use `https://` — `http://` endpoints transmit API keys in plaintext and are rejected at startup with a `ValueError`. API keys embedded in URLs (e.g. `infura.io/v3/SECRET`) are masked in all log output and never appear in error messages. When `EVM_PROVIDERS` is empty (`[]`), the pool falls back to the legacy `EVM_RPC_ETHEREUM` / `EVM_RPC_BASE` / `EVM_RPC_POLYGON` single-endpoint settings.
+
 **Transaction lifecycle**:
 
 1. **Build** — create an `InvokeContractFunction` operation for `submit_score(wallet, asset_pair, score, timestamp)`
@@ -295,6 +318,7 @@ ledgerlens-core/
 │   ├── historical_loader.py          ← Bulk historical trade ingestion
 │   ├── operations_loader.py          ← Order-book event ingestion (offer ops)
 │   ├── account_loader.py             ← Account funding-source / creation-time metadata
+│   ├── filters.py                    ← Configurable trade filter pipeline (whitelist/blacklist/volume/type/exclusion)
 │   ├── synthetic_data.py             ← Synthetic trade/wash-ring generator for local training
 │   ├── http_client.py                ← Retrying HTTP helper for Horizon calls
 │   └── data_models.py                ← Pydantic schemas for trade/asset/order-book records
@@ -334,6 +358,18 @@ cp .env.example .env
 Fill in the Horizon, model, and cross-repo settings described in
 [LedgerLens Organization](#ledgerlens-organization).
 
+### 2a. Configure trade filters (optional)
+
+```bash
+cp config/filter_config.yaml.example config/filter_config.yaml
+```
+
+Edit `config/filter_config.yaml` to enable asset pair whitelists/blacklists,
+minimum volume thresholds, and account exclusion lists. See
+[docs/filter-pipeline.md](docs/filter-pipeline.md) for full documentation.
+All filters default to `enabled: false` (pass-through) so the pipeline works
+out of the box without any filter configuration.
+
 ### 3. Train on synthetic data
 
 No labelled dataset from `ledgerlens-data` is required to get started —
@@ -364,6 +400,25 @@ Exposes `/health`, `/scores`, `/scores/{wallet}`, `/scores/{wallet}/explain`,
 `/alerts`, `/assets/risk-ranking`, `/correlations`, and `/rings` over the
 locally stored `RiskScore` records — a stand-in for `ledgerlens-api` during
 local development.
+
+#### Prometheus metrics
+
+The local API exposes a Prometheus-compatible metrics endpoint at `GET /metrics`
+(configurable via `METRICS_ENDPOINT`). It returns the standard text exposition
+format from `prometheus_client.generate_latest()`.
+
+```bash
+# Requires X-LedgerLens-Admin-Key when LEDGERLENS_ADMIN_API_KEY is set
+curl -H "X-LedgerLens-Admin-Key: your-admin-key" http://localhost:8000/metrics
+```
+
+All LedgerLens metric names are prefixed with `ledgerlens_`. See
+[docs/metrics.md](docs/metrics.md) for the full metric catalogue, label
+descriptions, and recommended alert thresholds.
+
+> **Security**: if `LEDGERLENS_ADMIN_API_KEY` is unset, `/metrics` is publicly
+> accessible and a WARNING is logged at startup. Always set an admin key in
+> production deployments to prevent operational data leakage.
 
 ##### SHAP Explanation Endpoint
 
