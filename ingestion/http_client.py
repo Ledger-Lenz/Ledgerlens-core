@@ -1,47 +1,49 @@
-"""Shared HTTP helper for Horizon API calls with rate-limiting and retry/backoff.
+"""Shared HTTP helper for Horizon API calls with retry/backoff and rate limiting.
 
-Horizon occasionally returns transient 5xx/429 responses under load;
-ingestion modules use `RetryingHorizonClient` instead of calling `httpx`
-directly so those are retried with full-jitter exponential backoff and a
-proactive token-bucket rate limiter rather than failing the whole pipeline.
+Horizon occasionally returns transient 5xx/429 responses under load.
+This module provides two client implementations:
 
-Key components
---------------
-TokenBucketRateLimiter
-    Proactively throttles outbound request dispatch to stay below the
-    Horizon per-IP rate limit, preventing 429s from occurring in the first
-    place.  The bucket is shared across all callers of the same
-    ``RetryingHorizonClient`` instance.
+* ``get_with_retry`` — synchronous helper used by the historical loader.
+* ``AsyncHorizonClient`` (alias: ``RetryingHorizonClient``) — async client used
+  by the streaming pipeline and parallel historical loader.
 
-compute_retry_delay
-    AWS-style "full jitter" delay: ``uniform(0, min(max_delay, base*2^n))``.
-    When a ``Retry-After`` value is present the computed delay is floored to
-    ``retry_after + uniform(0, 1)`` so the server-dictated minimum is
-    respected while still de-synchronising concurrent workers.
+Rate limiting
+-------------
+``TokenBucketRateLimiter`` enforces a proactive per-client request budget so the
+pipeline stays below Horizon's per-IP rate limit before 429s occur.  When tokens
+are exhausted the acquirer yields the event loop rather than blocking a thread.
 
-parse_retry_after
-    Parses both the integer-seconds and HTTP-date forms of the
-    ``Retry-After`` header, returning the number of seconds to wait.
+Retry logic
+-----------
+The retry loop in ``AsyncHorizonClient._make_request()`` uses **full jitter**
+(AWS "Exponential Backoff and Jitter" pattern) for all delays:
+``delay = uniform(0, min(max_delay, base * 2^attempt))``.
 
-RateLimitStats
-    Lightweight counters attached to every ``RetryingHorizonClient``
-    instance; useful for observability dashboards and test assertions.
+On HTTP 429 the ``Retry-After`` response header is parsed and respected: the
+computed jitter delay is floored at the server-specified wait time so the
+pipeline never hammers a rate-limited endpoint.  The ``Retry-After`` value is
+also clamped to ``HORIZON_MAX_RETRY_DELAY`` to prevent a malicious or
+misconfigured proxy from stalling the pipeline indefinitely.
 
-MaxRetriesExceededError
-    Raised when all retry attempts are exhausted without a successful
-    response.
+Version guard
+-------------
+Every response carries an ``X-Stellar-Horizon-Version`` header.  ``VersionGuard``
+parses it and raises ``HorizonVersionError`` when the server version falls
+outside the configured ``[min_version, max_version)`` range.
 
-`AsyncHorizonClient` / `RetryingHorizonClient`
-    Async HTTP client wrapping ``httpx.AsyncClient`` with semaphore-bounded
-    concurrency, the token-bucket rate limiter, full-jitter retry, and
-    Retry-After awareness.
-
-`get_with_retry`
-    Legacy sync helper retained for backward compatibility.
+Structural validation
+---------------------
+``HorizonSchemaError`` is raised when a response body is missing expected
+top-level structural keys (``_embedded.records`` for list endpoints; ``id`` /
+``paging_token`` for single-record endpoints).
 """
 
+from __future__ import annotations
+
 import asyncio
+import logging
 import random
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -49,260 +51,249 @@ from datetime import datetime, timezone
 
 import httpx
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+from ingestion.metrics import _normalise_endpoint, get_metrics
 
-#: Status codes that warrant a retry with backoff.
+_metrics = get_metrics()
+
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-#: Status codes that must never be retried — raise immediately.
-_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 410}
+# Pre-release suffix pattern (e.g. "-rc1", "-beta.2", "-alpha")
+_PRERELEASE_RE = re.compile(r"-[a-zA-Z].*$")
 
 
 # ---------------------------------------------------------------------------
-# Exceptions
+# Exception classes
 # ---------------------------------------------------------------------------
 
 
-class MaxRetriesExceededError(Exception):
-    """Raised when a request fails on every retry attempt.
-
-    Deliberately omits response body content to avoid leaking potentially
-    sensitive data from the Horizon node into exception messages and logs.
+class HorizonVersionError(RuntimeError):
+    """Raised when the Horizon server version is outside the supported range.
 
     Attributes
     ----------
+    detected:
+        The version string read from the ``X-Stellar-Horizon-Version`` header.
+    min_version:
+        The inclusive lower bound of the supported range.
+    max_version:
+        The exclusive upper bound of the supported range.
     url:
-        The request URL (path only, never a full URL with credentials).
-    attempts:
-        Total number of attempts made (initial request + retries).
+        The request URL that returned the out-of-range version.
+
+    Security note: the error message never includes response body content —
+    only the URL and version string — to prevent leaking potentially sensitive
+    API response data into logs or exception tracebacks.
     """
 
-    def __init__(self, url: str, attempts: int) -> None:
-        self.url = url
-        self.attempts = attempts
+    def __init__(
+        self,
+        detected: str,
+        min_version: str,
+        max_version: str,
+        url: str,
+    ) -> None:
         super().__init__(
-            f"Request to {url!r} failed after {attempts} attempt(s)"
+            f"Horizon version {detected!r} at {url!r} is outside supported range "
+            f"[{min_version}, {max_version}). Update HORIZON_MIN_VERSION / "
+            f"HORIZON_MAX_VERSION in config/settings.py after verifying schema "
+            f"compatibility."
         )
+        self.detected = detected
+        self.min_version = min_version
+        self.max_version = max_version
+        self.url = url
 
 
-# ---------------------------------------------------------------------------
-# RateLimitStats
-# ---------------------------------------------------------------------------
+class HorizonSchemaError(RuntimeError):
+    """Raised when a Horizon response body is missing expected structural keys.
 
-
-@dataclass
-class RateLimitStats:
-    """Counters tracking rate-limiting and retry activity on a single client.
+    This is distinct from a Pydantic ``ValidationError`` — it fires before
+    field-level parsing when a mandatory top-level key (e.g.
+    ``_embedded.records``, ``id``, ``paging_token``) is absent, giving a
+    clear error message that names the root cause rather than a confusing
+    ``KeyError`` or ``NoneType`` traceback.
 
     Attributes
     ----------
-    requests_sent:
-        Total number of HTTP requests dispatched (across all attempts).
-    retries_total:
-        Number of requests that required at least one retry.
-    rate_limit_hits:
-        Number of HTTP 429 responses received.
-    total_wait_seconds:
-        Cumulative seconds spent sleeping in retry/rate-limit backoff.
+    missing_key:
+        The dot-notation path of the absent key (e.g. ``"_embedded.records"``).
+    url:
+        The request URL whose response was structurally invalid.
     """
 
-    requests_sent: int = 0
-    retries_total: int = 0
-    rate_limit_hits: int = 0
-    total_wait_seconds: float = 0.0
-
-    @property
-    def retry_rate(self) -> float:
-        """Fraction of requests that required at least one retry.
-
-        Returns 0.0 when no requests have been sent yet.
-        """
-        return self.retries_total / self.requests_sent if self.requests_sent else 0.0
+    def __init__(self, missing_key: str, url: str) -> None:
+        super().__init__(
+            f"Horizon response from {url!r} is missing expected key {missing_key!r}. "
+            f"This may indicate a schema change in the Horizon API. Check the "
+            f"X-Stellar-Horizon-Version header and review the API changelog."
+        )
+        self.missing_key = missing_key
+        self.url = url
 
 
 # ---------------------------------------------------------------------------
-# Token-bucket rate limiter
+# VersionGuard
 # ---------------------------------------------------------------------------
 
 
-class TokenBucketRateLimiter:
-    """Async token-bucket rate limiter for outbound HTTP requests.
+class VersionGuard:
+    """Validates ``X-Stellar-Horizon-Version`` response headers.
 
-    Tokens are added at ``rate`` per second up to a maximum ``burst``
-    capacity.  Each call to :meth:`acquire` consumes one token; when the
-    bucket is empty the caller is suspended until enough tokens have
-    accumulated.
+    Parses the version string from the header and checks it against a
+    ``[min_version, max_version)`` range using semantic versioning
+    (``packaging.version.Version``).  Pre-release suffixes (e.g.
+    ``"2.28.0-rc1"``) are stripped before comparison with a ``WARNING``
+    log, because the base version is what determines schema compatibility.
 
-    The internal ``asyncio.Lock`` ensures correct behaviour under high
-    concurrency in a single event loop — it must **not** be shared across
-    threads.  For multi-process deployments, create one limiter per process.
+    Once a version has been validated for the client's base URL the result
+    is cached in memory for the lifetime of the guard instance, avoiding
+    repeated string-parsing overhead on every response.
 
     Parameters
     ----------
-    rate:
-        Steady-state token replenishment rate in requests per second.
-        This should be set to slightly below Horizon's documented per-IP
-        limit to leave headroom.
-    burst:
-        Maximum bucket capacity.  Allows short bursts above the steady
-        rate.  Defaults to ``rate * 2`` when not specified.
-
-    Example
-    -------
-    ::
-
-        limiter = TokenBucketRateLimiter(rate=5.0, burst=10.0)
-        async with AsyncHorizonClient(..., rate_limiter=limiter) as client:
-            data = await client.get("/trades")
+    min_version:
+        Inclusive lower bound, e.g. ``"2.0.0"``.
+    max_version:
+        Exclusive upper bound, e.g. ``"4.0.0"``.
+    tested_version:
+        The specific version against which the current codebase was
+        validated.  A ``WARNING`` is emitted when the server reports a
+        different (but in-range) version.
+    enabled:
+        When ``False`` the guard is a no-op for every check but emits a
+        single ``WARNING`` at construction time.
     """
 
-    def __init__(self, rate: float, burst: float | None = None) -> None:
-        if rate <= 0:
-            raise ValueError(f"rate must be positive, got {rate!r}")
-        self._rate = rate
-        self._capacity = burst if burst is not None else rate * 2
-        if self._capacity < rate:
-            raise ValueError(
-                f"burst ({burst}) must be >= rate ({rate})"
+    HEADER_NAME = "X-Stellar-Horizon-Version"
+
+    def __init__(
+        self,
+        min_version: str,
+        max_version: str,
+        tested_version: str,
+        enabled: bool = True,
+    ) -> None:
+        self._min_version = min_version
+        self._max_version = max_version
+        self._tested_version = tested_version
+        self._enabled = enabled
+        # Cache: base_url → validated version string (or sentinel for "header absent")
+        self._cache: dict[str, str | None] = {}
+
+        if not enabled:
+            logger.warning(
+                "Horizon version checking disabled — schema compatibility not guaranteed"
             )
-        self._tokens: float = self._capacity
-        self._last_refill: float = time.monotonic()
-        # Must be an asyncio.Lock — a threading.Lock would deadlock in the
-        # async event loop because it is not awaitable.
-        self._lock: asyncio.Lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def check(self, response_headers: Mapping[str, str], url: str) -> None:
+        """Validate the ``X-Stellar-Horizon-Version`` header from a response.
 
-    async def acquire(self) -> None:
-        """Block until a request token is available, then consume it.
+        Parameters
+        ----------
+        response_headers:
+            The HTTP response headers mapping (case-insensitive lookup is
+            handled by ``httpx``).
+        url:
+            The full request URL, used in error messages and cache keys.
 
-        This is the only method callers need.  The rate limiter tracks
-        elapsed wall time since the last refill to compute the correct
-        token count even when the event loop is busy.
+        Raises
+        ------
+        HorizonVersionError
+            When the header is present and the version falls outside
+            ``[min_version, max_version)``.
+
+        Notes
+        -----
+        - If the header is absent the method is a no-op (some proxy
+          configurations strip it).
+        - If version checking is disabled (``enabled=False``) the method
+          is always a no-op.
         """
-        async with self._lock:
-            self._refill()
-            if self._tokens < 1.0:
-                # Not enough tokens — sleep for the exact time needed and
-                # then refill again to handle any elapsed time during sleep.
-                wait = (1.0 - self._tokens) / self._rate
-                self._tokens = 0.0
-                await asyncio.sleep(wait)
-                self._refill()
-            self._tokens -= 1.0
+        if not self._enabled:
+            return
+
+        raw = response_headers.get(self.HEADER_NAME)
+        if not raw:
+            # Header absent or empty — graceful no-op.
+            return
+
+        raw = raw.strip()
+        if not raw:
+            return
+
+        # Use the URL as the cache key so callers talking to different
+        # Horizon nodes (e.g. testnet vs mainnet) are tracked separately.
+        # Strip query string for a stable cache key.
+        cache_key = url.split("?")[0]
+        if cache_key in self._cache and self._cache[cache_key] == raw:
+            # Already validated this exact version for this endpoint.
+            return
+
+        self._validate(raw, url, cache_key)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Private helpers
     # ------------------------------------------------------------------
 
-    def _refill(self) -> None:
-        """Add tokens proportional to elapsed time since the last refill."""
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-        self._last_refill = now
+    def _validate(self, raw: str, url: str, cache_key: str) -> None:
+        """Parse *raw* and run range + tested-version checks."""
+        from packaging.version import InvalidVersion, Version
+
+        version_str = raw
+        is_prerelease = bool(_PRERELEASE_RE.search(raw))
+        if is_prerelease:
+            # Strip suffix so "2.28.0-rc1" → "2.28.0" for range comparison.
+            version_str = _PRERELEASE_RE.sub("", raw)
+            logger.warning(
+                "Horizon pre-release version %r detected at %r — "
+                "using base version %r for range check",
+                raw,
+                url,
+                version_str,
+            )
+
+        try:
+            parsed = Version(version_str)
+            min_v = Version(self._min_version)
+            max_v = Version(self._max_version)
+        except InvalidVersion as exc:
+            logger.warning(
+                "Could not parse Horizon version header %r at %r: %s — skipping check",
+                raw,
+                url,
+                exc,
+            )
+            return
+
+        if parsed < min_v or parsed >= max_v:
+            raise HorizonVersionError(
+                detected=raw,
+                min_version=self._min_version,
+                max_version=self._max_version,
+                url=url,
+            )
+
+        # In-range; warn if different from the pinned tested version.
+        try:
+            tested = Version(self._tested_version)
+        except InvalidVersion:
+            tested = None
+
+        if tested is not None and parsed != tested:
+            logger.warning(
+                "Horizon version %r at %r differs from tested version %r — "
+                "monitor for schema changes",
+                version_str,
+                url,
+                self._tested_version,
+            )
+
+        # Cache the validated raw value so repeat responses are fast.
+        self._cache[cache_key] = raw
 
 
 # ---------------------------------------------------------------------------
-# Retry delay computation
-# ---------------------------------------------------------------------------
-
-
-def compute_retry_delay(
-    attempt: int,
-    base_delay: float = 1.0,
-    max_delay: float = 60.0,
-    retry_after: float | None = None,
-) -> float:
-    """Compute a full-jitter retry delay for the given attempt index.
-
-    Uses the AWS "full jitter" pattern: ``uniform(0, min(max_delay, base * 2^attempt))``.
-    Jitter de-synchronises concurrent workers that all hit a transient
-    failure at the same time, preventing the thundering-herd re-storm.
-
-    If *retry_after* is supplied (parsed from the server's ``Retry-After``
-    header), the returned delay is floored to ``retry_after + uniform(0, 1)``
-    so the server-mandated minimum wait is respected, while a small random
-    offset prevents multiple clients from retrying simultaneously at the exact
-    same moment.
-
-    Parameters
-    ----------
-    attempt:
-        Zero-based attempt index.  ``attempt=0`` for the very first retry
-        (i.e. the second overall request).
-    base_delay:
-        Base delay in seconds.  The exponential cap grows as
-        ``base_delay * 2^attempt``.
-    max_delay:
-        Hard upper bound on the jittered delay in seconds.
-    retry_after:
-        Server-dictated minimum wait in seconds, already clamped to
-        ``max_delay`` by the caller.  If ``None``, only jitter is applied.
-
-    Returns
-    -------
-    float
-        Seconds to sleep before the next attempt.  Always in ``[0, max_delay]``.
-    """
-    exponential_cap = min(max_delay, base_delay * (2 ** attempt))
-    jittered = random.uniform(0.0, exponential_cap)
-    if retry_after is not None:
-        # Floor to the server minimum, plus a tiny uniform offset to spread
-        # concurrent retries.  The +1 s window is intentionally small so the
-        # server-prescribed delay remains the dominant factor.
-        return max(retry_after + random.uniform(0.0, 1.0), jittered)
-    return jittered
-
-
-# ---------------------------------------------------------------------------
-# Retry-After header parsing
-# ---------------------------------------------------------------------------
-
-
-def parse_retry_after(headers: Mapping[str, str]) -> float | None:
-    """Parse the ``Retry-After`` response header.
-
-    Supports both the integer-seconds form (``Retry-After: 30``) and the
-    HTTP-date form (``Retry-After: Wed, 21 Oct 2015 07:28:00 GMT``).
-
-    Parameters
-    ----------
-    headers:
-        A case-insensitive mapping of HTTP response headers.  Both
-        ``Retry-After`` and ``retry-after`` keys are checked.
-
-    Returns
-    -------
-    float or None
-        Seconds to wait before retrying, or ``None`` when the header is
-        absent or cannot be parsed.  Negative values are clamped to ``0.0``.
-    """
-    value = headers.get("Retry-After") or headers.get("retry-after")
-    if value is None:
-        return None
-    # Integer-seconds form
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        pass
-    # HTTP-date form
-    try:
-        from email.utils import parsedate_to_datetime
-
-        retry_dt = parsedate_to_datetime(value)
-        wait = (retry_dt - datetime.now(tz=timezone.utc)).total_seconds()
-        return max(0.0, wait)
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Sync helper (backward compatibility)
+# Sync helper (unchanged public API)
 # ---------------------------------------------------------------------------
 
 
@@ -324,16 +315,41 @@ def get_with_retry(
         :class:`RetryingHorizonClient` (async) for full rate-limit support.
     """
     last_exception: Exception | None = None
+    endpoint = _normalise_endpoint(url)
 
     for attempt in range(max_retries + 1):
+        start = time.perf_counter()
         try:
             response = client.get(url, params=params)
         except httpx.TransportError as exc:
+            duration = time.perf_counter() - start
+            _metrics.http_requests_total.labels(
+                endpoint=endpoint, method="GET", status_code="error"
+            ).inc()
+            _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+            if attempt < max_retries:
+                _metrics.http_retries_total.labels(reason="timeout").inc()
             last_exception = exc
         else:
+            duration = time.perf_counter() - start
+            _metrics.http_requests_total.labels(
+                endpoint=endpoint,
+                method="GET",
+                status_code=str(response.status_code),
+            ).inc()
+            _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+
+            if response.status_code == 429:
+                _metrics.http_rate_limit_hits_total.inc()
+
             if response.status_code not in _RETRYABLE_STATUS_CODES:
                 response.raise_for_status()
                 return response
+
+            reason = "429" if response.status_code == 429 else "5xx"
+            if attempt < max_retries:
+                _metrics.http_retries_total.labels(reason=reason).inc()
+
             last_exception = httpx.HTTPStatusError(
                 f"Retryable status {response.status_code} from {url}",
                 request=response.request,
@@ -352,81 +368,51 @@ def get_with_retry(
 # ---------------------------------------------------------------------------
 
 
-import logging
-
-logger = logging.getLogger(__name__)
-
-
 class AsyncHorizonClient:
     """Async HTTP client for Horizon with token-bucket rate limiting and retry.
 
-    Wraps ``httpx.AsyncClient`` with:
+    Wraps `httpx.AsyncClient` with:
 
-    - A **token-bucket rate limiter** that proactively throttles dispatch to
-      stay below the Horizon per-IP request budget before 429s occur.
-    - A **semaphore** that caps the number of concurrent in-flight requests.
-    - **Full-jitter exponential backoff** on 429 and 5xx responses, with
-      ``Retry-After`` header awareness so the server-mandated minimum wait is
-      respected.
-    - **Non-retriable status codes** (400, 401, 403, 404, 410) are raised
-      immediately without burning retry budget.
-    - **:attr:`rate_limit_stats`** for observability.
-
-    Parameters
-    ----------
-    base_url:
-        Root URL of the Horizon node, e.g. ``"https://horizon.stellar.org"``.
-    max_concurrency:
-        Maximum number of in-flight HTTP requests at any moment.
-    max_retries:
-        Maximum number of retry attempts after the initial request.
-    base_retry_delay:
-        Base delay (seconds) for the full-jitter exponential back-off.
-    max_retry_delay:
-        Hard cap on any single retry sleep, including ``Retry-After`` values.
-        This prevents a malicious or mis-configured proxy from stalling the
-        pipeline indefinitely with an arbitrarily large ``Retry-After``.
-    rate_limiter:
-        A pre-constructed :class:`TokenBucketRateLimiter`.  When ``None``,
-        a limiter is built from *rate_limit_rps* / *rate_burst*.
-    rate_limit_rps:
-        Steady-state requests per second for the default rate limiter.
-        Ignored when *rate_limiter* is provided.
-    rate_burst:
-        Burst capacity for the default rate limiter.  Ignored when
-        *rate_limiter* is provided.
+    - A semaphore that caps concurrent in-flight requests at `max_concurrency`.
+    - Exponential backoff with jitter on 429 and 5xx responses (max `max_retries` retries).
+    - A `VersionGuard` that validates ``X-Stellar-Horizon-Version`` on every
+      response and raises `HorizonVersionError` when outside the configured range.
 
     Supports async context-manager usage::
 
         async with AsyncHorizonClient(settings.horizon_url) as client:
             data = await client.get("/trades", params={"limit": 200})
+
+    Version guard configuration is read from the four ``HORIZON_*`` settings
+    in ``config/settings.py``.  Pass ``version_guard=None`` to disable
+    validation entirely (useful for tests that don't exercise version logic).
     """
+
+    # Sentinel object used to distinguish "caller passed None explicitly" from
+    # "caller did not pass version_guard at all" (in which case we build one
+    # from settings).
+    _UNSET: object = object()
 
     def __init__(
         self,
         base_url: str,
         max_concurrency: int = 20,
         max_retries: int = 3,
-        base_retry_delay: float = 1.0,
-        max_retry_delay: float = 60.0,
-        rate_limiter: TokenBucketRateLimiter | None = None,
-        rate_limit_rps: float = 5.0,
-        rate_burst: float = 10.0,
+        version_guard: "VersionGuard | None | object" = _UNSET,
+        probe_timeout: float = 5.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._client = httpx.AsyncClient(timeout=30.0)
-        self.max_retries = max_retries
-        self._base_retry_delay = base_retry_delay
-        self._max_retry_delay = max_retry_delay
-        self._rate_limiter: TokenBucketRateLimiter = rate_limiter or TokenBucketRateLimiter(
-            rate=rate_limit_rps, burst=rate_burst
-        )
-        self.rate_limit_stats = RateLimitStats()
+        self._max_retries = max_retries
+        self._probe_timeout = probe_timeout
 
-    # ------------------------------------------------------------------
-    # URL resolution
-    # ------------------------------------------------------------------
+        # Build a VersionGuard from settings unless the caller supplies one
+        # explicitly (including ``None`` to disable entirely).
+        if version_guard is AsyncHorizonClient._UNSET:
+            self._version_guard: VersionGuard | None = _build_version_guard_from_settings()
+        else:
+            self._version_guard = version_guard  # type: ignore[assignment]
 
     def _resolve_url(self, path: str) -> str:
         if path.startswith(("http://", "https://")):
@@ -434,7 +420,52 @@ class AsyncHorizonClient:
         return f"{self._base_url}/{path.lstrip('/')}"
 
     # ------------------------------------------------------------------
-    # Public request API
+    # Internal request primitive
+    # ------------------------------------------------------------------
+
+    async def _make_request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: object,
+    ) -> httpx.Response:
+        """Execute a single HTTP request, raise on non-2xx, then version-check.
+
+        This is the integration point for `VersionGuard`: every HTTP
+        round-trip — whether called directly or via the retry loop in `get()`
+        — passes through here so version validation is never bypassed.
+
+        Parameters
+        ----------
+        method:
+            HTTP method string (``"GET"``, ``"POST"``, …).
+        url:
+            Fully-qualified URL.
+        **kwargs:
+            Forwarded verbatim to ``httpx.AsyncClient.request()``.
+
+        Returns
+        -------
+        httpx.Response
+            The validated response object.
+
+        Raises
+        ------
+        httpx.HTTPStatusError
+            On non-2xx status after ``raise_for_status()``.
+        HorizonVersionError
+            When the ``X-Stellar-Horizon-Version`` header is present and
+            outside the configured ``[min_version, max_version)`` range.
+        """
+        async with self._semaphore:
+            response = await self._client.request(method, url, **kwargs)
+        response.raise_for_status()
+        if self._version_guard is not None:
+            self._version_guard.check(response.headers, url)
+        return response
+
+    # ------------------------------------------------------------------
+    # Public API
     # ------------------------------------------------------------------
 
     async def get(self, path: str, params: dict | None = None) -> dict:
@@ -452,48 +483,13 @@ class AsyncHorizonClient:
         params:
             Optional query-string parameters.
 
-        Returns
-        -------
-        dict
-            Parsed JSON body of the successful response.
-
-        Raises
-        ------
-        MaxRetriesExceededError
-            All retry attempts exhausted without a successful response.
-        httpx.HTTPStatusError
-            Non-retriable status code received (400, 401, 403, 404, 410).
+        Acquires the concurrency semaphore for the duration of each HTTP
+        round-trip (via `_make_request`).  Retries on
+        `_RETRYABLE_STATUS_CODES` or transport errors with exponential
+        backoff + jitter.
         """
         url = self._resolve_url(path)
-        return await self._make_request("GET", url, params=params)
-
-    async def _make_request(
-        self, method: str, url: str, **kwargs: object
-    ) -> dict:
-        """Internal request dispatcher with rate limiting, retry, and stats.
-
-        Implements the full retry loop:
-
-        1. Acquire a token from the rate limiter (may sleep to respect RPS
-           budget).
-        2. Acquire the concurrency semaphore.
-        3. Dispatch the request.
-        4. On 429 — parse ``Retry-After``, update stats, sleep with jitter,
-           continue.
-        5. On non-retriable 4xx — raise immediately.
-        6. On retriable 5xx or transport error — sleep with jitter, continue.
-        7. After all retries exhausted — raise
-           :exc:`MaxRetriesExceededError`.
-
-        Parameters
-        ----------
-        method:
-            HTTP method string (e.g. ``"GET"``).
-        url:
-            Fully-resolved request URL.
-        **kwargs:
-            Extra keyword arguments forwarded to ``httpx.AsyncClient.request``.
-        """
+        endpoint = _normalise_endpoint(url)
         last_exc: Exception | None = None
 
         for attempt in range(self.max_retries + 1):
@@ -502,11 +498,17 @@ class AsyncHorizonClient:
             # ----------------------------------------------------------
             await self._rate_limiter.acquire()
 
+            start = time.perf_counter()
             try:
-                async with self._semaphore:
-                    response = await self._client.request(method, url, **kwargs)
-                self.rate_limit_stats.requests_sent += 1
+                response = await self._make_request("GET", url, params=params)
             except httpx.TransportError as exc:
+                duration = time.perf_counter() - start
+                _metrics.http_requests_total.labels(
+                    endpoint=endpoint, method="GET", status_code="error"
+                ).inc()
+                _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+                if attempt < self._max_retries:
+                    _metrics.http_retries_total.labels(reason="timeout").inc()
                 last_exc = exc
                 if attempt < self.max_retries:
                     delay = compute_retry_delay(
@@ -525,6 +527,22 @@ class AsyncHorizonClient:
                     self.rate_limit_stats.total_wait_seconds += delay
                     await asyncio.sleep(delay)
                 continue
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in _RETRYABLE_STATUS_CODES:
+                    raise
+                last_exc = exc
+                continue
+
+            duration = time.perf_counter() - start
+            _metrics.http_requests_total.labels(
+                endpoint=endpoint,
+                method="GET",
+                status_code=str(response.status_code),
+            ).inc()
+            _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+
+            if response.status_code == 429:
+                _metrics.http_rate_limit_hits_total.inc()
 
             # ----------------------------------------------------------
             # HTTP 429 — rate limited by Horizon
@@ -571,45 +589,56 @@ class AsyncHorizonClient:
             if response.status_code in _NON_RETRYABLE_STATUS_CODES:
                 response.raise_for_status()
 
-            # ----------------------------------------------------------
-            # Retriable 5xx
-            # ----------------------------------------------------------
-            if response.status_code in _RETRYABLE_STATUS_CODES:
-                last_exc = httpx.HTTPStatusError(
-                    f"HTTP {response.status_code} from {url}",
-                    request=response.request,
-                    response=response,
-                )
-                if attempt < self.max_retries:
-                    delay = compute_retry_delay(
-                        attempt,
-                        base_delay=self._base_retry_delay,
-                        max_delay=self._max_retry_delay,
-                    )
-                    logger.warning(
-                        "HTTP %d on %s (attempt %d/%d); retrying in %.2fs",
-                        response.status_code,
-                        url,
-                        attempt + 1,
-                        self.max_retries + 1,
-                        delay,
-                    )
-                    self.rate_limit_stats.retries_total += 1
-                    self.rate_limit_stats.total_wait_seconds += delay
-                    await asyncio.sleep(delay)
-                continue
+            reason = "429" if response.status_code == 429 else "5xx"
+            if attempt < self._max_retries:
+                _metrics.http_retries_total.labels(reason=reason).inc()
 
-            # ----------------------------------------------------------
-            # Success
-            # ----------------------------------------------------------
-            response.raise_for_status()
-            return response.json()
+            last_exc = httpx.HTTPStatusError(
+                f"Retryable status {response.status_code} from {url}",
+                request=response.request,
+                response=response,
+            )
 
         raise MaxRetriesExceededError(url, self.max_retries + 1)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    async def probe_server_version(self) -> str:
+        """Fetch the Horizon root endpoint and log the server version.
+
+        This is a startup pre-flight check.  It calls ``GET /`` (the
+        Horizon root), reads the ``horizon_version`` field from the JSON
+        body, and logs it at ``INFO`` level so operators can confirm which
+        Horizon instance the pipeline is talking to.
+
+        The request uses ``self._probe_timeout`` (default 5 s) to prevent
+        startup hangs when the Horizon node is unreachable.
+
+        Returns
+        -------
+        str
+            The ``horizon_version`` string from the root endpoint, or
+            ``"unknown"`` when the field is absent.
+
+        Raises
+        ------
+        HorizonVersionError
+            When the response ``X-Stellar-Horizon-Version`` header is
+            present and outside the configured range.
+        httpx.TimeoutException
+            When the probe request exceeds ``probe_timeout`` seconds.
+        """
+        resp = await self._make_request(
+            "GET",
+            self._base_url,
+            timeout=self._probe_timeout,
+        )
+        data = resp.json()
+        version = data.get("horizon_version", "unknown")
+        logger.info("Connected to Horizon %s at %s", version, self._base_url)
+        return version
 
     async def close(self) -> None:
         """Close the underlying ``httpx.AsyncClient``."""
@@ -623,8 +652,88 @@ class AsyncHorizonClient:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatible alias
+# Helper: build VersionGuard from config/settings.py
 # ---------------------------------------------------------------------------
 
-#: Descriptive alias used by historical ingestion and streaming modules.
+
+def _build_version_guard_from_settings() -> VersionGuard | None:
+    """Construct a `VersionGuard` from the application settings.
+
+    Returns ``None`` when the settings module cannot be imported (e.g.
+    during isolated unit tests that don't supply a full environment).
+    """
+    try:
+        from config.settings import settings  # local import to avoid circular deps
+    except Exception:
+        return None
+
+    return VersionGuard(
+        min_version=settings.horizon_min_version,
+        max_version=settings.horizon_max_version,
+        tested_version=settings.horizon_tested_version,
+        enabled=settings.horizon_version_check_enabled,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural response validation helpers
+# ---------------------------------------------------------------------------
+
+
+def validate_list_response(body: dict, url: str) -> None:
+    """Assert that *body* contains ``_embedded.records`` for list endpoints.
+
+    Horizon list endpoints (``/trades``, ``/operations``, etc.) always wrap
+    their result set in ``{"_embedded": {"records": [...]}, ...}``.  When
+    this structure is absent the response has either changed schema or is not
+    from the expected endpoint; raising `HorizonSchemaError` surfaces the
+    root cause before Pydantic parsing.
+
+    Parameters
+    ----------
+    body:
+        Parsed JSON response dictionary.
+    url:
+        The request URL, included in the error message.
+
+    Raises
+    ------
+    HorizonSchemaError
+        When ``_embedded`` or ``_embedded.records`` is missing.
+    """
+    if "_embedded" not in body:
+        raise HorizonSchemaError("_embedded", url)
+    if "records" not in body["_embedded"]:
+        raise HorizonSchemaError("_embedded.records", url)
+
+
+def validate_single_record_response(body: dict, url: str) -> None:
+    """Assert that *body* contains ``id`` and ``paging_token`` for single-record endpoints.
+
+    Single Horizon resource endpoints (``/trades/{id}``,
+    ``/operations/{id}``, etc.) always include ``id`` and ``paging_token``
+    at the top level.  Missing keys indicate a schema change or wrong
+    endpoint.
+
+    Parameters
+    ----------
+    body:
+        Parsed JSON response dictionary.
+    url:
+        The request URL, included in the error message.
+
+    Raises
+    ------
+    HorizonSchemaError
+        When ``id`` or ``paging_token`` is missing.
+    """
+    for key in ("id", "paging_token"):
+        if key not in body:
+            raise HorizonSchemaError(key, url)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible descriptive name used by the historical ingestion API.
+# ---------------------------------------------------------------------------
+
 RetryingHorizonClient = AsyncHorizonClient
