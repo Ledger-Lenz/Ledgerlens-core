@@ -304,11 +304,15 @@ def get_with_retry(
     max_retries: int = 3,
     backoff_seconds: float = 1.0,
 ) -> httpx.Response:
-    """GET `url` via `client`, retrying transient failures with exponential backoff.
+    """GET ``url`` via ``client``, retrying transient failures with exponential backoff.
 
-    Retries on connection errors and on `_RETRYABLE_STATUS_CODES` responses.
-    Raises the underlying `httpx` exception (or calls `raise_for_status`) if
-    all attempts fail.
+    Retries on connection errors and on ``_RETRYABLE_STATUS_CODES`` responses.
+    Raises the underlying ``httpx`` exception (or calls ``raise_for_status``)
+    if all attempts fail.
+
+    .. note::
+        This is the legacy synchronous helper.  New code should use
+        :class:`RetryingHorizonClient` (async) for full rate-limit support.
     """
     last_exception: Exception | None = None
     endpoint = _normalise_endpoint(url)
@@ -365,7 +369,7 @@ def get_with_retry(
 
 
 class AsyncHorizonClient:
-    """Async HTTP client for Horizon with semaphore-bounded concurrency and retry.
+    """Async HTTP client for Horizon with token-bucket rate limiting and retry.
 
     Wraps `httpx.AsyncClient` with:
 
@@ -465,7 +469,19 @@ class AsyncHorizonClient:
     # ------------------------------------------------------------------
 
     async def get(self, path: str, params: dict | None = None) -> dict:
-        """Async GET, returning parsed JSON.
+        """Async GET returning parsed JSON.
+
+        Acquires the token-bucket rate limiter before each attempt and the
+        concurrency semaphore for the duration of the HTTP round-trip.
+        Retries transient failures with full-jitter backoff and respects any
+        ``Retry-After`` header on 429 responses.
+
+        Parameters
+        ----------
+        path:
+            Absolute URL or path relative to *base_url*.
+        params:
+            Optional query-string parameters.
 
         Acquires the concurrency semaphore for the duration of each HTTP
         round-trip (via `_make_request`).  Retries on
@@ -476,10 +492,11 @@ class AsyncHorizonClient:
         endpoint = _normalise_endpoint(url)
         last_exc: Exception | None = None
 
-        for attempt in range(self._max_retries + 1):
-            if attempt > 0:
-                delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)
-                await asyncio.sleep(delay)
+        for attempt in range(self.max_retries + 1):
+            # ----------------------------------------------------------
+            # Proactive rate limiting — acquire before sending
+            # ----------------------------------------------------------
+            await self._rate_limiter.acquire()
 
             start = time.perf_counter()
             try:
@@ -493,6 +510,22 @@ class AsyncHorizonClient:
                 if attempt < self._max_retries:
                     _metrics.http_retries_total.labels(reason="timeout").inc()
                 last_exc = exc
+                if attempt < self.max_retries:
+                    delay = compute_retry_delay(
+                        attempt,
+                        base_delay=self._base_retry_delay,
+                        max_delay=self._max_retry_delay,
+                    )
+                    logger.debug(
+                        "Transport error on %s (attempt %d/%d); retrying in %.2fs",
+                        url,
+                        attempt + 1,
+                        self.max_retries + 1,
+                        delay,
+                    )
+                    self.rate_limit_stats.retries_total += 1
+                    self.rate_limit_stats.total_wait_seconds += delay
+                    await asyncio.sleep(delay)
                 continue
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code not in _RETRYABLE_STATUS_CODES:
@@ -511,9 +544,50 @@ class AsyncHorizonClient:
             if response.status_code == 429:
                 _metrics.http_rate_limit_hits_total.inc()
 
-            if response.status_code not in _RETRYABLE_STATUS_CODES:
+            # ----------------------------------------------------------
+            # HTTP 429 — rate limited by Horizon
+            # ----------------------------------------------------------
+            if response.status_code == 429:
+                self.rate_limit_stats.rate_limit_hits += 1
+                raw_retry_after = parse_retry_after(response.headers)
+                # Clamp to max_retry_delay to prevent DoS via huge header
+                clamped_retry_after = (
+                    min(raw_retry_after, self._max_retry_delay)
+                    if raw_retry_after is not None
+                    else None
+                )
+                delay = compute_retry_delay(
+                    attempt,
+                    base_delay=self._base_retry_delay,
+                    max_delay=self._max_retry_delay,
+                    retry_after=clamped_retry_after,
+                )
+                logger.warning(
+                    "Rate limited by Horizon (attempt %d/%d); waiting %.2fs "
+                    "(Retry-After=%s)",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    delay,
+                    raw_retry_after,
+                )
+                if attempt < self.max_retries:
+                    self.rate_limit_stats.retries_total += 1
+                    self.rate_limit_stats.total_wait_seconds += delay
+                    await asyncio.sleep(delay)
+                    continue
+                # Final attempt also got 429 — fall through to exhaustion
+                last_exc = httpx.HTTPStatusError(
+                    f"HTTP 429 from {url}",
+                    request=response.request,
+                    response=response,
+                )
+                continue
+
+            # ----------------------------------------------------------
+            # Non-retriable 4xx — fail fast
+            # ----------------------------------------------------------
+            if response.status_code in _NON_RETRYABLE_STATUS_CODES:
                 response.raise_for_status()
-                return response.json()
 
             reason = "429" if response.status_code == 429 else "5xx"
             if attempt < self._max_retries:
@@ -525,8 +599,11 @@ class AsyncHorizonClient:
                 response=response,
             )
 
-        assert last_exc is not None
-        raise last_exc
+        raise MaxRetriesExceededError(url, self.max_retries + 1)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def probe_server_version(self) -> str:
         """Fetch the Horizon root endpoint and log the server version.
@@ -564,6 +641,7 @@ class AsyncHorizonClient:
         return version
 
     async def close(self) -> None:
+        """Close the underlying ``httpx.AsyncClient``."""
         await self._client.aclose()
 
     async def __aenter__(self) -> "AsyncHorizonClient":
