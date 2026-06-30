@@ -15,6 +15,10 @@ import time
 
 import httpx
 
+from ingestion.metrics import _normalise_endpoint, get_metrics
+
+_metrics = get_metrics()
+
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
@@ -32,16 +36,41 @@ def get_with_retry(
     all attempts fail.
     """
     last_exception: Exception | None = None
+    endpoint = _normalise_endpoint(url)
 
     for attempt in range(max_retries + 1):
+        start = time.perf_counter()
         try:
             response = client.get(url, params=params)
         except httpx.TransportError as exc:
+            duration = time.perf_counter() - start
+            _metrics.http_requests_total.labels(
+                endpoint=endpoint, method="GET", status_code="error"
+            ).inc()
+            _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+            if attempt < max_retries:
+                _metrics.http_retries_total.labels(reason="timeout").inc()
             last_exception = exc
         else:
+            duration = time.perf_counter() - start
+            _metrics.http_requests_total.labels(
+                endpoint=endpoint,
+                method="GET",
+                status_code=str(response.status_code),
+            ).inc()
+            _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+
+            if response.status_code == 429:
+                _metrics.http_rate_limit_hits_total.inc()
+
             if response.status_code not in _RETRYABLE_STATUS_CODES:
                 response.raise_for_status()
                 return response
+
+            reason = "429" if response.status_code == 429 else "5xx"
+            if attempt < max_retries:
+                _metrics.http_retries_total.labels(reason=reason).inc()
+
             last_exception = httpx.HTTPStatusError(
                 f"Retryable status {response.status_code} from {url}",
                 request=response.request,
@@ -92,6 +121,7 @@ class AsyncHorizonClient:
         with exponential backoff + jitter.
         """
         url = self._resolve_url(path)
+        endpoint = _normalise_endpoint(url)
         last_exc: Exception | None = None
 
         for attempt in range(self._max_retries + 1):
@@ -99,16 +129,39 @@ class AsyncHorizonClient:
                 delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)
                 await asyncio.sleep(delay)
 
+            start = time.perf_counter()
             try:
                 async with self._semaphore:
                     response = await self._client.get(url, params=params)
             except httpx.TransportError as exc:
+                duration = time.perf_counter() - start
+                _metrics.http_requests_total.labels(
+                    endpoint=endpoint, method="GET", status_code="error"
+                ).inc()
+                _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+                if attempt < self._max_retries:
+                    _metrics.http_retries_total.labels(reason="timeout").inc()
                 last_exc = exc
                 continue
+
+            duration = time.perf_counter() - start
+            _metrics.http_requests_total.labels(
+                endpoint=endpoint,
+                method="GET",
+                status_code=str(response.status_code),
+            ).inc()
+            _metrics.http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+
+            if response.status_code == 429:
+                _metrics.http_rate_limit_hits_total.inc()
 
             if response.status_code not in _RETRYABLE_STATUS_CODES:
                 response.raise_for_status()
                 return response.json()
+
+            reason = "429" if response.status_code == 429 else "5xx"
+            if attempt < self._max_retries:
+                _metrics.http_retries_total.labels(reason=reason).inc()
 
             last_exc = httpx.HTTPStatusError(
                 f"Retryable status {response.status_code} from {url}",

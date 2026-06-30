@@ -387,6 +387,25 @@ Exposes `/health`, `/scores`, `/scores/{wallet}`, `/scores/{wallet}/explain`,
 locally stored `RiskScore` records — a stand-in for `ledgerlens-api` during
 local development.
 
+#### Prometheus metrics
+
+The local API exposes a Prometheus-compatible metrics endpoint at `GET /metrics`
+(configurable via `METRICS_ENDPOINT`). It returns the standard text exposition
+format from `prometheus_client.generate_latest()`.
+
+```bash
+# Requires X-LedgerLens-Admin-Key when LEDGERLENS_ADMIN_API_KEY is set
+curl -H "X-LedgerLens-Admin-Key: your-admin-key" http://localhost:8000/metrics
+```
+
+All LedgerLens metric names are prefixed with `ledgerlens_`. See
+[docs/metrics.md](docs/metrics.md) for the full metric catalogue, label
+descriptions, and recommended alert thresholds.
+
+> **Security**: if `LEDGERLENS_ADMIN_API_KEY` is unset, `/metrics` is publicly
+> accessible and a WARNING is logged at startup. Always set an admin key in
+> production deployments to prevent operational data leakage.
+
 ##### SHAP Explanation Endpoint
 
 ```bash
