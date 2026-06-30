@@ -126,6 +126,30 @@ class Settings(BaseSettings):
     # Store as raw string; parsed tuple exposed via .evm_pool_addresses property
     evm_pool_addresses: str = ""
 
+    # Multi-provider failover pool (ISSUE-013)
+    # JSON-encoded list of provider objects.  Each object must have:
+    #   chain_id (int), rpc_url (str, https:// only), name (str),
+    #   priority (int, optional), max_requests_per_second (float, optional)
+    # Example:
+    #   EVM_PROVIDERS=[
+    #     {"chain_id": 1, "rpc_url": "https://mainnet.infura.io/v3/KEY",
+    #      "name": "infura", "priority": 0},
+    #     {"chain_id": 1, "rpc_url": "https://eth-mainnet.alchemyapi.io/v2/KEY",
+    #      "name": "alchemy", "priority": 1}
+    #   ]
+    # Leave empty ("[]") to rely solely on the legacy evm_rpc_* settings.
+    evm_providers: str = "[]"
+
+    # Maximum blocks behind the chain head before a provider's health is
+    # considered degraded (also triggers lag alerts when ALL providers lag).
+    evm_max_block_lag: int = 10
+
+    # Seconds between health probe cycles (eth_blockNumber polls).
+    evm_probe_interval_seconds: float = 15.0
+
+    # Consecutive failures before a provider's circuit breaker opens.
+    evm_circuit_breaker_threshold: int = 5
+
     # ── Runtime config cache TTL ──────────────────────────────────────────────
     runtime_config_ttl_seconds: int = 60
 
@@ -345,6 +369,99 @@ class Settings(BaseSettings):
                 raise ValueError(f"EVM_POOL_ADDRESSES malformed address: {addr!r}")
             if not Web3.is_checksum_address(addr):
                 raise ValueError(f"EVM_POOL_ADDRESSES non-checksummed address: {addr!r}")
+        return self
+
+    @field_validator("evm_max_block_lag", mode="before")
+    @classmethod
+    def valid_evm_max_block_lag(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("EVM_MAX_BLOCK_LAG must be >= 1")
+        return val
+
+    @field_validator("evm_probe_interval_seconds", mode="before")
+    @classmethod
+    def valid_evm_probe_interval(cls, v: object) -> object:
+        val = float(v)
+        if val <= 0:
+            raise ValueError("EVM_PROBE_INTERVAL_SECONDS must be positive")
+        return val
+
+    @field_validator("evm_circuit_breaker_threshold", mode="before")
+    @classmethod
+    def valid_evm_circuit_breaker_threshold(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("EVM_CIRCUIT_BREAKER_THRESHOLD must be >= 1")
+        return val
+
+    @model_validator(mode="after")
+    def valid_evm_providers_json(self) -> "Settings":
+        """Validate EVM_PROVIDERS is a well-formed JSON list of provider objects.
+
+        Each entry must have:
+          - ``chain_id``: positive integer
+          - ``rpc_url``: https:// URL (API keys in plaintext over http:// are rejected)
+          - ``name``: non-empty string
+
+        Optional fields: ``priority`` (int), ``max_requests_per_second`` (float > 0).
+        """
+        import json
+
+        raw = self.evm_providers.strip()
+        if not raw or raw == "[]":
+            return self
+
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"EVM_PROVIDERS is not valid JSON: {exc}") from exc
+
+        if not isinstance(entries, list):
+            raise ValueError("EVM_PROVIDERS must be a JSON array")
+
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ValueError(f"EVM_PROVIDERS[{i}] must be a JSON object")
+
+            # chain_id
+            chain_id = entry.get("chain_id")
+            if not isinstance(chain_id, int) or chain_id <= 0:
+                raise ValueError(
+                    f"EVM_PROVIDERS[{i}].chain_id must be a positive integer, "
+                    f"got {chain_id!r}"
+                )
+
+            # rpc_url — must be https:// to protect embedded API keys
+            rpc_url = entry.get("rpc_url", "")
+            if not isinstance(rpc_url, str) or not rpc_url:
+                raise ValueError(f"EVM_PROVIDERS[{i}].rpc_url must be a non-empty string")
+            if not rpc_url.startswith("https://"):
+                raise ValueError(
+                    f"EVM_PROVIDERS[{i}].rpc_url must use https:// scheme. "
+                    f"HTTP endpoints transmit API keys in plaintext."
+                )
+
+            # name
+            name = entry.get("name", "")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"EVM_PROVIDERS[{i}].name must be a non-empty string"
+                )
+
+            # optional priority
+            if "priority" in entry:
+                if not isinstance(entry["priority"], int):
+                    raise ValueError(f"EVM_PROVIDERS[{i}].priority must be an integer")
+
+            # optional max_requests_per_second
+            if "max_requests_per_second" in entry:
+                mrps = entry["max_requests_per_second"]
+                if not isinstance(mrps, (int, float)) or float(mrps) <= 0:
+                    raise ValueError(
+                        f"EVM_PROVIDERS[{i}].max_requests_per_second must be > 0"
+                    )
+
         return self
 
     # ── Backward-compat properties ────────────────────────────────────────────

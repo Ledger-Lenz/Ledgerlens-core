@@ -244,6 +244,28 @@ After each pipeline run, all `RiskScore` records above `RISK_SCORE_THRESHOLD` ar
 | `SOROBAN_CIRCUIT_BREAKER_THRESHOLD` | Consecutive failures before the circuit opens (default: 5)                          |
 | `SOROBAN_CIRCUIT_RESET_SECONDS`     | Seconds until the circuit resets (default: 300)                                     |
 
+#### EVM Multi-Provider Configuration
+
+| Variable                          | Default  | Purpose                                                                                      |
+| --------------------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `EVM_PROVIDERS`                   | `[]`     | JSON array of provider objects for multi-chain failover (see format below)                   |
+| `EVM_MAX_BLOCK_LAG`               | `10`     | Blocks behind chain head before a provider's health score is penalised; triggers lag alerts when _all_ providers exceed this on a chain |
+| `EVM_PROBE_INTERVAL_SECONDS`      | `15.0`   | Seconds between `eth_blockNumber` health probe cycles                                        |
+| `EVM_CIRCUIT_BREAKER_THRESHOLD`   | `5`      | Consecutive failures before a provider's circuit opens and it is skipped                     |
+
+`EVM_PROVIDERS` format — a JSON array where each entry must have `chain_id` (int), `rpc_url` (**https:// only**), and `name` (string). Optional fields: `priority` (int, lower = tried first; default 0) and `max_requests_per_second` (float; default 10.0).
+
+```bash
+EVM_PROVIDERS=[
+  {"chain_id": 1, "rpc_url": "https://mainnet.infura.io/v3/YOUR_KEY", "name": "infura", "priority": 0},
+  {"chain_id": 1, "rpc_url": "https://eth-mainnet.alchemyapi.io/v2/YOUR_KEY", "name": "alchemy", "priority": 1},
+  {"chain_id": 8453, "rpc_url": "https://base-mainnet.infura.io/v3/YOUR_KEY", "name": "infura-base", "priority": 0},
+  {"chain_id": 137, "rpc_url": "https://polygon-mainnet.infura.io/v3/YOUR_KEY", "name": "infura-polygon", "priority": 0}
+]
+```
+
+> **Security**: `rpc_url` must use `https://` — `http://` endpoints transmit API keys in plaintext and are rejected at startup with a `ValueError`. API keys embedded in URLs (e.g. `infura.io/v3/SECRET`) are masked in all log output and never appear in error messages. When `EVM_PROVIDERS` is empty (`[]`), the pool falls back to the legacy `EVM_RPC_ETHEREUM` / `EVM_RPC_BASE` / `EVM_RPC_POLYGON` single-endpoint settings.
+
 **Transaction lifecycle**:
 
 1. **Build** — create an `InvokeContractFunction` operation for `submit_score(wallet, asset_pair, score, timestamp)`
