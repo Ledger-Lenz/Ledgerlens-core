@@ -1,0 +1,112 @@
+# LedgerLens Trade Filter Pipeline Configuration — Example
+# =========================================================
+# Copy this file to config/filter_config.yaml and edit to suit your deployment.
+#
+# SCHEMA VERSION
+# --------------
+# version: "1.0"   ← only supported value; reserved for future breaking changes.
+#
+# FILTER ORDER
+# ------------
+# Filters are applied in the order listed below.  A trade must pass ALL
+# enabled filters (logical AND).  The pipeline short-circuits on the first
+# rejection — place cheap, high-rejection filters first.
+#
+# HOT-RELOAD
+# ----------
+# Changes to this file are picked up automatically within
+# FILTER_CONFIG_RELOAD_INTERVAL_SECONDS (default: 60 s).
+# If validation fails the previous valid config is retained; the pipeline
+# is never left without filters.
+#
+# SECURITY
+# --------
+# The `excluded_accounts` list reveals which accounts have been vetted as
+# known-clean. Set file permissions to 0o640 and restrict read access to the
+# service user.
+#
+# See docs/filter-pipeline.md for full documentation.
+
+version: "1.0"
+
+filters:
+
+  # ── 1. Asset Pair Whitelist ───────────────────────────────────────────────
+  # ONLY allow trades on the listed pairs. Empty list = allow all (pass-through).
+  # Use this to focus detection on the most liquid, wash-trade-prone pairs.
+  #
+  # Pair format: "BASE_CODE/COUNTER_CODE" using asset codes only (not issuers).
+  # Example native XLM pair:         "XLM/USDC"
+  # Example credit-vs-credit pair:   "USDC/BTC"
+  #
+  # Deployment guidance:
+  #   development   → empty list (allow all)
+  #   staging       → top-20 pairs by volume
+  #   production    → curated list or empty (disable whitelist, use blacklist)
+  - type: asset_pair_whitelist
+    enabled: true
+    pairs:
+      - "XLM/USDC"
+      - "XLM/BTC"
+      - "XLM/yXLM"
+      - "USDC/BTC"
+      - "AQUA/XLM"
+
+  # ── 2. Asset Pair Blacklist ───────────────────────────────────────────────
+  # REJECT trades on the listed pairs unconditionally.
+  # Use for known spam/test pairs.
+  #
+  # Blacklist takes precedence over the whitelist if both list the same pair
+  # (the blacklist check runs after the whitelist in this example config).
+  - type: asset_pair_blacklist
+    enabled: true
+    pairs:
+      - "TEST/XLM"
+      - "DEMO/XLM"
+      - "SPAM/USDC"
+      - "TEST/USDC"
+
+  # ── 3. Minimum Volume Filter ──────────────────────────────────────────────
+  # Reject dust trades below the threshold. Eliminates bot-created micro-trades
+  # that distort Benford's Law analysis.
+  #
+  # min_volume supports full Decimal precision. "0" disables the filter.
+  # volume_field: base_amount (default) | counter_amount | price
+  #
+  # Deployment guidance:
+  #   conservative  → "0.001" XLM equivalent (catches sub-cent dust)
+  #   moderate      → "0.01"  (recommended starting point)
+  #   aggressive    → "1.0"   (only process meaningful trades)
+  - type: minimum_volume
+    enabled: true
+    min_volume: "0.01"
+    volume_field: base_amount
+
+  # ── 4. Asset Type Filter ──────────────────────────────────────────────────
+  # Restrict to specific Stellar asset types.
+  # Removing credit_alphanum12 excludes all 5-12 character code assets —
+  # useful when the detection scope is limited to short-code assets.
+  #
+  # Valid types: native | credit_alphanum4 | credit_alphanum12
+  - type: asset_type
+    enabled: true
+    allowed_types:
+      - native
+      - credit_alphanum4
+
+  # ── 5. Account Exclusion Filter ───────────────────────────────────────────
+  # Reject trades where either party is a known-clean account.
+  # Add verified institutional market makers, Stellar Foundation accounts,
+  # and DEX aggregator bots that have been manually audited.
+  #
+  # All keys must be valid Stellar public keys (G… format, 56 characters).
+  # Invalid keys raise a ValueError at config load time to catch typos.
+  #
+  # SECURITY: this list is operationally sensitive. Protect this file with
+  # appropriate permissions (chmod 640 config/filter_config.yaml).
+  - type: account_exclusion
+    enabled: true
+    excluded_accounts:
+      - "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGCHBZVM1PBWQ5FIWM77V4"  # Stellar Foundation
+      # Add additional verified accounts below:
+      # - "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"  # Description
