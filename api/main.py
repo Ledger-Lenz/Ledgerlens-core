@@ -168,6 +168,21 @@ async def _lifespan(application: FastAPI):
     """Load trained models at startup; drain requests and clean up on shutdown."""
     global _models, _shutting_down
     configure_tracing()
+
+    # ── Metrics startup check ─────────────────────────────────────────────
+    # Warn operators if /metrics is exposed without an admin key — metrics can
+    # reveal operational intelligence (queue depths, error rates) that should
+    # not be publicly accessible in production deployments.
+    try:
+        from config.settings import settings as _s  # noqa: PLC0415
+        if getattr(_s, "metrics_enabled", True) and not _s.ledgerlens_admin_api_key:
+            logger.warning(
+                "SECURITY WARNING: METRICS_ENABLED=True but LEDGERLENS_ADMIN_API_KEY "
+                "is unset. The /metrics endpoint is publicly accessible and may expose "
+                "operational intelligence. Set LEDGERLENS_ADMIN_API_KEY to protect it."
+            )
+    except Exception:
+        pass
     try:
         from detection.model_inference import load_models
         _models = load_models(settings.model_dir)
@@ -788,6 +803,58 @@ def stream_status() -> dict:
         "active_wallets": _stream_status["active_wallets"],
         "last_trade_at": _stream_status["last_trade_at"],
     }
+
+
+@app.get(
+    "/metrics",
+    tags=["System"],
+    summary="Prometheus metrics",
+    description=(
+        "Expose all LedgerLens Prometheus metrics in the standard text exposition "
+        "format. Requires the ``X-LedgerLens-Admin-Key`` header when "
+        "``LEDGERLENS_ADMIN_API_KEY`` is configured. "
+        "Returns ``503`` when ``METRICS_ENABLED=False``."
+    ),
+    include_in_schema=True,
+)
+async def prometheus_metrics(
+    _auth: None = Depends(require_admin_key),
+) -> Response:
+    """Return Prometheus metrics in text exposition format.
+
+    Protected by ``require_admin_key`` so that operational intelligence
+    (queue depths, error rates, request counts) is not publicly accessible.
+    When ``LEDGERLENS_ADMIN_API_KEY`` is unset the dependency is a no-op and
+    the endpoint is accessible without authentication — a startup WARNING is
+    logged in that case.
+
+    Returns ``503`` when ``METRICS_ENABLED=False`` in settings.
+    """
+    from fastapi.responses import Response as _Response  # noqa: PLC0415
+
+    try:
+        from config.settings import settings as _s  # noqa: PLC0415
+        if not getattr(_s, "metrics_enabled", True):
+            return _Response(
+                content="# Metrics collection is disabled (METRICS_ENABLED=False)\n",
+                status_code=503,
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+    except Exception:
+        pass
+
+    try:
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest  # noqa: PLC0415
+        return _Response(
+            content=generate_latest(),
+            media_type=CONTENT_TYPE_LATEST,
+        )
+    except ImportError:
+        return _Response(
+            content="# prometheus_client is not installed\n",
+            status_code=503,
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
 
 @v1_router.get(

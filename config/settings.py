@@ -174,6 +174,16 @@ class Settings(BaseSettings):
     path_payment_loader_enabled: bool = True
     path_payment_fetch_effects: bool = True
 
+    # ── Prometheus metrics ────────────────────────────────────────────────────
+    # Set to False to disable all prometheus_client metric collection.  When
+    # disabled, ingestion/metrics.py returns a _NoOpCollector and GET /metrics
+    # returns HTTP 503.  Useful in lightweight environments where prometheus_client
+    # is not installed.
+    metrics_enabled: bool = True
+    # URL path at which the Prometheus text metrics are served by the local API.
+    # Must start with "/" and contain no dynamic segments.
+    metrics_endpoint: str = "/metrics"
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -324,7 +334,15 @@ class Settings(BaseSettings):
             raise ValueError("FEATURE_ARCHIVE_CUTOFF_DAYS must be >= 1")
         return v
 
-    @model_validator(mode="after")
+    @field_validator("metrics_endpoint", mode="before")
+    @classmethod
+    def valid_metrics_endpoint(cls, v: object) -> object:
+        s = str(v).strip()
+        if not s.startswith("/"):
+            raise ValueError("METRICS_ENDPOINT must start with '/'")
+        if "{" in s or "}" in s:
+            raise ValueError("METRICS_ENDPOINT must not contain dynamic path segments")
+        return s    @model_validator(mode="after")
     def feature_archive_dir_no_traversal(self) -> "Settings":
         cwd = Path.cwd().resolve()
         candidate = Path(self.feature_archive_dir).expanduser()
