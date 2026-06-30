@@ -83,7 +83,22 @@ class AlertDeduplicator:
         return conn
 
     def process(self, wallet: str, score: float) -> list[dict]:
-        """Process a new score observation for wallet. Returns list of emitted events."""
+        """Process a new score observation for wallet. Returns list of emitted events.
+
+        Returns an empty list without updating alert state when an active
+        suppression rule exists for the wallet.
+        """
+        from detection.suppressions import is_suppressed
+        rule = is_suppressed(wallet, db_path=self._db_path)
+        if rule:
+            logger.info(
+                "Alert suppressed: wallet=%s rule_id=%d reason=%s",
+                wallet,
+                rule["id"],
+                rule["reason"],
+            )
+            return []
+
         events: list[dict] = []
         now = datetime.now(timezone.utc).isoformat()
 

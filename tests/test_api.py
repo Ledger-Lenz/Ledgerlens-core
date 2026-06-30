@@ -94,7 +94,9 @@ def _score(
 def test_health(client, tmp_path, monkeypatch):
     """Healthy path: DB reachable and all model stub files present → 200 all-ok."""
     import config.settings as settings_module
+    import ingestion.horizon_streamer as horizon_streamer
     from detection.model_inference import _MODEL_FILENAMES
+    from utils.circuit_breaker import CircuitBreaker
 
     model_dir = tmp_path / "models"
     model_dir.mkdir()
@@ -102,6 +104,9 @@ def test_health(client, tmp_path, monkeypatch):
         (model_dir / filename).write_bytes(b"stub")
 
     object.__setattr__(settings_module.settings, "model_dir", str(model_dir))
+    # Reset circuit breaker state so test isolation is guaranteed
+    closed_circuit = CircuitBreaker(name="horizon_test", failure_threshold=5, recovery_timeout=60)
+    monkeypatch.setattr(horizon_streamer, "horizon_circuit", closed_circuit)
 
     response = client.get("/v1/health")
     assert response.status_code == 200

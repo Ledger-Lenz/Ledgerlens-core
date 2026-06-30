@@ -12,11 +12,9 @@ committing to a hard model cutover.
 import logging
 import os
 import sqlite3
-import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.shadow_scoring")
 

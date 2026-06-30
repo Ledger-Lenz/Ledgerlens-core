@@ -177,7 +177,7 @@ def test_evaluate_robustness_returns_expected_keys():
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
     results = train_ensemble(df, adversarial_augment=False, calibrate=False)
-    models = {k: v["model"] for k, v in results.items()}
+    models = {k: v["model"] for k, v in results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     robustness = evaluate_robustness(models, n_trials=1, seed=99)
     assert "baseline" in robustness

@@ -30,7 +30,6 @@ Feedback collection loop architecture:
   4. Degradation triggers retraining and fires a webhook ``model_degradation`` event
 """
 
-import json
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -595,6 +594,28 @@ def export_psi_heatmap(output_path: Path, days_back: int = 90, db_path: str | No
 # ---------------------------------------------------------------------------
 # Performance monitoring — Issue-110
 # ---------------------------------------------------------------------------
+
+def load_production_features(
+    store: "DualTierFeatureStore",  # noqa: F821 — avoid circular import at module level
+    since_days: int = 30,
+) -> pd.DataFrame:
+    """Load recent production feature snapshots from a :class:`DualTierFeatureStore`.
+
+    Replaces direct SQLite queries in drift analysis workflows so that the caller
+    transparently receives data from both the SQLite hot tier and the Parquet cold
+    tier without needing to know which tier holds a particular record.
+
+    Args:
+        store: A :class:`~detection.feature_store.DualTierFeatureStore` instance.
+        since_days: How many days of history to retrieve.
+
+    Returns:
+        DataFrame with columns: wallet, asset_pair, feature_name,
+        feature_value, recorded_at.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    return store.query(since=since)
+
 
 _VALID_EVIDENCE_URL_SCHEMES = frozenset({"https"})
 _MAX_EVIDENCE_URL_LENGTH = 500

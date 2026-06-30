@@ -15,29 +15,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def _split_csv(raw: str) -> tuple[str, ...]:
     return tuple(s.strip() for s in raw.split(",") if s.strip())
 
-    benford_mad_threshold: float = field(default_factory=lambda: float(os.getenv("BENFORD_MAD_THRESHOLD", "0.015")))
-    benford_min_sample_count: int = field(default_factory=lambda: int(os.getenv("BENFORD_MIN_SAMPLE_COUNT", "30")))
-    benford_max_window_days: int = field(default_factory=lambda: int(os.getenv("BENFORD_MAX_WINDOW_DAYS", "90")))
-    # Causal feature selection (PC algorithm)
-    causal_independence_alpha: float = field(
-        default_factory=lambda: float(os.getenv("CAUSAL_INDEPENDENCE_ALPHA", "0.01"))
-    )
-    causal_max_conditioning_size: int = field(
-        default_factory=lambda: int(os.getenv("CAUSAL_MAX_CONDITIONING_SIZE", "3"))
-    )
-    _default_risk_score_threshold: int = field(default_factory=lambda: int(os.getenv("RISK_SCORE_THRESHOLD", "70")))
-    COMMITTEE_QUORUM: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_QUORUM", "3")))
-    COMMITTEE_VOTE_DEADLINE_DAYS: int = field(default_factory=lambda: int(os.getenv("COMMITTEE_VOTE_DEADLINE_DAYS", "14")))
-    ensemble_weight_rf: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_RF", "0.25")))
-    ensemble_weight_xgb: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_XGB", "0.50")))
-    ensemble_weight_lgbm: float = field(default_factory=lambda: float(os.getenv("ENSEMBLE_WEIGHT_LGBM", "0.25")))
-    temporal_weight: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_WEIGHT", "0.3")))
-    # Sequence model settings
-    temporal_model_type: str = field(default_factory=lambda: os.getenv("TEMPORAL_MODEL_TYPE", "lstm"))
-    temporal_max_seq_len: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_MAX_SEQ_LEN", "200")))
-    temporal_lstm_hidden_dim: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_LSTM_HIDDEN_DIM", "64")))
-    _runtime_cache_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("RUNTIME_CONFIG_TTL_SECONDS", "60")))
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -152,6 +129,27 @@ class Settings(BaseSettings):
     # ── Runtime config cache TTL ──────────────────────────────────────────────
     runtime_config_ttl_seconds: int = 60
 
+    # ── MLflow integration ────────────────────────────────────────────────────
+    mlflow_tracking_uri: str = ""
+    mlflow_experiment_name: str = "ledgerlens-training"
+    mlflow_tracking_enabled: bool = False
+
+    # ── Performance monitoring ────────────────────────────────────────────────
+    performance_min_feedback_samples: int = 20
+    performance_monitoring_window_days: int = 30
+
+    # ── Feature Store Archival ────────────────────────────────────────────────
+    feature_archive_dir: str = "./feature_archive"
+    feature_archive_cutoff_days: int = 30
+
+    # ── Bridge / cross-chain verification ────────────────────────────────────
+    bridge_verify_receipt_timeout_seconds: int = 30
+    bridge_verify_sample_rate: float = 1.0
+
+    # ── Path payment loader ───────────────────────────────────────────────────
+    path_payment_loader_enabled: bool = True
+    path_payment_fetch_effects: bool = True
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -191,7 +189,7 @@ class Settings(BaseSettings):
             raise ValueError("SOROBAN_CIRCUIT_BREAKER_THRESHOLD must be >= 1")
         return v
 
-    @field_validator("compliance_sar_min_score", mode="before")
+    @field_validator("compliance_sar_min_score", mode="before", check_fields=False)
     @classmethod
     def valid_sar_min_score(cls, v: object) -> object:
         val = int(v)
@@ -199,7 +197,7 @@ class Settings(BaseSettings):
             raise ValueError(f"COMPLIANCE_SAR_MIN_SCORE {val} must be 0-100")
         return v
 
-    @field_validator("compliance_export_rate_limit_per_hour", mode="before")
+    @field_validator("compliance_export_rate_limit_per_hour", mode="before", check_fields=False)
     @classmethod
     def valid_export_rate_limit(cls, v: object) -> object:
         if int(v) < 1:
@@ -295,6 +293,29 @@ class Settings(BaseSettings):
             )
         return self
 
+    @field_validator("feature_archive_cutoff_days", mode="before")
+    @classmethod
+    def valid_archive_cutoff(cls, v: object) -> object:
+        if int(v) < 1:
+            raise ValueError("FEATURE_ARCHIVE_CUTOFF_DAYS must be >= 1")
+        return v
+
+    @model_validator(mode="after")
+    def feature_archive_dir_no_traversal(self) -> "Settings":
+        cwd = Path.cwd().resolve()
+        candidate = Path(self.feature_archive_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = (cwd / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        try:
+            candidate.relative_to(cwd)
+        except ValueError as exc:
+            raise ValueError(
+                "FEATURE_ARCHIVE_DIR must be within the application working directory"
+            ) from exc
+        return self
+
     @model_validator(mode="after")
     def checkpoint_path_is_inside_data_directory(self) -> "Settings":
         data_root = Path(self.data_dir).expanduser().resolve()
@@ -332,6 +353,10 @@ class Settings(BaseSettings):
     def db_path(self) -> str:
         return self.ledgerlens_db_path
 
+    @db_path.setter
+    def db_path(self, value: str) -> None:
+        object.__setattr__(self, "ledgerlens_db_path", value)
+
     @property
     def score_contract_id(self) -> str:
         return self.ledgerlens_score_contract_id
@@ -355,6 +380,10 @@ class Settings(BaseSettings):
     @property
     def model_signing_key(self) -> str:
         return self.ledgerlens_model_signing_key
+
+    @model_signing_key.setter
+    def model_signing_key(self, value: str) -> None:
+        object.__setattr__(self, "ledgerlens_model_signing_key", value)
 
     @property
     def _default_risk_score_threshold(self) -> int:

@@ -31,7 +31,6 @@ from __future__ import annotations
 import base64
 import logging
 import uuid
-from typing import Iterator
 
 import numpy as np
 import pandas as pd
@@ -225,7 +224,6 @@ class FLClient:
         ValueError
             If data adapter returns no data.
         """
-        import pandas as pd
         
         protocol = self._ensure_protocol()
         

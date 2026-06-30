@@ -122,16 +122,17 @@ def test_build_ring_membership_index_empty():
 
 
 def test_build_ring_membership_index_prefers_larger_ring():
-    graph = nx.DiGraph()
-    graph.add_edge("A", "B", total_volume=10.0, trade_count=1, timestamps=[])
-    graph.add_edge("B", "C", total_volume=10.0, trade_count=1, timestamps=[])
-    graph.add_edge("C", "A", total_volume=10.0, trade_count=1, timestamps=[])
-    graph.add_edge("A", "D", total_volume=5.0, trade_count=1, timestamps=[])
-    graph.add_edge("D", "A", total_volume=5.0, trade_count=1, timestamps=[])
-    rings = find_wash_rings(graph)
-    membership = build_ring_membership_index(rings, graph=graph)
-    for account in ["A", "B", "C"]:
-        assert membership[account]["wash_ring_size"] == 3.0
+    # Build ring list directly so "A" appears in a ring-of-3 and a ring-of-2.
+    # build_ring_membership_index must assign A the largest ring (size 3).
+    rings = [
+        {"accounts": ["A", "B", "C"], "cycle_volume": 30.0, "timing_tightness": 0.0},
+        {"accounts": ["A", "D"], "cycle_volume": 10.0, "timing_tightness": 0.0},
+    ]
+    membership = build_ring_membership_index(rings)
+    assert membership["A"]["wash_ring_size"] == 3.0
+    assert membership["B"]["wash_ring_size"] == 3.0
+    assert membership["C"]["wash_ring_size"] == 3.0
+    assert membership["D"]["wash_ring_size"] == 2.0
 
 
 def test_build_transaction_graph_aggregates_edges_and_self_loops():

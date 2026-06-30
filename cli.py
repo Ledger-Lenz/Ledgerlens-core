@@ -12,9 +12,18 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import sys
 import time
 import tomllib
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomllib  # type: ignore[no-redef]
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
 
 import typer
 
@@ -26,7 +35,6 @@ except Exception:
     __version__ = "0.0.0"
 
 app = typer.Typer(help="LedgerLens detection engine CLI")
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.cli")
 
 
@@ -80,6 +88,55 @@ def generate_data(
     logger.info("Wrote %d trades, %d events, %d labelled accounts to %s", len(trades), len(events), len(labels), out_dir)
 
 
+@app.command("generate-adversarial")
+def generate_adversarial(
+    strategy: str = typer.Option(
+        ...,
+        help="Evasion strategy: benford_camouflage | timing_jitter | graph_fragmentation | cross_pair_rotation",
+    ),
+    out_dir: str = typer.Option("./data/adversarial", help="Directory to write the adversarial CSV to"),
+    n_wallets: int = typer.Option(50, help="Number of adversarial wash wallets to generate"),
+    n_trades: int = typer.Option(200, help="Number of adversarial trades to generate"),
+    seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    label_wash: bool = typer.Option(
+        True,
+        "--label-wash/--label-clean",
+        help="Label adversarial trades as wash (1) or override all labels to 0 (--label-clean). "
+             "Unlabelled adversarial data must not silently enter training datasets.",
+    ),
+) -> None:
+    """Generate a labelled adversarial feature dataset with a specific evasion strategy.
+
+    Writes a CSV to OUT_DIR/adversarial_{STRATEGY}.csv with FEATURE_NAMES columns
+    and a 'label' column (1 = wash, 0 = clean). Use --label-clean to produce a
+    baseline dataset with all labels zeroed for false-positive rate benchmarking.
+    """
+    import os
+
+    from ingestion.adversarial_data import AdversarialDataset
+
+    dataset = AdversarialDataset().build(
+        strategy=strategy, n_wallets=n_wallets, n_trades=n_trades, seed=seed
+    )
+
+    if not label_wash:
+        dataset = dataset.copy()
+        dataset["label"] = 0
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"adversarial_{strategy}.csv")
+    dataset.to_csv(out_path, index=False)
+
+    n_wash = int((dataset["label"] == 1).sum())
+    logger.info(
+        "Wrote %d accounts (%d wash-labelled, %d normal) to %s",
+        len(dataset),
+        n_wash,
+        len(dataset) - n_wash,
+        out_path,
+    )
+
+
 @app.command("train")
 def train(
     n_normal_accounts: int = typer.Option(60, help="Number of normal (non-wash) accounts"),
@@ -115,7 +172,7 @@ def train(
 
     results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
-        if name == "_calib":
+        if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
             continue
         logger.info("%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
 
@@ -124,6 +181,34 @@ def train(
         coverage = results["_calib"].get("coverage_avg", 0.0)
         logger.info("Conformal calibration complete (avg coverage=%.4f)", coverage)
     logger.info("Saved models to %s", settings.model_dir)
+
+
+@app.command("archive-features")
+def archive_features(
+    cutoff_days: int = typer.Option(
+        0, help="Archive rows older than this many days (0 = use FEATURE_ARCHIVE_CUTOFF_DAYS setting)"
+    ),
+) -> None:
+    """Archive feature distribution snapshots older than cutoff_days to Parquet cold tier.
+
+    Reads qualifying rows from the ``feature_distribution_snapshots`` SQLite table,
+    writes them to date-partitioned Parquet files under FEATURE_ARCHIVE_DIR, then
+    deletes them from SQLite. Safe to interrupt: Parquet is written before SQLite
+    delete, so no data is lost on failure.
+    """
+    from pathlib import Path
+
+    from config.settings import settings
+    from detection.feature_store import FeatureStoreArchiver
+
+    effective_cutoff = cutoff_days if cutoff_days > 0 else settings.feature_archive_cutoff_days
+    archive_dir = Path(settings.feature_archive_dir)
+    archiver = FeatureStoreArchiver(db_path=settings.db_path, archive_dir=archive_dir)
+    n = archiver.archive_old_features(cutoff_days=effective_cutoff)
+    if n:
+        typer.echo(f"Archived {n} rows (cutoff={effective_cutoff} days) → {archive_dir}")
+    else:
+        typer.echo(f"No rows older than {effective_cutoff} days found; nothing to archive.")
 
 
 @app.command("retrain-check")
@@ -149,6 +234,7 @@ def retrain_check(
     import json
     import os
     from datetime import datetime
+    from pathlib import Path
 
     from config.settings import settings
     from detection.dataset import build_training_dataset
@@ -166,6 +252,20 @@ def retrain_check(
     from detection.model_training import save_models, train_ensemble
     from detection.storage import save_drift_report, save_retrain_run
     from ingestion.synthetic_data import generate_synthetic_dataset
+
+    # Run archival before drift check to keep hot tier lean
+    try:
+        from detection.feature_store import FeatureStoreArchiver
+
+        _archiver = FeatureStoreArchiver(
+            db_path=settings.db_path,
+            archive_dir=Path(settings.feature_archive_dir),
+        )
+        _archived = _archiver.archive_old_features(cutoff_days=settings.feature_archive_cutoff_days)
+        if _archived:
+            logger.info("retrain-check: archived %d feature snapshot rows before drift check", _archived)
+    except Exception as _exc:
+        logger.warning("retrain-check: archival step failed (%s); continuing without archival", _exc)
 
     # Read training metadata
     metadata_path = os.path.join(settings.model_dir, "training_metadata.json")
@@ -245,7 +345,7 @@ def retrain_check(
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     new_results = train_ensemble(df)
-    model_names = [k for k in new_results if k != "_calib"]
+    model_names = [k for k in new_results if not k.startswith("_") and isinstance(new_results[k], dict) and "auc_roc" in new_results[k]]
     for name in model_names:
         result = new_results[name]
         logger.info("New %s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f", name, result["auc_roc"], result["pr_auc"], result["f1"])
@@ -368,15 +468,42 @@ def retrain_check(
     logger.info("Wrote drift report to %s", report_path)
 
 
-@app.command("score")
+score_app = typer.Typer(help="Scoring commands")
+app.add_typer(score_app, name="score")
+
+
+@score_app.callback(invoke_without_command=True)
 def score(
+    ctx: typer.Context,
     no_submit: bool = typer.Option(False, "--no-submit", help="Run scoring without on-chain submission"),
     use_async: bool = typer.Option(False, "--async", help="Use async pipeline for concurrent I/O and batched inference"),
+    bootstrap_threshold: int = typer.Option(
+        None,
+        "--bootstrap-threshold",
+        help="Override BENFORD_BOOTSTRAP_THRESHOLD: wallets with fewer transactions than this use Monte Carlo bootstrap p-values instead of asymptotic chi-square.",
+    ),
+    bootstrap_samples: int = typer.Option(
+        None,
+        "--bootstrap-samples",
+        help="Override BENFORD_BOOTSTRAP_SAMPLES: number of bootstrap replicates for small-sample p-value estimation.",
+    ),
 ) -> None:
     """Run the detection pipeline against live Horizon data and store the resulting scores."""
+    if ctx.invoked_subcommand is not None:
+        return
     import asyncio
 
     import run_pipeline
+
+    if bootstrap_threshold is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_THRESHOLD = bootstrap_threshold
+        logger.info("Bootstrap threshold overridden to %d", bootstrap_threshold)
+
+    if bootstrap_samples is not None:
+        import detection.benford_engine as _be
+        _be.BENFORD_BOOTSTRAP_SAMPLES = bootstrap_samples
+        logger.info("Bootstrap samples overridden to %d", bootstrap_samples)
 
     if use_async:
         scores = asyncio.run(run_pipeline.async_run())
@@ -384,6 +511,154 @@ def score(
         scores = run_pipeline.run(no_submit=no_submit)
     for s in scores:
         logger.info("%s %s -> score=%d (benford=%s, ml=%s, confidence=%d)", s.wallet, s.asset_pair, s.score, s.benford_flag, s.ml_flag, s.confidence)
+
+
+_STELLAR_RE = __import__("re").compile(r"^G[A-Z2-7]{55}$")
+
+
+@score_app.command("bulk")
+def score_bulk(
+    input: Path = typer.Option(..., "--input", "-i", help="Input CSV: one Stellar wallet per row (wallet column required)"),
+    output: Path = typer.Option(..., "--output", "-o", help="Output CSV for scored results"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=16, help="Parallel workers (max 16)"),
+    min_score: int = typer.Option(0, "--min-score", help="Exclude results with score below this value"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate input file and report wallet count without scoring"),
+) -> None:
+    """Score a CSV list of Stellar wallets against the local detection pipeline.
+
+    Input CSV must have a 'wallet' column (one address per row). An optional
+    'label' column is passed through to the output unchanged.  Malformed
+    addresses are skipped with a warning written to stderr.
+
+    Output columns: wallet, score, confidence_lower, confidence_upper,
+    top_features, scored_at, label (if present).
+    """
+    import csv
+    import json
+    import sys
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime, timezone
+
+    import pandas as pd
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
+
+    from config.settings import settings as cfg
+    from detection.model_inference import load_models, score_with_uncertainty
+    from detection.storage import get_feature_vector, init_db
+
+    # ── 1. Read input CSV ────────────────────────────────────────────────
+    if not input.exists():
+        typer.echo(f"Error: input file not found: {input}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        df_in = pd.read_csv(input)
+    except Exception as exc:
+        typer.echo(f"Error reading CSV: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if "wallet" not in df_in.columns:
+        typer.echo("Error: input CSV must have a 'wallet' column", err=True)
+        raise typer.Exit(1)
+
+    has_label = "label" in df_in.columns
+    raw_rows = df_in.to_dict("records")
+
+    # ── 2. Validate addresses ────────────────────────────────────────────
+    valid: list[dict] = []
+    skipped = 0
+    for row in raw_rows:
+        wallet = str(row.get("wallet", "")).strip()
+        if not _STELLAR_RE.match(wallet):
+            typer.echo(f"WARNING: skipping malformed address: {wallet!r}", err=True)
+            skipped += 1
+        else:
+            valid.append(row)
+
+    typer.echo(f"Loaded {len(valid)} valid wallet(s) ({skipped} skipped).")
+
+    if dry_run:
+        typer.echo("[dry-run] Input validation complete — no scoring performed.")
+        return
+
+    if not valid:
+        typer.echo("No valid wallets to score.", err=True)
+        raise typer.Exit(1)
+
+    # ── 3. Load models once ──────────────────────────────────────────────
+    try:
+        models = load_models(cfg.model_dir)
+    except Exception as exc:
+        typer.echo(f"Error loading models: {exc}", err=True)
+        raise typer.Exit(1)
+
+    # ── 4. Initialise DB ─────────────────────────────────────────────────
+    init_db(cfg.db_path)
+
+    # ── 5. Scoring worker ────────────────────────────────────────────────
+    asset_pair = "XLM/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    scored_at = datetime.now(timezone.utc).isoformat()
+
+    def _score_wallet(row: dict) -> dict | None:
+        wallet = str(row["wallet"]).strip()
+        fv = get_feature_vector(wallet, asset_pair, db_path=cfg.db_path)
+        if fv is None:
+            from detection.feature_engineering import FEATURE_NAMES
+            fv = {name: 0.0 for name in FEATURE_NAMES}
+        try:
+            result = score_with_uncertainty(models, fv)
+        except Exception as exc:
+            logger.warning("Scoring failed for %s: %s", wallet, exc)
+            return None
+        score_val = int(round(result["score"]))
+        out: dict = {
+            "wallet": wallet,
+            "score": score_val,
+            "confidence_lower": round(result.get("score_lower", 0.0), 2),
+            "confidence_upper": round(result.get("score_upper", 100.0), 2),
+            "top_features": json.dumps(result.get("shap_values", [])),
+            "scored_at": scored_at,
+        }
+        if has_label:
+            out["label"] = row.get("label", "")
+        return out
+
+    # ── 6. Run with progress bar ─────────────────────────────────────────
+    results: list[dict] = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        refresh_per_second=2,
+    ) as progress:
+        task = progress.add_task("Scoring wallets", total=len(valid))
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_score_wallet, row): row for row in valid}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is not None and result["score"] >= min_score:
+                    results.append(result)
+                progress.advance(task)
+
+    # ── 7. Write output CSV ──────────────────────────────────────────────
+    if not results:
+        typer.echo("No results to write (all wallets filtered or failed).")
+        return
+
+    fieldnames = ["wallet", "score", "confidence_lower", "confidence_upper", "top_features", "scored_at"]
+    if has_label:
+        fieldnames.append("label")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    typer.echo(f"Scored {len(results)} wallet(s) → {output}")
 
 
 @app.command("historical-load")
@@ -479,7 +754,7 @@ def eval_robustness(
     )
     df = build_training_dataset(trades, labels, account_metadata=meta, order_book_events=events)
     baseline_results = train_ensemble(df, adversarial_augment=False, calibrate=False)
-    baseline_models = {k: v["model"] for k, v in baseline_results.items()}
+    baseline_models = {k: v["model"] for k, v in baseline_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of baseline model…")
     robustness = evaluate_robustness(baseline_models, n_trials=n_trials, seed=seed)
@@ -487,7 +762,7 @@ def eval_robustness(
     # Train an adversarially-augmented model
     logger.info("Training adversarially-augmented model…")
     adv_results = train_ensemble(df, adversarial_augment=adversarial_augment, calibrate=False)
-    adv_models = {k: v["model"] for k, v in adv_results.items()}
+    adv_models = {k: v["model"] for k, v in adv_results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     logger.info("Evaluating robustness of augmented model…")
     adv_robustness = evaluate_robustness(adv_models, n_trials=n_trials, seed=seed)
@@ -554,7 +829,7 @@ def robustness_eval(
 
         logger.info("No trained models found; training temporary ensemble for robustness evaluation")
         results = train_ensemble(df, adversarial_augment=False)
-        models = {k: v["model"] for k, v in results.items()}
+        models = {k: v["model"] for k, v in results.items() if not k.startswith("_") and isinstance(v, dict) and "model" in v}
 
     report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
     typer.echo(report.model_dump_json(indent=2))
@@ -1232,7 +1507,7 @@ def red_team(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
-db_app = typer.Typer(help="Database maintenance commands")
+db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
 app.add_typer(db_app, name="db")
 
 
@@ -1268,6 +1543,27 @@ def db_retention(
             typer.echo(f"{prefix}{table}: archived {archived} rows → {path}")
 
 
+api_app = typer.Typer(help="API utility commands")
+app.add_typer(api_app, name="api")
+
+
+@api_app.command("export-schema")
+def api_export_schema(
+    output: str = typer.Option("docs/openapi.json", "--output", "-o", help="Path to write the OpenAPI JSON schema"),
+) -> None:
+    """Export the auto-generated OpenAPI 3.1 schema to a JSON file."""
+    import json
+    import os
+
+    from api.main import app as fastapi_app
+
+    schema = fastapi_app.openapi()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(schema, f, indent=2)
+    typer.echo(f"OpenAPI schema written to {output}")
+
+
 @config_app.command("validate")
 def config_validate() -> None:
     """Load and validate configuration, printing all settings (secrets masked)."""
@@ -1293,10 +1589,6 @@ def config_validate() -> None:
         raw = getattr(s, name)
         value = "***" if name in _SECRETS and raw else raw
         typer.echo(f"  {name}={value}")
-
-
-db_app = typer.Typer(help="Database migration commands (Alembic-backed)")
-app.add_typer(db_app, name="db")
 
 
 @db_app.command("migrate")
@@ -1327,6 +1619,26 @@ def db_rollback(
         cwd=str(Path(__file__).resolve().parent),
     )
     raise typer.Exit(result.returncode)
+
+
+benford_app = typer.Typer(help="Benford baseline calibration commands")
+app.add_typer(benford_app, name="benford")
+
+
+@benford_app.command("calibrate")
+def benford_calibrate(
+    asset_pair: str = typer.Option("XLM/USDC", help="Asset pair to calibrate (e.g. XLM/USDC)"),
+    days: int = typer.Option(30, "--days", help="Rolling window in days"),
+) -> None:
+    """Recompute the Benford digit-frequency baseline for an asset pair from stored trades."""
+    from detection.benford_baseline import BenfordBaselineCalibrator
+
+    calibrator = BenfordBaselineCalibrator()
+    baseline = calibrator.calibrate(asset_pair, window_days=days)
+    typer.echo(
+        f"Calibrated {baseline.asset_pair}: {baseline.trade_count} trades, "
+        f"window={baseline.window_days}d, computed_at={baseline.computed_at.isoformat()}"
+    )
 
 
 if __name__ == "__main__":

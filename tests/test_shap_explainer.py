@@ -1,5 +1,3 @@
-import time
-from unittest.mock import patch
 
 from sklearn.ensemble import RandomForestClassifier
 

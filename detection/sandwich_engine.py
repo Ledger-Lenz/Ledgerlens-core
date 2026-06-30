@@ -14,10 +14,8 @@ False-positive hardening (issue #122):
 
 from __future__ import annotations
 
-import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 import pandas as pd
 
@@ -44,9 +42,7 @@ optional: when absent they are derived deterministically from
 without requiring a migration of `Trade`.
 """
 
-from dataclasses import dataclass
 
-import pandas as pd
 
 from ingestion.data_models import TradeType
 

@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 
 from web3 import Web3
 
-from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.curve_adapter")
 

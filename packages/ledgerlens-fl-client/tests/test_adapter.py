@@ -2,7 +2,6 @@
 
 import pytest
 import pandas as pd
-from pathlib import Path
 
 from ledgerlens_fl_client.adapter import DataAdapter, CSVDirectoryAdapter
 

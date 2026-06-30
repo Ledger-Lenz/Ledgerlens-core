@@ -1,0 +1,34 @@
+name: OpenAPI Schema Drift Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  schema-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export current OpenAPI schema
+        run: python -m cli api export-schema --output /tmp/openapi-current.json
+
+      - name: Compare with committed schema
+        run: |
+          if ! diff -u docs/openapi.json /tmp/openapi-current.json; then
+            echo "❌ OpenAPI schema has drifted from docs/openapi.json"
+            echo "Run: python -m cli api export-schema --output docs/openapi.json"
+            echo "and commit the updated schema."
+            exit 1
+          fi
+          echo "✅ OpenAPI schema is up to date"
