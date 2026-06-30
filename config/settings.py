@@ -35,6 +35,30 @@ class Settings(BaseSettings):
     cursor_flush_seconds: float = 10.0  # Persist after this many seconds.
     horizon_rate_limit: float = 50.0
     horizon_rate_bucket_capacity: float = 100.0
+
+    # ── Horizon HTTP retry / rate-limit budget ────────────────────────────────
+    # These five variables control RetryingHorizonClient's token-bucket rate
+    # limiter and full-jitter retry loop.
+    #
+    # HORIZON_RATE_LIMIT_RPS is the steady-state request budget in requests per
+    # second.  Set it to a value comfortably below Horizon's documented per-IP
+    # limit (currently 3 500 req/hour ≈ ~0.97 req/s on the public testnet, or
+    # higher on a private node).  The default of 5.0 is appropriate for the
+    # public testnet; raise it when pointing at a dedicated mainnet node.
+    #
+    # HORIZON_RATE_BURST sets the bucket capacity.  A burst of 10 means up to
+    # 10 requests can be dispatched immediately when the bucket is full before
+    # throttling kicks in.  Keep burst ≥ HISTORICAL_LOADER_CONCURRENCY so
+    # the parallel loader can dispatch its first batch without waiting.
+    #
+    # HORIZON_MAX_RETRY_DELAY is a hard upper bound on any single retry sleep,
+    # including values from the server's Retry-After header.  This prevents a
+    # malicious proxy from stalling the pipeline with Retry-After: 999999.
+    horizon_rate_limit_rps: float = 5.0
+    horizon_rate_burst: float = 10.0
+    horizon_max_retries: int = 5
+    horizon_base_retry_delay: float = 1.0
+    horizon_max_retry_delay: float = 60.0
     streamer_queue_maxsize: int = 1000  # Hard cap on buffered Horizon trades.
     streamer_overflow_strategy: str = "drop_oldest"  # block/drop_newest/drop_oldest.
     streamer_high_water_ratio: float = 0.8  # Begin producer throttling at 80%.
