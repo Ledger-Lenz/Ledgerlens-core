@@ -403,20 +403,18 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         15,
-        "add filtered_trades table for filter pipeline review",
+        "add benford_baselines table for market-wide calibration",
         """
-        CREATE TABLE IF NOT EXISTS filtered_trades (
-            id TEXT NOT NULL,
-            paging_token TEXT NOT NULL,
-            ledger_close_time TIMESTAMP NOT NULL,
-            rejection_reason TEXT NOT NULL,
-            filtered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (paging_token)
+        CREATE TABLE IF NOT EXISTS benford_baselines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_pair TEXT NOT NULL,
+            digit_freqs_json TEXT NOT NULL,
+            trade_count INTEGER NOT NULL,
+            computed_at TEXT NOT NULL,
+            window_days INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_filtered_trades_filtered_at
-            ON filtered_trades (filtered_at);
-        CREATE INDEX IF NOT EXISTS idx_filtered_trades_rejection_reason
-            ON filtered_trades (rejection_reason);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_benford_baselines_pair
+            ON benford_baselines (asset_pair);
         """,
     ),
 ]

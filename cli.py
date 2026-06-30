@@ -1709,5 +1709,25 @@ def db_rollback(
     raise typer.Exit(result.returncode)
 
 
+benford_app = typer.Typer(help="Benford baseline calibration commands")
+app.add_typer(benford_app, name="benford")
+
+
+@benford_app.command("calibrate")
+def benford_calibrate(
+    asset_pair: str = typer.Option("XLM/USDC", help="Asset pair to calibrate (e.g. XLM/USDC)"),
+    days: int = typer.Option(30, "--days", help="Rolling window in days"),
+) -> None:
+    """Recompute the Benford digit-frequency baseline for an asset pair from stored trades."""
+    from detection.benford_baseline import BenfordBaselineCalibrator
+
+    calibrator = BenfordBaselineCalibrator()
+    baseline = calibrator.calibrate(asset_pair, window_days=days)
+    typer.echo(
+        f"Calibrated {baseline.asset_pair}: {baseline.trade_count} trades, "
+        f"window={baseline.window_days}d, computed_at={baseline.computed_at.isoformat()}"
+    )
+
+
 if __name__ == "__main__":
     app()
