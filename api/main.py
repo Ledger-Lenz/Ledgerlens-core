@@ -327,6 +327,13 @@ app.include_router(api_keys_router)
 
 app.include_router(cross_chain_router)
 
+# GNN ring-detection endpoints (issue #295)
+try:
+    from api.gnn_router import router as gnn_router
+    app.include_router(gnn_router)
+except ImportError:  # pragma: no cover
+    pass
+
 
 class WebhookCreate(BaseModel):
     url: str
