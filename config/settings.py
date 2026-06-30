@@ -184,6 +184,15 @@ class Settings(BaseSettings):
     # Must start with "/" and contain no dynamic segments.
     metrics_endpoint: str = "/metrics"
 
+    # ── Parquet export (ledgerlens-data integration) ──────────────────────────
+    # Default root directory for `cli.py export-parquet` output.
+    # Resolved relative to the working directory; must remain inside the project.
+    parquet_export_dir: str = "./data/parquet_export"
+    # Default Parquet compression codec: snappy | zstd | gzip | none
+    parquet_compression: str = "snappy"
+    # Rows per Parquet row group — larger = faster scans, higher write memory.
+    parquet_row_group_size: int = 100_000
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -342,7 +351,42 @@ class Settings(BaseSettings):
             raise ValueError("METRICS_ENDPOINT must start with '/'")
         if "{" in s or "}" in s:
             raise ValueError("METRICS_ENDPOINT must not contain dynamic path segments")
-        return s    @model_validator(mode="after")
+        return s
+
+    @field_validator("parquet_compression", mode="before")
+    @classmethod
+    def valid_parquet_compression(cls, v: object) -> object:
+        val = str(v).strip().lower()
+        allowed = {"snappy", "zstd", "gzip", "none"}
+        if val not in allowed:
+            raise ValueError(
+                f"PARQUET_COMPRESSION must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return val
+
+    @field_validator("parquet_row_group_size", mode="before")
+    @classmethod
+    def valid_parquet_row_group_size(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("PARQUET_ROW_GROUP_SIZE must be >= 1")
+        return val
+
+    @model_validator(mode="after")
+    def parquet_export_dir_no_traversal(self) -> "Settings":
+        cwd = Path.cwd().resolve()
+        candidate = Path(self.parquet_export_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = (cwd / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        try:
+            candidate.relative_to(cwd)
+        except ValueError as exc:
+            raise ValueError(
+                "PARQUET_EXPORT_DIR must be within the application working directory"
+            ) from exc
+        return self    @model_validator(mode="after")
     def feature_archive_dir_no_traversal(self) -> "Settings":
         cwd = Path.cwd().resolve()
         candidate = Path(self.feature_archive_dir).expanduser()
