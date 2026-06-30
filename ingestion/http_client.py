@@ -1,34 +1,41 @@
-"""Shared HTTP helper for Horizon API calls with retry/backoff.
+"""Shared HTTP helper for Horizon API calls with retry/backoff and rate limiting.
 
-Horizon occasionally returns transient 5xx/429 responses under load;
-ingestion modules use `get_with_retry` instead of calling `httpx` directly
-so those are retried with exponential backoff rather than failing the
-whole pipeline run.
+Horizon occasionally returns transient 5xx/429 responses under load.
+This module provides two client implementations:
 
-`AsyncHorizonClient` provides an async variant with semaphore-bounded
-concurrency, used by the async pipeline entry point in `run_pipeline.async_run`.
+* ``get_with_retry`` — synchronous helper used by the historical loader.
+* ``AsyncHorizonClient`` (alias: ``RetryingHorizonClient``) — async client used
+  by the streaming pipeline and parallel historical loader.
+
+Rate limiting
+-------------
+``TokenBucketRateLimiter`` enforces a proactive per-client request budget so the
+pipeline stays below Horizon's per-IP rate limit before 429s occur.  When tokens
+are exhausted the acquirer yields the event loop rather than blocking a thread.
+
+Retry logic
+-----------
+The retry loop in ``AsyncHorizonClient._make_request()`` uses **full jitter**
+(AWS "Exponential Backoff and Jitter" pattern) for all delays:
+``delay = uniform(0, min(max_delay, base * 2^attempt))``.
+
+On HTTP 429 the ``Retry-After`` response header is parsed and respected: the
+computed jitter delay is floored at the server-specified wait time so the
+pipeline never hammers a rate-limited endpoint.  The ``Retry-After`` value is
+also clamped to ``HORIZON_MAX_RETRY_DELAY`` to prevent a malicious or
+misconfigured proxy from stalling the pipeline indefinitely.
 
 Version guard
 -------------
-Every response from the Horizon API carries an ``X-Stellar-Horizon-Version``
-header that identifies the server software version.  `VersionGuard` parses
-this header on each response and raises `HorizonVersionError` when the server
-version falls outside the configured acceptable range.  This surfaces API
-version mismatches as explicit, actionable errors before they can silently
-corrupt ingested data or produce cryptic Pydantic parse failures deep in the
-pipeline.
-
-The guard is integrated into `AsyncHorizonClient._make_request()` so every
-HTTP call — whether a one-shot GET or a retried request — is version-checked
-before its result is returned to callers.
+Every response carries an ``X-Stellar-Horizon-Version`` header.  ``VersionGuard``
+parses it and raises ``HorizonVersionError`` when the server version falls
+outside the configured ``[min_version, max_version)`` range.
 
 Structural validation
 ---------------------
-`HorizonSchemaError` is raised when a response body is missing expected
-structural keys (``_embedded.records`` for list endpoints; ``id`` /
-``paging_token`` for single-record endpoints).  This catches schema-level
-breakage before Pydantic validation so the error message names the missing
-key rather than emitting a confusing ``KeyError``.
+``HorizonSchemaError`` is raised when a response body is missing expected
+top-level structural keys (``_embedded.records`` for list endpoints; ``id`` /
+``paging_token`` for single-record endpoints).
 """
 
 from __future__ import annotations
@@ -39,6 +46,8 @@ import random
 import re
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 
