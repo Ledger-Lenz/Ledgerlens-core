@@ -150,6 +150,36 @@ class Settings(BaseSettings):
     path_payment_loader_enabled: bool = True
     path_payment_fetch_effects: bool = True
 
+    # ── GNN Ring Detector (Issue #295) ────────────────────────────────────────
+    gnn_enabled: bool = True
+    gnn_model_path: str = "models/gnn_ring_detector.pt"
+    gnn_embedding_dim: int = 64
+    gnn_hidden_channels: int = 128
+    gnn_num_layers: int = 3
+    gnn_dropout: float = 0.3
+    gnn_ring_score_threshold: float = 0.5
+    gnn_fallback_to_scc: bool = True
+
+    # ── Event Sourcing Audit Log (Issue #297) ─────────────────────────────────
+    audit_log_enabled: bool = True
+    audit_feature_snapshot_max_keys: int = 50
+    audit_verify_on_read: bool = False
+    audit_retention_days: int = 2555  # 7 years — regulatory minimum
+
+    # ── SSE Streaming (Issue #296) ────────────────────────────────────────────
+    sse_heartbeat_interval_seconds: int = 15
+    sse_max_wallets_per_connection: int = 50
+    sse_missed_event_replay_window_seconds: int = 300
+    redis_pubsub_pool_size: int = 10
+
+    # ── Temporal Pattern Analysis (Issue #298) ────────────────────────────────
+    temporal_bin_minutes: int = 5
+    temporal_sequence_length: int = 48
+    temporal_arima_fit_window_days: int = 7
+    temporal_lstm_model_path: str = "models/lstm_autoencoder.pt"
+    temporal_enabled: bool = True
+    temporal_min_trades_for_analysis: int = 10
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",

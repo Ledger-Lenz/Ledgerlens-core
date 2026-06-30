@@ -327,7 +327,16 @@ app.include_router(api_keys_router)
 
 app.include_router(cross_chain_router)
 
+# ── New feature routers (Issues #295, #296, #297, #298) ──────────────────────
+from api.gnn_router import router as gnn_router  # noqa: E402
+from api.audit_router import router as audit_router  # noqa: E402
+from api.temporal_router import router as temporal_router  # noqa: E402
+from api.streaming_router import router as streaming_router  # noqa: E402
 
+app.include_router(gnn_router)
+app.include_router(audit_router)
+app.include_router(temporal_router)
+app.include_router(streaming_router)
 class WebhookCreate(BaseModel):
     url: str
     secret: str
