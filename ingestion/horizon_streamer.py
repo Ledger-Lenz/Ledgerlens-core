@@ -34,11 +34,14 @@ from ingestion.checkpoint import (
     validate_cursor,
 )
 from ingestion.data_models import Asset, Trade, TradeType
+from ingestion.metrics import get_metrics
 from ingestion.rate_limiter import (
     AdaptiveRateController,
     TokenBucket,
 )
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
+
+_metrics = get_metrics()
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +430,21 @@ class HorizonStreamer:
             self._metrics.queue_depth_current = depth
             self._metrics.queue_depth_peak = max(self._metrics.queue_depth_peak, depth)
             total_dropped = self._metrics.events_dropped
+
+        # ── Prometheus instrumentation ────────────────────────────────────
+        if accepted:
+            _metrics.events_queued_total.labels(source="horizon_sse").inc()
+        if dropped:
+            _metrics.events_dropped_total.labels(
+                source="horizon_sse",
+                reason=self.queue.overflow_strategy,
+            ).inc(dropped)
+        _metrics.queue_depth.labels(source="horizon_sse").set(depth)
+        _metrics.queue_depth_peak.labels(source="horizon_sse").set(
+            self._metrics.queue_depth_peak
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         if dropped and total_dropped % 100 == 0:
             logger.warning(
                 "Dropped %d Horizon trade events (strategy=%s, queue_depth=%d)",
@@ -503,6 +521,7 @@ class HorizonStreamer:
                 raise
             except httpx.TransportError:
                 logger.warning("SSE connection lost; reconnecting in 5s…")
+                _metrics.sse_reconnects_total.inc()
                 await asyncio.sleep(5)
 
     async def run(self) -> None:
@@ -516,6 +535,7 @@ class HorizonStreamer:
                 with self._metrics_lock:
                     self._metrics.events_received += 1
                     self._metrics.last_event_at = datetime.now(timezone.utc)
+                _metrics.events_received_total.labels(source="horizon_sse").inc()
                 try:
                     trade = _parse_trade(record)
                 except (KeyError, ValueError, TypeError) as exc:
@@ -539,6 +559,7 @@ class HorizonStreamer:
                 with self._metrics_lock:
                     self._metrics.events_received += 1
                     self._metrics.last_event_at = datetime.now(timezone.utc)
+                _metrics.events_received_total.labels(source="horizon_sse").inc()
                 try:
                     trade = _parse_trade(record)
                 except (KeyError, ValueError, TypeError) as exc:

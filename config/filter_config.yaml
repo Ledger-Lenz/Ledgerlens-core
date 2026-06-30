@@ -1,0 +1,64 @@
+# LedgerLens Trade Filter Pipeline Configuration
+# ================================================
+# version: schema version — currently only "1.0" is supported.
+#
+# Each entry under `filters` must have a `type` and an `enabled` flag.
+# Filters are applied in order; a trade must pass ALL enabled filters
+# (logical AND) to reach the detection engine.
+#
+# Disabled filters (enabled: false) are loaded but skipped.
+#
+# Hot-reload: changes to this file are detected automatically within
+# FILTER_CONFIG_RELOAD_INTERVAL_SECONDS (default: 60 s) without restarting.
+# If a reload fails validation, the previous valid config is retained.
+#
+# See docs/filter-pipeline.md for full documentation and tuning guidance.
+
+version: "1.0"
+
+filters:
+  # ── Asset Pair Whitelist ──────────────────────────────────────────────────
+  # When enabled and non-empty, ONLY trades on the listed pairs are processed.
+  # An empty `pairs` list means "allow all" (whitelist is inactive).
+  # Pair format: "BASE_CODE/COUNTER_CODE" (e.g. "XLM/USDC")
+  - type: asset_pair_whitelist
+    enabled: false
+    pairs: []
+
+  # ── Asset Pair Blacklist ──────────────────────────────────────────────────
+  # Trades on blacklisted pairs are rejected regardless of other filters.
+  # An empty `pairs` list means "block nothing".
+  - type: asset_pair_blacklist
+    enabled: false
+    pairs: []
+
+  # ── Minimum Volume Filter ─────────────────────────────────────────────────
+  # Reject dust trades whose volume is below the threshold.
+  # `min_volume` supports full decimal precision (e.g. "0.0001").
+  # `volume_field` must be one of: base_amount | counter_amount | price
+  # A min_volume of "0" means "allow all".
+  - type: minimum_volume
+    enabled: false
+    min_volume: "0.01"
+    volume_field: base_amount
+
+  # ── Asset Type Filter ─────────────────────────────────────────────────────
+  # Restrict processing to specific Stellar asset types.
+  # Valid types: native | credit_alphanum4 | credit_alphanum12
+  - type: asset_type
+    enabled: false
+    allowed_types:
+      - native
+      - credit_alphanum4
+      - credit_alphanum12
+
+  # ── Account Exclusion Filter ──────────────────────────────────────────────
+  # Reject trades where either party is a known-clean account (e.g. verified
+  # market makers or Stellar Foundation accounts).
+  # All keys must be valid Stellar G… public keys (56 characters).
+  #
+  # SECURITY NOTE: this list is operationally sensitive — it reveals which
+  # accounts have been vetted. Protect this file with 0o640 permissions.
+  - type: account_exclusion
+    enabled: false
+    excluded_accounts: []

@@ -725,6 +725,94 @@ def historical_load(
     asyncio.run(run())
 
 
+@app.command("export-parquet")
+def export_parquet(
+    output_dir: str = typer.Option(
+        ..., "--output-dir", help="Root directory for Parquet output (must be inside project root)"
+    ),
+    since: str | None = typer.Option(
+        None, "--since", help="Earliest date to export, ISO-8601 (e.g. 2026-01-01). Default: all."
+    ),
+    until: str | None = typer.Option(
+        None, "--until", help="Latest date to export, ISO-8601 (e.g. 2026-06-30). Default: all."
+    ),
+    asset_pair: str | None = typer.Option(
+        None, "--asset-pair", help="Filter to one asset pair, e.g. XLM/USDC. Default: all pairs."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Re-export all partitions even if unchanged (bypass delta detection)."
+    ),
+    compression: str = typer.Option(
+        "snappy", "--compression", help="Parquet compression: snappy | zstd | gzip | none."
+    ),
+) -> None:
+    """Export Trade records from SQLite to date-partitioned Parquet files.
+
+    Writes Hive-style partitions to OUTPUT_DIR and generates a SHA-256
+    manifest.json. Unchanged partitions are skipped automatically
+    (incremental export); use --force to re-export everything.
+
+    The output layout is compatible with the ledgerlens-data repository::
+
+        <output_dir>/
+        ├── manifest.json
+        └── trades/
+            └── year=YYYY/month=MM/day=DD/
+                └── asset_pair=XLM_USDC/
+                    └── trades_YYYYMMDD_XLM_USDC.parquet
+    """
+    import sqlite3
+    from datetime import date as _date
+
+    from config.settings import settings as cfg
+    from ingestion.parquet_exporter import ParquetExporter
+
+    if compression not in ("snappy", "zstd", "gzip", "none"):
+        raise typer.BadParameter(
+            f"Invalid compression '{compression}'. Must be one of: snappy, zstd, gzip, none",
+            param_hint="--compression",
+        )
+
+    def _parse_date(value: str, flag: str) -> _date:
+        try:
+            return _date.fromisoformat(value)
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"must be an ISO-8601 date (YYYY-MM-DD)", param_hint=flag
+            ) from exc
+
+    since_date = _parse_date(since, "--since") if since else None
+    until_date = _parse_date(until, "--until") if until else None
+
+    try:
+        conn = sqlite3.connect(cfg.ledgerlens_db_path)
+        exporter = ParquetExporter(
+            db_conn=conn,
+            output_dir=Path(output_dir),
+            compression=compression,
+        )
+        result = exporter.export(
+            since=since_date,
+            until=until_date,
+            asset_pair=asset_pair,
+            force=force,
+        )
+        conn.close()
+    except (ValueError, ImportError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(
+        f"Export complete: "
+        f"partitions_exported={result.exported_partitions} "
+        f"partitions_skipped={result.skipped_partitions} "
+        f"records={result.total_records_exported} "
+        f"size_bytes={result.total_size_bytes} "
+        f"duration={result.duration_seconds:.2f}s "
+        f"manifest={result.manifest_path}"
+    )
+
+
 @app.command("eval-robustness")
 def eval_robustness(
     n_trials: int = typer.Option(5, help="Adversarial dataset repetitions per strategy (more = slower but stabler)"),
@@ -1619,6 +1707,26 @@ def db_rollback(
         cwd=str(Path(__file__).resolve().parent),
     )
     raise typer.Exit(result.returncode)
+
+
+benford_app = typer.Typer(help="Benford baseline calibration commands")
+app.add_typer(benford_app, name="benford")
+
+
+@benford_app.command("calibrate")
+def benford_calibrate(
+    asset_pair: str = typer.Option("XLM/USDC", help="Asset pair to calibrate (e.g. XLM/USDC)"),
+    days: int = typer.Option(30, "--days", help="Rolling window in days"),
+) -> None:
+    """Recompute the Benford digit-frequency baseline for an asset pair from stored trades."""
+    from detection.benford_baseline import BenfordBaselineCalibrator
+
+    calibrator = BenfordBaselineCalibrator()
+    baseline = calibrator.calibrate(asset_pair, window_days=days)
+    typer.echo(
+        f"Calibrated {baseline.asset_pair}: {baseline.trade_count} trades, "
+        f"window={baseline.window_days}d, computed_at={baseline.computed_at.isoformat()}"
+    )
 
 
 if __name__ == "__main__":

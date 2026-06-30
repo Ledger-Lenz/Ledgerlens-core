@@ -82,3 +82,147 @@ until Horizon's per-IP rate limit is reached. Start conservatively, monitor
 429 responses, and reduce concurrency when retries dominate. Smaller chunks
 improve load balancing and restart granularity but increase progress metadata
 and initial request overhead.
+
+## API version management
+
+The Stellar Horizon API evolves over time.  Between major versions, field
+names can be renamed, types can change, and new required envelope keys can
+be added.  Without explicit version checking, a Horizon upgrade can silently
+corrupt ingested data or produce cryptic Pydantic parse failures deep in the
+pipeline with no indication that the root cause is an API version mismatch.
+
+LedgerLens addresses this with a **VersionGuard** middleware layer inside
+`RetryingHorizonClient` (defined in `ingestion/http_client.py`).
+
+### How it works
+
+Every Horizon response includes the `X-Stellar-Horizon-Version` header
+(e.g. `"2.28.0"`).  On each HTTP response, `VersionGuard.check()`:
+
+1. Parses the header value using `packaging.version.Version` (semantic
+   versioning).
+2. Checks the parsed version against the `[HORIZON_MIN_VERSION,
+   HORIZON_MAX_VERSION)` range from `config/settings.py`.
+3. Raises `HorizonVersionError` if the version is outside the range —
+   before the response body reaches any Pydantic model.
+4. Emits a `WARNING` log if the version is in range but differs from
+   `HORIZON_TESTED_VERSION` (the version the current data models were
+   validated against).
+
+The validated version is cached in memory for the lifetime of the client
+instance so there is no per-response overhead after the first check.
+
+Pre-release versions (e.g. `"2.28.0-rc1"`) have their suffix stripped
+before comparison, with a `WARNING` log noting the pre-release suffix.
+
+If the header is absent (some proxy configurations strip it), the check is
+a no-op.
+
+### Structural response validation
+
+In addition to version header checking, two helper functions validate that
+response bodies contain expected structural keys before Pydantic parsing:
+
+| Helper | Checked keys | When to use |
+|---|---|---|
+| `validate_list_response(body, url)` | `_embedded`, `_embedded.records` | List endpoints (`/trades`, `/operations`, …) |
+| `validate_single_record_response(body, url)` | `id`, `paging_token` | Single-resource endpoints |
+
+Both raise `HorizonSchemaError` with the name of the missing key and the
+request URL when a structural key is absent.
+
+### Configuration
+
+Four environment variables control version checking (all settable in `.env`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HORIZON_MIN_VERSION` | `"2.0.0"` | Inclusive lower bound of supported range |
+| `HORIZON_MAX_VERSION` | `"4.0.0"` | Exclusive upper bound of supported range |
+| `HORIZON_TESTED_VERSION` | `"2.28.0"` | Version against which data models were validated |
+| `HORIZON_VERSION_CHECK_ENABLED` | `true` | Set to `false` to disable checking (see below) |
+
+### Checking which Horizon version is in use
+
+Call `probe_server_version()` on a client instance to fetch the Horizon root
+endpoint and log the server version:
+
+```python
+from ingestion.http_client import AsyncHorizonClient
+
+async with AsyncHorizonClient(settings.horizon_url) as client:
+    version = await client.probe_server_version()
+    # Logs: INFO "Connected to Horizon 2.28.0 at https://horizon.stellar.org"
+    print(version)  # "2.28.0"
+```
+
+This is useful at pipeline startup to confirm exactly which Horizon instance
+is being used.
+
+### Updating the tested version range after a Horizon upgrade
+
+1. **Review the changelog** for the new version:
+   <https://github.com/stellar/go/blob/master/services/horizon/CHANGELOG.md>
+
+2. **Verify schema compatibility** — check whether any fields used by
+   `ingestion/data_models.py` have been renamed, re-typed, or removed.
+
+3. **Update `data_models.py`** if the new version introduces a breaking
+   change.
+
+4. **Bump `HORIZON_TESTED_VERSION`** in `.env` (or `config/settings.py`
+   default) to the new version string, e.g.:
+   ```
+   HORIZON_TESTED_VERSION=2.30.0
+   ```
+
+5. **Widen the range** if the new version crosses a major-version boundary:
+   ```
+   HORIZON_MIN_VERSION=2.0.0
+   HORIZON_MAX_VERSION=5.0.0   # if you are now supporting Horizon 4.x
+   ```
+
+6. **Run the test suite** to confirm no regressions:
+   ```bash
+   pytest tests/test_version_guard.py
+   ```
+
+### What to do when a HorizonVersionError is raised in production
+
+A `HorizonVersionError` means the live Horizon node is running a version
+outside `[HORIZON_MIN_VERSION, HORIZON_MAX_VERSION)`.  The pipeline will
+refuse to ingest data until the issue is resolved.  Options:
+
+- **If you control the Horizon node**: upgrade or downgrade it to a version
+  within the supported range.
+- **If using a third-party Horizon node**: contact the provider, or switch to
+  a node running a supported version.
+- **If you have verified schema compatibility manually** and want to widen the
+  range temporarily, update `HORIZON_MIN_VERSION` / `HORIZON_MAX_VERSION` in
+  `.env` and restart the pipeline.  Always update `HORIZON_TESTED_VERSION` at
+  the same time.
+- **Do not** set `HORIZON_VERSION_CHECK_ENABLED=false` as a permanent fix —
+  this silences the warning but does not resolve the underlying schema
+  compatibility risk.
+
+### Disabling version checking
+
+Set `HORIZON_VERSION_CHECK_ENABLED=false` in `.env` for private or custom
+Horizon nodes that strip the `X-Stellar-Horizon-Version` header.
+
+> **Warning**: when disabled, a `WARNING` log is emitted at startup:
+> ```
+> Horizon version checking disabled — schema compatibility not guaranteed
+> ```
+> This is intentional: operators must acknowledge the risk rather than
+> silently disabling the check in production.
+
+### Exception reference
+
+| Exception | Raised when |
+|---|---|
+| `HorizonVersionError` | The `X-Stellar-Horizon-Version` header is present and outside `[min, max)` |
+| `HorizonSchemaError` | A response body is missing a required structural key |
+
+Both exceptions include the request URL in their message.
+`HorizonVersionError` never includes response body content (security).

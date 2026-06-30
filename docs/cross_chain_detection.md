@@ -188,11 +188,74 @@ See `.env.example` for the full list of EVM settings. Required variables:
 
 | Variable | Description |
 |---|---|
-| `EVM_RPC_ETHEREUM` | JSON-RPC endpoint for Ethereum mainnet |
-| `EVM_RPC_BASE` | JSON-RPC endpoint for Base |
-| `EVM_RPC_POLYGON` | JSON-RPC endpoint for Polygon |
+| `EVM_RPC_ETHEREUM` | JSON-RPC endpoint for Ethereum mainnet (legacy single-provider) |
+| `EVM_RPC_BASE` | JSON-RPC endpoint for Base (legacy single-provider) |
+| `EVM_RPC_POLYGON` | JSON-RPC endpoint for Polygon (legacy single-provider) |
 | `EVM_LOOKBACK_BLOCKS` | Number of blocks to look back when fetching events (default: 7200 ≈ 24h) |
 | `EVM_POOL_ADDRESSES` | Comma-separated list of EIP-55 checksummed pool addresses to monitor |
+
+### Multi-Provider Failover (EVMProviderPool)
+
+`EVMProviderPool` replaces the single-endpoint model with a prioritised list of JSON-RPC providers per chain. When the primary provider fails, the pool automatically retries on the next healthy provider without any manual intervention. This eliminates the cross-chain ingestion gap that occurred during provider maintenance windows, rate-limit spikes, or regional outages.
+
+#### Provider Configuration
+
+Set `EVM_PROVIDERS` to a JSON array of provider objects. Each entry requires `chain_id` (int), `rpc_url` (**must be `https://`**), and `name` (string). Optional fields: `priority` (int, lower = tried first, default 0) and `max_requests_per_second` (float, default 10.0).
+
+```bash
+EVM_PROVIDERS=[
+  {"chain_id": 1, "rpc_url": "https://mainnet.infura.io/v3/YOUR_KEY", "name": "infura", "priority": 0},
+  {"chain_id": 1, "rpc_url": "https://eth-mainnet.alchemyapi.io/v2/YOUR_KEY", "name": "alchemy", "priority": 1},
+  {"chain_id": 8453, "rpc_url": "https://base-mainnet.infura.io/v3/YOUR_KEY", "name": "infura-base", "priority": 0},
+  {"chain_id": 137, "rpc_url": "https://polygon-mainnet.infura.io/v3/YOUR_KEY", "name": "infura-polygon", "priority": 0}
+]
+```
+
+When `EVM_PROVIDERS` is empty or unset (`[]`), the pool falls back to the legacy `EVM_RPC_ETHEREUM` / `EVM_RPC_BASE` / `EVM_RPC_POLYGON` single-endpoint settings.
+
+| Variable | Default | Description |
+|---|---|---|
+| `EVM_PROVIDERS` | `[]` | JSON array of provider objects (see above) |
+| `EVM_MAX_BLOCK_LAG` | `10` | Blocks behind chain head before health degrades; triggers lag alert when all providers exceed this |
+| `EVM_PROBE_INTERVAL_SECONDS` | `15.0` | Seconds between `eth_blockNumber` health probe cycles |
+| `EVM_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before a provider's circuit opens |
+
+#### Failover Behaviour
+
+On each `eth_getLogs` / `eth_blockNumber` / `eth_getTransactionReceipt` call, the pool selects providers in order of a composite **health score**:
+
+```
+provider_score = health_score - max(0, reference_block - current_block) * 0.1
+```
+
+Where `reference_block` is the highest `current_block` seen across all providers for that chain. Each block behind the estimated chain head costs 0.1 health points. Circuit-open providers are always scored at −1.0 and skipped entirely.
+
+If a call fails (timeout or JSON-RPC error):
+- The failed provider's `health_score` decreases by 0.2
+- `consecutive_failures` increments
+- Once `consecutive_failures >= EVM_CIRCUIT_BREAKER_THRESHOLD`, the circuit opens and the provider is bypassed
+
+A successful call restores 0.05 health per call (capped at 1.0) and resets `consecutive_failures` to 0.
+
+If every provider for a chain is exhausted, `EVMProviderPoolExhaustedError` is raised — bridge ingestion for that chain pauses until the next probe cycle recovers at least one provider.
+
+#### Health Probing
+
+A background asyncio task polls every provider's `eth_blockNumber` every `EVM_PROBE_INTERVAL_SECONDS` seconds. On a successful probe:
+- `current_block` and `last_probe_at` are updated
+- If the provider's circuit was open **and** `consecutive_failures == 0` (cleared by a prior successful `call()`), the circuit resets automatically
+
+#### Block-Lag Monitoring
+
+After each probe cycle, the pool computes the reference block (maximum `current_block` across all providers per chain). If **all** providers for a chain are more than `EVM_MAX_BLOCK_LAG` blocks behind the reference, a `WARNING` is emitted and the chain ID is added to `EVMProviderPoolStats.chains_with_lag_alert`. This distinguishes the "all providers old news" scenario (which causes missed events) from a single lagging provider (which is handled silently by routing to others).
+
+Inspect lag alerts via `pool.stats.chains_with_lag_alert` or the Prometheus metrics layer.
+
+#### API Key Security
+
+All `rpc_url` values must use `https://`. The `http://` scheme is rejected at startup with a `ValueError` because HTTP transmits API keys in plaintext — a passive network observer would be able to exfiltrate your Infura or Alchemy credentials.
+
+API keys embedded in URLs (e.g. `infura.io/v3/SECRET`) are **masked** in all log output. `EVMProvider.__repr__` replaces the key segment with `***`. `EVMProviderPoolExhaustedError` messages contain only provider names and chain IDs — never URLs.
 
 ## Bridge Event Integrity Verification
 
