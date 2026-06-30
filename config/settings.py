@@ -193,6 +193,21 @@ class Settings(BaseSettings):
     # Rows per Parquet row group — larger = faster scans, higher write memory.
     parquet_row_group_size: int = 100_000
 
+    # ── Trade filter pipeline ─────────────────────────────────────────────────
+    # Path to the YAML file that configures the ingestion filter pipeline.
+    # See config/filter_config.yaml.example for the full schema.
+    filter_config_path: str = "./config/filter_config.yaml"
+    # How often (seconds) FilterConfigLoader polls filter_config.yaml for changes.
+    # Set to 0 to disable hot-reload (not recommended in production).
+    filter_config_reload_interval_seconds: int = 60
+    # When True, rejected trades are persisted to the `filtered_trades` SQLite
+    # table so operators can review and tune filter rules without losing data.
+    filter_store_rejected_trades: bool = True
+    # Maximum rows in the `filtered_trades` table before pruning.
+    # When exceeded, the oldest rows are deleted until the count reaches
+    # 90 % of this limit (450 000 rows at the default).
+    filter_rejected_trades_max_rows: int = 500_000
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -372,6 +387,22 @@ class Settings(BaseSettings):
             raise ValueError("PARQUET_ROW_GROUP_SIZE must be >= 1")
         return val
 
+    @field_validator("filter_config_reload_interval_seconds", mode="before")
+    @classmethod
+    def valid_filter_reload_interval(cls, v: object) -> object:
+        val = int(v)
+        if val < 0:
+            raise ValueError("FILTER_CONFIG_RELOAD_INTERVAL_SECONDS must be >= 0")
+        return val
+
+    @field_validator("filter_rejected_trades_max_rows", mode="before")
+    @classmethod
+    def valid_filter_max_rows(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("FILTER_REJECTED_TRADES_MAX_ROWS must be >= 1")
+        return val
+
     @model_validator(mode="after")
     def parquet_export_dir_no_traversal(self) -> "Settings":
         cwd = Path.cwd().resolve()
@@ -386,7 +417,9 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PARQUET_EXPORT_DIR must be within the application working directory"
             ) from exc
-        return self    @model_validator(mode="after")
+        return self
+
+    @model_validator(mode="after")
     def feature_archive_dir_no_traversal(self) -> "Settings":
         cwd = Path.cwd().resolve()
         candidate = Path(self.feature_archive_dir).expanduser()

@@ -105,6 +105,7 @@ graph TB
 - **ingestion/historical_loader.py**: Bulk historical trade ingestion
 - **ingestion/operations_loader.py**: Order-book event ingestion (offer create/update/cancel) from Horizon operations
 - **ingestion/account_loader.py**: Account funding-source and creation-time metadata for wallet-graph features
+- **ingestion/filters.py**: Configurable filter pipeline — asset pair whitelist/blacklist, minimum volume, asset type, and account exclusion filters with hot-reload and SQLite rejection storage (see [docs/filter-pipeline.md](docs/filter-pipeline.md))
 - **ingestion/data_models.py**: Pydantic schemas for trade, asset, and order-book records
 - **detection/benford_engine.py**: Benford's Law feature computation (chi-square, Z-score, MAD)
 - **detection/graph_engine.py**: Directed trade graph construction, SCC wash-ring discovery, and ring membership indexing
@@ -317,6 +318,7 @@ ledgerlens-core/
 │   ├── historical_loader.py          ← Bulk historical trade ingestion
 │   ├── operations_loader.py          ← Order-book event ingestion (offer ops)
 │   ├── account_loader.py             ← Account funding-source / creation-time metadata
+│   ├── filters.py                    ← Configurable trade filter pipeline (whitelist/blacklist/volume/type/exclusion)
 │   ├── synthetic_data.py             ← Synthetic trade/wash-ring generator for local training
 │   ├── http_client.py                ← Retrying HTTP helper for Horizon calls
 │   └── data_models.py                ← Pydantic schemas for trade/asset/order-book records
@@ -355,6 +357,18 @@ cp .env.example .env
 
 Fill in the Horizon, model, and cross-repo settings described in
 [LedgerLens Organization](#ledgerlens-organization).
+
+### 2a. Configure trade filters (optional)
+
+```bash
+cp config/filter_config.yaml.example config/filter_config.yaml
+```
+
+Edit `config/filter_config.yaml` to enable asset pair whitelists/blacklists,
+minimum volume thresholds, and account exclusion lists. See
+[docs/filter-pipeline.md](docs/filter-pipeline.md) for full documentation.
+All filters default to `enabled: false` (pass-through) so the pipeline works
+out of the box without any filter configuration.
 
 ### 3. Train on synthetic data
 
