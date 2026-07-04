@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-import pytest
 
 from ingestion.data_models import OrderBookEvent
 from ingestion.replay_buffer import OrderBookReplayBuffer

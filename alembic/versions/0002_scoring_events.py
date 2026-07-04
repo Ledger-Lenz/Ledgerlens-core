@@ -11,7 +11,6 @@ Adds the event-sourced scoring audit log table with:
 from __future__ import annotations
 
 from alembic import op
-import sqlalchemy as sa
 
 # revision identifiers
 revision = "0002_scoring_events"

@@ -1,7 +1,6 @@
 """Tests for Prometheus metrics."""
 
 import re
-import pytest
 from prometheus_client import REGISTRY, generate_latest
 
 
@@ -60,7 +59,6 @@ def test_no_wallet_address_in_metric_labels():
 
 
 def test_all_10_metrics_registered():
-    import api.metrics  # ensure module imported
     output = generate_latest(REGISTRY).decode()
     expected = [
         "ledgerlens_wallets_scored_total",

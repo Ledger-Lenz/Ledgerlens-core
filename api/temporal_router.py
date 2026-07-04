@@ -22,7 +22,6 @@ from __future__ import annotations
 import base64
 import logging
 import re
-from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Optional
 
@@ -137,7 +136,6 @@ def _generate_sequence_plot_b64(ts) -> Optional[str]:
 
         matplotlib.use("Agg")  # non-interactive backend
         import matplotlib.pyplot as plt
-        import numpy as np
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
         n = len(ts.log_amount_series)

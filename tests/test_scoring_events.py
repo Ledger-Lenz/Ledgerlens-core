@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
-import uuid
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -11,7 +9,6 @@ import pytest
 
 from audit.scoring_events import (
     ChainHashVerifier,
-    ChainVerificationResult,
     ScoringEvent,
     ScoringEventStore,
     make_scoring_event,

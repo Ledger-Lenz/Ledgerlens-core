@@ -40,8 +40,6 @@ from pydantic import BaseModel
 
 from api.streaming import (
     SSEConnectionManager,
-    ScorePublisher,
-    ScoreUpdateEvent,
     _MAX_CONNECTIONS_PER_KEY,
     _decrement_connection_count,
     _increment_connection_count,
@@ -78,7 +76,6 @@ def _get_manager() -> SSEConnectionManager:
             )
         except ImportError:
             # Redis not available — return a no-op manager
-            from api.streaming import SSEConnectionManager as _SSEConnectionManager
             _manager = _FallbackManager()
     return _manager
 
@@ -175,7 +172,6 @@ async def stream_scores(
 
     # Try to enforce connection limit
     try:
-        import redis.asyncio as aioredis
 
         if hasattr(manager, "_redis_pool"):
             count = await _increment_connection_count(manager._redis_pool, api_key_id)
@@ -204,7 +200,6 @@ async def stream_scores(
                 yield chunk
         finally:
             try:
-                import redis.asyncio as aioredis
 
                 if hasattr(manager, "_redis_pool"):
                     await _decrement_connection_count(manager._redis_pool, api_key_id)

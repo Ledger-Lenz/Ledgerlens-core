@@ -4,7 +4,6 @@ import json
 import logging
 import uuid
 
-import pytest
 from starlette.testclient import TestClient
 
 
@@ -45,7 +44,7 @@ def test_log_records_include_required_fields(capfd):
     logger.info("checking fields")
     captured = capfd.readouterr()
 
-    line = next(l for l in captured.err.strip().splitlines() if l.strip())
+    line = next(ln for ln in captured.err.strip().splitlines() if ln.strip())
     data = json.loads(line)
     assert data.get("correlation_id") == cid
     assert "timestamp" in data

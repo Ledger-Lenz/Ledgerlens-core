@@ -41,13 +41,9 @@ top-level structural keys (``_embedded.records`` for list endpoints; ``id`` /
 from __future__ import annotations
 
 import asyncio
-import logging
-import random
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 import httpx
 

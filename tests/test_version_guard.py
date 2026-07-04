@@ -275,7 +275,6 @@ class TestVersionGuardCheck:
 
     def test_cache_prevents_revalidation(self):
         """Calling check() twice with the same URL and version should not re-run validation."""
-        from packaging.version import Version as PkgVersion
 
         guard = _guard()
         parse_calls = []

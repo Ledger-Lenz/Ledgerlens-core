@@ -26,6 +26,9 @@ models/optuna_studies/
 horizon_cursor.txt
 drift_reports/
 
+# MkDocs build output
+site/
+
 # Editors
 .vscode/
 .idea/

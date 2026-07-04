@@ -331,7 +331,7 @@ def compute_chi_square_pvalue(counts: np.ndarray, N: int) -> tuple[float, str]:
     Args:
         counts: array of shape (9,) with raw digit counts (not proportions).
         N: total number of observations (typically counts.sum(); passed
-           explicitly to avoid recomputation and handle edge cases cleanly).
+            explicitly to avoid recomputation and handle edge cases cleanly).
 
     Returns:
         Tuple of (p_value, method) where method is "bootstrap" or "asymptotic".

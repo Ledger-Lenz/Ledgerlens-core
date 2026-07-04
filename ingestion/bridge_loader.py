@@ -18,6 +18,7 @@ import json
 import logging
 import random
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -103,7 +104,7 @@ class BridgeEventVerifier:
     independent providers (see EVMProviderPool in ISSUE-013).
     """
 
-    def __init__(self, rpc_call_fn, timeout: float | None = None) -> None:
+    def __init__(self, rpc_call_fn: Callable[[str, list], dict], timeout: float | None = None) -> None:
         """
         Args:
             rpc_call_fn: Synchronous callable ``(method, params) -> dict`` that

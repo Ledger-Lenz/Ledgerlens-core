@@ -1,11 +1,10 @@
 """Tests for account metadata enrichment pipeline (Issue #91)."""
 from __future__ import annotations
 
-import json
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

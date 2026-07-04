@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from prometheus_client import (
-    CollectorRegistry,
     Counter,
     Gauge,
     Histogram,

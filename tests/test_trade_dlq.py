@@ -1,6 +1,5 @@
 """Tests for ingestion/dlq.py — Trade ingestion Dead-Letter Queue."""
 import sqlite3
-import tempfile
 from datetime import datetime
 
 import pytest
@@ -150,7 +149,7 @@ def test_get_replayable_max_entries(dlq):
 
 def test_classify_validation_error(dlq):
     try:
-        from pydantic import BaseModel, ValidationError
+        from pydantic import BaseModel
         class M(BaseModel):
             x: int
         M(x="not-an-int")
@@ -160,7 +159,8 @@ def test_classify_validation_error(dlq):
 
 
 def test_classify_network_timeout(dlq):
-    class TimeoutError(Exception): pass
+    class TimeoutError(Exception):
+        pass
     assert dlq.classify_exception(TimeoutError()) == DLQErrorClass.NETWORK_ERROR
 
 
@@ -170,12 +170,14 @@ def test_classify_sqlite_operational_error(dlq):
 
 
 def test_classify_schema_error(dlq):
-    class HorizonSchemaError(Exception): pass
+    class HorizonSchemaError(Exception):
+        pass
     assert dlq.classify_exception(HorizonSchemaError()) == DLQErrorClass.SCHEMA_ERROR
 
 
 def test_classify_version_error(dlq):
-    class HorizonVersionError(Exception): pass
+    class HorizonVersionError(Exception):
+        pass
     assert dlq.classify_exception(HorizonVersionError()) == DLQErrorClass.VERSION_ERROR
 
 

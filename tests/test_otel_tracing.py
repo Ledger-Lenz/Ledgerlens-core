@@ -1,7 +1,5 @@
 """Tests for OpenTelemetry distributed tracing."""
 
-import pytest
-from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -90,8 +88,8 @@ def test_trace_context_propagated_through_call():
 
     with tracer.start_as_current_span("pipeline.run") as root_span:
         root_ctx = root_span.get_span_context()
-        with tracer.start_as_current_span("inner.operation") as inner_span:
-            inner_parent = inner_span.parent
+        with tracer.start_as_current_span("inner.operation"):
+            pass
 
     spans = exporter.get_finished_spans()
     inner = [s for s in spans if s.name == "inner.operation"]

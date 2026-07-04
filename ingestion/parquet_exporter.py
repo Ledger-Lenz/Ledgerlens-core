@@ -56,7 +56,10 @@ import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 logger = logging.getLogger("ledgerlens.parquet_exporter")
 

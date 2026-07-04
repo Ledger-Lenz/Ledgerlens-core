@@ -392,16 +392,3 @@ def delete_suppression(rule_id: int) -> dict:
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
     return {"deleted": rule_id}
-
-
-# ---------------------------------------------------------------------------
-# Database storage stats  (Issue #180)
-# ---------------------------------------------------------------------------
-
-
-@router.get("/storage", include_in_schema=False)
-def storage_stats() -> dict:
-    """Return current database size, per-table row counts, and next archival date."""
-    from storage.retention import RetentionEngine
-    engine = RetentionEngine(db_path=settings.db_path)
-    return engine.storage_stats()

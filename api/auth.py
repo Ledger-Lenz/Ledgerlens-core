@@ -17,7 +17,6 @@ import secrets
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional
 
 from fastapi import Header, HTTPException, Request
 

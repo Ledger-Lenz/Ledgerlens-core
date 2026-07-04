@@ -535,7 +535,6 @@ def score_bulk(
     """
     import csv
     import json
-    import sys
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import datetime, timezone
 
@@ -778,7 +777,7 @@ def export_parquet(
             return _date.fromisoformat(value)
         except ValueError as exc:
             raise typer.BadParameter(
-                f"must be an ISO-8601 date (YYYY-MM-DD)", param_hint=flag
+                "must be an ISO-8601 date (YYYY-MM-DD)", param_hint=flag
             ) from exc
 
     since_date = _parse_date(since, "--since") if since else None

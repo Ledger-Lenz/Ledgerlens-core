@@ -121,7 +121,6 @@ _TRANSLATIONS.update(
         "pdc_1h": "Make trades that genuinely move and improve the mid-price over a 1-hour horizon, rather than trades with no causal price impact.",
         "gnn_wash_ring_probability": "Change your trading-graph neighbourhood and behaviour so it no longer resembles a detected wash-ring pattern.",
         "gnn_neighbor_avg_score": "Trade with counterparties that themselves have lower risk scores.",
-        "path_payment_frequency": "Reduce the proportion of your trades executed as path payments to lower the wash-trading signal.",
     }
 )
 

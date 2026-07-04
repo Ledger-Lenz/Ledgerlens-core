@@ -33,13 +33,10 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import yaml
@@ -53,7 +50,6 @@ from ingestion.filters import (
     FilterConfigLoader,
     FilterResult,
     MinimumVolumeFilter,
-    TradeFilter,
     TradeFilterPipeline,
     _is_valid_stellar_public_key,
     load_pipeline_from_config,

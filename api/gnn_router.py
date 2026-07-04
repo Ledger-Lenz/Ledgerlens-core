@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -155,13 +155,12 @@ def _build_graph_for_wallet(wallet: str):
     Returns an empty-graph stub when PyG is unavailable or no trades found.
     """
     try:
-        from detection.gnn_ring_detector import HeteroData, _HAS_PYG, build_transaction_graph
+        from detection.gnn_ring_detector import _HAS_PYG, build_transaction_graph
 
         if not _HAS_PYG:
             return _empty_graph_stub(wallet)
 
         from config.settings import settings
-        import sqlite3
 
         db_path = getattr(settings, "ledgerlens_db_path", "./ledgerlens.db")
         trades = _load_recent_trades(db_path, wallet, limit=500)

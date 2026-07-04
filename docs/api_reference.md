@@ -52,7 +52,7 @@ Manipulation alerts. Use `alert_type` to filter by type
 
 ## Analyst Dashboard
 
-See [analyst endpoints](#analyst-endpoints) below — all require `X-LedgerLens-Admin-Key`.
+The following endpoints all require `X-LedgerLens-Admin-Key`.
 
 ### GET /analyst/wallet/{wallet}
 

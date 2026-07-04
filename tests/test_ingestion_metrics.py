@@ -169,10 +169,10 @@ class TestIngestionMetricsCollectorSingleton:
 
     def test_get_metrics_returns_noop_when_disabled(self):
         from ingestion.metrics import _NoOpCollector, get_metrics
-        with patch("ingestion.metrics.IngestionMetricsCollector.instance") as mock_inst:
+        with patch("ingestion.metrics.IngestionMetricsCollector.instance"):
             with patch("config.settings.settings") as mock_settings:
                 mock_settings.metrics_enabled = False
-                result = get_metrics()
+                get_metrics()
         # Can't easily test via settings mock due to import order; test _NoOpCollector directly
         noop = _NoOpCollector()
         # Verify _NoOpCollector has all required interface methods
@@ -359,10 +359,7 @@ class TestHttpClientInstrumentation:
         mock_response.status_code = 200
         mock_response.request = MagicMock()
 
-        duration_observations = []
-        orig_observe = metrics.http_request_duration_seconds.labels(endpoint="/trades").observe
-
-        with patch("httpx.Client.get", return_value=mock_response) as mock_get:
+        with patch("httpx.Client.get", return_value=mock_response):
             mock_response.raise_for_status = MagicMock()
             client = httpx.Client()
 
@@ -439,7 +436,7 @@ class TestHttpClientInstrumentation:
                 with pytest.raises(Exception):
                     get_with_retry(client, "https://horizon.stellar.org/trades", max_retries=0, backoff_seconds=0)
 
-        assert any(l.get("status_code") == "error" for l in recorded_labels)
+        assert any(entry.get("status_code") == "error" for entry in recorded_labels)
 
     def test_retry_counter_incremented_on_5xx(self):
         import httpx
@@ -473,7 +470,6 @@ class TestHttpClientInstrumentation:
 
     @pytest.mark.asyncio
     async def test_async_client_records_duration_on_success(self):
-        import httpx
         from ingestion.http_client import AsyncHorizonClient
         from ingestion.metrics import IngestionMetricsCollector
 
@@ -535,7 +531,7 @@ class TestMetricsEndpoint:
         if resp.status_code == 200:
             lines = resp.text.splitlines()
             # All non-empty lines must start with '#' (comment) or a metric name
-            non_comment = [l for l in lines if l and not l.startswith("#")]
+            non_comment = [ln for ln in lines if ln and not ln.startswith("#")]
             for line in non_comment:
                 # Prometheus text format: metric_name{labels} value [timestamp]
                 assert " " in line, f"Unexpected line format: {line!r}"
@@ -573,7 +569,7 @@ class TestStreamerMetricsIntegration:
         from ingestion.data_models import Asset, Trade, TradeType
         from datetime import datetime, timezone
 
-        metrics = IngestionMetricsCollector.instance()
+        IngestionMetricsCollector.instance()
         queue = BoundedTradeQueue(maxsize=200, overflow_strategy="drop_oldest")
         streamer = HorizonStreamer(queue=queue)
 

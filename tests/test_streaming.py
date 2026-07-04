@@ -12,16 +12,17 @@ Covers:
 """
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import json
-import re
 import uuid
 from datetime import datetime, timezone
-from typing import AsyncGenerator
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from api.streaming import ScoreUpdateEvent
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +53,6 @@ def _make_event(wallet: str = "G" + "A" * 55, delta: int = 5) -> "ScoreUpdateEve
 
 class TestScoreUpdateEvent:
     def test_to_sse_format(self):
-        from api.streaming import ScoreUpdateEvent
 
         event = _make_event()
         sse = event.to_sse()
@@ -62,18 +62,16 @@ class TestScoreUpdateEvent:
         assert sse.endswith("\n\n")
 
     def test_to_sse_valid_json_payload(self):
-        from api.streaming import ScoreUpdateEvent
 
         event = _make_event()
         sse = event.to_sse()
-        data_line = [l for l in sse.split("\n") if l.startswith("data: ")][0]
+        data_line = [ln for ln in sse.split("\n") if ln.startswith("data: ")][0]
         payload = json.loads(data_line[len("data: "):])
         assert payload["wallet"] == event.wallet
         assert payload["current_score"] == event.current_score
         assert payload["delta"] == event.delta
 
     def test_to_sse_contains_event_id(self):
-        from api.streaming import ScoreUpdateEvent
 
         event = _make_event()
         sse = event.to_sse()
@@ -124,6 +122,8 @@ class TestScorePublisher:
             str(call).find("ledgerlens:score:*") != -1
             for call in mock_pipe.publish.call_args_list
         )
+        assert wallet_channel_call
+        assert wildcard_call
         assert mock_pipe.publish.call_count == 2
         assert mock_pipe.hset.called
         assert mock_pipe.expire.called
@@ -220,7 +220,7 @@ class TestSSEConnectionManager:
     @pytest.mark.asyncio
     async def test_namespace_isolation(self):
         """Events from another namespace are silently dropped."""
-        from api.streaming import SSEConnectionManager, ScorePublisher, ScoreUpdateEvent
+        from api.streaming import ScoreUpdateEvent
 
         manager, mock_redis, mock_pubsub = self._make_manager()
 
@@ -274,7 +274,7 @@ class TestSSEConnectionManager:
         gen = manager.subscribe(connection_id=conn_id, wallets=[wallet])
         # Start the generator
         try:
-            chunk = await gen.__anext__()
+            await gen.__anext__()
         except StopAsyncIteration:
             pass
         except Exception:

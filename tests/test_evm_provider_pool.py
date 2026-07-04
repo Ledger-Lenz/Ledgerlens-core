@@ -19,8 +19,7 @@ Coverage:
 import asyncio
 import json
 import time
-from dataclasses import replace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,8 +27,6 @@ from ingestion.evm_loader import (
     EVMProvider,
     EVMProviderPool,
     EVMProviderPoolExhaustedError,
-    EVMProviderStats,
-    EVMProviderPoolStats,
     EVMRPCError,
     _mask_rpc_url,
     _validate_rpc_url,

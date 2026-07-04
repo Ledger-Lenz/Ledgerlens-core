@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import logging
 import os
 import random
@@ -33,7 +32,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("train_gnn")
@@ -210,7 +208,6 @@ def train(
         Dropout rate.
     """
     import torch
-    import torch.nn as nn
     from sklearn.metrics import roc_auc_score
 
     from detection.gnn_ring_detector import (
@@ -243,16 +240,6 @@ def train(
     logger.info("Train: %d wallets | Val: %d wallets", len(train_wallets), len(val_wallets))
 
     # Build graphs
-    train_trades = _make_dummy_trades(train_wallets, n_trades=len(train_wallets) * 5)
-    val_trades = _make_dummy_trades(val_wallets, n_trades=len(val_wallets) * 5)
-
-    train_graph = build_transaction_graph(train_wallets + val_wallets, _default_node_feature_fn)
-    # Use combined graph so val nodes have embeddings
-    all_graph = build_transaction_graph(
-        list(set(train_wallets + val_wallets)),
-        _default_node_feature_fn,
-    )
-
     # Re-build with actual trades
     # In production this would use real trade data from the DB
     all_trades = _make_dummy_trades(list(set(train_wallets + val_wallets)), n_trades=500)
@@ -291,7 +278,6 @@ def train(
         list(encoder.parameters()) + list(classifier.parameters()), lr=lr
     )
     pos_weight = torch.tensor([float(neg_sample_ratio)], dtype=torch.float)
-    loss_fn = nn.BCELoss(reduction="mean")
 
     x = full_graph["wallet"].x
     edge_index = full_graph["wallet", "trades", "wallet"].edge_index

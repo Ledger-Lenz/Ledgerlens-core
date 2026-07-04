@@ -16,7 +16,6 @@ import hashlib
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -44,15 +43,14 @@ def _default_node_fn(wallet: str):
             dtype=torch.float,
         )
     except ImportError:
-        import numpy as np
         return [0.0] * 4
 
 
 # ── PyG availability guard ────────────────────────────────────────────────────
 
 try:
-    import torch
-    from torch_geometric.data import HeteroData
+    import torch  # noqa: F401
+    from torch_geometric.data import HeteroData  # noqa: F401
     from detection.gnn_ring_detector import (
         GraphSAGEEncoder,
         RingMembershipClassifier,
@@ -144,7 +142,6 @@ class TestRingMembershipClassifier:
 
 class TestGNNRingDetectorFallback:
     def _build_graph_with_scc(self, wallet: str):
-        import torch
         wallets = [wallet, f"G{'E'*54}1"]
         trades = [_make_trade(wallets[0], wallets[1])]
         graph = build_transaction_graph(trades, _default_node_fn)
@@ -183,7 +180,6 @@ class TestTopNeighbours:
 
     def test_returns_k_wallets_when_fitted(self):
         """After loading a model, top_neighbours returns exactly k wallets."""
-        import torch
         wallets = [f"G{'M'*54}{i}" for i in range(10)]
         trades = [_make_trade(wallets[i], wallets[(i + 1) % 10]) for i in range(10)]
         graph = build_transaction_graph(trades, _default_node_fn)

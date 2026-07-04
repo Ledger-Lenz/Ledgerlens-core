@@ -20,8 +20,12 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from detection.feature_store import WalletFeatureState
 
 from config.settings import settings
 from detection.risk_score import RiskScore
@@ -1499,7 +1503,7 @@ def get_rings(
     ]
 
 
-def save_feature_state(state, db_path: str | None = None) -> None:
+def save_feature_state(state: "WalletFeatureState", db_path: str | None = None) -> None:
     """Persist a WalletFeatureState to cold storage (SQLite).
 
     Args:
