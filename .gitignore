@@ -22,6 +22,10 @@ models/optuna_studies/
 # Local RiskScore store
 *.db
 
+# Runtime state / generated output
+horizon_cursor.txt
+drift_reports/
+
 # Editors
 .vscode/
 .idea/
