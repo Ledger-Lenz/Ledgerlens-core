@@ -116,9 +116,13 @@ graph TB
 - **detection/shap_explainer.py**: SHAP-based interpretability layer
 - **detection/causal_engine.py**: DoWhy structural causal model — do-calculus interventions, ATE estimation, counterfactual scores
 
-The Soroban contract, REST API, and dashboard live in the
-`ledgerlens-contracts`, `ledgerlens-api`, and `ledgerlens-dashboard` repos
-respectively — see [LedgerLens Organization](#ledgerlens-organization).
+> **Note:** the sections below describe an original multi-repo split
+> (`ledgerlens-api`, `ledgerlens-dashboard`, `ledgerlens-contracts`). In
+> practice the REST API (`api/`) and Soroban/oracle contracts (`contracts/`)
+> now live in this repo alongside the detection engine; only the dashboard
+> remains external. See [LedgerLens Organization](#ledgerlens-organization)
+> for the cross-repo contracts that still apply, and [ROADMAP.md](ROADMAP.md)
+> for current direction.
 
 ## Benford's Law on the Blockchain
 
@@ -295,8 +299,9 @@ EVM_PROVIDERS=[
 
 ## Repository Structure
 
-This repository (`ledgerlens-core`) contains only the detection engine. The
-API, dashboard, and Soroban contract live in separate repos — see
+This repository (`ledgerlens-core`) contains the detection engine, the
+FastAPI REST API (`api/`), and the Soroban/oracle contracts (`contracts/`).
+The dashboard remains a separate repo — see
 [LedgerLens Organization](#ledgerlens-organization) below.
 
 ```
