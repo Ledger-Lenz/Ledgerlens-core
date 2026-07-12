@@ -46,7 +46,6 @@ from detection.storage import (
     promote_cold_to_hot,
 )
 from detection.shap_explainer import explain_score, top_contributing_features
-from detection.gnn_model import load_gnn_engine, GNNInferenceEngine
 from ingestion.account_loader import async_load_account_metadata, load_account_metadata
 from ingestion.data_models import Trade, TradeType
 from ingestion.historical_loader import async_load_historical_trades, load_historical_trades
@@ -99,6 +98,45 @@ def _ingest_solana_trades(stellar_accounts: list[str]) -> pd.DataFrame:
     except Exception:
         logger.warning("solana.ingest failed", exc_info=True)
         return pd.DataFrame()
+
+
+_gnn_detector = None
+
+
+def _get_gnn_detector():
+    """Return a shared `GNNRingDetector`, loaded lazily from settings."""
+    global _gnn_detector
+    if _gnn_detector is None:
+        from detection.gnn_ring_detector import GNNRingDetector
+
+        model_path = getattr(settings, "gnn_model_path", "models/gnn_ring_detector.pt")
+        fallback = getattr(settings, "gnn_fallback_to_scc", True)
+        _gnn_detector = GNNRingDetector(model_path=model_path, fallback_to_scc=fallback)
+        _gnn_detector.load()
+    return _gnn_detector
+
+
+def _score_wallets_with_gnn(graph) -> dict[str, float]:
+    """Return a wallet -> ring-membership-probability map for every wallet node.
+
+    Uses the batched forward pass when the model is fitted (one encoder call
+    for the whole graph); falls back to per-wallet SCC membership via
+    `GNNRingDetector.predict()` when the model isn't loaded.
+    """
+    detector = _get_gnn_detector()
+    wallet_list = list(getattr(graph["wallet"], "wallet_list", []))
+    if not wallet_list:
+        return {}
+
+    if detector._fitted:
+        try:
+            scores = detector.predict_batch(graph)
+            return {wallet: float(scores[i].item()) for i, wallet in enumerate(wallet_list)}
+        except Exception:
+            logger.exception("GNN batch scoring failed; falling back to per-wallet predict")
+
+    return {wallet: detector.predict(wallet, graph) for wallet in wallet_list}
+
 
 # Global feature store instance
 _feature_store: Optional[FeatureStore] = None
@@ -251,14 +289,11 @@ def run(
             rings = find_wash_rings(graph)
             all_rings.extend(rings)
             ring_membership = build_ring_membership_index(rings, trades=trades)
-            # GNN scoring — optional; degrades to 0.0 if torch_geometric not installed
-            _gnn_engine = load_gnn_engine(settings.model_dir)
-            if _gnn_engine is not None:
-                GNNInferenceEngine.set_instance(_gnn_engine)
+            # GNN scoring — optional; degrades to SCC-membership (or 0.0) if
+            # torch_geometric or the trained checkpoint is unavailable.
             gnn_scores: dict[str, float] = {}
             try:
-                if _gnn_engine is not None:
-                    gnn_scores = _gnn_engine.score_graph(graph)
+                gnn_scores = _score_wallets_with_gnn(graph)
             except Exception:
                 logger.exception("GNN scoring failed; using 0.0 for gnn_wash_ring_prob")
             accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
