@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     horizon_max_retries: int = 5
     horizon_base_retry_delay: float = 1.0
     horizon_max_retry_delay: float = 60.0
+
+    # ── GNN ring detection ──────────────────────────────────────────────────
+    gnn_model_path: str = "models/gnn_ring_detector.pt"
+    gnn_fallback_to_scc: bool = True
+
     streamer_queue_maxsize: int = 1000  # Hard cap on buffered Horizon trades.
     streamer_overflow_strategy: str = "drop_oldest"  # block/drop_newest/drop_oldest.
     streamer_high_water_ratio: float = 0.8  # Begin producer throttling at 80%.
