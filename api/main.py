@@ -108,6 +108,31 @@ def _check_causal_rate_limit(client_ip: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Simple in-process IP rate limiter for the similar-wallets endpoint.
+# ---------------------------------------------------------------------------
+_GNN_SIMILARITY_RATE_WINDOW = 60.0  # window size in seconds
+_gnn_similarity_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_gnn_similarity_rate_limit(client_ip: str) -> None:
+    """Raise HTTP 429 if ``client_ip`` has exceeded the similar-wallets rate limit."""
+    from config.settings import settings
+    now = time.monotonic()
+    bucket = _gnn_similarity_rate_buckets[client_ip]
+    # Evict timestamps outside the window
+    _gnn_similarity_rate_buckets[client_ip] = [t for t in bucket if now - t < _GNN_SIMILARITY_RATE_WINDOW]
+    if len(_gnn_similarity_rate_buckets[client_ip]) >= settings.gnn_similarity_rate_limit_per_minute:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: similar-wallets endpoint allows "
+                f"{settings.gnn_similarity_rate_limit_per_minute} requests per minute per IP."
+            ),
+        )
+    _gnn_similarity_rate_buckets[client_ip].append(now)
+
+
+# ---------------------------------------------------------------------------
 # Causal engine singleton — fitted lazily on first request.
 # ---------------------------------------------------------------------------
 _causal_engine = None
@@ -1027,22 +1052,139 @@ def wallet_scores(wallet: str) -> dict:
     }
 
 
-@v1_router.get(
-    "/wallets/{wallet}/cross-chain",
-    tags=["Wallets"],
-    summary="Cross-chain bridge history",
-    description="Return full EVM bridge transfer history for a Stellar wallet.",
-)
-def wallet_cross_chain(wallet: str) -> list[dict]:
-    """Return the full bridge transfer history for ``wallet``.
+class SimilarWallet(BaseModel):
+    wallet: str
+    similarity: float
+    current_risk_score: int
+    wash_ring_membership: bool
 
-    ``amount_usd_estimate`` values are derived from on-chain oracle prices and
-    may be manipulated — treat them as estimates only.
+
+class SimilarWalletsResponse(BaseModel):
+    wallet: str
+    computed_from: str
+    model_version: str
+    similar_wallets: list[SimilarWallet]
+
+
+# Global vector index and embedding store singletons
+_vector_index: Optional[object] = None
+_embedding_store: Optional[object] = None
+_model_version: Optional[str] = None
+
+
+def _initialize_vector_resources():
+    """Initialize the vector index and embedding store singletons."""
+    global _vector_index, _embedding_store, _model_version
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+    from detection.vector_index import create_vector_index
+    import numpy as np
+
+    if _embedding_store is None:
+        _embedding_store = EmbeddingStore()
+
+    # Get the latest model version
+    _model_version = _embedding_store.get_latest_model_version()
+    if _model_version is None:
+        return  # No embeddings yet
+
+    if _vector_index is None:
+        _vector_index = create_vector_index()
+        # Load all embeddings from the store
+        wallets = []
+        vectors = []
+        for wallet, embedding_bytes in _embedding_store.get_all_embeddings(_model_version):
+            wallets.append(wallet)
+            vectors.append(np.frombuffer(embedding_bytes, dtype=np.float32))
+        if vectors:
+            _vector_index.add_batch(wallets, np.array(vectors))
+
+
+@v1_router.get(
+    "/wallets/{wallet}/similar",
+    tags=["Wallets"],
+    summary="Find structurally similar wallets",
+    description="Return globally similar wallets using precomputed GNN embeddings and ANN search.",
+)
+def find_similar_wallets(
+    request: Request,
+    wallet: str,
+    k: int = Query(10, ge=1, le=100, description="Number of similar wallets to return"),
+    min_score: float = Query(0.0, ge=0.0, le=1.0, description="Minimum similarity score"),
+) -> SimilarWalletsResponse:
+    """Return structurally similar wallets using the global vector index.
+
+    - **404** — no embedding found for the given wallet.
+    - **503** — vector index not initialized.
     """
-    history = get_bridge_transfer_history(stellar_wallet=wallet)
-    if not history:
-        raise HTTPException(status_code=404, detail=f"No bridge transfer history for wallet {wallet}")
-    return history
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+    from detection.vector_index import create_vector_index
+    import numpy as np
+
+    validate_stellar_address(wallet)
+
+    # Check rate limit
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    _check_gnn_similarity_rate_limit(client_ip)
+
+    # Initialize resources if needed
+    if _embedding_store is None:
+        _initialize_vector_resources()
+    if _vector_index is None:
+        _initialize_vector_resources()
+    if _embedding_store is None or _vector_index is None or _model_version is None:
+        raise HTTPException(status_code=503, detail="Vector similarity index not available")
+
+    # Get the embedding for the queried wallet
+    embedding_result = _embedding_store.get_embedding(wallet, _model_version)
+    if embedding_result is None:
+        raise HTTPException(status_code=404, detail=f"No embedding found for wallet {wallet}")
+    embedding, _ = embedding_result
+
+    # Search for similar wallets
+    similar_wallets_with_scores = _vector_index.search(embedding, k + 1)  # +1 to exclude self
+
+    # Filter out the queried wallet and apply min_score
+    filtered_similar = []
+    for similar_wallet, similarity in similar_wallets_with_scores:
+        if similar_wallet == wallet:
+            continue
+        if similarity < min_score:
+            continue
+        # Get current risk score and wash ring membership
+        scores = get_latest_scores(wallet=similar_wallet, limit=1)
+        current_risk_score = scores[0].score if scores else 0
+        # For wash ring membership, we can check if the wallet is in any wash ring
+        # Let's query the wash_rings table
+        wash_ring_membership = False
+        try:
+            with sqlite3.connect(settings.db_path) as conn:
+                cursor = conn.execute(
+                    "SELECT 1 FROM wash_rings WHERE accounts_json LIKE ? LIMIT 1",
+                    (f'%"{similar_wallet}"%',),
+                )
+                if cursor.fetchone():
+                    wash_ring_membership = True
+        except Exception:
+            pass
+        filtered_similar.append(
+            SimilarWallet(
+                wallet=similar_wallet,
+                similarity=similarity,
+                current_risk_score=current_risk_score,
+                wash_ring_membership=wash_ring_membership,
+            )
+        )
+        if len(filtered_similar) >= k:
+            break
+
+    return SimilarWalletsResponse(
+        wallet=wallet,
+        computed_from="global_index",
+        model_version=_model_version,
+        similar_wallets=filtered_similar,
+    )
 
 
 @v1_router.get("/alerts/dedup-state/{wallet}", tags=["Alerts"])
