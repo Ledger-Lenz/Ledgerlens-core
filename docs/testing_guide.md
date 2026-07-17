@@ -81,3 +81,56 @@ trades and edits to the id/paging-token scheme only need to happen in
 one place. Use the same pattern (call `TradeFactory.trade(...)` with
 your existing literal field values) when touching other ad hoc
 `Trade(...)` constructions.
+
+
+## Cross-Repo E2E Harness
+
+### Overview
+
+The `tests/e2e_cross_repo/` suite is a Testcontainers-based harness
+that exercises the full end-to-end data flow:
+core computes scores → ledgerlens-api serves them via REST →
+scores above threshold are forwarded to the Soroban ledgerlens-score
+contract.
+
+This suite is **not part of the default pytest run** (marked with
+`@pytest.mark.cross_repo_e2e` and excluded via `pyproject.toml`'s
+`addopts = "-m 'not cross_repo_e2e'"`).
+
+### Local Multi-Repo Directory Layout
+
+To run locally, we recommend this sibling directory structure:
+```
+my-workspace/
+├── ledgerlens-core/
+├── ledgerlens-api/
+└── ledgerlens-contracts/
+```
+
+### Environment Variables
+
+- `LEDGERLENS_API_REPO_PATH`: Optional path to local ledgerlens-api
+  checkout. Defaults to `../ledgerlens-api`.
+- `LEDGERLENS_CONTRACTS_REPO_PATH`: Optional path to local
+  ledgerlens-contracts checkout. Defaults to `../ledgerlens-contracts`.
+- `CROSS_REPO_E2E_PINNED_REF`: Git ref to use when cloning sibling
+  repos locally if no path is set. Defaults to `main`.
+
+### Running Locally
+
+1. Ensure Docker is running locally.
+2. Set up the sibling directory layout as above (or set env vars
+   accordingly).
+3. Run:
+   ```bash
+   pytest -m cross_repo_e2e tests/e2e_cross_repo/
+   ```
+
+### What This Catches That `tests/e2e/` Doesn't
+
+- Schema drift between core's `RiskScore` model and ledgerlens-api's
+  response models.
+- Integration issues between core's score output and ledgerlens-api's
+  ingestion.
+- Correctness of the Soroban contract's `submit_score` and `get_score`
+  functions when fed real core scores.

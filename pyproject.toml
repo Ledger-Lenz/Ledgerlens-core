@@ -21,10 +21,11 @@ ledgerlens = "cli:app"
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
-addopts = "--continue-on-collection-errors"
+addopts = "--continue-on-collection-errors -m 'not cross_repo_e2e'"
 markers = [
     "benchmark: performance benchmarks (excluded from standard CI; run with -m benchmark)",
     "slow: long-running tests such as 100K-node graph performance (excluded from standard CI; run with -m slow)",
+    "cross_repo_e2e: requires Docker + sibling repo checkouts; excluded from default `pytest` run",
 ]
 filterwarnings = [
     "ignore::UserWarning:sklearn.utils.parallel",
