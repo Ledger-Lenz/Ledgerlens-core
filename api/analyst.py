@@ -7,11 +7,14 @@ All endpoints are admin-key gated (X-LedgerLens-Admin-Key header).
 
 Endpoints
 ---------
-GET  /analyst/wallet/{wallet}           Combined review view for a wallet
-POST /analyst/wallet/{wallet}/feedback  Submit analyst verdict
-GET  /analyst/queue                     Top 20 wallets awaiting review
-GET  /analyst/stats                     Aggregate review statistics
-GET  /analyst/feedback                  Export feedback since ISO timestamp (active learning)
+GET    /analyst/wallet/{wallet}           Combined review view for a wallet
+POST   /analyst/wallet/{wallet}/claim     Claim a wallet for review (soft lock)
+POST   /analyst/wallet/{wallet}/release   Release a claim before verdict
+POST   /analyst/wallet/{wallet}/feedback  Submit analyst verdict (requires claim)
+GET    /analyst/queue                     Top 20 wallets awaiting review
+GET    /analyst/stats                     Aggregate review statistics
+GET    /analyst/case-stats                SLA and case-management metrics
+GET    /analyst/feedback                  Export feedback since ISO timestamp
 """
 
 from __future__ import annotations
@@ -26,9 +29,14 @@ from pydantic import BaseModel
 from api.auth import require_admin_key
 from config.settings import settings
 from detection.analyst_store import (
+    claim_wallet,
+    expire_stale_locks,
+    get_active_claim,
     get_analyst_feedback_since,
     get_analyst_queue,
     get_analyst_stats,
+    get_case_stats,
+    release_wallet,
     submit_analyst_feedback,
 )
 from detection.storage import get_latest_scores, get_shap_values, get_rings, init_db
@@ -175,6 +183,9 @@ def analyst_wallet_view(
 
     current_score = next((s for s in scores if s.asset_pair == focus_pair), top_score)
 
+    # Include assignment state in the wallet view
+    claim = get_active_claim(wallet, focus_pair)
+
     return {
         "wallet": wallet,
         "focus_asset_pair": focus_pair,
@@ -184,6 +195,104 @@ def analyst_wallet_view(
         "ring_membership": _get_ring_membership(wallet),
         "score_trend": _get_score_trend(wallet),
         "open_alerts": _get_open_alerts(wallet),
+        "assignment": {
+            "is_assigned": claim is not None,
+            "assigned_to": claim["analyst_key_hash"] if claim else None,
+            "lock_expires_at": claim["lock_expires_at"] if claim else None,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /analyst/wallet/{wallet}/claim
+# ---------------------------------------------------------------------------
+
+
+class ClaimRequest(BaseModel):
+    analyst_key_hash: str
+
+
+@router.post("/wallet/{wallet}/claim", dependencies=[Depends(require_admin_key)])
+def claim_analyst_wallet(
+    wallet: str,
+    body: ClaimRequest,
+    asset_pair: str | None = Query(default=None),
+) -> dict:
+    """Claim a wallet for review.
+
+    Atomically assigns the wallet to the requesting analyst if unassigned or
+    the existing lock has expired.  Returns 409 if actively claimed by another
+    analyst, or 429 if the analyst has reached the claim cap.
+    """
+    _validate_wallet(wallet)
+    init_db()
+
+    if asset_pair is None:
+        scores = get_latest_scores(wallet=wallet)
+        if not scores:
+            raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
+        asset_pair = max(scores, key=lambda s: s.score).asset_pair
+
+    try:
+        result = claim_wallet(
+            wallet=wallet,
+            asset_pair=asset_pair,
+            analyst_key_hash=body.analyst_key_hash,
+        )
+    except RuntimeError as exc:
+        # Already claimed by another analyst
+        existing = get_active_claim(wallet, asset_pair)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": "Already claimed",
+                "assigned_to": existing["analyst_key_hash"] if existing else None,
+                "lock_expires_at": existing["lock_expires_at"] if existing else None,
+            },
+        ) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# POST /analyst/wallet/{wallet}/release
+# ---------------------------------------------------------------------------
+
+
+class ReleaseRequest(BaseModel):
+    analyst_key_hash: str
+
+
+@router.post("/wallet/{wallet}/release", dependencies=[Depends(require_admin_key)])
+def release_analyst_wallet(
+    wallet: str,
+    body: ReleaseRequest,
+    asset_pair: str | None = Query(default=None),
+) -> dict:
+    """Release an analyst's claim on a wallet.
+
+    Returns 404 if no active claim exists for this analyst on this wallet.
+    """
+    _validate_wallet(wallet)
+    init_db()
+
+    if asset_pair is None:
+        scores = get_latest_scores(wallet=wallet)
+        if not scores:
+            raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
+        asset_pair = max(scores, key=lambda s: s.score).asset_pair
+
+    released = release_wallet(wallet, asset_pair, body.analyst_key_hash)
+    if not released:
+        raise HTTPException(status_code=404, detail="No active claim found for this analyst on this wallet.")
+
+    return {
+        "wallet": wallet,
+        "asset_pair": asset_pair,
+        "released_by": body.analyst_key_hash,
+        "status": "released",
     }
 
 
@@ -203,6 +312,7 @@ class AnalystFeedbackRequest(BaseModel):
 def submit_feedback(wallet: str, body: AnalystFeedbackRequest) -> dict:
     """Capture analyst verdict for ``wallet``.
 
+    Requires an active claim held by the submitting analyst_key_hash.
     The verdict is stored in ``analyst_feedback`` and is available to the
     active learning loop via ``GET /analyst/feedback?since=<ISO_TIMESTAMP>``.
 
@@ -231,9 +341,14 @@ def submit_feedback(wallet: str, body: AnalystFeedbackRequest) -> dict:
             notes=body.notes,
             analyst_key_hash=body.analyst_key_hash,
             review_started_at=review_started_at,
+            require_claim=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     return record
 
@@ -250,7 +365,8 @@ def analyst_queue(
     """Return the top ``limit`` wallets awaiting analyst review, sorted by score desc.
 
     A wallet is "awaiting review" when it has a risk score >= threshold and
-    has not been reviewed today.
+    has not been reviewed today.  Each item includes assignment state:
+    ``is_assigned``, ``assigned_to``, and ``lock_expires_at``.
     """
     init_db()
     return get_analyst_queue(limit=limit)
@@ -272,6 +388,26 @@ def analyst_stats() -> dict:
     """
     init_db()
     return get_analyst_stats()
+
+
+# ---------------------------------------------------------------------------
+# GET /analyst/case-stats
+# ---------------------------------------------------------------------------
+
+
+@router.get("/case-stats", dependencies=[Depends(require_admin_key)])
+def analyst_case_stats() -> dict:
+    """Return SLA and case-management metrics.
+
+    Response fields:
+    - avg_time_to_claim_seconds: float | None
+    - avg_time_to_resolution_seconds: float | None
+    - assigned_count: int
+    - unassigned_count: int
+    - expired_reclaimed_count: int
+    """
+    init_db()
+    return get_case_stats()
 
 
 # ---------------------------------------------------------------------------

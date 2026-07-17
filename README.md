@@ -750,6 +750,19 @@ The response returns a `subscriber_id` (UUID) used for management.
 | `POST` | `/v1/feedback`      | Submit analyst label correction (admin-key required) |
 | `GET`  | `/v1/feedback`      | Paginated correction history (admin-key required)    |
 
+### Analyst Review Dashboard & Case Management
+
+| Method | Path                                       | Description                                              |
+| ------ | ------------------------------------------ | -------------------------------------------------------- |
+| `GET`  | `/analyst/queue`                           | Top 20 wallets awaiting review (with assignment state)   |
+| `GET`  | `/analyst/wallet/{wallet}`                 | Combined review view (score, SHAP, timeline, rings)      |
+| `POST` | `/analyst/wallet/{wallet}/claim`           | Claim a wallet for review (soft lock, 30 min)            |
+| `POST` | `/analyst/wallet/{wallet}/release`         | Release a claim before verdict                           |
+| `POST` | `/analyst/wallet/{wallet}/feedback`        | Submit verdict (requires active claim)                   |
+| `GET`  | `/analyst/stats`                           | Aggregate review statistics                              |
+| `GET`  | `/analyst/case-stats`                      | SLA metrics (claim/resolution times, queue depth)        |
+| `GET`  | `/analyst/feedback`                        | Export feedback for active learning loop                 |
+
 ### Cross-Chain Link Endpoints
 
 | Method | Path                                          | Description                                                |

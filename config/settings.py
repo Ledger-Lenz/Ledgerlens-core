@@ -126,6 +126,10 @@ class Settings(BaseSettings):
     feature_store_ttl_hours: int = 48
     feature_store_flush_interval_seconds: int = 300
 
+    # ── Analyst case management (Issue #200 follow-up) ──────────────────────
+    analyst_lock_timeout_seconds: int = 1800  # 30 min soft lock before auto-release
+    analyst_claim_max_active_per_analyst: int = 10  # max concurrent claims per analyst
+
     # ── Detection ─────────────────────────────────────────────────────────────
     benford_mad_threshold: float = 0.015
     risk_score_threshold: int = 70
@@ -286,6 +290,7 @@ class Settings(BaseSettings):
                      "federated_min_participants", "cursor_flush_events",
                      "stream_checkpoint_interval", "streamer_queue_maxsize",
                      "historical_loader_concurrency", "historical_max_lookback_days",
+                     "analyst_lock_timeout_seconds", "analyst_claim_max_active_per_analyst",
                      mode="before")
     @classmethod
     def must_be_positive(cls, v: object) -> object:
