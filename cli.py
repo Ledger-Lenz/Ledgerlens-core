@@ -183,6 +183,37 @@ def train(
     logger.info("Saved models to %s", settings.model_dir)
 
 
+@app.command("generate-model-card")
+def generate_model_card_cli(
+    model: str = typer.Option(..., "--model", help="Model name (e.g., random_forest, xgboost)"),
+    version: str = typer.Option(..., "--version", help="Model version string"),
+    output_dir: str = typer.Option(None, "--output-dir", help="Output directory (default: settings.model_card_dir)"),
+) -> None:
+    """Generate a model card for a specific model version on demand."""
+    from config.settings import settings
+    from detection.model_card import generate_model_card, render_markdown, render_pdf
+    from pathlib import Path
+
+    output_dir = output_dir or settings.model_card_dir
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        card = generate_model_card(model, version)
+        md_path = output_path / f"{model}_{version}.md"
+        md_path.write_text(render_markdown(card))
+        logger.info("Generated model card Markdown at %s", md_path)
+
+        if settings.model_card_pdf_enabled:
+            pdf_path = output_path / f"{model}_{version}.pdf"
+            render_pdf(card, output_path=str(pdf_path))
+
+        typer.echo(f"Model card generated for {model} v{version} at {md_path}")
+    except Exception as e:
+        typer.echo(f"Error generating model card: {e}", err=True)
+        raise typer.Exit(1)
+
+
 @app.command("archive-features")
 def archive_features(
     cutoff_days: int = typer.Option(
@@ -424,6 +455,29 @@ def retrain_check(
         save_models(new_results, training_dataset_path=training_dataset_path)
         if new_shap:
             save_shap_importances(new_shap, settings.model_dir)
+        
+        # Auto-generate model cards if enabled
+        if settings.model_card_auto_generate:
+            from detection.model_card import generate_model_card, render_markdown, render_pdf
+            model_card_dir = Path(settings.model_card_dir)
+            model_card_dir.mkdir(parents=True, exist_ok=True)
+            
+            for model_name in model_names:
+                version = get_current_version(model_name, settings.model_dir)
+                if not version:
+                    continue
+                try:
+                    card = generate_model_card(model_name, version)
+                    md_path = model_card_dir / f"{model_name}_{version}.md"
+                    md_path.write_text(render_markdown(card))
+                    logger.info("Generated model card for %s v%s at %s", model_name, version, md_path)
+                    
+                    if settings.model_card_pdf_enabled:
+                        pdf_path = model_card_dir / f"{model_name}_{version}.pdf"
+                        render_pdf(card, output_path=str(pdf_path))
+                except Exception as e:
+                    logger.warning("Failed to generate model card for %s v%s: %s", model_name, version, e)
+        
         logger.info("Promoted new models to production")
     else:
         logger.info("New models not promoted; keeping previous versions")

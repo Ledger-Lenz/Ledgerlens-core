@@ -396,6 +396,53 @@ def delete_suppression(rule_id: int) -> dict:
 
 @router.get("/waf/blocked-requests", tags=["Admin"], summary="Get recent WAF blocked requests")
 def get_waf_blocked_requests(limit: int = Query(100, ge=1, le=1000)) -> list[dict]:
-    """Return recent requests blocked by the WAF (admin-only)."""
+    """Return recent requests blocked by WAF (admin-only)."""
     from api.waf_middleware import get_blocked_requests
     return get_blocked_requests(limit=limit)
+
+
+@router.get("/model-cards/{model_name}/{version}", tags=["Admin"], summary="Get model card metadata")
+def get_model_card_metadata(model_name: str, version: str) -> dict:
+    """Return model card metadata (admin-only)."""
+    from config.settings import settings
+    from detection.model_card import generate_model_card
+    card = generate_model_card(model_name, version)
+    return {
+        "model_name": card.model_name,
+        "version": card.version,
+        "trained_at": card.trained_at,
+        "metrics": card.metrics,
+        "top_shap_features": card.top_shap_features,
+        "stability_vs_previous": card.stability_vs_previous,
+        "fairness_summary": card.fairness_summary,
+        "markdown_url": f"/admin/model-cards/{model_name}/{version}/markdown"
+    }
+
+
+@router.get("/model-cards/{model_name}/{version}/markdown", tags=["Admin"], summary="Get model card as Markdown")
+def get_model_card_markdown(model_name: str, version: str):
+    """Return model card as Markdown (admin-only)."""
+    from fastapi.responses import PlainTextResponse
+    from config.settings import settings
+    from detection.model_card import generate_model_card, render_markdown
+    card = generate_model_card(model_name, version)
+    return PlainTextResponse(render_markdown(card), media_type="text/markdown")
+
+
+@router.get("/model-cards/{model_name}/{version}/pdf", tags=["Admin"], summary="Get model card as PDF")
+def get_model_card_pdf(model_name: str, version: str):
+    """Return model card as PDF (admin-only, requires model_card_pdf_enabled=True)."""
+    from fastapi.responses import Response
+    from config.settings import settings
+    if not settings.model_card_pdf_enabled:
+        return Response(status_code=404, content="PDF rendering is disabled")
+    from detection.model_card import generate_model_card, render_pdf
+    card = generate_model_card(model_name, version)
+    pdf_bytes = render_pdf(card)
+    if pdf_bytes is None:
+        return Response(status_code=503, content="PDF generation failed")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={model_name}_{version}.pdf"}
+    )
