@@ -71,6 +71,12 @@ model_auc_roc = Gauge(
     ["model_name"],
 )
 
+gateway_requests_total = Counter(
+    "ledgerlens_gateway_requests_total",
+    "Total API gateway requests",
+    ["namespace", "scope", "status"],
+)
+
 
 def metrics_response():
     """Return (body_bytes, content_type) for the /metrics endpoint."""

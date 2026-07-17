@@ -1,4 +1,16 @@
-"""API Key Management with scoped permissions and per-key rate limits (Issue #195)."""
+"""API Key Management with scoped permissions and per-key rate limits (Issue #195).
+
+.. deprecated::
+    This router is **deprecated**. Use ``api/api_key_router.py`` (which
+    delegates to ``detection/api_key_store.py``) or the consolidated
+    :class:`api.gateway.GatewayMiddleware` instead.
+
+    All endpoints now delegate to the canonical ``detection.api_key_store``
+    and return a ``Deprecation`` header (RFC 8594) pointing to the migration
+    guide at ``docs/api_gateway.md``.
+
+    This router will be removed in a future release.
+"""
 
 import hashlib
 import secrets
@@ -15,10 +27,20 @@ from config.settings import settings
 
 router = APIRouter(prefix="/admin/api-keys", tags=["API Keys"])
 
+_DEPRECATION_HEADER = {"Deprecation": "True", "Sunset": "Sat, 31 Jan 2027 00:00:00 GMT"}
+_MIGRATION_GUIDE = "https://ledgerlens.ai/docs/api_gateway_migration"
+
 VALID_SCOPES = {"read:scores", "write:suppressions", "admin"}
 
 # In-memory sliding window counters: {key_hash: [timestamps]}
 _rate_windows: dict[str, list[float]] = {}
+
+
+def _add_deprecation_headers(response: dict | None = None) -> dict:
+    """Add RFC 8594 Deprecation headers to the response."""
+    headers = dict(_DEPRECATION_HEADER)
+    headers["Link"] = f'<{_MIGRATION_GUIDE}>; rel="deprecation"'
+    return headers
 
 
 def _hash_key(plaintext: str) -> str:
@@ -64,26 +86,39 @@ def check_rate_limit(key_hash: str, limit: int) -> None:
         raise HTTPException(
             status_code=429,
             detail="Per-key rate limit exceeded",
-            headers={"Retry-After": "60"},
+            headers={"Retry-After": "60", **_add_deprecation_headers()},
         )
     _rate_windows[key_hash].append(now)
 
 
 def require_scope(required_scope: str):
+    """.. deprecated:: Use :mod:`api.gateway` instead."""
     def dependency(x_api_key: str = Header(default="")) -> dict:
         if not x_api_key:
-            raise HTTPException(status_code=401, detail="Missing X-Api-Key header")
+            raise HTTPException(
+                status_code=401,
+                detail="Missing X-Api-Key header",
+                headers=_add_deprecation_headers(),
+            )
 
         key_hash = _hash_key(x_api_key)
         record = get_api_key_record(key_hash)
 
         if record is None:
-            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or revoked API key",
+                headers=_add_deprecation_headers(),
+            )
 
         if record.get("expires_at"):
             now_iso = datetime.now(timezone.utc).isoformat()
             if record["expires_at"] < now_iso:
-                raise HTTPException(status_code=401, detail="API key has expired")
+                raise HTTPException(
+                    status_code=401,
+                    detail="API key has expired",
+                    headers=_add_deprecation_headers(),
+                )
 
         check_rate_limit(key_hash, record["rate_limit_per_minute"])
 
@@ -92,6 +127,7 @@ def require_scope(required_scope: str):
             raise HTTPException(
                 status_code=403,
                 detail=f"Scope '{required_scope}' is required for this endpoint",
+                headers=_add_deprecation_headers(),
             )
 
         with sqlite3.connect(settings.db_path) as conn:
@@ -126,10 +162,11 @@ class CreateKeyResponse(BaseModel):
     "",
     response_model=CreateKeyResponse,
     status_code=201,
-    summary="Create a new API key",
+    summary="Create a new API key (deprecated)",
     description=(
         "Creates a scoped API key. The plaintext key is returned once and never stored. "
-        "Valid scopes: read:scores, write:suppressions, admin."
+        "Valid scopes: read:scores, write:suppressions, admin. "
+        "**DEPRECATED** — use POST /admin/api-keys from api/api_key_router.py instead."
     ),
     dependencies=[Depends(require_admin_key)],
 )
@@ -167,8 +204,9 @@ def create_api_key(body: CreateKeyRequest) -> CreateKeyResponse:
 
 @router.delete(
     "/{key_id}",
-    summary="Revoke an API key",
-    description="Immediately revokes a key. Subsequent requests with this key return 401.",
+    summary="Revoke an API key (deprecated)",
+    description="Immediately revokes a key. Subsequent requests with this key return 401. "
+                "**DEPRECATED** — use DELETE /admin/api-keys/{key_id} from api/api_key_router.py instead.",
     dependencies=[Depends(require_admin_key)],
 )
 def revoke_api_key(key_id: int) -> dict:
@@ -179,7 +217,13 @@ def revoke_api_key(key_id: int) -> dict:
             (key_id,),
         )
         if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail=f"API key {key_id} not found or already revoked")
+            raise HTTPException(
+                status_code=404,
+                detail=f"API key {key_id} not found or already revoked",
+                headers=_add_deprecation_headers(),
+            )
 
-    _rate_windows.pop(key_id, None)
-    return {"revoked": True, "id": key_id}
+    _rate_windows.pop(str(key_id), None)
+
+    response = {"revoked": True, "id": key_id}
+    return response

@@ -1100,8 +1100,17 @@ def stream(
 @app.command("db-migrate")
 def db_migrate(
     db_path: str = typer.Option(None, "--db-path", help="Path to the SQLite database (defaults to LEDGERLENS_DB_PATH)"),
+    consolidate_api_keys: bool = typer.Option(
+        True, "--consolidate-api-keys/--skip-consolidation",
+        help="Consolidate legacy api_keys tables into the canonical detection.api_key_store schema.",
+    ),
 ) -> None:
-    """Apply any pending schema migrations to the database and report the result."""
+    """Apply any pending schema migrations to the database and report the result.
+
+    Also consolidates legacy API key tables (from ``api/api_keys_router.py``
+    and ``api/namespace.py``) into the canonical ``detection.api_key_store``
+    schema when ``--consolidate-api-keys`` is set (the default).
+    """
     from detection.storage import _connect, get_schema_version, migrate_db
 
     with _connect(db_path) as conn:
@@ -1115,6 +1124,35 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+    if consolidate_api_keys:
+        import json
+        import sqlite3
+
+        from detection.api_key_store import migrate_legacy_api_keys
+        from detection.api_key_store import _init_table as _init_api_keys
+
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            report = migrate_legacy_api_keys(conn)
+            total = report["migrated"]
+            key_id_updated = report["rows_updated_key_id"]
+            scopes_updated = report["rows_updated_scopes"]
+            if total > 0:
+                typer.echo(
+                    f"API key consolidation: {total} change(s) applied "
+                    f"(key_id_populated={key_id_updated}, scopes_updated={scopes_updated})"
+                )
+            else:
+                typer.echo(
+                    "API key consolidation: no changes needed "
+                    f"(key_id_populated={key_id_updated}, scopes_updated={scopes_updated})"
+                )
+        except Exception as exc:
+            typer.echo(f"API key consolidation failed: {exc}", err=True)
+            raise typer.Exit(1)
+        finally:
+            conn.close()
 
 
 @app.command("dlq-replay")
