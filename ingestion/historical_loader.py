@@ -190,6 +190,12 @@ class ParallelHistoricalLoader:
         self.chunk_hours = chunk_hours
         self.progress_path = _resolve_progress_path(progress_path)
         self.tracker = ProgressTracker(self.progress_path)
+        from ingestion.dedup import IdempotencyKeyStore
+        db_path = getattr(storage, "db_path", None) or settings.db_path
+        self.dedup_store = IdempotencyKeyStore(
+            db_path=db_path,
+            replay_window_seconds=0.0
+        ) if settings.ingestion_dedup_enabled else None
 
     async def load(
         self,
@@ -284,6 +290,7 @@ class ParallelHistoricalLoader:
         path: str | None = "/trades"
         request_params: dict | None = params
         records_fetched = 0
+        from ingestion.dedup import DedupResult
         async with sem:
             while path:
                 payload = await self.client.get(path, params=request_params)
@@ -292,6 +299,7 @@ class ParallelHistoricalLoader:
                     break
 
                 validated = []
+                seen_in_batch = set()
                 reached_end = False
                 for raw in raw_records:
                     trade = _parse_trade(raw)
@@ -300,10 +308,56 @@ class ParallelHistoricalLoader:
                         reached_end = True
                         continue
                     if close_time >= start:
-                        validated.append(trade)
+                        if self.dedup_store is not None:
+                            pt = trade.paging_token or trade.id
+                            parts = pt.split("-")
+                            if len(parts) == 2:
+                                ledger_sequence = int(parts[0])
+                                operation_index = int(parts[1])
+                            else:
+                                ledger_sequence = 0
+                                operation_index = 0
+                            
+                            key = self.dedup_store.compute_key(
+                                "horizon",
+                                ledger_sequence=ledger_sequence,
+                                tx_hash=trade.transaction_hash or "",
+                                operation_index=operation_index,
+                            )
+                            
+                            if key in seen_in_batch:
+                                logger.debug("Skipping duplicate historical Horizon trade in batch %s", key[:16])
+                                continue
+                            
+                            metadata = {
+                                "ledger_sequence": ledger_sequence,
+                                "tx_hash": trade.transaction_hash,
+                                "operation_index": operation_index,
+                            }
+                            
+                            result = self.dedup_store.is_duplicate(
+                                key,
+                                timestamp=trade.ledger_close_time,
+                                source="horizon",
+                                metadata=metadata,
+                            )
+                            if result is DedupResult.NEW:
+                                seen_in_batch.add(key)
+                                validated.append((trade, key, metadata))
+                            else:
+                                logger.debug("Skipping duplicate historical Horizon trade %s", key[:16])
+                        else:
+                            validated.append((trade, None, None))
 
                 if validated:
-                    await asyncio.to_thread(self.storage.upsert_trades, validated)
+                    trades_to_upsert = [item[0] for item in validated]
+                    await asyncio.to_thread(self.storage.upsert_trades, trades_to_upsert)
+                    
+                    if self.dedup_store is not None:
+                        for _, key, metadata in validated:
+                            if key is not None:
+                                self.dedup_store.mark_seen(key, source="horizon", metadata=metadata)
+                                
                     records_fetched += len(validated)
                 if reached_end:
                     break

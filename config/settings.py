@@ -146,6 +146,9 @@ class Settings(BaseSettings):
     # ── Storage ───────────────────────────────────────────────────────────────
     model_dir: str = "./models"
     ledgerlens_db_path: str = "./ledgerlens.db"
+    ingestion_dedup_enabled: bool = True
+    idempotency_retention_days: int = 90
+    idempotency_replay_window_seconds: float = 3600.0
 
     # ── Downstream services ───────────────────────────────────────────────────
     ledgerlens_api_url: str = "http://localhost:8000"

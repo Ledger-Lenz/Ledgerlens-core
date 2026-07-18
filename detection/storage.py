@@ -100,6 +100,30 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
+
+        CREATE TABLE IF NOT EXISTS trades (
+            paging_token TEXT PRIMARY KEY,
+            trade_id TEXT NOT NULL,
+            ledger_close_time TEXT NOT NULL,
+            base_account TEXT NOT NULL,
+            counter_account TEXT,
+            base_asset_code TEXT NOT NULL,
+            base_asset_issuer TEXT,
+            counter_asset_code TEXT NOT NULL,
+            counter_asset_issuer TEXT,
+            base_amount REAL NOT NULL,
+            counter_amount REAL NOT NULL,
+            price REAL NOT NULL,
+            base_is_seller INTEGER NOT NULL,
+            trade_type TEXT NOT NULL,
+            liquidity_pool_id TEXT,
+            transaction_hash TEXT,
+            path_payment_id TEXT,
+            hop_index INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_trades_ledger_close_time ON trades (ledger_close_time);
+        CREATE INDEX IF NOT EXISTS idx_trades_base_account ON trades (base_account);
+        CREATE INDEX IF NOT EXISTS idx_trades_counter_account ON trades (counter_account);
         """,
     ),
     (
@@ -419,6 +443,53 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_benford_baselines_pair
             ON benford_baselines (asset_pair);
+        """,
+    ),
+    (
+        16,
+        "add ingestion_dedup_keys and ingestion_dedup_audit tables and backfill from bridge_event_dedup",
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_dedup_keys (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            source          TEXT NOT NULL,
+            metadata_json   TEXT,
+            first_seen_at   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dedup_source ON ingestion_dedup_keys (source);
+        CREATE INDEX IF NOT EXISTS idx_dedup_first_seen ON ingestion_dedup_keys (first_seen_at);
+
+        CREATE TABLE IF NOT EXISTS ingestion_dedup_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL,
+            source          TEXT NOT NULL,
+            result          TEXT NOT NULL,
+            checked_at      TEXT NOT NULL,
+            metadata_json   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dedup_audit_source_time ON ingestion_dedup_audit (source, checked_at);
+
+        -- Dummy bridge_event_dedup table if it does not exist to ensure compile-safety
+        CREATE TABLE IF NOT EXISTS bridge_event_dedup (
+            event_hash   TEXT    PRIMARY KEY,
+            chain_id     INTEGER NOT NULL,
+            tx_hash      TEXT    NOT NULL,
+            log_index    INTEGER NOT NULL,
+            block_number INTEGER NOT NULL,
+            first_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Backfill existing rows from bridge_event_dedup
+        INSERT OR IGNORE INTO ingestion_dedup_keys (idempotency_key, source, metadata_json, first_seen_at)
+        SELECT 
+            event_hash, 
+            'evm', 
+            '{"chain_id": ' || chain_id || ', "tx_hash": "' || tx_hash || '", "log_index": ' || log_index || ', "block_number": ' || block_number || '}', 
+            first_seen_at 
+        FROM bridge_event_dedup;
+
+        -- Drop the old table
+        DROP TABLE IF EXISTS bridge_event_dedup;
         """,
     ),
 ]

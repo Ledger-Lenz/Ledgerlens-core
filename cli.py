@@ -1728,5 +1728,75 @@ def benford_calibrate(
     )
 
 
+@app.command("dedup-audit")
+def dedup_audit(
+    source: str = typer.Option(..., "--source", help="The ingestion source: 'horizon' | 'evm' | 'solana'"),
+    since: str = typer.Option(..., "--since", help="ISO-8601 start datetime (UTC)"),
+) -> None:
+    """Report duplicate-detection statistics and details since a given ISO-8601 datetime."""
+    import json
+    import sqlite3
+    from datetime import datetime, timezone
+    from config.settings import settings
+    from config.correlation import mask_wallet
+    from ingestion.dedup import DeduplicationStats
+
+    try:
+        since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+    except Exception as e:
+        typer.echo(f"Invalid ISO-8601 datetime for --since: {e}", err=True)
+        raise typer.Exit(1)
+
+    since_str = since_dt.isoformat()
+    conn = sqlite3.connect(settings.db_path)
+    try:
+        # Check if table exists
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ingestion_dedup_audit'")
+        if not cursor.fetchone():
+            typer.echo("DeduplicationStats(seen_total=0, duplicate_total=0, replay_rejected_total=0, duplicate_rate=0.0)")
+            return
+
+        rows = conn.execute(
+            """
+            SELECT idempotency_key, result, checked_at, metadata_json 
+            FROM ingestion_dedup_audit 
+            WHERE source = ? AND checked_at >= ?
+            ORDER BY checked_at ASC
+            """,
+            (source, since_str),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    seen_total = len(rows)
+    duplicate_total = sum(1 for r in rows if r[1] == "duplicate")
+    replay_rejected_total = sum(1 for r in rows if r[1] == "replay_rejected")
+    rate = (duplicate_total / seen_total) if seen_total > 0 else 0.0
+
+    stats = DeduplicationStats(
+        seen_total=seen_total,
+        duplicate_total=duplicate_total,
+        replay_rejected_total=replay_rejected_total,
+        duplicate_rate=rate,
+    )
+
+    typer.echo(f"DeduplicationStats(seen_total={stats.seen_total}, duplicate_total={stats.duplicate_total}, replay_rejected_total={stats.replay_rejected_total}, duplicate_rate={stats.duplicate_rate})")
+
+    typer.echo("\nDuplicate/Replay Checked Events Details:")
+    for key, result, checked_at, metadata_json in rows:
+        if result in ("duplicate", "replay_rejected"):
+            meta = json.loads(metadata_json) if metadata_json else {}
+            masked_meta = {}
+            for k, v in meta.items():
+                if isinstance(v, str) and ("wallet" in k.lower() or "account" in k.lower() or k in ("pubkey", "address")):
+                    masked_meta[k] = mask_wallet(v)
+                else:
+                    masked_meta[k] = v
+            typer.echo(f"[{checked_at}] Result={result} Key={key[:16]} Metadata={masked_meta}")
+
+
 if __name__ == "__main__":
     app()
