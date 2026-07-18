@@ -136,3 +136,17 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
+
+# ── Cost and Capacity Configuration ──────────────────────────────────────────
+costConfig:
+  enabled: true
+  # Cost per vCPU-hour in USD (adjust to your actual cloud pricing)
+  costPerVcpuHourUsd: "0.0416"
+  # Cost per GB memory-hour in USD
+  costPerGbMemoryHourUsd: "0.0056"
+  # Cost per GB storage per month in USD
+  costPerGbStorageMonthUsd: "0.10"
+  # Days of historical data for capacity projection
+  capacityProjectionWindowDays: "7"
+  # Lead time for capacity alerts (days)
+  capacityProjectionLeadTimeDays: "14"

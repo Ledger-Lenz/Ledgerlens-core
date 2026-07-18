@@ -1,0 +1,96 @@
+# LedgerLens Cost & Capacity Recording Rules
+#
+# These recording rules aggregate Kubernetes resource metrics (from
+# kube-state-metrics and cadvisor) with configurable cost coefficients
+# to produce cost and capacity projection metrics.
+#
+# Prerequisites:
+# - kube-state-metrics and cadvisor are scraped by Prometheus
+# - Cost coefficients are exposed as gauges (see config/cost_exporter.py)
+#
+# Usage:
+#   promtool check rules monitoring/recording_rules_cost.yml
+#   # Add to Prometheus prometheus.yml:
+#   rule_files:
+#     - "monitoring/recording_rules_cost.yml"
+
+groups:
+  - name: ledgerlens_cost
+    interval: 5m
+    rules:
+      # Cost per pod per hour (CPU + memory)
+      # Multiplies per-pod CPU usage (cores) by cost-per-vCPU-hour and
+      # per-pod memory usage (GB) by cost-per-GB-hour.
+      - record: ledgerlens:pod_cost_per_hour:usd
+        expr: |
+          (
+            sum by (pod, namespace) (rate(container_cpu_usage_seconds_total{namespace="ledgerlens"}[5m]))
+            * on() group_left() ledgerlens_cost_per_vcpu_hour_usd
+          )
+          +
+          (
+            sum by (pod, namespace) (container_memory_working_set_bytes{namespace="ledgerlens"}) / 1073741824
+            * on() group_left() ledgerlens_cost_per_gb_memory_hour_usd
+          )
+
+      # Total cost per hour across all pods in the namespace
+      - record: ledgerlens:namespace_cost_per_hour:usd
+        expr: |
+          sum(ledgerlens:pod_cost_per_hour:usd{namespace="ledgerlens"})
+
+      # Cost per wallet scored (amortized over the last hour)
+      # Divides total hourly cost by the number of wallets scored in that hour.
+      # Result is NaN when no wallets are scored (division by zero).
+      - record: ledgerlens:cost_per_wallet_scored:usd
+        expr: |
+          sum(ledgerlens:pod_cost_per_hour:usd{namespace="ledgerlens"})
+          /
+          (sum(rate(ledgerlens_wallets_scored_total[1h])) * 3600)
+
+      # Storage cost per hour (PVC size × cost per GB per month / hours per month)
+      - record: ledgerlens:storage_cost_per_hour:usd
+        expr: |
+          sum by (persistentvolumeclaim, namespace) (
+            kube_persistentvolumeclaim_resource_requests_storage_bytes{namespace="ledgerlens"}
+          ) / 1073741824
+          * on() group_left() ledgerlens_cost_per_gb_storage_month_usd
+          / 730
+
+  - name: ledgerlens_capacity_projection
+    interval: 15m
+    rules:
+      # Days until API replica count hits autoscaling.maxReplicas at current growth rate
+      # Uses linear extrapolation (deriv over 7 days × 86400 s/day = replicas/day)
+      # clamp_min prevents division by zero or negative growth rates
+      - record: ledgerlens:replica_count_projected_days_to_max
+        expr: |
+          (10 - kube_deployment_status_replicas{deployment="ledgerlens-api", namespace="ledgerlens"})
+          /
+          clamp_min(deriv(kube_deployment_status_replicas{deployment="ledgerlens-api", namespace="ledgerlens"}[7d]) * 86400, 1e-9)
+
+      # Days until PVC usage hits persistence.size at current growth rate
+      # kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes = current usage fraction
+      - record: ledgerlens:pvc_projected_days_to_full
+        expr: |
+          (
+            kubelet_volume_stats_capacity_bytes{namespace="ledgerlens", persistentvolumeclaim=~"ledgerlens-.*"}
+            -
+            kubelet_volume_stats_used_bytes{namespace="ledgerlens", persistentvolumeclaim=~"ledgerlens-.*"}
+          )
+          /
+          clamp_min(
+            deriv(kubelet_volume_stats_used_bytes{namespace="ledgerlens", persistentvolumeclaim=~"ledgerlens-.*"}[7d]) * 86400,
+            1e-9
+          )
+
+      # Wallet scoring rate (wallets per hour) — useful for capacity planning dashboards
+      - record: ledgerlens:wallets_scored_per_hour
+        expr: |
+          rate(ledgerlens_wallets_scored_total[1h]) * 3600
+
+      # Projected wallet scoring rate 7 days from now using predict_linear
+      # Helps answer "what will our throughput look like next week?"
+      - record: ledgerlens:wallets_scored_per_hour:predicted_7d
+        expr: |
+          predict_linear(ledgerlens_wallets_scored_total[7d], 7*86400) 
+          - ledgerlens_wallets_scored_total

@@ -40,3 +40,14 @@ groups:
           summary: "Pipeline has not run in over 5 minutes"
           description: "The detection pipeline last completed more than 300 seconds ago."
           runbook: "Check that `python run_pipeline.py` or `cli.py score` is running and not stuck. Review logs for exceptions in horizon ingestion or model loading. Verify LEDGERLENS_DB_PATH is writable."
+
+      - alert: CapacityLimitApproaching
+        expr: |
+          ledgerlens:replica_count_projected_days_to_max < 14
+          or
+          ledgerlens:pvc_projected_days_to_full < 14
+        for: 1h
+        annotations:
+          summary: "Cluster capacity projected to be exhausted within 14 days"
+          description: "Current growth trends indicate API replica count or PVC usage will hit configured limits within {{ $value | printf \"%.1f\" }} days."
+          runbook: "Review `ledgerlens_wallets_scored_total` growth trend in the cost_capacity dashboard. Consider raising `autoscaling.maxReplicas` or `persistence.size` in helm/ledgerlens/values.yaml. Investigate unexpected ingestion volume growth with `GET /metrics` and Horizon SSE metrics. If growth is expected (e.g., mainnet launch), plan cluster expansion now to avoid service degradation."

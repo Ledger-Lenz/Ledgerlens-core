@@ -277,6 +277,17 @@ class Settings(BaseSettings):
     # 90 % of this limit (450 000 rows at the default).
     filter_rejected_trades_max_rows: int = 500_000
 
+    # ── Cost and Capacity Planning ────────────────────────────────────────────
+    # Cost coefficients for cloud resource consumption, used to compute
+    # cost-per-pod and cost-per-wallet-scored metrics.
+    cost_per_vcpu_hour_usd: float = 0.0416
+    cost_per_gb_memory_hour_usd: float = 0.0056
+    cost_per_gb_storage_month_usd: float = 0.10
+    # Days of historical data used for capacity projection (predict_linear window)
+    capacity_projection_window_days: int = 7
+    # Lead time (days) for capacity limit alerting
+    capacity_projection_lead_time_days: int = 14
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -470,6 +481,24 @@ class Settings(BaseSettings):
         val = int(v)
         if val < 1:
             raise ValueError("FILTER_REJECTED_TRADES_MAX_ROWS must be >= 1")
+        return val
+
+    @field_validator("cost_per_vcpu_hour_usd", "cost_per_gb_memory_hour_usd",
+                     "cost_per_gb_storage_month_usd", mode="before")
+    @classmethod
+    def non_negative_cost(cls, v: object) -> object:
+        val = float(v)
+        if val < 0:
+            raise ValueError("Cost coefficients must be non-negative")
+        return val
+
+    @field_validator("capacity_projection_window_days",
+                     "capacity_projection_lead_time_days", mode="before")
+    @classmethod
+    def positive_capacity_days(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("Capacity projection days must be >= 1")
         return val
 
     @model_validator(mode="after")

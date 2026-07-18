@@ -1,0 +1,86 @@
+name: Cost Monitoring Validation
+
+on:
+  pull_request:
+    paths:
+      - 'monitoring/recording_rules_cost.yml'
+      - 'monitoring/alerts.yml'
+      - 'monitoring/grafana/**'
+      - 'config/cost_exporter.py'
+      - 'tests/test_cost_metrics.py'
+      - '.github/workflows/cost-monitoring-validation.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'monitoring/recording_rules_cost.yml'
+      - 'monitoring/alerts.yml'
+      - 'monitoring/grafana/**'
+
+jobs:
+  validate-prometheus-rules:
+    name: Validate Prometheus Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Download promtool
+        run: |
+          wget -q https://github.com/prometheus/prometheus/releases/download/v2.45.0/prometheus-2.45.0.linux-amd64.tar.gz
+          tar xzf prometheus-2.45.0.linux-amd64.tar.gz
+          sudo mv prometheus-2.45.0.linux-amd64/promtool /usr/local/bin/
+          promtool --version
+      
+      - name: Validate recording rules syntax
+        run: promtool check rules monitoring/recording_rules_cost.yml
+      
+      - name: Validate alerts syntax
+        run: promtool check rules monitoring/alerts.yml
+  
+  validate-grafana-dashboard:
+    name: Validate Grafana Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Validate dashboard JSON is well-formed
+        run: |
+          jq empty monitoring/grafana/cost_capacity_dashboard.json
+          echo "✓ Dashboard JSON is valid"
+      
+      - name: Check dashboard has required panels
+        run: |
+          # Verify key panels exist
+          jq -e '.panels[] | select(.title == "Namespace Cost Per Hour")' monitoring/grafana/cost_capacity_dashboard.json > /dev/null
+          jq -e '.panels[] | select(.title == "Cost Per Wallet Scored")' monitoring/grafana/cost_capacity_dashboard.json > /dev/null
+          jq -e '.panels[] | select(.title == "Days Until Max Replicas")' monitoring/grafana/cost_capacity_dashboard.json > /dev/null
+          jq -e '.panels[] | select(.title == "Days Until PVC Full")' monitoring/grafana/cost_capacity_dashboard.json > /dev/null
+          echo "✓ All required panels present"
+      
+      - name: Check dashboard references correct metrics
+        run: |
+          # Verify recording rule metrics are referenced
+          grep -q "ledgerlens:namespace_cost_per_hour:usd" monitoring/grafana/cost_capacity_dashboard.json
+          grep -q "ledgerlens:cost_per_wallet_scored:usd" monitoring/grafana/cost_capacity_dashboard.json
+          grep -q "ledgerlens:replica_count_projected_days_to_max" monitoring/grafana/cost_capacity_dashboard.json
+          grep -q "ledgerlens:pvc_projected_days_to_full" monitoring/grafana/cost_capacity_dashboard.json
+          echo "✓ Dashboard references correct metrics"
+  
+  test-cost-metrics:
+    name: Test Cost Metrics Exporter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+      
+      - name: Run cost metrics tests
+        run: pytest tests/test_cost_metrics.py -v --cov=config.cost_exporter --cov-report=term-missing
