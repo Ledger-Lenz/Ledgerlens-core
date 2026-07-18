@@ -277,6 +277,13 @@ class Settings(BaseSettings):
     # 90 % of this limit (450 000 rows at the default).
     filter_rejected_trades_max_rows: int = 500_000
 
+    # ── SLO / Alerting targets ────────────────────────────────────────────────
+    slo_scoring_latency_target_seconds: float = 2.0
+    slo_scoring_latency_target_percent: float = 99.0
+    slo_webhook_delivery_target_percent: float = 99.0
+    slo_soroban_submission_target_percent: float = 99.0
+    slo_window_days: int = 30
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -286,12 +293,32 @@ class Settings(BaseSettings):
                      "federated_min_participants", "cursor_flush_events",
                      "stream_checkpoint_interval", "streamer_queue_maxsize",
                      "historical_loader_concurrency", "historical_max_lookback_days",
+                     "slo_window_days",
                      mode="before")
     @classmethod
     def must_be_positive(cls, v: object) -> object:
         if int(v) <= 0:
             raise ValueError("must be a positive integer")
         return v
+
+    @field_validator("slo_scoring_latency_target_percent",
+                     "slo_webhook_delivery_target_percent",
+                     "slo_soroban_submission_target_percent",
+                     mode="before")
+    @classmethod
+    def valid_slo_percent(cls, v: object) -> object:
+        val = float(v)
+        if not (0.0 <= val <= 100.0):
+            raise ValueError("must be between 0.0 and 100.0")
+        return val
+
+    @field_validator("slo_scoring_latency_target_seconds", mode="before")
+    @classmethod
+    def positive_slo_seconds(cls, v: object) -> object:
+        val = float(v)
+        if val <= 0:
+            raise ValueError("must be positive")
+        return val
 
     @field_validator("federated_server_port", mode="before")
     @classmethod
