@@ -46,3 +46,55 @@ jobs:
 
       - name: Run scoring pipeline benchmarks
         run: make benchmark-check
+
+  fuzz:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+          components: rustfmt, clippy
+      
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      
+      - name: Cache fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: |
+            contracts/oracle_aggregator/fuzz/corpus
+            contracts/zk_verifier/fuzz/corpus
+          key: fuzz-corpus-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-
+      
+      - name: Fuzz oracle_aggregator (short PR run)
+        run: |
+          cd contracts/oracle_aggregator
+          for target in fuzz_submit_with_quorum fuzz_canonical_message fuzz_auth_bypass; do
+            echo "Running $target for 120 seconds..."
+            cargo +nightly fuzz run $target -- -max_total_time=120 -max_len=1024 || exit 1
+          done
+      
+      - name: Fuzz zk_verifier (short PR run)
+        run: |
+          cd contracts/zk_verifier
+          for target in fuzz_submit_score fuzz_verify_threshold fuzz_auth_bypass; do
+            echo "Running $target for 120 seconds..."
+            cargo +nightly fuzz run $target -- -max_total_time=120 -max_len=1024 || exit 1
+          done
+      
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: |
+            contracts/oracle_aggregator/fuzz/artifacts
+            contracts/zk_verifier/fuzz/artifacts
+          retention-days: 30

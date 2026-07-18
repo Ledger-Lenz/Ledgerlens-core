@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "contracts/oracle_aggregator",
+    "contracts/zk_verifier",
+]
+resolver = "2"
+
+[workspace.dependencies]
+soroban-sdk = "21.0"
