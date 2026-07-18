@@ -492,6 +492,27 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         DROP TABLE IF EXISTS bridge_event_dedup;
         """,
     ),
+    (
+        17,
+        "add lineage_events table for tracking run events",
+        """
+        CREATE TABLE IF NOT EXISTS lineage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            parent_run_id TEXT,
+            job_namespace TEXT NOT NULL,
+            job_name TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            outputs_json TEXT NOT NULL,
+            producer TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_lineage_run_id ON lineage_events (run_id);
+        CREATE INDEX IF NOT EXISTS idx_lineage_parent_run_id ON lineage_events (parent_run_id);
+        """,
+    ),
 ]
 
 

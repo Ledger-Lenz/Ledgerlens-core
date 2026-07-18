@@ -276,6 +276,20 @@ class ParallelHistoricalLoader:
     ) -> ChunkResult:
         """Fetch and validate every page in one half-open chunk, writing per page."""
         start, end = chunk
+        from detection.lineage import lineage, Dataset
+        from config.correlation import get_correlation_id
+        
+        cid = get_correlation_id()
+        parent_run_id = None if cid == "unset" else cid
+        
+        inputs = [
+            Dataset(
+                namespace="horizon",
+                name="trades",
+                facets={"cursor_range": f"{_horizon_time(start)}..{_horizon_time(end)}"}
+            )
+        ]
+
         params: dict[str, str | int] = {
             "limit": PAGE_LIMIT,
             "order": "asc",
@@ -291,79 +305,89 @@ class ParallelHistoricalLoader:
         request_params: dict | None = params
         records_fetched = 0
         from ingestion.dedup import DedupResult
-        async with sem:
-            while path:
-                payload = await self.client.get(path, params=request_params)
-                raw_records = payload.get("_embedded", {}).get("records", [])
-                if not raw_records:
-                    break
+        
+        with lineage.run("ingestion.historical_loader.fetch_chunk", inputs=inputs, parent_run_id=parent_run_id) as r:
+            async with sem:
+                while path:
+                    payload = await self.client.get(path, params=request_params)
+                    raw_records = payload.get("_embedded", {}).get("records", [])
+                    if not raw_records:
+                        break
 
-                validated = []
-                seen_in_batch = set()
-                reached_end = False
-                for raw in raw_records:
-                    trade = _parse_trade(raw)
-                    close_time = _utc(trade.ledger_close_time)
-                    if close_time >= end:
-                        reached_end = True
-                        continue
-                    if close_time >= start:
-                        if self.dedup_store is not None:
-                            pt = trade.paging_token or trade.id
-                            parts = pt.split("-")
-                            if len(parts) == 2:
-                                ledger_sequence = int(parts[0])
-                                operation_index = int(parts[1])
-                            else:
-                                ledger_sequence = 0
-                                operation_index = 0
-                            
-                            key = self.dedup_store.compute_key(
-                                "horizon",
-                                ledger_sequence=ledger_sequence,
-                                tx_hash=trade.transaction_hash or "",
-                                operation_index=operation_index,
-                            )
-                            
-                            if key in seen_in_batch:
-                                logger.debug("Skipping duplicate historical Horizon trade in batch %s", key[:16])
-                                continue
-                            
-                            metadata = {
-                                "ledger_sequence": ledger_sequence,
-                                "tx_hash": trade.transaction_hash,
-                                "operation_index": operation_index,
-                            }
-                            
-                            result = self.dedup_store.is_duplicate(
-                                key,
-                                timestamp=trade.ledger_close_time,
-                                source="horizon",
-                                metadata=metadata,
-                            )
-                            if result is DedupResult.NEW:
-                                seen_in_batch.add(key)
-                                validated.append((trade, key, metadata))
-                            else:
-                                logger.debug("Skipping duplicate historical Horizon trade %s", key[:16])
-                        else:
-                            validated.append((trade, None, None))
-
-                if validated:
-                    trades_to_upsert = [item[0] for item in validated]
-                    await asyncio.to_thread(self.storage.upsert_trades, trades_to_upsert)
-                    
-                    if self.dedup_store is not None:
-                        for _, key, metadata in validated:
-                            if key is not None:
-                                self.dedup_store.mark_seen(key, source="horizon", metadata=metadata)
+                    validated = []
+                    seen_in_batch = set()
+                    reached_end = False
+                    for raw in raw_records:
+                        trade = _parse_trade(raw)
+                        close_time = _utc(trade.ledger_close_time)
+                        if close_time >= end:
+                            reached_end = True
+                            continue
+                        if close_time >= start:
+                            if self.dedup_store is not None:
+                                pt = trade.paging_token or trade.id
+                                parts = pt.split("-")
+                                if len(parts) == 2:
+                                    ledger_sequence = int(parts[0])
+                                    operation_index = int(parts[1])
+                                else:
+                                    ledger_sequence = 0
+                                    operation_index = 0
                                 
-                    records_fetched += len(validated)
-                if reached_end:
-                    break
+                                key = self.dedup_store.compute_key(
+                                    "horizon",
+                                    ledger_sequence=ledger_sequence,
+                                    tx_hash=trade.transaction_hash or "",
+                                    operation_index=operation_index,
+                                )
+                                
+                                if key in seen_in_batch:
+                                    logger.debug("Skipping duplicate historical Horizon trade in batch %s", key[:16])
+                                    continue
+                                
+                                metadata = {
+                                    "ledger_sequence": ledger_sequence,
+                                    "tx_hash": trade.transaction_hash,
+                                    "operation_index": operation_index,
+                                }
+                                
+                                result = self.dedup_store.is_duplicate(
+                                    key,
+                                    timestamp=trade.ledger_close_time,
+                                    source="horizon",
+                                    metadata=metadata,
+                                )
+                                if result is DedupResult.NEW:
+                                    seen_in_batch.add(key)
+                                    validated.append((trade, key, metadata))
+                                else:
+                                    logger.debug("Skipping duplicate historical Horizon trade %s", key[:16])
+                            else:
+                                validated.append((trade, None, None))
 
-                path = payload.get("_links", {}).get("next", {}).get("href") or None
-                request_params = None
+                    if validated:
+                        trades_to_upsert = [item[0] for item in validated]
+                        await asyncio.to_thread(self.storage.upsert_trades, trades_to_upsert)
+                        
+                        if self.dedup_store is not None:
+                            for _, key, metadata in validated:
+                                if key is not None:
+                                    self.dedup_store.mark_seen(key, source="horizon", metadata=metadata)
+                                    
+                        records_fetched += len(validated)
+                    if reached_end:
+                        break
+
+                    path = payload.get("_links", {}).get("next", {}).get("href") or None
+                    request_params = None
+
+            r.add_output(
+                Dataset(
+                    namespace=f"{settings.openlineage_namespace}.sqlite",
+                    name="trades",
+                    facets={"rowCount": records_fetched}
+                )
+            )
 
         return ChunkResult(chunk=chunk, records_fetched=records_fetched)
 

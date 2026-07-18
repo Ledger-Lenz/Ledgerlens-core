@@ -841,6 +841,7 @@ LedgerLens ships a production-grade observability stack. See [docs/observability
 - **Structured JSON logging** — every log record is valid JSON with `timestamp`, `level`, `correlation_id`, and `trace_id` fields (via [structlog](https://www.structlog.org/))
 - **Correlation IDs** — each pipeline pass and API request is assigned a UUID4 that threads through all log lines and spans; the `X-Correlation-ID` header is propagated in API responses
 - **OpenTelemetry tracing** — spans for `pipeline.run`, `model.score_batch`, `soroban.submit_score`, and `webhook.deliver`; FastAPI routes are auto-instrumented; export via OTLP gRPC or console fallback
+- **OpenLineage tracking** — START/COMPLETE/FAIL events at ingestion, feature engineering, and model training stages; supports Marquez backend and a built-in admin-only REST API (see [docs/lineage.md](docs/lineage.md))
 - **Prometheus metrics** — 10 metrics covering scoring throughput, latency, Soroban submissions, circuit breaker state, webhook delivery health, drift events, and model AUC-ROC; scraped at `GET /metrics`
 - **Alerting rules** — 5 Prometheus alert rules in `monitoring/alerts.yml` for circuit-breaker open, dead-letter backlog, feature drift, high scoring latency, and pipeline stall
 - **Wallet masking** — Stellar wallet addresses are truncated to `GABC1234...WXYZ` in all log output; no PII in metric labels

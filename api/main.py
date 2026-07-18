@@ -35,6 +35,7 @@ from fastapi.routing import APIRouter
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
+from api.api_key_router import router as api_key_router, require_scope
 from api.admin_router import router as admin_router
 from api.analyst import router as analyst_router
 from api.export_router import router as export_router
@@ -54,7 +55,6 @@ from detection.risk_score import RiskScore
 from detection.counterfactual_engine import generate_counterfactuals
 from detection.counterfactual_translator import translate_counterfactual
 from detection.storage import (
-    get_active_wallet_override,
     get_alerts,
     get_bridge_transfer_history,
     get_bridge_transfers,
@@ -337,7 +337,6 @@ app.include_router(api_key_router)
 app.include_router(batch_router)
 
 app.include_router(export_router)
-app.include_router(api_keys_router)
 
 
 app.include_router(cross_chain_router)
@@ -1294,6 +1293,13 @@ def retrain_runs(
     return get_retrain_runs(limit=limit, model_name=model_name)
 
 
+@v1_router.get("/admin/lineage/{dataset}", tags=["Admin"], summary="Lineage graph", description="Return the lineage graph for a named dataset or model version.", dependencies=[Depends(require_admin_key)])
+def get_lineage(dataset: str) -> dict:
+    """Return the lineage graph for a named dataset or model version."""
+    from detection.lineage import get_lineage_graph
+    return get_lineage_graph(dataset)
+
+
 @v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),
@@ -1547,7 +1553,7 @@ class ProposalCreate(BaseModel):
     proposed_value: str
     proposed_by_key_hash: str
 
-ProposalCreate = LegacyProposalCreate
+
 
 
 @v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Create proposal", description="Create a new governance proposal (admin only).")
@@ -1563,7 +1569,7 @@ class ProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
 
-ProposalVote = LegacyProposalVote
+
 
 
 @v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Vote on proposal", description="Cast a vote on a governance proposal (admin only).")
@@ -2090,6 +2096,11 @@ def legacy_admin_retrain_runs(request: Request):
     qs = request.url.query
     target = "/v1/admin/retrain-runs" + (f"?{qs}" if qs else "")
     return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/admin/lineage/{dataset}", include_in_schema=False)
+def legacy_admin_lineage(dataset: str, request: Request):
+    return RedirectResponse(url=f"/v1/admin/lineage/{dataset}", status_code=302)
 
 
 @app.get("/admin/federated/audit-log", include_in_schema=False)

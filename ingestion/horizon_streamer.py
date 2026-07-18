@@ -131,75 +131,97 @@ def stream_trades_with_cursor(
     connection.
     """
     headers = {"Accept": "text/event-stream"}
+    from detection.lineage import lineage, Dataset
+    from config.correlation import get_correlation_id
 
-    while True:
-        if not horizon_circuit.allow_request():
-            raise CircuitOpenError(horizon_circuit.name)
+    cid = get_correlation_id()
+    parent_run_id = None if cid == "unset" else cid
 
-        url = f"{settings.horizon_stream_url}/trades?cursor={cursor}"
-        try:
-            client = sseclient.SSEClient(url, headers=headers)
-            for event in client:
-                if not event.data:
-                    continue
-                record = _decode_event(event.data)
-                if record is not None:
-                    trade = _parse_trade(record)
-                    cursor = event.id or cursor
-                    
-                    dedup_store = IdempotencyKeyStore(
-                        db_path=settings.db_path,
-                        replay_window_seconds=settings.idempotency_replay_window_seconds
-                    ) if settings.ingestion_dedup_enabled else None
+    inputs = [
+        Dataset(
+            namespace="horizon",
+            name="trades",
+            facets={"start_cursor": cursor}
+        )
+    ]
 
-                    if dedup_store is not None:
-                        pt = trade.paging_token or trade.id
-                        parts = pt.split("-")
-                        if len(parts) == 2:
-                            ledger_sequence = int(parts[0])
-                            operation_index = int(parts[1])
+    with lineage.run("ingestion.horizon_streamer.stream", inputs=inputs, parent_run_id=parent_run_id) as run:
+        while True:
+            if not horizon_circuit.allow_request():
+                raise CircuitOpenError(horizon_circuit.name)
+
+            url = f"{settings.horizon_stream_url}/trades?cursor={cursor}"
+            try:
+                client = sseclient.SSEClient(url, headers=headers)
+                for event in client:
+                    if not event.data:
+                        continue
+                    record = _decode_event(event.data)
+                    if record is not None:
+                        trade = _parse_trade(record)
+                        cursor = event.id or cursor
+
+                        run.add_output(
+                            Dataset(
+                                namespace=f"{settings.openlineage_namespace}.sqlite",
+                                name="trades",
+                                facets={"last_cursor": cursor}
+                            )
+                        )
+
+                        dedup_store = IdempotencyKeyStore(
+                            db_path=settings.db_path,
+                            replay_window_seconds=settings.idempotency_replay_window_seconds
+                        ) if settings.ingestion_dedup_enabled else None
+
+                        if dedup_store is not None:
+                            pt = trade.paging_token or trade.id
+                            parts = pt.split("-")
+                            if len(parts) == 2:
+                                ledger_sequence = int(parts[0])
+                                operation_index = int(parts[1])
+                            else:
+                                ledger_sequence = 0
+                                operation_index = 0
+                            
+                            key = dedup_store.compute_key(
+                                "horizon",
+                                ledger_sequence=ledger_sequence,
+                                tx_hash=trade.transaction_hash or "",
+                                operation_index=operation_index,
+                            )
+                            
+                            metadata = {
+                                "ledger_sequence": ledger_sequence,
+                                "tx_hash": trade.transaction_hash,
+                                "operation_index": operation_index,
+                            }
+                            
+                            result = dedup_store.is_duplicate(
+                                key,
+                                timestamp=trade.ledger_close_time,
+                                source="horizon",
+                                metadata=metadata,
+                            )
+                            if result is DedupResult.DUPLICATE:
+                                logger.debug("Skipping duplicate Horizon trade %s", key[:16])
+                                continue
+                            elif result is DedupResult.REPLAY_REJECTED:
+                                logger.warning("Rejecting replay Horizon trade %s", key[:16])
+                                continue
+
+                            horizon_circuit.record_success()
+                            yield trade, cursor
+                            dedup_store.mark_seen(key, source="horizon", metadata=metadata)
                         else:
-                            ledger_sequence = 0
-                            operation_index = 0
-                        
-                        key = dedup_store.compute_key(
-                            "horizon",
-                            ledger_sequence=ledger_sequence,
-                            tx_hash=trade.transaction_hash or "",
-                            operation_index=operation_index,
-                        )
-                        
-                        metadata = {
-                            "ledger_sequence": ledger_sequence,
-                            "tx_hash": trade.transaction_hash,
-                            "operation_index": operation_index,
-                        }
-                        
-                        result = dedup_store.is_duplicate(
-                            key,
-                            timestamp=trade.ledger_close_time,
-                            source="horizon",
-                            metadata=metadata,
-                        )
-                        if result is DedupResult.DUPLICATE:
-                            logger.debug("Skipping duplicate Horizon trade %s", key[:16])
-                            continue
-                        elif result is DedupResult.REPLAY_REJECTED:
-                            logger.warning("Rejecting replay Horizon trade %s", key[:16])
-                            continue
-
-                        horizon_circuit.record_success()
-                        yield trade, cursor
-                        dedup_store.mark_seen(key, source="horizon", metadata=metadata)
-                    else:
-                        horizon_circuit.record_success()
-                        yield trade, cursor
-            # The SSE stream ended without raising -- treat as a successful
-            # connection that simply closed, not a failure.
-            return
-        except Exception as exc:
-            response = getattr(exc, "response", None)
-            status_code = getattr(response, "status_code", None)
+                            horizon_circuit.record_success()
+                            yield trade, cursor
+                # The SSE stream ended without raising -- treat as a successful
+                # connection that simply closed, not a failure.
+                return
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
             if status_code in (404, 410) and cursor != "now":
                 logger.warning(
                     "Horizon rejected cursor %s with HTTP %d; falling back to now",
@@ -581,65 +603,77 @@ class HorizonStreamer:
         Handles HTTP 429 by delegating to :meth:`AdaptiveRateController.on_429`.
         """
         self._running = True
-        try:
-            async for record in self.stream_events():
-                with self._metrics_lock:
-                    self._metrics.events_received += 1
-                    self._metrics.last_event_at = datetime.now(timezone.utc)
-                _metrics.events_received_total.labels(source="horizon_sse").inc()
-                try:
-                    trade = _parse_trade(record)
-                except (KeyError, ValueError, TypeError) as exc:
-                    logger.warning("Failed to parse trade record: %s", exc)
-                    continue
+        from detection.lineage import lineage, Dataset
+        from config.correlation import get_correlation_id
 
-                if self.dedup_store is not None:
-                    pt = trade.paging_token or trade.id
-                    parts = pt.split("-")
-                    if len(parts) == 2:
-                        ledger_sequence = int(parts[0])
-                        operation_index = int(parts[1])
+        cid = get_correlation_id()
+        parent_run_id = None if cid == "unset" else cid
+
+        inputs = [Dataset(namespace="horizon", name="trades", facets={"start_cursor": self._cursor})]
+
+        with lineage.run("ingestion.horizon_streamer.run", inputs=inputs, parent_run_id=parent_run_id) as run:
+            try:
+                async for record in self.stream_events():
+                    with self._metrics_lock:
+                        self._metrics.events_received += 1
+                        self._metrics.last_event_at = datetime.now(timezone.utc)
+                    _metrics.events_received_total.labels(source="horizon_sse").inc()
+                    try:
+                        trade = _parse_trade(record)
+                    except (KeyError, ValueError, TypeError) as exc:
+                        logger.warning("Failed to parse trade record: %s", exc)
+                        continue
+
+                    if self.dedup_store is not None:
+                        pt = trade.paging_token or trade.id
+                        parts = pt.split("-")
+                        if len(parts) == 2:
+                            ledger_sequence = int(parts[0])
+                            operation_index = int(parts[1])
+                        else:
+                            ledger_sequence = 0
+                            operation_index = 0
+                        
+                        key = self.dedup_store.compute_key(
+                            "horizon",
+                            ledger_sequence=ledger_sequence,
+                            tx_hash=trade.transaction_hash or "",
+                            operation_index=operation_index,
+                        )
+                        
+                        metadata = {
+                            "ledger_sequence": ledger_sequence,
+                            "tx_hash": trade.transaction_hash,
+                            "operation_index": operation_index,
+                        }
+                        
+                        result = self.dedup_store.is_duplicate(
+                            key,
+                            timestamp=trade.ledger_close_time,
+                            source="horizon",
+                            metadata=metadata,
+                        )
+                        if result is DedupResult.DUPLICATE:
+                            logger.debug("Skipping duplicate Horizon trade %s", key[:16])
+                            self._record_processed_event(record)
+                            continue
+                        elif result is DedupResult.REPLAY_REJECTED:
+                            logger.warning("Rejecting replay Horizon trade %s", key[:16])
+                            self._record_processed_event(record)
+                            continue
+                        
+                        accepted = await self._enqueue(trade)
+                        self._record_processed_event(record)
+                        if accepted:
+                            self.dedup_store.mark_seen(key, source="horizon", metadata=metadata)
+                            run.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="trades", facets={"last_cursor": self._cursor}))
                     else:
-                        ledger_sequence = 0
-                        operation_index = 0
-                    
-                    key = self.dedup_store.compute_key(
-                        "horizon",
-                        ledger_sequence=ledger_sequence,
-                        tx_hash=trade.transaction_hash or "",
-                        operation_index=operation_index,
-                    )
-                    
-                    metadata = {
-                        "ledger_sequence": ledger_sequence,
-                        "tx_hash": trade.transaction_hash,
-                        "operation_index": operation_index,
-                    }
-                    
-                    result = self.dedup_store.is_duplicate(
-                        key,
-                        timestamp=trade.ledger_close_time,
-                        source="horizon",
-                        metadata=metadata,
-                    )
-                    if result is DedupResult.DUPLICATE:
-                        logger.debug("Skipping duplicate Horizon trade %s", key[:16])
+                        accepted = await self._enqueue(trade)
                         self._record_processed_event(record)
-                        continue
-                    elif result is DedupResult.REPLAY_REJECTED:
-                        logger.warning("Rejecting replay Horizon trade %s", key[:16])
-                        self._record_processed_event(record)
-                        continue
-                    
-                    accepted = await self._enqueue(trade)
-                    self._record_processed_event(record)
-                    if accepted:
-                        self.dedup_store.mark_seen(key, source="horizon", metadata=metadata)
-                else:
-                    await self._enqueue(trade)
-                    self._record_processed_event(record)
-        finally:
-            self._flush_checkpoint()
+                        if accepted:
+                            run.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="trades", facets={"last_cursor": self._cursor}))
+            finally:
+                self._flush_checkpoint()
 
     async def run_with_cursor(self) -> AsyncIterator[tuple[Trade, str]]:
         """Yield ``(Trade, cursor)`` tuples with rate limiting and backpressure.
@@ -648,70 +682,81 @@ class HorizonStreamer:
         for resume capability.
         """
         self._running = True
-        try:
-            async for record in self.stream_events():
-                with self._metrics_lock:
-                    self._metrics.events_received += 1
-                    self._metrics.last_event_at = datetime.now(timezone.utc)
-                _metrics.events_received_total.labels(source="horizon_sse").inc()
-                try:
-                    trade = _parse_trade(record)
-                except (KeyError, ValueError, TypeError) as exc:
-                    logger.warning("Failed to parse trade record: %s", exc)
-                    continue
+        from detection.lineage import lineage, Dataset
+        from config.correlation import get_correlation_id
 
-                if self.dedup_store is not None:
-                    pt = trade.paging_token or trade.id
-                    parts = pt.split("-")
-                    if len(parts) == 2:
-                        ledger_sequence = int(parts[0])
-                        operation_index = int(parts[1])
+        cid = get_correlation_id()
+        parent_run_id = None if cid == "unset" else cid
+
+        inputs = [Dataset(namespace="horizon", name="trades", facets={"start_cursor": self._cursor})]
+
+        with lineage.run("ingestion.horizon_streamer.run", inputs=inputs, parent_run_id=parent_run_id) as run:
+            try:
+                async for record in self.stream_events():
+                    with self._metrics_lock:
+                        self._metrics.events_received += 1
+                        self._metrics.last_event_at = datetime.now(timezone.utc)
+                    _metrics.events_received_total.labels(source="horizon_sse").inc()
+                    try:
+                        trade = _parse_trade(record)
+                    except (KeyError, ValueError, TypeError) as exc:
+                        logger.warning("Failed to parse trade record: %s", exc)
+                        continue
+
+                    if self.dedup_store is not None:
+                        pt = trade.paging_token or trade.id
+                        parts = pt.split("-")
+                        if len(parts) == 2:
+                            ledger_sequence = int(parts[0])
+                            operation_index = int(parts[1])
+                        else:
+                            ledger_sequence = 0
+                            operation_index = 0
+                        
+                        key = self.dedup_store.compute_key(
+                            "horizon",
+                            ledger_sequence=ledger_sequence,
+                            tx_hash=trade.transaction_hash or "",
+                            operation_index=operation_index,
+                        )
+                        
+                        metadata = {
+                            "ledger_sequence": ledger_sequence,
+                            "tx_hash": trade.transaction_hash,
+                            "operation_index": operation_index,
+                        }
+                        
+                        result = self.dedup_store.is_duplicate(
+                            key,
+                            timestamp=trade.ledger_close_time,
+                            source="horizon",
+                            metadata=metadata,
+                        )
+                        if result is DedupResult.DUPLICATE:
+                            logger.debug("Skipping duplicate Horizon trade %s", key[:16])
+                            self._record_processed_event(record)
+                            continue
+                        elif result is DedupResult.REPLAY_REJECTED:
+                            logger.warning("Rejecting replay Horizon trade %s", key[:16])
+                            self._record_processed_event(record)
+                            continue
+                        
+                        accepted = await self._enqueue(trade)
+                        self._record_processed_event(record)
+                        event_cursor = self._cursor
+                        if accepted:
+                            self.dedup_store.mark_seen(key, source="horizon", metadata=metadata)
+                            run.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="trades", facets={"last_cursor": event_cursor}))
+                            yield trade, event_cursor
                     else:
-                        ledger_sequence = 0
-                        operation_index = 0
-                    
-                    key = self.dedup_store.compute_key(
-                        "horizon",
-                        ledger_sequence=ledger_sequence,
-                        tx_hash=trade.transaction_hash or "",
-                        operation_index=operation_index,
-                    )
-                    
-                    metadata = {
-                        "ledger_sequence": ledger_sequence,
-                        "tx_hash": trade.transaction_hash,
-                        "operation_index": operation_index,
-                    }
-                    
-                    result = self.dedup_store.is_duplicate(
-                        key,
-                        timestamp=trade.ledger_close_time,
-                        source="horizon",
-                        metadata=metadata,
-                    )
-                    if result is DedupResult.DUPLICATE:
-                        logger.debug("Skipping duplicate Horizon trade %s", key[:16])
+                        accepted = await self._enqueue(trade)
                         self._record_processed_event(record)
-                        continue
-                    elif result is DedupResult.REPLAY_REJECTED:
-                        logger.warning("Rejecting replay Horizon trade %s", key[:16])
-                        self._record_processed_event(record)
-                        continue
-                    
-                    accepted = await self._enqueue(trade)
-                    self._record_processed_event(record)
-                    event_cursor = self._cursor
-                    if accepted:
-                        self.dedup_store.mark_seen(key, source="horizon", metadata=metadata)
-                        yield trade, event_cursor
-                else:
-                    accepted = await self._enqueue(trade)
-                    self._record_processed_event(record)
-                    event_cursor = self._cursor
-                    if accepted:
-                        yield trade, event_cursor
-        finally:
-            self._flush_checkpoint()
+                        event_cursor = self._cursor
+                        if accepted:
+                            run.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="trades", facets={"last_cursor": event_cursor}))
+                            yield trade, event_cursor
+            finally:
+                self._flush_checkpoint()
 
     def stop(self) -> None:
         """Signal the stream loop to stop."""
