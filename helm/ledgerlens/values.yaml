@@ -136,3 +136,17 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
+
+# ── Canary rollout configuration ───────────────────────────────────────────────────────
+canary:
+  enabled: false
+  controller: "argo-rollouts"   # argo-rollouts | flagger
+  prometheusUrl: "http://prometheus.monitoring:9090"
+  steps:
+    - setWeight: 10
+    - pauseSeconds: 120
+    - setWeight: 50
+    - pauseSeconds: 300
+  analysis:
+    p95LatencyThresholdSeconds: 2.0
+    errorRateThreshold: 0.02
