@@ -35,6 +35,7 @@ from fastapi.routing import APIRouter
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
+from api.api_key_router import router as api_key_router, require_scope
 from api.admin_router import router as admin_router
 from api.analyst import router as analyst_router
 from api.api_key_router import require_scope, router as api_key_router
@@ -441,7 +442,6 @@ app.include_router(api_key_router)
 app.include_router(batch_router)
 
 app.include_router(export_router)
-app.include_router(api_keys_router)
 
 
 app.include_router(cross_chain_router)
@@ -1631,6 +1631,13 @@ def retrain_runs(
     return get_retrain_runs(limit=limit, model_name=model_name)
 
 
+@v1_router.get("/admin/lineage/{dataset}", tags=["Admin"], summary="Lineage graph", description="Return the lineage graph for a named dataset or model version.", dependencies=[Depends(require_admin_key)])
+def get_lineage(dataset: str) -> dict:
+    """Return the lineage graph for a named dataset or model version."""
+    from detection.lineage import get_lineage_graph
+    return get_lineage_graph(dataset)
+
+
 @v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),
@@ -2423,6 +2430,11 @@ def legacy_admin_retrain_runs(request: Request):
     qs = request.url.query
     target = "/v1/admin/retrain-runs" + (f"?{qs}" if qs else "")
     return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/admin/lineage/{dataset}", include_in_schema=False)
+def legacy_admin_lineage(dataset: str, request: Request):
+    return RedirectResponse(url=f"/v1/admin/lineage/{dataset}", status_code=302)
 
 
 @app.get("/admin/federated/audit-log", include_in_schema=False)

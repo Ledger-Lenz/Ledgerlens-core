@@ -151,6 +151,16 @@ class Settings(BaseSettings):
     # ── Storage ───────────────────────────────────────────────────────────────
     model_dir: str = "./models"
     ledgerlens_db_path: str = "./ledgerlens.db"
+    ingestion_dedup_enabled: bool = True
+    idempotency_retention_days: int = 90
+    idempotency_replay_window_seconds: float = 3600.0
+
+    # ── Lineage ───────────────────────────────────────────────────────────────
+    lineage_enabled: bool = False
+    lineage_backend: str = "console"
+    openlineage_url: str = ""
+    openlineage_namespace: str = "ledgerlens-core"
+    lineage_queue_maxsize: int = 1000
 
     # ── Downstream services ───────────────────────────────────────────────────
     ledgerlens_api_url: str = "http://localhost:8000"

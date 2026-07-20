@@ -683,15 +683,7 @@ def save_models(
     model_dir = model_dir or settings.model_dir
     os.makedirs(model_dir, exist_ok=True)
 
-    signing_key = settings.model_signing_key.encode()
-    for name, result in results.items():
-        if name.startswith("_") or not isinstance(result, dict) or "model" not in result:
-            continue
-        path = os.path.join(model_dir, f"{name}.joblib")
-        joblib.dump(result["model"], path)
-        sign_model_file(path, signing_key)
-
-    # Write training_metadata.json
+    # Compute version first
     if training_dataset_path:
         try:
             train_df = pd.read_csv(training_dataset_path)
@@ -707,6 +699,36 @@ def save_models(
         column_hash = "unknown"
 
     version = _compute_version_hash(training_row_count, column_hash)
+
+    from detection.lineage import lineage, Dataset
+    
+    inputs = [
+        Dataset(namespace="ledgerlens-core.csv", name="training_reference.csv"),
+        Dataset(namespace="ledgerlens-core.models", name=f"labelled_dataset_v{version}")
+    ]
+
+    with lineage.run("model_training.train_ensemble", inputs=inputs) as r:
+        signing_key = settings.model_signing_key.encode()
+        for name, result in results.items():
+            if name.startswith("_") or not isinstance(result, dict) or "model" not in result:
+                continue
+            
+            # Save normal model file
+            path = os.path.join(model_dir, f"{name}.joblib")
+            joblib.dump(result["model"], path)
+            sign_model_file(path, signing_key)
+            
+            # Save versioned model file
+            version_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
+            joblib.dump(result["model"], version_path)
+            sign_model_file(version_path, signing_key)
+            
+            # Save latest.txt pointer
+            latest_path = os.path.join(model_dir, f"{name}_latest.txt")
+            with open(latest_path, "w") as f:
+                f.write(version)
+                
+            r.add_output(Dataset(namespace="ledgerlens-core.models", name=f"{name}_v{version}.joblib"))
 
     _causal_selected = results.get("_causal_selected_features")
     metadata = {

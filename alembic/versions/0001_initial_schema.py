@@ -9,7 +9,7 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0001"
+revision = "0001_initial_schema"
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -57,6 +57,31 @@ def upgrade() -> None:
     )
     op.create_index("idx_pair_correlations_pair_a", "pair_correlations", ["pair_a"])
     op.create_index("idx_pair_correlations_pair_b", "pair_correlations", ["pair_b"])
+
+    op.create_table(
+        "trades",
+        sa.Column("paging_token", sa.Text, primary_key=True),
+        sa.Column("trade_id", sa.Text, nullable=False),
+        sa.Column("ledger_close_time", sa.Text, nullable=False),
+        sa.Column("base_account", sa.Text, nullable=False),
+        sa.Column("counter_account", sa.Text),
+        sa.Column("base_asset_code", sa.Text, nullable=False),
+        sa.Column("base_asset_issuer", sa.Text),
+        sa.Column("counter_asset_code", sa.Text, nullable=False),
+        sa.Column("counter_asset_issuer", sa.Text),
+        sa.Column("base_amount", sa.Float, nullable=False),
+        sa.Column("counter_amount", sa.Float, nullable=False),
+        sa.Column("price", sa.Float, nullable=False),
+        sa.Column("base_is_seller", sa.Integer, nullable=False),
+        sa.Column("trade_type", sa.Text, nullable=False),
+        sa.Column("liquidity_pool_id", sa.Text),
+        sa.Column("transaction_hash", sa.Text),
+        sa.Column("path_payment_id", sa.Text),
+        sa.Column("hop_index", sa.Integer),
+    )
+    op.create_index("idx_trades_ledger_close_time", "trades", ["ledger_close_time"])
+    op.create_index("idx_trades_base_account", "trades", ["base_account"])
+    op.create_index("idx_trades_counter_account", "trades", ["counter_account"])
 
     op.create_table(
         "feature_vectors",
@@ -475,6 +500,7 @@ def downgrade() -> None:
     op.drop_table("path_payments")
     op.drop_table("liquidity_pool_trades")
     op.drop_table("feature_vectors")
+    op.drop_table("trades")
     op.drop_table("pair_correlations")
     op.drop_table("on_chain_submissions")
     op.drop_table("risk_scores")

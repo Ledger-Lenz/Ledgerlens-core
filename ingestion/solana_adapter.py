@@ -169,11 +169,27 @@ class SolanaAdapter:
     ----------
     rpc_url:
         Overrides the SOLANA_RPC_URL environment variable when provided.
+    dedup_store:
+        Optional IdempotencyKeyStore instance. If not provided and settings.ingestion_dedup_enabled is True,
+        a default one will be created.
     """
 
-    def __init__(self, rpc_url: str | None = None) -> None:
+    def __init__(
+        self,
+        rpc_url: str | None = None,
+        dedup_store: IdempotencyKeyStore | None = None,
+    ) -> None:
         if rpc_url:
             os.environ.setdefault("SOLANA_RPC_URL", rpc_url)
+        from config.settings import settings
+        from ingestion.dedup import IdempotencyKeyStore
+        
+        self.dedup_store = dedup_store or (
+            IdempotencyKeyStore(
+                db_path=settings.db_path,
+                replay_window_seconds=settings.idempotency_replay_window_seconds
+            ) if settings.ingestion_dedup_enabled else None
+        )
 
     def ingest(
         self,
@@ -183,6 +199,7 @@ class SolanaAdapter:
     ) -> list[Trade]:
         """Fetch SPL swap events for ``address`` and return canonical Trade records."""
         trades: list[Trade] = []
+        from ingestion.dedup import DedupResult
         with httpx.Client() as client:
             sigs = _get_signatures(address, client, limit=limit, before=before_signature)
             for sig_info in sigs:
@@ -195,7 +212,34 @@ class SolanaAdapter:
                         continue
                     trade = _tx_to_trade(tx, sig)
                     if trade:
-                        trades.append(trade)
+                        if self.dedup_store is not None:
+                            key = self.dedup_store.compute_key(
+                                "solana",
+                                signature=sig,
+                                instruction_index=0,
+                            )
+                            metadata = {
+                                "signature": sig,
+                                "instruction_index": 0,
+                                "wallet": address,
+                            }
+                            result = self.dedup_store.is_duplicate(
+                                key,
+                                timestamp=trade.ledger_close_time,
+                                source="solana",
+                                metadata=metadata,
+                            )
+                            if result is DedupResult.DUPLICATE:
+                                logger.debug("Skipping duplicate Solana trade %s", key[:16])
+                                continue
+                            elif result is DedupResult.REPLAY_REJECTED:
+                                logger.warning("Rejecting replay Solana trade %s", key[:16])
+                                continue
+                            
+                            trades.append(trade)
+                            self.dedup_store.mark_seen(key, source="solana", metadata=metadata)
+                        else:
+                            trades.append(trade)
                 except Exception:
                     logger.warning("Failed to process Solana tx %s", sig, exc_info=True)
         logger.info(

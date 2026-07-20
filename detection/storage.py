@@ -100,6 +100,30 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
+
+        CREATE TABLE IF NOT EXISTS trades (
+            paging_token TEXT PRIMARY KEY,
+            trade_id TEXT NOT NULL,
+            ledger_close_time TEXT NOT NULL,
+            base_account TEXT NOT NULL,
+            counter_account TEXT,
+            base_asset_code TEXT NOT NULL,
+            base_asset_issuer TEXT,
+            counter_asset_code TEXT NOT NULL,
+            counter_asset_issuer TEXT,
+            base_amount REAL NOT NULL,
+            counter_amount REAL NOT NULL,
+            price REAL NOT NULL,
+            base_is_seller INTEGER NOT NULL,
+            trade_type TEXT NOT NULL,
+            liquidity_pool_id TEXT,
+            transaction_hash TEXT,
+            path_payment_id TEXT,
+            hop_index INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_trades_ledger_close_time ON trades (ledger_close_time);
+        CREATE INDEX IF NOT EXISTS idx_trades_base_account ON trades (base_account);
+        CREATE INDEX IF NOT EXISTS idx_trades_counter_account ON trades (counter_account);
         """,
     ),
     (
