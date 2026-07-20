@@ -22,6 +22,7 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
         populate_by_name=True,
+        feature_engine_jit_enabled: bool = True
     )
 
     # ── Horizon ───────────────────────────────────────────────────────────────
