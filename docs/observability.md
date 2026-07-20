@@ -92,6 +92,41 @@ OTEL_EXPORTER_OTLP_CLIENT_KEY=/path/to/client.key
 OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/path/to/client.crt
 ```
 
+### Trace Sampling
+
+LedgerLens supports two sampling strategies:
+
+1. **Static (head-based)** (default): Makes sampling decisions when spans start, using `OTEL_TRACES_SAMPLER`.
+2. **Tail (tail-based)**: Makes sampling decisions after traces complete, based on trace characteristics.
+
+#### Tail Sampling Policies
+
+When `TRACE_SAMPLING_STRATEGY="tail"`, the following policies are applied:
+
+| Policy | Description |
+|---|---|
+| Error | Always keep traces with any span in error state |
+| Slow | Always keep traces with any span taking > 2000ms |
+| Circuit Open | Always keep traces with `soroban.submit_score` spans where `circuit_state != closed` |
+| Baseline | Keep 5% of remaining "boring" traces (configurable with `TRACE_TAIL_BASELINE_RATIO`) |
+
+All kept traces have a `ledgerlens.sampling.reason` attribute indicating why they were kept (`error`, `slow`, `circuit_open`, or `baseline`).
+
+#### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRACE_SAMPLING_STRATEGY` | `static` | Sampling strategy: `static` or `tail` |
+| `TRACE_TAIL_BASELINE_RATIO` | `0.05` | Fraction of "boring" traces to keep |
+| `TRACE_TAIL_BUFFER_TIMEOUT_SECONDS` | `30.0` | Max time to wait for a trace to complete |
+| `TRACE_TAIL_MAX_BUFFERED_TRACES` | `10000` | Max traces to buffer in memory |
+
+#### Memory Management
+
+- Traces are automatically flushed after `TRACE_TAIL_BUFFER_TIMEOUT_SECONDS`
+- If the buffer hits `TRACE_TAIL_MAX_BUFFERED_TRACES`, the oldest trace is dropped
+- The buffer runs in a background thread to avoid blocking application processing
+
 ---
 
 ## Prometheus Metrics
@@ -182,3 +217,9 @@ See [docs/slo.md](file:///c:/Users/hp/drips/kosiso/Ledgerlens-core/docs/slo.md) 
 | `SLO_WINDOW_DAYS` | `30` | Rolling window in days over which targets are measured |
 
 See `.env.example` for all configuration variables.
+
+---
+
+## Model Cards
+
+For model governance, compliance, and auditing, LedgerLens generates Model Cards for each promoted model version, including a Datasheet for the training dataset. For full details, see the [Model Cards documentation](./model_cards.md).
