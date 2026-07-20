@@ -6,5 +6,19 @@ edition = "2021"
 [dependencies]
 soroban-sdk = "21.0"
 
+[dev-dependencies]
+# `testutils` gates soroban_sdk::testutils (Env mocking, Address::generate,
+# Ledger::set_timestamp). Without it the test module cannot compile.
+# `alloc` provides Bytes::to_alloc_vec, used to compare digests in tests.
+soroban-sdk = { version = "21.0", features = ["testutils", "alloc"] }
+# Used to produce real ED25519 signatures so tests exercise the contract's
+# on-chain ed25519_verify path rather than a stub.
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+rand = "0.8"
+# Mirrors the Python side's hashlib.sha256 for the cross-language parity vector.
+sha2 = "0.10"
+
 [lib]
-crate-type = ["cdylib"]
+# `rlib` is required in addition to `cdylib`: a cdylib-only crate cannot be
+# linked by the test harness, so `cargo test` fails to build the unit tests.
+crate-type = ["cdylib", "rlib"]

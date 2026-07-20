@@ -35,3 +35,7 @@ site/
 
 # Project specific
 somzilla.md
+
+# Rust / Soroban contract build artifacts
+contracts/*/target/
+contracts/*/test_snapshots/
