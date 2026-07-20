@@ -200,6 +200,22 @@ async def _lifespan(application: FastAPI):
     global _models, _shutting_down
     configure_tracing()
 
+    # ── Cost metrics initialization ───────────────────────────────────────
+    # Initialize cost coefficient gauges for Prometheus recording rules.
+    # These gauges are static (set once from settings.py) and referenced by
+    # cost recording rules in monitoring/recording_rules_cost.yml.
+    try:
+        from config.cost_exporter import init_cost_metrics
+        init_cost_metrics()
+        logger.info(
+            "Cost metrics initialized: vCPU=$%.4f/hr, Memory=$%.4f/GB-hr, Storage=$%.4f/GB-month",
+            settings.cost_per_vcpu_hour_usd,
+            settings.cost_per_gb_memory_hour_usd,
+            settings.cost_per_gb_storage_month_usd,
+        )
+    except Exception as e:
+        logger.warning("Failed to initialize cost metrics: %s", e)
+
     # ── Metrics startup check ─────────────────────────────────────────────
     # Warn operators if /metrics is exposed without an admin key — metrics can
     # reveal operational intelligence (queue depths, error rates) that should

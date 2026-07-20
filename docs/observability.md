@@ -190,6 +190,28 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 
 **Runbook**: The detection pipeline has not completed a run in over 5 minutes. Check that `python run_pipeline.py` (or `cli.py score`) is still running and not blocked. Review logs for exceptions in Horizon ingestion or model loading. Verify `LEDGERLENS_DB_PATH` is writable.
 
+### CapacityLimitApproaching
+
+**Condition**: `ledgerlens:replica_count_projected_days_to_max < 14 or ledgerlens:pvc_projected_days_to_full < 14` for 1 hour
+
+**Runbook**: Current growth trends indicate API replica count or PVC usage will hit configured limits within 14 days. Review `ledgerlens_wallets_scored_total` growth trend in the cost_capacity dashboard. Consider raising `autoscaling.maxReplicas` or `persistence.size` in `helm/ledgerlens/values.yaml`. Investigate unexpected ingestion volume growth with `GET /metrics` and Horizon SSE metrics. See [docs/cost_and_capacity.md](cost_and_capacity.md) for full runbook.
+
+---
+
+## Cost and Capacity Metrics
+
+LedgerLens includes cost visibility and capacity projection metrics. See [docs/cost_and_capacity.md](cost_and_capacity.md) for configuration and the full Grafana dashboard.
+
+**Key metrics:**
+
+- `ledgerlens:pod_cost_per_hour:usd` — Cost per pod (CPU + memory)
+- `ledgerlens:cost_per_wallet_scored:usd` — Unit economics (cost per scored wallet)
+- `ledgerlens:replica_count_projected_days_to_max` — Days until maxReplicas exhausted
+- `ledgerlens:pvc_projected_days_to_full` — Days until PVC full
+
+**Recording rules:** `monitoring/recording_rules_cost.yml`  
+**Alert:** `CapacityLimitApproaching` (fires 14 days before projected limit)
+
 ---
 
 ### SLO Burn-Rate Alerts

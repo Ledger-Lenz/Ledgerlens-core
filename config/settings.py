@@ -574,6 +574,24 @@ class Settings(BaseSettings):
             raise ValueError("FILTER_REJECTED_TRADES_MAX_ROWS must be >= 1")
         return val
 
+    @field_validator("cost_per_vcpu_hour_usd", "cost_per_gb_memory_hour_usd",
+                     "cost_per_gb_storage_month_usd", mode="before")
+    @classmethod
+    def non_negative_cost(cls, v: object) -> object:
+        val = float(v)
+        if val < 0:
+            raise ValueError("Cost coefficients must be non-negative")
+        return val
+
+    @field_validator("capacity_projection_window_days",
+                     "capacity_projection_lead_time_days", mode="before")
+    @classmethod
+    def positive_capacity_days(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("Capacity projection days must be >= 1")
+        return val
+
     @model_validator(mode="after")
     def parquet_export_dir_no_traversal(self) -> "Settings":
         cwd = Path.cwd().resolve()
