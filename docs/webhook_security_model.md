@@ -1,6 +1,6 @@
 # Webhook Security Model
 
-This document describes the security properties of the LedgerLens webhook system, covering HMAC signing, replay prevention, secret rotation, dead-letter recovery, and SSRF protection.
+This document describes the security properties of the LedgerLens webhook system, covering HMAC signing, replay prevention, secret rotation, dead-letter recovery, and SSRF protection. For a consolidated system threat model, see the [STRIDE Threat Model](threat_model.md).
 
 ## HMAC Signing Scheme
 

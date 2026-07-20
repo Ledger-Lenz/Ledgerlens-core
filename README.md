@@ -32,6 +32,8 @@ At a high level, it does three things:
 - **📊 Scores** — assigns each wallet and each trading pair a **LedgerLens Risk Score (0–100)** based on the combined output of its Benford anomaly metrics and ML classifiers, updating continuously as new ledger data is processed
 - **📡 Reports** — exposes risk scores and flagged activity through a public API and lightweight dashboard, making the intelligence accessible to DEX users, protocol teams, wallet providers, and compliance integrators without requiring technical expertise
 
+> 🔒 **Security Model**: LedgerLens incorporates point security controls across webhooks, oracle quorums, model loading, and admin APIs. See the consolidated [STRIDE Threat Model](docs/threat_model.md) for a systematic analysis of trust boundaries.
+
 ## Features
 
 - **Benford's Law Anomaly Engine**: Chi-square, per-digit Z-score, and MAD analysis of transaction amounts across rolling time windows (1h, 4h, 24h, 7d, 30d)
@@ -51,13 +53,20 @@ At a high level, it does three things:
 
 ```mermaid
 graph TB
-    subgraph Ingestion["Layer 1: Data Ingestion"]
+    subgraph External["External Network (Trust Boundary 1: Untrusted)"]
         HOR[Stellar Horizon API]
-        STREAM[horizon_streamer.py]
-        HIST[historical_loader.py]
+        EVM[EVM RPC Providers]
+        SOL[Solana RPC]
     end
 
-    subgraph Detection["Layer 2: Detection Engine"]
+    subgraph Ingestion["Layer 1: Data Ingestion"]
+        STREAM[horizon_streamer.py]
+        HIST[historical_loader.py]
+        EVM_LOAD[evm_loader.py]
+        SOL_ADAPT[solana_adapter.py]
+    end
+
+    subgraph Detection["Layer 2: Detection Engine (Internal Trust)"]
         BENF[benford_engine.py]
         FEAT[feature_engineering.py]
         GRAPH[graph_engine.py]
@@ -67,38 +76,69 @@ graph TB
         SCORE[LedgerLens Risk Score]
     end
 
-    subgraph Output["Layer 3: Contract + API"]
+    subgraph Output["Layer 3: Contract + API (Trust Boundaries 3 & 4)"]
         CONTRACT[Soroban Contract\nledgerlens-score]
         API[FastAPI REST API]
         DASH[Web Dashboard]
         WEBHOOK[Webhook Alerts]
     end
 
-    subgraph Consumers["Ecosystem Consumers"]
+    subgraph Consumers["Ecosystem Consumers (Trust Boundary 2)"]
         AMM[AMMs / Lending Protocols]
         AGG[DEX Aggregators]
         USERS[Traders / Issuers]
+        SUB[Webhook Subscribers]
     end
 
+    subgraph Federation["Federated Learning (Trust Boundary 5)"]
+        FL_SERVER[Federated Aggregation Server]
+        FL_CLIENTS[Federated Learning Participants]
+    end
+
+    subgraph CICD["CI/CD Pipeline (Trust Boundary 6)"]
+        BUILD[CI/CD Build System]
+        MODELS[Models Storage: models/]
+    end
+
+    %% External to Ingestion
     HOR --> STREAM
     HOR --> HIST
+    EVM --> EVM_LOAD
+    SOL --> SOL_ADAPT
+
+    %% Ingestion to Engine
     STREAM --> FEAT
     HIST --> FEAT
+    EVM_LOAD --> FEAT
+    SOL_ADAPT --> FEAT
+
+    %% Engine internal
     FEAT --> BENF
     FEAT --> GRAPH
     GRAPH --> FEAT
     FEAT --> TRAIN
-    TRAIN --> INFER
-    BENF --> SCORE
+    TRAIN -->|Save Joblib| MODELS
+    MODELS -->|Load Joblib| INFER
+    BUILD -->|Build & Sign| MODELS
     INFER --> SCORE
+    BENF --> SCORE
+
+    %% Engine to Output/API
     SCORE --> SHAP
     SCORE --> CONTRACT
     SCORE --> API
+
+    %% Output to consumers
     API --> DASH
     API --> WEBHOOK
     CONTRACT -->|get_score| AMM
     CONTRACT -->|get_score| AGG
     API --> USERS
+    WEBHOOK -.->|Signed Webhook| SUB
+
+    %% Federated Learning
+    FL_CLIENTS <==>|Signed update| FL_SERVER
+    FL_SERVER -->|p_global| FEAT
 ```
 
 ### Core Components
@@ -217,7 +257,7 @@ LedgerLens includes an off-chain dispute and governance mechanism for managing p
 - Committee members vote to resolve disputes; approved disputes remove the score locally and publish a `score=0` override on-chain.
 - Governance proposals allow runtime configuration changes (e.g. `risk_score_threshold`) and committee membership changes.
 
-See `docs/governance_protocol.md` for full details.
+See `docs/governance_protocol.md` for full details and [docs/threat_model.md](docs/threat_model.md) for the Soroban trust boundary analysis.
 
 - `get_score(wallet: Address, asset_pair: Symbol) -> RiskScore` - Read-only; returns the most recent risk score and timestamp for a wallet/asset pair, callable by any other Soroban contract
 
@@ -864,7 +904,7 @@ Run as a long-lived foreground process (e.g., under systemd or supervisor).
 
 ## Observability
 
-LedgerLens ships a production-grade observability stack. See [docs/observability.md](docs/observability.md) for full details.
+LedgerLens ships a production-grade observability stack. See [docs/observability.md](docs/observability.md) for full details and [docs/threat_model.md](docs/threat_model.md) for the STRIDE threat model.
 
 - **Structured JSON logging** — every log record is valid JSON with `timestamp`, `level`, `correlation_id`, and `trace_id` fields (via [structlog](https://www.structlog.org/))
 - **Correlation IDs** — each pipeline pass and API request is assigned a UUID4 that threads through all log lines and spans; the `X-Correlation-ID` header is propagated in API responses
