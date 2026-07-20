@@ -138,5 +138,24 @@ helm/ledgerlens/
     ├── configmap.yaml
     ├── secret.yaml
     ├── pvc.yaml
+    ├── cost-config.yaml
     └── serviceaccount.yaml
 ```
+
+## Cost and Capacity Monitoring
+
+The Helm chart includes built-in support for cost visibility and capacity projection. Cost coefficients are configured in `values.yaml` and exposed to Prometheus as gauges:
+
+```yaml
+costConfig:
+  enabled: true
+  costPerVcpuHourUsd: "0.0416"   # Adjust to your cloud pricing
+  costPerGbMemoryHourUsd: "0.0056"
+  costPerGbStorageMonthUsd: "0.10"
+```
+
+The cost and capacity dashboard requires:
+- **kube-state-metrics** (for replica counts, PVC sizes)
+- **cadvisor** (for CPU/memory usage, included in kubelet)
+
+Most Kubernetes distributions include these by default. See [docs/cost_and_capacity.md](cost_and_capacity.md) for the full setup guide and Grafana dashboard.

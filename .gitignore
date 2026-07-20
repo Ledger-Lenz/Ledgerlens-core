@@ -35,3 +35,7 @@ site/
 
 # Project specific
 somzilla.md
+
+
+*.nbi
+*.nbc

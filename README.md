@@ -117,6 +117,8 @@ graph TB
 - **detection/model_inference.py**: Real-time risk scoring
 - **detection/shap_explainer.py**: SHAP-based interpretability layer
 - **detection/causal_engine.py**: DoWhy structural causal model — do-calculus interventions, ATE estimation, counterfactual scores
+- **detection/embedding_store.py**: SQLite-backed store for GNN wallet embeddings (model version, embedding vector, timestamp)
+- **detection/vector_index.py**: FAISS-based approximate nearest neighbor (ANN) index for global similarity search of wallet embeddings
 
 The Soroban contract, REST API, and dashboard live in the
 `ledgerlens-contracts`, `ledgerlens-api`, and `ledgerlens-dashboard` repos
@@ -436,6 +438,18 @@ human-readable summary sentence. Supports `model` query parameter:
 [docs/shap_explanation.md](docs/shap_explanation.md) for the full caching
 strategy and TTL.
 
+#### Authentication (Gateway Middleware)
+
+All authenticated routes go through the consolidated **API Gateway**
+(`api/gateway.py`), which resolves auth, enforces quota, and logs every
+request in one pass. See [`docs/api_gateway.md`](docs/api_gateway.md) for
+the full architecture and migration guide.
+
+Authentication is resolved via (in order):
+1. `X-LedgerLens-Admin-Key` — matched against `LEDGERLENS_ADMIN_API_KEY`
+2. `X-LedgerLens-Compliance-Key` — matched against `LEDGERLENS_COMPLIANCE_API_KEY`
+3. `X-LedgerLens-Api-Key` — looked up in the canonical `api_keys` table
+
 #### CORS configuration
 
 The local API defaults to **deny-all** CORS (no browser origins are allowed
@@ -513,6 +527,7 @@ python cli.py stream          # stream trades from Horizon SSE and score increme
                               #   --overflow-strategy S    block, drop_newest, or drop_oldest
                               #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
+python cli.py compute-embeddings --window-days 30  # compute and store GNN embeddings for all wallets in the last 30 days
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
@@ -749,6 +764,19 @@ The response returns a `subscriber_id` (UUID) used for management.
 | ------ | ------------------- | --------------------------------------------------- |
 | `POST` | `/v1/feedback`      | Submit analyst label correction (admin-key required) |
 | `GET`  | `/v1/feedback`      | Paginated correction history (admin-key required)    |
+
+### Analyst Review Dashboard & Case Management
+
+| Method | Path                                       | Description                                              |
+| ------ | ------------------------------------------ | -------------------------------------------------------- |
+| `GET`  | `/analyst/queue`                           | Top 20 wallets awaiting review (with assignment state)   |
+| `GET`  | `/analyst/wallet/{wallet}`                 | Combined review view (score, SHAP, timeline, rings)      |
+| `POST` | `/analyst/wallet/{wallet}/claim`           | Claim a wallet for review (soft lock, 30 min)            |
+| `POST` | `/analyst/wallet/{wallet}/release`         | Release a claim before verdict                           |
+| `POST` | `/analyst/wallet/{wallet}/feedback`        | Submit verdict (requires active claim)                   |
+| `GET`  | `/analyst/stats`                           | Aggregate review statistics                              |
+| `GET`  | `/analyst/case-stats`                      | SLA metrics (claim/resolution times, queue depth)        |
+| `GET`  | `/analyst/feedback`                        | Export feedback for active learning loop                 |
 
 ### Cross-Chain Link Endpoints
 
@@ -1014,9 +1042,9 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 `core` and `api` must call `submit_score` with `score` already clamped to 0-100 (see `RiskScore.combine` in `detection/risk_score.py`).
 
-### Open Integration Points (not yet implemented)
+### Open Integration Points
 
-- How `core` hands `RiskScore` records to `api` (direct DB write, message queue, or `core` calling an `api` ingestion endpoint) — see `run_pipeline.py`.
+- How `core` hands `RiskScore` records to `api` (direct DB write, message queue, or `core` calling an `api` ingestion endpoint) — see `run_pipeline.py`. The integration is tested via the cross-repo E2E harness in `tests/e2e_cross_repo/`.
 - Where labelled training data lives in `ledgerlens-data` and its schema version — see `detection/model_training.py`.
 - Order-book event ingestion (needed for `round_trip_trade_frequency`, cancellation-rate features) — see TODOs in `detection/feature_engineering.py`.
 

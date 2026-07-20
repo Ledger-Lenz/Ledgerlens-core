@@ -447,74 +447,65 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         16,
-        "add ingestion_dedup_keys and ingestion_dedup_audit tables and backfill from bridge_event_dedup",
+        "add case_assignments table for analyst case management",
         """
-        CREATE TABLE IF NOT EXISTS ingestion_dedup_keys (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            idempotency_key TEXT NOT NULL UNIQUE,
-            source          TEXT NOT NULL,
-            metadata_json   TEXT,
-            first_seen_at   TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_dedup_source ON ingestion_dedup_keys (source);
-        CREATE INDEX IF NOT EXISTS idx_dedup_first_seen ON ingestion_dedup_keys (first_seen_at);
-
-        CREATE TABLE IF NOT EXISTS ingestion_dedup_audit (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            idempotency_key TEXT NOT NULL,
-            source          TEXT NOT NULL,
-            result          TEXT NOT NULL,
-            checked_at      TEXT NOT NULL,
-            metadata_json   TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_dedup_audit_source_time ON ingestion_dedup_audit (source, checked_at);
-
-        -- Dummy bridge_event_dedup table if it does not exist to ensure compile-safety
-        CREATE TABLE IF NOT EXISTS bridge_event_dedup (
-            event_hash   TEXT    PRIMARY KEY,
-            chain_id     INTEGER NOT NULL,
-            tx_hash      TEXT    NOT NULL,
-            log_index    INTEGER NOT NULL,
-            block_number INTEGER NOT NULL,
-            first_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- Backfill existing rows from bridge_event_dedup
-        INSERT OR IGNORE INTO ingestion_dedup_keys (idempotency_key, source, metadata_json, first_seen_at)
-        SELECT 
-            event_hash, 
-            'evm', 
-            '{"chain_id": ' || chain_id || ', "tx_hash": "' || tx_hash || '", "log_index": ' || log_index || ', "block_number": ' || block_number || '}', 
-            first_seen_at 
-        FROM bridge_event_dedup;
-
-        -- Drop the old table
-        DROP TABLE IF EXISTS bridge_event_dedup;
-        """,
-    ),
-    (
-        17,
-        "add lineage_events table for tracking run events",
-        """
-        CREATE TABLE IF NOT EXISTS lineage_events (
+        CREATE TABLE IF NOT EXISTS case_assignments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT NOT NULL,
-            event_time TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            parent_run_id TEXT,
-            job_namespace TEXT NOT NULL,
-            job_name TEXT NOT NULL,
-            inputs_json TEXT NOT NULL,
-            outputs_json TEXT NOT NULL,
-            producer TEXT NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            analyst_key_hash TEXT NOT NULL,
+            assigned_at TEXT NOT NULL,
+            lock_expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'assigned'
+                CHECK(status IN ('assigned', 'released', 'resolved')),
+            released_at TEXT,
+            resolved_at TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_lineage_run_id ON lineage_events (run_id);
-        CREATE INDEX IF NOT EXISTS idx_lineage_parent_run_id ON lineage_events (parent_run_id);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_wallet
+            ON case_assignments (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_analyst
+            ON case_assignments (analyst_key_hash, status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_status
+            ON case_assignments (status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_lock_expires
+            ON case_assignments (lock_expires_at)
+            WHERE status = 'assigned';
+
+        -- analyst_feedback table for verdicts (distinct from feedback_store's analyst_feedback)
+        CREATE TABLE IF NOT EXISTS analyst_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            notes TEXT,
+            analyst_key_hash TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            review_started_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_wallet ON analyst_feedback (wallet);
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted ON analyst_feedback (submitted_at);
         """,
     ),
 ]
 
+        -- gateway_request_log for consolidated access logging
+        CREATE TABLE IF NOT EXISTS gateway_request_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id TEXT,
+            namespace_id TEXT,
+            method TEXT,
+            path TEXT,
+            status_code INTEGER,
+            latency_ms REAL,
+            scope TEXT,
+            recorded_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_key ON gateway_request_log (key_id);
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_ns ON gateway_request_log (namespace_id);
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_date ON gateway_request_log (recorded_at);
+        """,
+    ),
+]
 
 
 @contextmanager
@@ -2129,6 +2120,32 @@ def get_krum_aggregation_log(
         }
         for r in rows
     ]
+
+
+def get_active_wallet_override(
+    wallet: str, db_path: str | None = None
+) -> dict | None:
+    """Return any active score override for ``wallet``, or ``None``."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT wallet, asset_pair, override_score, reason, recorded_at
+            FROM score_overrides
+            WHERE wallet = ? AND status = 'active'
+            ORDER BY recorded_at DESC LIMIT 1
+            """,
+            (wallet,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "wallet": row[0],
+        "asset_pair": row[1],
+        "override_score": row[2],
+        "reason": row[3],
+        "recorded_at": row[4],
+    }
 
 
 if __name__ == "__main__":
