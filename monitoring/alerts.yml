@@ -31,7 +31,7 @@ groups:
         annotations:
           summary: "p95 scoring latency exceeds 2 seconds"
           description: "The 95th-percentile wallet scoring latency is above 2.0s over the last 10 minutes."
-          runbook: "Check Horizon API latency (HORIZON_URL), model inference load, and DB write throughput. Consider reducing TRADE_HISTORY_LOOKBACK_DAYS or scaling the pipeline."
+          runbook: "Check Horizon API latency (HORIZON_URL), model inference load, and DB write throughput. Consider reducing TRADE_HISTORY_LOOKBACK_DAYS or scaling the pipeline. Acts as a backstop symptom alert alongside SLO burn-rate alerts."
 
       - alert: PipelineStalled
         expr: (time() - ledgerlens_pipeline_run_duration_seconds_created) > 300
@@ -41,13 +41,10 @@ groups:
           description: "The detection pipeline last completed more than 300 seconds ago."
           runbook: "Check that `python run_pipeline.py` or `cli.py score` is running and not stuck. Review logs for exceptions in horizon ingestion or model loading. Verify LEDGERLENS_DB_PATH is writable."
 
-      - alert: CapacityLimitApproaching
-        expr: |
-          ledgerlens:replica_count_projected_days_to_max < 14
-          or
-          ledgerlens:pvc_projected_days_to_full < 14
-        for: 1h
+      - alert: WAFAbuseDetected
+        expr: increase(ledgerlens_waf_blocks_total[5m]) > 10
+        for: 1m
         annotations:
-          summary: "Cluster capacity projected to be exhausted within 14 days"
-          description: "Current growth trends indicate API replica count or PVC usage will hit configured limits within {{ $value | printf \"%.1f\" }} days."
-          runbook: "Review `ledgerlens_wallets_scored_total` growth trend in the cost_capacity dashboard. Consider raising `autoscaling.maxReplicas` or `persistence.size` in helm/ledgerlens/values.yaml. Investigate unexpected ingestion volume growth with `GET /metrics` and Horizon SSE metrics. If growth is expected (e.g., mainnet launch), plan cluster expansion now to avoid service degradation."
+          summary: "WAF detected potential abuse"
+          description: "More than 10 requests have been blocked by the WAF in the last 5 minutes."
+          runbook: "Review blocked requests via GET /admin/waf/blocked-requests. Check for SQLi/XSS patterns or oversized requests. Consider adjusting rate limits or blocking specific clients if needed."

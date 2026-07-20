@@ -15,6 +15,41 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+
+try:
+    import numba
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+
+if _HAS_NUMBA:
+
+    @numba.njit(cache=True)
+    def _round_trip_count_jit(gave_ids: "np.ndarray", got_ids: "np.ndarray", max_trades: int) -> int:
+        n = len(gave_ids)
+        round_trips = 0
+        for i in range(n):
+            for j in range(i + 1, min(i + 1 + max_trades, n)):
+                if gave_ids[j] == got_ids[i] and got_ids[j] == gave_ids[i]:
+                    round_trips += 1
+                    break
+        return round_trips
+
+    @numba.njit(cache=True)
+    def _burst_overlap_count_jit(times_a: "np.ndarray", times_b: "np.ndarray", window_us: int) -> int:
+        count = 0
+        j_start = 0
+        for t in times_a:
+            while j_start < len(times_b) and times_b[j_start] < t - window_us:
+                j_start += 1
+            for j in range(j_start, len(times_b)):
+                if times_b[j] > t + window_us:
+                    break
+                count += 1
+                break
+        return count
+
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import (
     AdaptiveBenfordWindow,
@@ -488,12 +523,46 @@ def graph_ring_features(account: str, ring_membership: dict[str, dict] | None) -
     }
 
 
-def cross_pair_features(
-    account: str,
-    trades_by_pair: dict[str, pd.DataFrame] | None,
-    correlated_pairs: list[tuple[str, str, float]] | None,
-    cross_pair_wallets: dict[str, list[str]] | None,
-) -> dict:
+def _burst_overlap_count_python(times_a, times_b_sorted, window_us: int) -> int:
+    count = 0
+    j_start = 0
+    for t in times_a:
+        while j_start < len(times_b_sorted) and times_b_sorted[j_start] < t - window_us:
+            j_start += 1
+        for j in range(j_start, len(times_b_sorted)):
+            if times_b_sorted[j] > t + window_us:
+                break
+            count += 1
+            break
+    return count
+
+
+def cross_pair_features(trades: pd.DataFrame, account: str, window_us: int = 5_000_000) -> dict:
+    acct_trades = trades[trades["account"] == account]
+    active_pairs = acct_trades["pair"].unique()
+
+    results = {}
+    for pair in active_pairs:
+        acct_df_pair = acct_trades[acct_trades["pair"] == pair]
+        times_a = acct_df_pair["timestamp_us"].to_numpy(dtype=np.int64)
+
+        total_overlap = 0
+        for other_pair in active_pairs:
+            if other_pair == pair:
+                continue
+            other_pair_df = trades[trades["pair"] == other_pair]
+            times_b_sorted = np.sort(other_pair_df["timestamp_us"].to_numpy(dtype=np.int64))
+
+            if _HAS_NUMBA and settings.feature_engine_jit_enabled:
+                overlap_count = _burst_overlap_count_jit(times_a, times_b_sorted, window_us)
+            else:
+                overlap_count = _burst_overlap_count_python(times_a, times_b_sorted, window_us)
+
+            total_overlap += overlap_count
+
+        results[pair] = total_overlap
+
+    return results -> dict:
     """Compute the five cross-pair features for `account`.
 
     All inputs are optional; omitting any yields 0.0 for all five features.

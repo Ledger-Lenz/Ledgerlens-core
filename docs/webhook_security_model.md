@@ -77,6 +77,36 @@ Subscriber URLs are validated at registration time:
 
 This prevents the delivery worker from being used as a proxy to reach internal services (SSRF).
 
+## Go Verification Helper
+
+The Go SDK (`go/`) ships an equivalent helper using `hmac.Equal` (constant-time), which directly mirrors the Python `hmac.compare_digest` reference above:
+
+```go
+import (
+    ledgerlens "github.com/Ledger-Lenz/Ledgerlens-core/go"
+)
+
+// In your webhook HTTP handler:
+ok := ledgerlens.VerifyWebhookSignature(body, webhookSecret, r.Header.Get("X-LedgerLens-Signature"))
+if !ok {
+    http.Error(w, "invalid signature", http.StatusUnauthorized)
+    return
+}
+
+ok = ledgerlens.VerifyWebhookTimestamp(
+    r.Header.Get("X-LedgerLens-Timestamp"),
+    ledgerlens.DefaultWebhookMaxAge, // 5 * time.Minute
+)
+if !ok {
+    http.Error(w, "timestamp too old", http.StatusUnauthorized)
+    return
+}
+```
+
+`VerifyWebhookSignature` uses `hmac.Equal` — never `==` or `bytes.Equal`. The Go and Python helpers produce identical digests for the same `(secret, body)` input; this is verified in `go/webhook_test.go`'s `TestVerifyWebhookSignature_CrossCheckPythonScheme` test.
+
+See `go/README.md` for installation instructions.
+
 ## Test Coverage
 
 `tests/test_webhook_security.py` provides exhaustive coverage:

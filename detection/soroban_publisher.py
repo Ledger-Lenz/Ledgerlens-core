@@ -398,19 +398,45 @@ class SorobanPublisher:
 
         if dry_run:
             save_submission(score.wallet, score.asset_pair, score.score, "skipped")
+            try:
+                from api.metrics import soroban_submissions_total
+                soroban_submissions_total.labels(status="skipped").inc()
+            except Exception:
+                pass
             return None
+
+        import time
+        start_time = time.perf_counter()
 
         server = SorobanServer(self._soroban_rpc_url)
         try:
             tx_hash = self._execute_with_retries(server, score, zk_bundle=zk_bundle)
             self._record_success()
             save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash)
+            try:
+                from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
+                soroban_submissions_total.labels(status="success").inc()
+                soroban_submission_latency_seconds.observe(time.perf_counter() - start_time)
+            except Exception:
+                pass
             return tx_hash
-        except SorobanSubmissionError:
+        except SorobanSubmissionError as exc:
             save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Submission failed after retries")
+            try:
+                from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
+                soroban_submissions_total.labels(status="failed").inc()
+                soroban_submission_latency_seconds.observe(time.perf_counter() - start_time)
+            except Exception:
+                pass
             raise
-        except Exception:
+        except Exception as exc:
             save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error")
+            try:
+                from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
+                soroban_submissions_total.labels(status="failed").inc()
+                soroban_submission_latency_seconds.observe(time.perf_counter() - start_time)
+            except Exception:
+                pass
             raise
         finally:
             server.close()

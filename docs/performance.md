@@ -42,3 +42,23 @@ For the typical 100 K-node random graph, a single giant SCC containing ~98 % of 
 | --------------------- | -------- | --------------------------------------------------------------- |
 | `GRAPH_MMAP_THRESHOLD`| 50 000   | Node count above which CSR adjacency is used instead of a dict  |
 | `MAX_GRAPH_NODES`     | 1 000 000| Hard cap; `GraphTooLargeError` is raised above this limit       |
+
+
+## Numba JIT for feature engineering
+
+`round_trip_trade_frequency` and `cross_pair_features` in `detection/feature_engineering.py`
+use Numba `@njit`-compiled kernels for their hot inner loops (reversed-leg comparison
+and pairwise burst-window timestamp matching), falling back to pure Python when
+Numba is unavailable or disabled.
+
+**Flag:** `FEATURE_ENGINE_JIT_ENABLED` (default `true`). Set to `false` to force
+the pure-Python path — useful for cold-start-sensitive serverless deployments,
+since Numba's first-call compilation adds measurable warm-up latency.
+
+**Benchmark results** (run via `python benchmarks/benchmark_feature_engineering.py`):
+
+<paste your actual benchmark output here>
+
+**When to disable:** if your deployment has strict cold-start latency requirements
+(e.g. AWS Lambda, short-lived containers) and doesn't reuse warm processes long
+enough to amortize JIT compilation cost, set the flag to `false`.
