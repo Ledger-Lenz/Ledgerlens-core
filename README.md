@@ -117,6 +117,8 @@ graph TB
 - **detection/model_inference.py**: Real-time risk scoring
 - **detection/shap_explainer.py**: SHAP-based interpretability layer
 - **detection/causal_engine.py**: DoWhy structural causal model — do-calculus interventions, ATE estimation, counterfactual scores
+- **detection/embedding_store.py**: SQLite-backed store for GNN wallet embeddings (model version, embedding vector, timestamp)
+- **detection/vector_index.py**: FAISS-based approximate nearest neighbor (ANN) index for global similarity search of wallet embeddings
 
 The Soroban contract, REST API, and dashboard live in the
 `ledgerlens-contracts`, `ledgerlens-api`, and `ledgerlens-dashboard` repos
@@ -525,6 +527,7 @@ python cli.py stream          # stream trades from Horizon SSE and score increme
                               #   --overflow-strategy S    block, drop_newest, or drop_oldest
                               #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
+python cli.py compute-embeddings --window-days 30  # compute and store GNN embeddings for all wallets in the last 30 days
 python cli.py serve           # serve the local API
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations

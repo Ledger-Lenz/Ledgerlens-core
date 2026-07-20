@@ -298,6 +298,20 @@ class Settings(BaseSettings):
     # Enable PDF rendering for model cards
     model_card_pdf_enabled: bool = False
 
+    # ── Vector Similarity Search ──────────────────────────────────────────────────────
+    # Vector index backend: faiss_flat | faiss_ivf | pgvector
+    vector_index_backend: str = "faiss_flat"
+    # Dimension of the embedding vectors (64 for GraphSAGE
+    vector_index_dim: int = 64
+    # Number of wallets threshold to switch from flat to IVF index
+    vector_index_ivf_threshold: int = 50000
+    # Seconds between index refresh interval for incremental updates
+    vector_index_refresh_seconds: int = 300
+    # Path to SQLite database for storing embeddings
+    embedding_store_path: str = "./data/wallet_embeddings.db"
+    # Rate limit for similarity queries (per minute)
+    gnn_similarity_rate_limit_per_minute: int = 10
+
     # ── Parquet export (ledgerlens-data integration) ──────────────────────────
     # Default root directory for `cli.py export-parquet` output.
     # Resolved relative to the working directory; must remain inside the project.
