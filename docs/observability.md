@@ -202,3 +202,9 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` | *(unset)* | Client cert for mTLS |
 
 See `.env.example` for all configuration variables.
+
+---
+
+## Model Cards
+
+For model governance, compliance, and auditing, LedgerLens generates Model Cards for each promoted model version, including a Datasheet for the training dataset. For full details, see the [Model Cards documentation](./model_cards.md).

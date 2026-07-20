@@ -281,6 +281,14 @@ class Settings(BaseSettings):
     # Maximum number of traces to buffer in memory (tail sampling)
     trace_tail_max_buffered_traces: int = 10_000
 
+    # ── Model Cards ─────────────────────────────────────────────────────────────
+    # Directory to store generated model cards
+    model_card_dir: str = "./model_cards"
+    # Auto-generate model cards when models are promoted
+    model_card_auto_generate: bool = True
+    # Enable PDF rendering for model cards
+    model_card_pdf_enabled: bool = False
+
     # ── Parquet export (ledgerlens-data integration) ──────────────────────────
     # Default root directory for `cli.py export-parquet` output.
     # Resolved relative to the working directory; must remain inside the project.
