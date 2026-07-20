@@ -79,3 +79,11 @@ alembic downgrade 0001
 ```
 
 Each migration script must include a correct `downgrade()` implementation — PRs without a working downgrade will not be merged.
+
+## Migration history
+
+| Revision | Description |
+|----------|-------------|
+| `0001_initial_schema` | Full schema as of issue #168 |
+| `0002_scoring_events` | Event-sourced scoring audit log (Issue #297) |
+| `0003_case_assignments` | Analyst case management: `case_assignments` table and `analyst_feedback` verdicts table (Issue #200) |

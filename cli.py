@@ -1381,6 +1381,48 @@ def webhook_worker(
     asyncio.run(run_delivery_worker(interval_seconds=interval))
 
 
+@app.command("analyst-lock-sweep")
+def analyst_lock_sweep(
+    interval: float = typer.Option(60.0, "--interval", help="Sweep interval in seconds"),
+) -> None:
+    """Run the analyst case lock expiry sweep as a foreground process.
+
+    Expires stale analyst claims (past ANALYST_LOCK_TIMEOUT_SECONDS) so
+    wallets return to the unassigned queue.  Runs continuously until SIGINT/SIGTERM.
+    """
+    from detection.analyst_store import expire_stale_locks
+    from config.settings import settings as cfg
+
+    sweep_interval = max(interval, 10.0)
+    logger.info(
+        "Starting analyst lock sweep (interval=%ss, lock_timeout=%ss)",
+        sweep_interval,
+        cfg.analyst_lock_timeout_seconds,
+    )
+
+    try:
+        import signal
+        _stop = False
+
+        def _handle_signal(signum, frame):
+            nonlocal _stop
+            logger.info("Shutdown signal received — stopping lock sweep")
+            _stop = True
+
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+
+        while not _stop:
+            released = expire_stale_locks()
+            if released:
+                logger.info("Lock sweep: released %d expired lock(s)", released)
+            time.sleep(sweep_interval)
+    except KeyboardInterrupt:
+        pass
+
+    logger.info("Analyst lock sweep stopped.")
+
+
 backtest_app = typer.Typer(help="Backtesting framework for model evaluation")
 app.add_typer(backtest_app, name="backtest")
 

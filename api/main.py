@@ -30,13 +30,15 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
 from api.admin_router import router as admin_router
 from api.analyst import router as analyst_router
+from api.api_key_router import require_scope, router as api_key_router
+from api.api_keys_router import router as api_keys_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
@@ -1547,8 +1549,6 @@ class ProposalCreate(BaseModel):
     proposed_value: str
     proposed_by_key_hash: str
 
-ProposalCreate = LegacyProposalCreate
-
 
 @v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Create proposal", description="Create a new governance proposal (admin only).")
 def create_proposal_endpoint(body: ProposalCreate):
@@ -1562,8 +1562,6 @@ def create_proposal_endpoint(body: ProposalCreate):
 class ProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
-
-ProposalVote = LegacyProposalVote
 
 
 @v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Vote on proposal", description="Cast a vote on a governance proposal (admin only).")
