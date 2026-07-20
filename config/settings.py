@@ -126,6 +126,10 @@ class Settings(BaseSettings):
     feature_store_ttl_hours: int = 48
     feature_store_flush_interval_seconds: int = 300
 
+    # ── Analyst case management (Issue #200 follow-up) ──────────────────────
+    analyst_lock_timeout_seconds: int = 1800  # 30 min soft lock before auto-release
+    analyst_claim_max_active_per_analyst: int = 10  # max concurrent claims per analyst
+
     # ── Detection ─────────────────────────────────────────────────────────────
     benford_mad_threshold: float = 0.015
     risk_score_threshold: int = 70
@@ -252,7 +256,7 @@ class Settings(BaseSettings):
     path_payment_loader_enabled: bool = True
     path_payment_fetch_effects: bool = True
 
-    # ── Prometheus metrics ────────────────────────────────────────────────────
+    # ── Prometheus metrics ─────────────────────────────────────────────────────
     # Set to False to disable all prometheus_client metric collection.  When
     # disabled, ingestion/metrics.py returns a _NoOpCollector and GET /metrics
     # returns HTTP 503.  Useful in lightweight environments where prometheus_client
@@ -261,6 +265,38 @@ class Settings(BaseSettings):
     # URL path at which the Prometheus text metrics are served by the local API.
     # Must start with "/" and contain no dynamic segments.
     metrics_endpoint: str = "/metrics"
+
+    # ── WAF and Adaptive Rate Limiting ──────────────────────────────────────────
+    # Enable the in-process WAF middleware for request validation
+    waf_enabled: bool = True
+    # Maximum allowed request body size in bytes
+    waf_max_body_bytes: int = 1_048_576
+    # Timeout in seconds for slow request mitigation
+    waf_slow_request_timeout_seconds: float = 10.0
+    # Factor by which to tighten rate limits when abuse is detected
+    adaptive_rate_tighten_factor: float = 0.5
+    # Time window in seconds to track abuse signals
+    adaptive_rate_abuse_window_seconds: int = 300
+    # Number of abuse signals required to trigger rate limit tightening
+    adaptive_rate_abuse_threshold: int = 20
+
+    # ── Trace Sampling ──────────────────────────────────────────────────────────
+    # Sampling strategy: "static" (head-based) or "tail" (tail-based)
+    trace_sampling_strategy: str = "static"
+    # Baseline fraction of "boring" traces to keep when using tail sampling
+    trace_tail_baseline_ratio: float = 0.05
+    # Max time to wait for a trace to complete before flushing (tail sampling)
+    trace_tail_buffer_timeout_seconds: float = 30.0
+    # Maximum number of traces to buffer in memory (tail sampling)
+    trace_tail_max_buffered_traces: int = 10_000
+
+    # ── Model Cards ─────────────────────────────────────────────────────────────
+    # Directory to store generated model cards
+    model_card_dir: str = "./model_cards"
+    # Auto-generate model cards when models are promoted
+    model_card_auto_generate: bool = True
+    # Enable PDF rendering for model cards
+    model_card_pdf_enabled: bool = False
 
     # ── Parquet export (ledgerlens-data integration) ──────────────────────────
     # Default root directory for `cli.py export-parquet` output.
@@ -295,6 +331,7 @@ class Settings(BaseSettings):
                      "federated_min_participants", "cursor_flush_events",
                      "stream_checkpoint_interval", "streamer_queue_maxsize",
                      "historical_loader_concurrency", "historical_max_lookback_days",
+                     "analyst_lock_timeout_seconds", "analyst_claim_max_active_per_analyst",
                      mode="before")
     @classmethod
     def must_be_positive(cls, v: object) -> object:

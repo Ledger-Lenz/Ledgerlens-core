@@ -423,10 +423,46 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         16,
-        "api keys v2: add daily_quota, namespace_daily_quota, gateway_request_log, and consolidate legacy api_keys",
+        "add case_assignments table for analyst case management",
         """
-        -- Canonical api_keys table (created by detection.api_key_store)
-        -- Adds daily_quota and namespace_daily_quota columns via ALTER TABLE IF NOT EXISTS pattern
+        CREATE TABLE IF NOT EXISTS case_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            analyst_key_hash TEXT NOT NULL,
+            assigned_at TEXT NOT NULL,
+            lock_expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'assigned'
+                CHECK(status IN ('assigned', 'released', 'resolved')),
+            released_at TEXT,
+            resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_wallet
+            ON case_assignments (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_analyst
+            ON case_assignments (analyst_key_hash, status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_status
+            ON case_assignments (status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_lock_expires
+            ON case_assignments (lock_expires_at)
+            WHERE status = 'assigned';
+
+        -- analyst_feedback table for verdicts (distinct from feedback_store's analyst_feedback)
+        CREATE TABLE IF NOT EXISTS analyst_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            notes TEXT,
+            analyst_key_hash TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            review_started_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_wallet ON analyst_feedback (wallet);
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted ON analyst_feedback (submitted_at);
+        """,
+    ),
+]
 
         -- gateway_request_log for consolidated access logging
         CREATE TABLE IF NOT EXISTS gateway_request_log (
@@ -2060,6 +2096,32 @@ def get_krum_aggregation_log(
         }
         for r in rows
     ]
+
+
+def get_active_wallet_override(
+    wallet: str, db_path: str | None = None
+) -> dict | None:
+    """Return any active score override for ``wallet``, or ``None``."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT wallet, asset_pair, override_score, reason, recorded_at
+            FROM score_overrides
+            WHERE wallet = ? AND status = 'active'
+            ORDER BY recorded_at DESC LIMIT 1
+            """,
+            (wallet,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "wallet": row[0],
+        "asset_pair": row[1],
+        "override_score": row[2],
+        "reason": row[3],
+        "recorded_at": row[4],
+    }
 
 
 if __name__ == "__main__":

@@ -75,9 +75,17 @@ def _hash_key(plaintext: str) -> str:
 def require_api_key_scope(required_scope: str):
     """Return a FastAPI dependency that validates ``X-LedgerLens-Api-Key``.
 
-    .. deprecated::
-        Use :class:`api.gateway.GatewayMiddleware` with route scope
-        annotations instead.
+    The dependency:
+    1. Hashes the provided key with BLAKE2b-256.
+    2. Looks up the hash in the ``api_keys`` table.
+    3. Checks revocation status → 401 if revoked.
+    4. Checks expiry → 401 if expired.
+    5. Checks scope → 403 if ``required_scope`` not in key's scopes.
+    6. Enforces per-key rate limit (Redis sliding window, local fallback) → 429.
+       Uses adaptive rate limiting if abuse is detected.
+    7. Updates ``last_used_at`` asynchronously.
+
+    A missing header returns 401 so clients know authentication is required.
     """
 
     async def _dependency(
@@ -118,7 +126,17 @@ def require_api_key_scope(required_scope: str):
                 detail=f"API key lacks required scope '{required_scope}'",
             )
 
-        from detection.api_key_store import check_rate_limit as _rate_check
+        # Get effective limit with adaptive rate limiting
+        key_id = record["key_id"]
+        namespace_id = record.get("namespace_id", "")
+        from api.adaptive_rate_limiter import get_adaptive_limiter
+        adaptive_limiter = get_adaptive_limiter()
+        limit = adaptive_limiter.effective_limit(key_id, record["rate_limit_per_minute"])
+
+        allowed, retry_after = _check_rate_limit_redis(key_id, limit)
+        if allowed is None:
+            # Redis unavailable — use local fallback
+            allowed, retry_after = _check_rate_limit_local(key_id, limit)
 
         key_id = record["key_id"]
         limit = record["rate_limit_per_minute"]
@@ -134,5 +152,9 @@ def require_api_key_scope(required_scope: str):
             touch_api_key_last_used(key_id)
         except Exception:
             pass
+
+        # Store key info on request for later response recording
+        request.state.key_id = key_id
+        request.state.namespace_id = namespace_id
 
     return _dependency

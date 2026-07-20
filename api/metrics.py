@@ -71,10 +71,18 @@ model_auc_roc = Gauge(
     ["model_name"],
 )
 
-gateway_requests_total = Counter(
-    "ledgerlens_gateway_requests_total",
-    "Total API gateway requests",
-    ["namespace", "scope", "status"],
+# WAF metrics
+ledgerlens_waf_blocks_total = Counter(
+    "ledgerlens_waf_blocks_total",
+    "Total number of requests blocked by WAF",
+    ["rule", "namespace_id"],
+)
+
+# Adaptive rate limiting metrics
+ledgerlens_adaptive_rate_limit_tightened_total = Counter(
+    "ledgerlens_adaptive_rate_limit_tightened_total",
+    "Total number of times adaptive rate limiting was tightened per namespace",
+    ["namespace_id"],
 )
 
 
