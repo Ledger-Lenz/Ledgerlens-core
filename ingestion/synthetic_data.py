@@ -374,3 +374,126 @@ class LayeringProfile(BenfordEvasionMixin, AttackProfile):
             trades.append(self._make_trade(attacker, victim, buy_amount, buy_time))
 
         return trades, events
+
+
+# ---------------------------------------------------------------------------
+# AssetMediatedProfile
+# ---------------------------------------------------------------------------
+
+BRIDGE_ASSET = Asset(code="BRDG", issuer="GBRIDGE2THLF7SGITDFMXJVYH3LHDSMGEAKSBU267M2K7A3W543CKUEF")
+
+
+class AssetMediatedProfile(BenfordEvasionMixin, AttackProfile):
+    """Asset-mediated laundering: routes volume through an intermediate asset.
+
+    The attacker launders volume by routing XLM → BRIDGE_ASSET → XLM across
+    two different asset pairs.  In a homogeneous wallet-only graph this looks
+    identical to a ring trading a single pair directly, because the asset
+    identity is thrown away.  A heterogeneous graph with asset node types
+    exposes this pattern because the intermediate asset node bridges two
+    distinct wallet subgraphs.
+
+    The attack has two phases:
+    1. Wallet A sells XLM for BRIDGE_ASSET to wallet B (XLM/BRDG pair).
+    2. Wallet B sells BRIDGE_ASSET for XLM to wallet C (BRDG/XLM pair).
+    3. Wallet C sells XLM back to wallet A (XLM/USDC pair).
+
+    This creates a cycle that uses two different asset pairs to obscure
+    the ring structure, and additionally generates coordinated order-book
+    events (creates + cancels) for the order-lifecycle edges.
+
+    Features exercised
+    ------------------
+    - ``asset_mediated_ring_score`` (heterogeneous GNN feature)
+    - ``order_cancel_coordination_score`` (order-lifecycle feature)
+    - ``funding_proximity_score`` (funding edge feature)
+    - ``order_cancellation_rate`` (tabular feature)
+    """
+
+    def __init__(
+        self,
+        config: AttackProfileConfig,
+        intermediate_asset: Asset = BRIDGE_ASSET,
+        ring_size: int = 3,
+    ) -> None:
+        super().__init__(config)
+        self.intermediate_asset = intermediate_asset
+        self.ring_size = min(ring_size, config.n_wallets)
+
+    def generate(self) -> tuple[list[Trade], list[OrderBookEvent]]:
+        """Return (trades, order_book_events) for an asset-mediated laundering campaign."""
+        ring = self._wallets[: self.ring_size]
+        n = self.config.n_trades
+        raw_amounts = [float(self._rng.choice(WASH_LOT_SIZES)) for _ in range(n)]
+        amounts = self._apply_evasion(raw_amounts, self._rng, self.config.evasion_noise_std)
+        times = self._tight_cluster_times(n, spread_seconds=180.0)
+
+        trades: list[Trade] = []
+        events: list[OrderBookEvent] = []
+
+        for i in range(n):
+            # Phase 1: A sells XLM for BRIDGE_ASSET (XLM/BRDG pair)
+            sender_a = ring[i % self.ring_size]
+            receiver_b = ring[(i + 1) % self.ring_size]
+            t = times[i]
+
+            price_xlm_brdg = float(self._rng.uniform(0.5, 2.0))
+            trades.append(Trade(
+                id=self._next_id(),
+                ledger_close_time=t,
+                base_account=sender_a,
+                counter_account=receiver_b,
+                base_asset=NATIVE,
+                counter_asset=self.intermediate_asset,
+                base_amount=max(1e-7, amounts[i]),
+                counter_amount=max(1e-7, round(amounts[i] * price_xlm_brdg, 7)),
+                price=price_xlm_brdg,
+                base_is_seller=True,
+            ))
+
+            # Phase 2: B sells BRIDGE_ASSET for XLM (BRDG/XLM pair)
+            receiver_c = ring[(i + 2) % self.ring_size]
+            trade_time_b = t + timedelta(seconds=float(self._rng.uniform(10, 60)))
+            price_brdg_xlm = float(self._rng.uniform(0.5, 2.0))
+            trades.append(Trade(
+                id=self._next_id(),
+                ledger_close_time=trade_time_b,
+                base_account=receiver_b,
+                counter_account=receiver_c,
+                base_asset=self.intermediate_asset,
+                counter_asset=NATIVE,
+                base_amount=max(1e-7, amounts[i] * price_xlm_brdg),
+                counter_amount=max(1e-7, round(amounts[i], 7)),
+                price=price_brdg_xlm,
+                base_is_seller=True,
+            ))
+
+            # Phase 3: C sells XLM back to A (XLM/USDC pair)
+            trade_time_c = t + timedelta(seconds=float(self._rng.uniform(60, 180)))
+            trades.append(self._make_trade(receiver_c, sender_a, amounts[i], trade_time_c))
+
+            # Coordinated order-book events: create + cancel offers around the trades
+            ev_id = f"AssetMed_{self.config.seed}_{i}"
+            order_time_a = t - timedelta(seconds=float(self._rng.uniform(5, 30)))
+            events.append(OrderBookEvent(
+                id=ev_id + "_create_a",
+                timestamp=order_time_a,
+                account=sender_a,
+                asset_pair=f"NATIVE/{self.intermediate_asset.code}",
+                side="sell",
+                amount=amounts[i],
+                price=price_xlm_brdg,
+                event_type="created",
+            ))
+            events.append(OrderBookEvent(
+                id=ev_id + "_cancel_a",
+                timestamp=trade_time_b + timedelta(seconds=float(self._rng.uniform(1, 5))),
+                account=sender_a,
+                asset_pair=f"NATIVE/{self.intermediate_asset.code}",
+                side="sell",
+                amount=amounts[i],
+                price=price_xlm_brdg,
+                event_type="cancelled",
+            ))
+
+        return trades, events

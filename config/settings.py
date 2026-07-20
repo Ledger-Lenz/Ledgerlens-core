@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     # ── GNN ring detection ──────────────────────────────────────────────────
     gnn_model_path: str = "models/gnn_ring_detector.pt"
     gnn_fallback_to_scc: bool = True
+    gnn_graph_mode: str = "homogeneous"  # homogeneous | heterogeneous
+    gnn_hetero_conv_type: str = "sage"  # sage | hgt
+    gnn_hetero_model_path: str = "models/gnn_ring_detector_hetero.pt"
+    gnn_hetero_checksum_path: str = "models/gnn_ring_detector_hetero.sha256"
 
     streamer_queue_maxsize: int = 1000  # Hard cap on buffered Horizon trades.
     streamer_overflow_strategy: str = "drop_oldest"  # block/drop_newest/drop_oldest.
