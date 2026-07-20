@@ -100,6 +100,30 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
+
+        CREATE TABLE IF NOT EXISTS trades (
+            paging_token TEXT PRIMARY KEY,
+            trade_id TEXT NOT NULL,
+            ledger_close_time TEXT NOT NULL,
+            base_account TEXT NOT NULL,
+            counter_account TEXT,
+            base_asset_code TEXT NOT NULL,
+            base_asset_issuer TEXT,
+            counter_asset_code TEXT NOT NULL,
+            counter_asset_issuer TEXT,
+            base_amount REAL NOT NULL,
+            counter_amount REAL NOT NULL,
+            price REAL NOT NULL,
+            base_is_seller INTEGER NOT NULL,
+            trade_type TEXT NOT NULL,
+            liquidity_pool_id TEXT,
+            transaction_hash TEXT,
+            path_payment_id TEXT,
+            hop_index INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_trades_ledger_close_time ON trades (ledger_close_time);
+        CREATE INDEX IF NOT EXISTS idx_trades_base_account ON trades (base_account);
+        CREATE INDEX IF NOT EXISTS idx_trades_counter_account ON trades (counter_account);
         """,
     ),
     (
@@ -421,8 +445,67 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON benford_baselines (asset_pair);
         """,
     ),
+    (
+        16,
+        "add case_assignments table for analyst case management",
+        """
+        CREATE TABLE IF NOT EXISTS case_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            analyst_key_hash TEXT NOT NULL,
+            assigned_at TEXT NOT NULL,
+            lock_expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'assigned'
+                CHECK(status IN ('assigned', 'released', 'resolved')),
+            released_at TEXT,
+            resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_wallet
+            ON case_assignments (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_analyst
+            ON case_assignments (analyst_key_hash, status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_status
+            ON case_assignments (status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_lock_expires
+            ON case_assignments (lock_expires_at)
+            WHERE status = 'assigned';
+
+        -- analyst_feedback table for verdicts (distinct from feedback_store's analyst_feedback)
+        CREATE TABLE IF NOT EXISTS analyst_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            notes TEXT,
+            analyst_key_hash TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            review_started_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_wallet ON analyst_feedback (wallet);
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted ON analyst_feedback (submitted_at);
+        """,
+    ),
 ]
 
+        -- gateway_request_log for consolidated access logging
+        CREATE TABLE IF NOT EXISTS gateway_request_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id TEXT,
+            namespace_id TEXT,
+            method TEXT,
+            path TEXT,
+            status_code INTEGER,
+            latency_ms REAL,
+            scope TEXT,
+            recorded_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_key ON gateway_request_log (key_id);
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_ns ON gateway_request_log (namespace_id);
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_date ON gateway_request_log (recorded_at);
+        """,
+    ),
+]
 
 
 @contextmanager
@@ -2037,6 +2120,32 @@ def get_krum_aggregation_log(
         }
         for r in rows
     ]
+
+
+def get_active_wallet_override(
+    wallet: str, db_path: str | None = None
+) -> dict | None:
+    """Return any active score override for ``wallet``, or ``None``."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT wallet, asset_pair, override_score, reason, recorded_at
+            FROM score_overrides
+            WHERE wallet = ? AND status = 'active'
+            ORDER BY recorded_at DESC LIMIT 1
+            """,
+            (wallet,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "wallet": row[0],
+        "asset_pair": row[1],
+        "override_score": row[2],
+        "reason": row[3],
+        "recorded_at": row[4],
+    }
 
 
 if __name__ == "__main__":

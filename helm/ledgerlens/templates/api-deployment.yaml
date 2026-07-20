@@ -44,6 +44,10 @@ spec:
                 name: {{ include "ledgerlens.fullname" . }}
             - secretRef:
                 name: {{ include "ledgerlens.fullname" . }}
+            {{- if .Values.costConfig.enabled }}
+            - configMapRef:
+                name: {{ include "ledgerlens.fullname" . }}-cost-config
+            {{- end }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
           volumeMounts:

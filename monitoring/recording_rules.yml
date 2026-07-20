@@ -1,0 +1,43 @@
+groups:
+  - name: ledgerlens_slo_recording
+    interval: 30s
+    rules:
+      # --- Scoring Latency (p99 < 2s, target 99%) ---
+      - record: ledgerlens:scoring_latency_slo:good_rate5m
+        expr: rate(ledgerlens_scoring_latency_seconds_bucket{le="2.0"}[5m])
+      - record: ledgerlens:scoring_latency_slo:total_rate5m
+        expr: rate(ledgerlens_scoring_latency_seconds_count[5m])
+      - record: ledgerlens:scoring_latency_slo:ratio_rate5m
+        expr: sum(ledgerlens:scoring_latency_slo:good_rate5m) / sum(ledgerlens:scoring_latency_slo:total_rate5m)
+      - record: ledgerlens:scoring_latency_slo:error_budget_remaining
+        expr: ((sum(rate(ledgerlens_scoring_latency_seconds_bucket{le="2.0"}[30d])) / sum(rate(ledgerlens_scoring_latency_seconds_count[30d]))) - 0.99) / 0.01
+
+      # --- Webhook Delivery Success (target 99%) ---
+      - record: ledgerlens:webhook_delivery_slo:good_rate5m
+        expr: rate(ledgerlens_webhook_deliveries_total{result="delivered"}[5m])
+      - record: ledgerlens:webhook_delivery_slo:total_rate5m
+        expr: rate(ledgerlens_webhook_deliveries_total[5m])
+      - record: ledgerlens:webhook_delivery_slo:ratio_rate5m
+        expr: sum(ledgerlens:webhook_delivery_slo:good_rate5m) / sum(ledgerlens:webhook_delivery_slo:total_rate5m)
+      - record: ledgerlens:webhook_delivery_slo:error_budget_remaining
+        expr: ((sum(rate(ledgerlens_webhook_deliveries_total{result="delivered"}[30d])) / sum(rate(ledgerlens_webhook_deliveries_total[30d]))) - 0.99) / 0.01
+
+      # --- Soroban Submission Success (target 99%, excluding skipped dry runs) ---
+      - record: ledgerlens:soroban_submission_slo:good_rate5m
+        expr: rate(ledgerlens_soroban_submissions_total{status="success"}[5m])
+      - record: ledgerlens:soroban_submission_slo:total_rate5m
+        expr: rate(ledgerlens_soroban_submissions_total{status!="skipped"}[5m])
+      - record: ledgerlens:soroban_submission_slo:ratio_rate5m
+        expr: sum(ledgerlens:soroban_submission_slo:good_rate5m) / sum(ledgerlens:soroban_submission_slo:total_rate5m)
+      - record: ledgerlens:soroban_submission_slo:error_budget_remaining
+        expr: ((sum(rate(ledgerlens_soroban_submissions_total{status="success"}[30d])) / sum(rate(ledgerlens_soroban_submissions_total{status!="skipped"}[30d]))) - 0.99) / 0.01
+
+      # --- Score Availability (GET /scores/{wallet}, target 99.5%) ---
+      - record: ledgerlens:score_availability_slo:good_rate5m
+        expr: rate(ledgerlens_api_request_duration_seconds_count{method="GET",endpoint=~"/v1/scores/\\{wallet\\}|/scores/\\{wallet\\}",status_code!~"5.."}[5m])
+      - record: ledgerlens:score_availability_slo:total_rate5m
+        expr: rate(ledgerlens_api_request_duration_seconds_count{method="GET",endpoint=~"/v1/scores/\\{wallet\\}|/scores/\\{wallet\\}"}[5m])
+      - record: ledgerlens:score_availability_slo:ratio_rate5m
+        expr: sum(ledgerlens:score_availability_slo:good_rate5m) / sum(ledgerlens:score_availability_slo:total_rate5m)
+      - record: ledgerlens:score_availability_slo:error_budget_remaining
+        expr: ((sum(rate(ledgerlens_api_request_duration_seconds_count{method="GET",endpoint=~"/v1/scores/\\{wallet\\}|/scores/\\{wallet\\}",status_code!~"5.."}[30d])) / sum(rate(ledgerlens_api_request_duration_seconds_count{method="GET",endpoint=~"/v1/scores/\\{wallet\\}|/scores/\\{wallet\\}"}[30d]))) - 0.995) / 0.005

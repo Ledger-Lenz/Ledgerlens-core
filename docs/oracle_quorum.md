@@ -1,6 +1,6 @@
 # Multi-Signature Oracle Quorum
 
-Ledgerlens-core utilizes a 3-of-5 multi-signature oracle quorum to secure on-chain RiskScore submissions, eliminating single points of failure and preventing single-key compromise attacks.
+Ledgerlens-core utilizes a 3-of-5 multi-signature oracle quorum to secure on-chain RiskScore submissions, eliminating single points of failure and preventing single-key compromise attacks. For a consolidated system threat model, see the [STRIDE Threat Model](threat_model.md).
 
 ## Architecture Overview
 

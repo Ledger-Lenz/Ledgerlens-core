@@ -319,62 +319,72 @@ def run(
             save_path_payment_cycles(path_cycles)
             save_alerts(path_payment_cycles_to_alerts(path_cycles))
 
-            for account in accounts:
-                _t_acct = time.monotonic()
-                features = build_feature_vector(
-                    trades,
-                    account,
-                    as_of,
-                    order_book_events=order_book_events,
-                    account_metadata=account_metadata,
-                    trades_by_pair=trades_by_pair if multi_pair else None,
-                    correlated_pairs=correlated_pairs if multi_pair else None,
-                    cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
-                    path_payments=path_payments,
-                    gnn_scores=gnn_scores,
-                    path_cycles=path_cycles,
-                    ring_membership=ring_membership,
-                )
-                if calibrators:
-                    uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
-                    probability = uncertainty["score"] / 100.0
-                    _, confidence = score_feature_vector(models, features)
-                    score = RiskScore.combine(
-                        wallet=account,
-                        asset_pair=pair_key,
-                        benford_mad=features.get("benford_mad_24h", 0.0),
-                        benford_mad_threshold=settings.benford_mad_threshold,
-                        ml_probability=probability,
-                        ml_confidence=confidence,
-                        score_lower=uncertainty["score_lower"],
-                        score_upper=uncertainty["score_upper"],
-                        prediction_set=uncertainty.get("prediction_set"),
-                        coverage_guarantee=uncertainty.get("coverage_guarantee"),
-                        sandwich_signal=features.get("pdc_5m", 0.0),
-                        sandwich_weight=settings.pdc_discount_weight,
-                    )
-                else:
-                    probability, confidence = score_feature_vector(models, features)
-                    score = RiskScore.combine(
-                        wallet=account,
-                        asset_pair=pair_key,
-                        benford_mad=features.get("benford_mad_24h", 0.0),
-                        benford_mad_threshold=settings.benford_mad_threshold,
-                        ml_probability=probability,
-                        ml_confidence=confidence,
-                        sandwich_signal=features.get("pdc_5m", 0.0),
-                        sandwich_weight=settings.pdc_discount_weight,
-                    )
-                adjust_score_with_temporal(account, pair_key, score, models)
-                scores.append(score)
-                scored_features.append(features)
-                scored_wallets.append(account)
-                scored_pairs.append(pair_key)
+            from detection.lineage import lineage, Dataset
+            from config.correlation import get_correlation_id
 
-                _elapsed = time.monotonic() - _t_acct
-                scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
-                _result = "above_threshold" if score.score >= settings.risk_score_threshold else "below_threshold"
-                wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
+            cid = get_correlation_id()
+            parent_run_id = None if cid == "unset" else cid
+
+            inputs = [Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="trades")]
+
+            with lineage.run("feature_engineering.build_feature_vector", inputs=inputs, parent_run_id=parent_run_id) as r:
+                for account in accounts:
+                    _t_acct = time.monotonic()
+                    features = build_feature_vector(
+                        trades,
+                        account,
+                        as_of,
+                        order_book_events=order_book_events,
+                        account_metadata=account_metadata,
+                        trades_by_pair=trades_by_pair if multi_pair else None,
+                        correlated_pairs=correlated_pairs if multi_pair else None,
+                        cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
+                        path_payments=path_payments,
+                        gnn_scores=gnn_scores,
+                        path_cycles=path_cycles,
+                        ring_membership=ring_membership,
+                    )
+                    if calibrators:
+                        uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
+                        probability = uncertainty["score"] / 100.0
+                        _, confidence = score_feature_vector(models, features)
+                        score = RiskScore.combine(
+                            wallet=account,
+                            asset_pair=pair_key,
+                            benford_mad=features.get("benford_mad_24h", 0.0),
+                            benford_mad_threshold=settings.benford_mad_threshold,
+                            ml_probability=probability,
+                            ml_confidence=confidence,
+                            score_lower=uncertainty["score_lower"],
+                            score_upper=uncertainty["score_upper"],
+                            prediction_set=uncertainty.get("prediction_set"),
+                            coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                            sandwich_signal=features.get("pdc_5m", 0.0),
+                            sandwich_weight=settings.pdc_discount_weight,
+                        )
+                    else:
+                        probability, confidence = score_feature_vector(models, features)
+                        score = RiskScore.combine(
+                            wallet=account,
+                            asset_pair=pair_key,
+                            benford_mad=features.get("benford_mad_24h", 0.0),
+                            benford_mad_threshold=settings.benford_mad_threshold,
+                            ml_probability=probability,
+                            ml_confidence=confidence,
+                            sandwich_signal=features.get("pdc_5m", 0.0),
+                            sandwich_weight=settings.pdc_discount_weight,
+                        )
+                    adjust_score_with_temporal(account, pair_key, score, models)
+                    scores.append(score)
+                    scored_features.append(features)
+                    scored_wallets.append(account)
+                    scored_pairs.append(pair_key)
+
+                    _elapsed = time.monotonic() - _t_acct
+                    scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
+                    _result = "above_threshold" if score.score >= settings.risk_score_threshold else "below_threshold"
+                    wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
+                r.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="feature_distribution_snapshots"))
 
         logger.info("Computed %d risk scores", len(scores))
 
@@ -535,18 +545,28 @@ async def async_run(
             save_path_payment_cycles(path_cycles)
             save_alerts(path_payment_cycles_to_alerts(path_cycles))
 
-            feature_vectors = [
-                build_feature_vector(
-                    trades,
-                    account,
-                    as_of,
-                    order_book_events=order_book_events,
-                    account_metadata=account_metadata,
-                    path_payments=path_payments,
-                    path_cycles=path_cycles,
-                )
-                for account in accounts
-            ]
+            from detection.lineage import lineage, Dataset
+            from config.correlation import get_correlation_id
+
+            cid = get_correlation_id()
+            parent_run_id = None if cid == "unset" else cid
+
+            inputs = [Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="trades")]
+
+            with lineage.run("feature_engineering.build_feature_vector", inputs=inputs, parent_run_id=parent_run_id) as r:
+                feature_vectors = [
+                    build_feature_vector(
+                        trades,
+                        account,
+                        as_of,
+                        order_book_events=order_book_events,
+                        account_metadata=account_metadata,
+                        path_payments=path_payments,
+                        path_cycles=path_cycles,
+                    )
+                    for account in accounts
+                ]
+                r.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="feature_distribution_snapshots"))
 
             batch_results = score_feature_matrix(models, feature_vectors)
 
@@ -689,49 +709,60 @@ def _flush_streaming_buffer(
     scored_wallets: list[str] = []
     scored_pairs: list[str] = []
 
-    for account in accounts:
-        features = build_feature_vector(
-            trades_df,
-            account,
-            as_of,
-            account_metadata=account_metadata,
-        )
+    from detection.lineage import lineage, Dataset
+    from config.correlation import get_correlation_id
 
-        if calibrators:
-            uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
-            probability = uncertainty["score"] / 100.0
-            _, confidence = score_feature_vector(models, features)
-            score = RiskScore.combine(
-                wallet=account,
-                asset_pair=pair_key,
-                benford_mad=features.get("benford_mad_24h", 0.0),
-                benford_mad_threshold=settings.benford_mad_threshold,
-                ml_probability=probability,
-                ml_confidence=confidence,
-                score_lower=uncertainty["score_lower"],
-                score_upper=uncertainty["score_upper"],
-                prediction_set=uncertainty.get("prediction_set"),
-                coverage_guarantee=uncertainty.get("coverage_guarantee"),
-                sandwich_signal=features.get("pdc_5m", 0.0),
-                sandwich_weight=settings.pdc_discount_weight,
+    cid = get_correlation_id()
+    parent_run_id = None if cid == "unset" else cid
+
+    inputs = [Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="trades")]
+
+    with lineage.run("feature_engineering.build_feature_vector", inputs=inputs, parent_run_id=parent_run_id) as r:
+        for account in accounts:
+            features = build_feature_vector(
+                trades_df,
+                account,
+                as_of,
+                account_metadata=account_metadata,
             )
-        else:
-            probability, confidence = score_feature_vector(models, features)
-            score = RiskScore.combine(
-                wallet=account,
-                asset_pair=pair_key,
-                benford_mad=features.get("benford_mad_24h", 0.0),
-                benford_mad_threshold=settings.benford_mad_threshold,
-                ml_probability=probability,
-                ml_confidence=confidence,
-                sandwich_signal=features.get("pdc_5m", 0.0),
-                sandwich_weight=settings.pdc_discount_weight,
-            )
-        adjust_score_with_temporal(account, pair_key, score, models)
-        scores.append(score)
-        scored_features.append(features)
-        scored_wallets.append(account)
-        scored_pairs.append(pair_key)
+
+            if calibrators:
+                uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
+                probability = uncertainty["score"] / 100.0
+                _, confidence = score_feature_vector(models, features)
+                score = RiskScore.combine(
+                    wallet=account,
+                    asset_pair=pair_key,
+                    benford_mad=features.get("benford_mad_24h", 0.0),
+                    benford_mad_threshold=settings.benford_mad_threshold,
+                    ml_probability=probability,
+                    ml_confidence=confidence,
+                    score_lower=uncertainty["score_lower"],
+                    score_upper=uncertainty["score_upper"],
+                    prediction_set=uncertainty.get("prediction_set"),
+                    coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                    sandwich_signal=features.get("pdc_5m", 0.0),
+                    sandwich_weight=settings.pdc_discount_weight,
+                )
+            else:
+                probability, confidence = score_feature_vector(models, features)
+                score = RiskScore.combine(
+                    wallet=account,
+                    asset_pair=pair_key,
+                    benford_mad=features.get("benford_mad_24h", 0.0),
+                    benford_mad_threshold=settings.benford_mad_threshold,
+                    ml_probability=probability,
+                    ml_confidence=confidence,
+                    sandwich_signal=features.get("pdc_5m", 0.0),
+                    sandwich_weight=settings.pdc_discount_weight,
+                )
+            adjust_score_with_temporal(account, pair_key, score, models)
+            scores.append(score)
+            scored_features.append(features)
+            scored_wallets.append(account)
+            scored_pairs.append(pair_key)
+            
+        r.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="feature_distribution_snapshots"))
 
     elapsed = time.monotonic() - t0
 

@@ -28,19 +28,27 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRouter
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
+from api.api_key_router import router as api_key_router, require_scope
 from api.admin_router import router as admin_router
 from api.analyst import router as analyst_router
+from api.api_key_router import require_scope, router as api_key_router
+from api.api_keys_router import router as api_keys_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
+from api.api_key_router import router as api_key_router
+from api.api_keys_router import router as api_keys_router, require_scope
 from api.namespace import list_namespaces
+from api.api_key_router import router as api_key_router, require_scope
+from api.api_keys_router import router as api_keys_router
+from api.gateway import GatewayMiddleware
 from config.settings import settings
 from detection.tracing import (
     configure_tracing,
@@ -54,7 +62,6 @@ from detection.risk_score import RiskScore
 from detection.counterfactual_engine import generate_counterfactuals
 from detection.counterfactual_translator import translate_counterfactual
 from detection.storage import (
-    get_active_wallet_override,
     get_alerts,
     get_bridge_transfer_history,
     get_bridge_transfers,
@@ -105,6 +112,31 @@ def _check_causal_rate_limit(client_ip: str) -> None:
             ),
         )
     _causal_rate_buckets[client_ip].append(now)
+
+
+# ---------------------------------------------------------------------------
+# Simple in-process IP rate limiter for the similar-wallets endpoint.
+# ---------------------------------------------------------------------------
+_GNN_SIMILARITY_RATE_WINDOW = 60.0  # window size in seconds
+_gnn_similarity_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_gnn_similarity_rate_limit(client_ip: str) -> None:
+    """Raise HTTP 429 if ``client_ip`` has exceeded the similar-wallets rate limit."""
+    from config.settings import settings
+    now = time.monotonic()
+    bucket = _gnn_similarity_rate_buckets[client_ip]
+    # Evict timestamps outside the window
+    _gnn_similarity_rate_buckets[client_ip] = [t for t in bucket if now - t < _GNN_SIMILARITY_RATE_WINDOW]
+    if len(_gnn_similarity_rate_buckets[client_ip]) >= settings.gnn_similarity_rate_limit_per_minute:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: similar-wallets endpoint allows "
+                f"{settings.gnn_similarity_rate_limit_per_minute} requests per minute per IP."
+            ),
+        )
+    _gnn_similarity_rate_buckets[client_ip].append(now)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +200,22 @@ async def _lifespan(application: FastAPI):
     """Load trained models at startup; drain requests and clean up on shutdown."""
     global _models, _shutting_down
     configure_tracing()
+
+    # ── Cost metrics initialization ───────────────────────────────────────
+    # Initialize cost coefficient gauges for Prometheus recording rules.
+    # These gauges are static (set once from settings.py) and referenced by
+    # cost recording rules in monitoring/recording_rules_cost.yml.
+    try:
+        from config.cost_exporter import init_cost_metrics
+        init_cost_metrics()
+        logger.info(
+            "Cost metrics initialized: vCPU=$%.4f/hr, Memory=$%.4f/GB-hr, Storage=$%.4f/GB-month",
+            settings.cost_per_vcpu_hour_usd,
+            settings.cost_per_gb_memory_hour_usd,
+            settings.cost_per_gb_storage_month_usd,
+        )
+    except Exception as e:
+        logger.warning("Failed to initialize cost metrics: %s", e)
 
     # ── Metrics startup check ─────────────────────────────────────────────
     # Warn operators if /metrics is exposed without an admin key — metrics can
@@ -287,6 +335,59 @@ app = FastAPI(
 )
 
 
+# Add WAF middleware first
+from api.waf_middleware import WAFMiddleware
+app.add_middleware(WAFMiddleware)
+
+
+@app.middleware("http")
+async def _adaptive_rate_recording_middleware(request: Request, call_next):
+    """Record response status codes for adaptive rate limiting."""
+    response = await call_next(request)
+    try:
+        if hasattr(request.state, "key_id"):
+            from api.adaptive_rate_limiter import get_adaptive_limiter
+            adaptive_limiter = get_adaptive_limiter()
+            adaptive_limiter.record_response(
+                key_id=request.state.key_id,
+                status_code=response.status_code,
+                waf_blocked=False,
+                namespace_id=getattr(request.state, "namespace_id", ""),
+            )
+    except Exception:
+        pass
+    return response
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Record FastAPI request duration metrics."""
+    from config.settings import settings as _s
+    if not getattr(_s, "metrics_enabled", True):
+        return await call_next(request)
+
+    import time
+    start_time = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration = time.perf_counter() - start_time
+        status_code = str(response.status_code) if response else "500"
+        route = request.scope.get("route")
+        endpoint = route.path if route else request.url.path
+        try:
+            from api.metrics import api_request_duration_seconds
+            api_request_duration_seconds.labels(
+                method=request.method,
+                endpoint=endpoint,
+                status_code=status_code,
+            ).observe(duration)
+        except Exception:
+            pass
+
+
 @app.middleware("http")
 async def _shutdown_guard_middleware(request: Request, call_next):
     """Reject new requests during shutdown; track in-flight count."""
@@ -328,6 +429,10 @@ app.add_middleware(
     allow_credentials=False,
 )
 
+# ── Gateway middleware (auth, quota, logging) ────────────────────────────────
+app.add_middleware(GatewayMiddleware)
+
+# ── Router registration ──────────────────────────────────────────────────────
 from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
@@ -337,7 +442,6 @@ app.include_router(api_key_router)
 app.include_router(batch_router)
 
 app.include_router(export_router)
-app.include_router(api_keys_router)
 
 
 app.include_router(cross_chain_router)
@@ -1003,22 +1107,139 @@ def wallet_scores(wallet: str) -> dict:
     }
 
 
-@v1_router.get(
-    "/wallets/{wallet}/cross-chain",
-    tags=["Wallets"],
-    summary="Cross-chain bridge history",
-    description="Return full EVM bridge transfer history for a Stellar wallet.",
-)
-def wallet_cross_chain(wallet: str) -> list[dict]:
-    """Return the full bridge transfer history for ``wallet``.
+class SimilarWallet(BaseModel):
+    wallet: str
+    similarity: float
+    current_risk_score: int
+    wash_ring_membership: bool
 
-    ``amount_usd_estimate`` values are derived from on-chain oracle prices and
-    may be manipulated — treat them as estimates only.
+
+class SimilarWalletsResponse(BaseModel):
+    wallet: str
+    computed_from: str
+    model_version: str
+    similar_wallets: list[SimilarWallet]
+
+
+# Global vector index and embedding store singletons
+_vector_index: Optional[object] = None
+_embedding_store: Optional[object] = None
+_model_version: Optional[str] = None
+
+
+def _initialize_vector_resources():
+    """Initialize the vector index and embedding store singletons."""
+    global _vector_index, _embedding_store, _model_version
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+    from detection.vector_index import create_vector_index
+    import numpy as np
+
+    if _embedding_store is None:
+        _embedding_store = EmbeddingStore()
+
+    # Get the latest model version
+    _model_version = _embedding_store.get_latest_model_version()
+    if _model_version is None:
+        return  # No embeddings yet
+
+    if _vector_index is None:
+        _vector_index = create_vector_index()
+        # Load all embeddings from the store
+        wallets = []
+        vectors = []
+        for wallet, embedding_bytes in _embedding_store.get_all_embeddings(_model_version):
+            wallets.append(wallet)
+            vectors.append(np.frombuffer(embedding_bytes, dtype=np.float32))
+        if vectors:
+            _vector_index.add_batch(wallets, np.array(vectors))
+
+
+@v1_router.get(
+    "/wallets/{wallet}/similar",
+    tags=["Wallets"],
+    summary="Find structurally similar wallets",
+    description="Return globally similar wallets using precomputed GNN embeddings and ANN search.",
+)
+def find_similar_wallets(
+    request: Request,
+    wallet: str,
+    k: int = Query(10, ge=1, le=100, description="Number of similar wallets to return"),
+    min_score: float = Query(0.0, ge=0.0, le=1.0, description="Minimum similarity score"),
+) -> SimilarWalletsResponse:
+    """Return structurally similar wallets using the global vector index.
+
+    - **404** — no embedding found for the given wallet.
+    - **503** — vector index not initialized.
     """
-    history = get_bridge_transfer_history(stellar_wallet=wallet)
-    if not history:
-        raise HTTPException(status_code=404, detail=f"No bridge transfer history for wallet {wallet}")
-    return history
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+    from detection.vector_index import create_vector_index
+    import numpy as np
+
+    validate_stellar_address(wallet)
+
+    # Check rate limit
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    _check_gnn_similarity_rate_limit(client_ip)
+
+    # Initialize resources if needed
+    if _embedding_store is None:
+        _initialize_vector_resources()
+    if _vector_index is None:
+        _initialize_vector_resources()
+    if _embedding_store is None or _vector_index is None or _model_version is None:
+        raise HTTPException(status_code=503, detail="Vector similarity index not available")
+
+    # Get the embedding for the queried wallet
+    embedding_result = _embedding_store.get_embedding(wallet, _model_version)
+    if embedding_result is None:
+        raise HTTPException(status_code=404, detail=f"No embedding found for wallet {wallet}")
+    embedding, _ = embedding_result
+
+    # Search for similar wallets
+    similar_wallets_with_scores = _vector_index.search(embedding, k + 1)  # +1 to exclude self
+
+    # Filter out the queried wallet and apply min_score
+    filtered_similar = []
+    for similar_wallet, similarity in similar_wallets_with_scores:
+        if similar_wallet == wallet:
+            continue
+        if similarity < min_score:
+            continue
+        # Get current risk score and wash ring membership
+        scores = get_latest_scores(wallet=similar_wallet, limit=1)
+        current_risk_score = scores[0].score if scores else 0
+        # For wash ring membership, we can check if the wallet is in any wash ring
+        # Let's query the wash_rings table
+        wash_ring_membership = False
+        try:
+            with sqlite3.connect(settings.db_path) as conn:
+                cursor = conn.execute(
+                    "SELECT 1 FROM wash_rings WHERE accounts_json LIKE ? LIMIT 1",
+                    (f'%"{similar_wallet}"%',),
+                )
+                if cursor.fetchone():
+                    wash_ring_membership = True
+        except Exception:
+            pass
+        filtered_similar.append(
+            SimilarWallet(
+                wallet=similar_wallet,
+                similarity=similarity,
+                current_risk_score=current_risk_score,
+                wash_ring_membership=wash_ring_membership,
+            )
+        )
+        if len(filtered_similar) >= k:
+            break
+
+    return SimilarWalletsResponse(
+        wallet=wallet,
+        computed_from="global_index",
+        model_version=_model_version,
+        similar_wallets=filtered_similar,
+    )
 
 
 @v1_router.get("/alerts/dedup-state/{wallet}", tags=["Alerts"])
@@ -1250,6 +1471,122 @@ def submit_feedback(body: FeedbackRequest) -> dict:
     return {"recorded": count}
 
 
+def get_slo_status_from_registry() -> dict:
+    try:
+        from prometheus_client import REGISTRY
+    except ImportError:
+        return {}
+
+    # Initialise counters
+    # 1. Score Availability
+    avail_good = 0.0
+    avail_total = 0.0
+
+    # 2. Scoring Latency
+    latency_good = 0.0
+    latency_total = 0.0
+
+    # 3. Webhook Delivery
+    webhook_good = 0.0
+    webhook_total = 0.0
+
+    # 4. Soroban Submission
+    soroban_good = 0.0
+    soroban_total = 0.0
+
+    from config.settings import settings
+
+    for metric in REGISTRY.collect():
+        if metric.name == "ledgerlens_api_request_duration_seconds":
+            for sample in metric.samples:
+                if sample.name == "ledgerlens_api_request_duration_seconds_count":
+                    labels = sample.labels
+                    if labels.get("method") == "GET" and labels.get("endpoint") in ("/scores/{wallet}", "/v1/scores/{wallet}"):
+                        status = labels.get("status_code", "")
+                        avail_total += sample.value
+                        if not status.startswith("5"):
+                            avail_good += sample.value
+
+        elif metric.name == "ledgerlens_scoring_latency_seconds":
+            for sample in metric.samples:
+                if sample.name == "ledgerlens_scoring_latency_seconds_bucket":
+                    le_val = sample.labels.get("le", "")
+                    try:
+                        if le_val and float(le_val) <= settings.slo_scoring_latency_target_seconds:
+                            latency_good += sample.value
+                    except ValueError:
+                        pass
+                elif sample.name == "ledgerlens_scoring_latency_seconds_count":
+                    latency_total += sample.value
+
+        elif metric.name == "ledgerlens_webhook_deliveries_total":
+            for sample in metric.samples:
+                if sample.name in ("ledgerlens_webhook_deliveries_total", "ledgerlens_webhook_deliveries_total_total"):
+                    res = sample.labels.get("result", "")
+                    webhook_total += sample.value
+                    if res == "delivered":
+                        webhook_good += sample.value
+
+        elif metric.name == "ledgerlens_soroban_submissions_total":
+            for sample in metric.samples:
+                if sample.name in ("ledgerlens_soroban_submissions_total", "ledgerlens_soroban_submissions_total_total"):
+                    status = sample.labels.get("status", "")
+                    if status != "skipped":
+                        soroban_total += sample.value
+                        if status in ("success", "submitted"):
+                            soroban_good += sample.value
+
+    # Compute error budget remaining
+    def budget_remaining(good, total, target_pct):
+        if total == 0:
+            return 100.0
+        success_rate = good / total
+        target_rate = target_pct / 100.0
+        allowed_error = 1.0 - target_rate
+        actual_error = 1.0 - success_rate
+        if allowed_error == 0:
+            return 100.0 if actual_error == 0 else -100.0
+        pct = (1.0 - (actual_error / allowed_error)) * 100.0
+        return round(pct, 2)
+
+    return {
+        "score_availability": {
+            "sli": round((avail_good / avail_total * 100.0) if avail_total > 0 else 100.0, 4),
+            "target": 99.5,
+            "error_budget_remaining": budget_remaining(avail_good, avail_total, 99.5),
+            "good_count": int(avail_good),
+            "total_count": int(avail_total),
+        },
+        "scoring_latency": {
+            "sli": round((latency_good / latency_total * 100.0) if latency_total > 0 else 100.0, 4),
+            "target": settings.slo_scoring_latency_target_percent,
+            "error_budget_remaining": budget_remaining(latency_good, latency_total, settings.slo_scoring_latency_target_percent),
+            "good_count": int(latency_good),
+            "total_count": int(latency_total),
+        },
+        "webhook_delivery": {
+            "sli": round((webhook_good / webhook_total * 100.0) if webhook_total > 0 else 100.0, 4),
+            "target": settings.slo_webhook_delivery_target_percent,
+            "error_budget_remaining": budget_remaining(webhook_good, webhook_total, settings.slo_webhook_delivery_target_percent),
+            "good_count": int(webhook_good),
+            "total_count": int(webhook_total),
+        },
+        "soroban_submission": {
+            "sli": round((soroban_good / soroban_total * 100.0) if soroban_total > 0 else 100.0, 4),
+            "target": settings.slo_soroban_submission_target_percent,
+            "error_budget_remaining": budget_remaining(soroban_good, soroban_total, settings.slo_soroban_submission_target_percent),
+            "good_count": int(soroban_good),
+            "total_count": int(soroban_total),
+        }
+    }
+
+
+@v1_router.get("/admin/slo-status", tags=["Admin"], summary="SLO and error budget status", description="Return the current error budget status for all defined SLOs (admin only).", dependencies=[Depends(require_admin_key)])
+def slo_status() -> dict:
+    """Return the current error budget status for all defined SLOs (admin only)."""
+    return get_slo_status_from_registry()
+
+
 # ---------------------------------------------------------------------------
 # Model observability — drift reports and retrain runs (admin-key gated)
 # ---------------------------------------------------------------------------
@@ -1292,6 +1629,13 @@ def retrain_runs(
 ) -> list[dict]:
     """Return the most recent per-model retrain outcomes recorded by `cli.py retrain-check`."""
     return get_retrain_runs(limit=limit, model_name=model_name)
+
+
+@v1_router.get("/admin/lineage/{dataset}", tags=["Admin"], summary="Lineage graph", description="Return the lineage graph for a named dataset or model version.", dependencies=[Depends(require_admin_key)])
+def get_lineage(dataset: str) -> dict:
+    """Return the lineage graph for a named dataset or model version."""
+    from detection.lineage import get_lineage_graph
+    return get_lineage_graph(dataset)
 
 
 @v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
@@ -1547,8 +1891,6 @@ class ProposalCreate(BaseModel):
     proposed_value: str
     proposed_by_key_hash: str
 
-ProposalCreate = LegacyProposalCreate
-
 
 @v1_router.post("/governance/proposals", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Create proposal", description="Create a new governance proposal (admin only).")
 def create_proposal_endpoint(body: ProposalCreate):
@@ -1562,8 +1904,6 @@ def create_proposal_endpoint(body: ProposalCreate):
 class ProposalVote(BaseModel):
     voter_key_hash: str
     vote: str
-
-ProposalVote = LegacyProposalVote
 
 
 @v1_router.post("/governance/proposals/{proposal_id}/vote", dependencies=[Depends(require_admin_key)], tags=["Governance"], summary="Vote on proposal", description="Cast a vote on a governance proposal (admin only).")
@@ -2090,6 +2430,11 @@ def legacy_admin_retrain_runs(request: Request):
     qs = request.url.query
     target = "/v1/admin/retrain-runs" + (f"?{qs}" if qs else "")
     return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/admin/lineage/{dataset}", include_in_schema=False)
+def legacy_admin_lineage(dataset: str, request: Request):
+    return RedirectResponse(url=f"/v1/admin/lineage/{dataset}", status_code=302)
 
 
 @app.get("/admin/federated/audit-log", include_in_schema=False)

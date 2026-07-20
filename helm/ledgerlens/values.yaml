@@ -137,16 +137,16 @@ serviceAccount:
   annotations: {}
   name: ""
 
-# ── Canary rollout configuration ───────────────────────────────────────────────────────
-canary:
-  enabled: false
-  controller: "argo-rollouts"   # argo-rollouts | flagger
-  prometheusUrl: "http://prometheus.monitoring:9090"
-  steps:
-    - setWeight: 10
-    - pauseSeconds: 120
-    - setWeight: 50
-    - pauseSeconds: 300
-  analysis:
-    p95LatencyThresholdSeconds: 2.0
-    errorRateThreshold: 0.02
+# ── Cost and Capacity Configuration ──────────────────────────────────────────
+costConfig:
+  enabled: true
+  # Cost per vCPU-hour in USD (adjust to your actual cloud pricing)
+  costPerVcpuHourUsd: "0.0416"
+  # Cost per GB memory-hour in USD
+  costPerGbMemoryHourUsd: "0.0056"
+  # Cost per GB storage per month in USD
+  costPerGbStorageMonthUsd: "0.10"
+  # Days of historical data for capacity projection
+  capacityProjectionWindowDays: "7"
+  # Lead time for capacity alerts (days)
+  capacityProjectionLeadTimeDays: "14"

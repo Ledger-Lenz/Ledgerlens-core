@@ -1,5 +1,7 @@
 # Model Signing (ED25519)
 
+For a consolidated system threat model and all defined trust boundaries, see the [STRIDE Threat Model](threat_model.md).
+
 ## Threat Model
 
 LedgerLens ensemble models (Random Forest, XGBoost, LightGBM) are serialised as

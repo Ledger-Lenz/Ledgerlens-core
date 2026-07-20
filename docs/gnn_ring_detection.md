@@ -122,9 +122,22 @@ The fallback is logged at WARNING level. Detection quality degrades gracefully r
 | Field | Description |
 |-------|-------------|
 | `ring_membership_score` | GNN probability ∈ [0,1]. Above `GNN_RING_SCORE_THRESHOLD` (default 0.5) → ring member. |
-| `top_neighbours` | Up to 5 most similar wallets by embedding cosine similarity. |
+| `top_neighbours` | Up to 5 most similar wallets **in the queried wallet's local ego-network** (last 500 trades involving the wallet). |
 | `model_fitted` | `false` when score is from SCC fallback. |
 | `fallback_used` | `true` when GNN model was not available. |
+
+### `GET /v1/wallets/{wallet}/similar`
+
+For globally similar wallets across the entire graph (not just the local ego-network), use the vector similarity API. See [docs/vector_similarity_search.md](./vector_similarity_search.md) for details.
+
+## Local vs Global Similarity
+
+| Aspect | Local (`top_neighbours` from `/gnn/ring-score`) | Global (`/v1/wallets/{wallet}/similar`) |
+|--------|-------------------------------------------------|------------------------------------------|
+| Scope | Queries only last 500 trades involving the wallet. | Queries all wallets with precomputed embeddings. |
+| Use Case | Quick check of nearby, recently trading wallets. | Finding structurally similar siblings that have no direct trade relationship with the queried wallet. |
+| Freshness | Computed on-the-fly every request. | Uses precomputed embeddings (updated via `cli.py compute-embeddings`). |
+| Backend | Brute-force cosine similarity on small subgraph. | FAISS-based approximate nearest neighbor (ANN) search. |
 
 ### `GET /gnn/health`
 
