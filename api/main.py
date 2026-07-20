@@ -289,6 +289,30 @@ app = FastAPI(
 )
 
 
+# Add WAF middleware first
+from api.waf_middleware import WAFMiddleware
+app.add_middleware(WAFMiddleware)
+
+
+@app.middleware("http")
+async def _adaptive_rate_recording_middleware(request: Request, call_next):
+    """Record response status codes for adaptive rate limiting."""
+    response = await call_next(request)
+    try:
+        if hasattr(request.state, "key_id"):
+            from api.adaptive_rate_limiter import get_adaptive_limiter
+            adaptive_limiter = get_adaptive_limiter()
+            adaptive_limiter.record_response(
+                key_id=request.state.key_id,
+                status_code=response.status_code,
+                waf_blocked=False,
+                namespace_id=getattr(request.state, "namespace_id", ""),
+            )
+    except Exception:
+        pass
+    return response
+
+
 @app.middleware("http")
 async def _shutdown_guard_middleware(request: Request, call_next):
     """Reject new requests during shutdown; track in-flight count."""

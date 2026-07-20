@@ -247,7 +247,7 @@ class Settings(BaseSettings):
     path_payment_loader_enabled: bool = True
     path_payment_fetch_effects: bool = True
 
-    # ── Prometheus metrics ────────────────────────────────────────────────────
+    # ── Prometheus metrics ─────────────────────────────────────────────────────
     # Set to False to disable all prometheus_client metric collection.  When
     # disabled, ingestion/metrics.py returns a _NoOpCollector and GET /metrics
     # returns HTTP 503.  Useful in lightweight environments where prometheus_client
@@ -256,6 +256,20 @@ class Settings(BaseSettings):
     # URL path at which the Prometheus text metrics are served by the local API.
     # Must start with "/" and contain no dynamic segments.
     metrics_endpoint: str = "/metrics"
+
+    # ── WAF and Adaptive Rate Limiting ──────────────────────────────────────────
+    # Enable the in-process WAF middleware for request validation
+    waf_enabled: bool = True
+    # Maximum allowed request body size in bytes
+    waf_max_body_bytes: int = 1_048_576
+    # Timeout in seconds for slow request mitigation
+    waf_slow_request_timeout_seconds: float = 10.0
+    # Factor by which to tighten rate limits when abuse is detected
+    adaptive_rate_tighten_factor: float = 0.5
+    # Time window in seconds to track abuse signals
+    adaptive_rate_abuse_window_seconds: int = 300
+    # Number of abuse signals required to trigger rate limit tightening
+    adaptive_rate_abuse_threshold: int = 20
 
     # ── Parquet export (ledgerlens-data integration) ──────────────────────────
     # Default root directory for `cli.py export-parquet` output.

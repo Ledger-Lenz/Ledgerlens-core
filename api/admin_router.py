@@ -392,3 +392,10 @@ def delete_suppression(rule_id: int) -> dict:
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
     return {"deleted": rule_id}
+
+
+@router.get("/waf/blocked-requests", tags=["Admin"], summary="Get recent WAF blocked requests")
+def get_waf_blocked_requests(limit: int = Query(100, ge=1, le=1000)) -> list[dict]:
+    """Return recent requests blocked by the WAF (admin-only)."""
+    from api.waf_middleware import get_blocked_requests
+    return get_blocked_requests(limit=limit)
