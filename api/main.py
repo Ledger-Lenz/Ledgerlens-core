@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRouter
@@ -42,6 +42,8 @@ from api.api_keys_router import router as api_keys_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
+from api.api_key_router import router as api_key_router
+from api.api_keys_router import router as api_keys_router, require_scope
 from api.namespace import list_namespaces
 from api.api_key_router import router as api_key_router, require_scope
 from api.api_keys_router import router as api_keys_router
@@ -59,7 +61,6 @@ from detection.risk_score import RiskScore
 from detection.counterfactual_engine import generate_counterfactuals
 from detection.counterfactual_translator import translate_counterfactual
 from detection.storage import (
-    get_active_wallet_override,
     get_alerts,
     get_bridge_transfer_history,
     get_bridge_transfers,
@@ -339,6 +340,35 @@ async def _adaptive_rate_recording_middleware(request: Request, call_next):
     except Exception:
         pass
     return response
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Record FastAPI request duration metrics."""
+    from config.settings import settings as _s
+    if not getattr(_s, "metrics_enabled", True):
+        return await call_next(request)
+
+    import time
+    start_time = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration = time.perf_counter() - start_time
+        status_code = str(response.status_code) if response else "500"
+        route = request.scope.get("route")
+        endpoint = route.path if route else request.url.path
+        try:
+            from api.metrics import api_request_duration_seconds
+            api_request_duration_seconds.labels(
+                method=request.method,
+                endpoint=endpoint,
+                status_code=status_code,
+            ).observe(duration)
+        except Exception:
+            pass
 
 
 @app.middleware("http")
@@ -1423,6 +1453,122 @@ def submit_feedback(body: FeedbackRequest) -> dict:
         count += 1
 
     return {"recorded": count}
+
+
+def get_slo_status_from_registry() -> dict:
+    try:
+        from prometheus_client import REGISTRY
+    except ImportError:
+        return {}
+
+    # Initialise counters
+    # 1. Score Availability
+    avail_good = 0.0
+    avail_total = 0.0
+
+    # 2. Scoring Latency
+    latency_good = 0.0
+    latency_total = 0.0
+
+    # 3. Webhook Delivery
+    webhook_good = 0.0
+    webhook_total = 0.0
+
+    # 4. Soroban Submission
+    soroban_good = 0.0
+    soroban_total = 0.0
+
+    from config.settings import settings
+
+    for metric in REGISTRY.collect():
+        if metric.name == "ledgerlens_api_request_duration_seconds":
+            for sample in metric.samples:
+                if sample.name == "ledgerlens_api_request_duration_seconds_count":
+                    labels = sample.labels
+                    if labels.get("method") == "GET" and labels.get("endpoint") in ("/scores/{wallet}", "/v1/scores/{wallet}"):
+                        status = labels.get("status_code", "")
+                        avail_total += sample.value
+                        if not status.startswith("5"):
+                            avail_good += sample.value
+
+        elif metric.name == "ledgerlens_scoring_latency_seconds":
+            for sample in metric.samples:
+                if sample.name == "ledgerlens_scoring_latency_seconds_bucket":
+                    le_val = sample.labels.get("le", "")
+                    try:
+                        if le_val and float(le_val) <= settings.slo_scoring_latency_target_seconds:
+                            latency_good += sample.value
+                    except ValueError:
+                        pass
+                elif sample.name == "ledgerlens_scoring_latency_seconds_count":
+                    latency_total += sample.value
+
+        elif metric.name == "ledgerlens_webhook_deliveries_total":
+            for sample in metric.samples:
+                if sample.name in ("ledgerlens_webhook_deliveries_total", "ledgerlens_webhook_deliveries_total_total"):
+                    res = sample.labels.get("result", "")
+                    webhook_total += sample.value
+                    if res == "delivered":
+                        webhook_good += sample.value
+
+        elif metric.name == "ledgerlens_soroban_submissions_total":
+            for sample in metric.samples:
+                if sample.name in ("ledgerlens_soroban_submissions_total", "ledgerlens_soroban_submissions_total_total"):
+                    status = sample.labels.get("status", "")
+                    if status != "skipped":
+                        soroban_total += sample.value
+                        if status in ("success", "submitted"):
+                            soroban_good += sample.value
+
+    # Compute error budget remaining
+    def budget_remaining(good, total, target_pct):
+        if total == 0:
+            return 100.0
+        success_rate = good / total
+        target_rate = target_pct / 100.0
+        allowed_error = 1.0 - target_rate
+        actual_error = 1.0 - success_rate
+        if allowed_error == 0:
+            return 100.0 if actual_error == 0 else -100.0
+        pct = (1.0 - (actual_error / allowed_error)) * 100.0
+        return round(pct, 2)
+
+    return {
+        "score_availability": {
+            "sli": round((avail_good / avail_total * 100.0) if avail_total > 0 else 100.0, 4),
+            "target": 99.5,
+            "error_budget_remaining": budget_remaining(avail_good, avail_total, 99.5),
+            "good_count": int(avail_good),
+            "total_count": int(avail_total),
+        },
+        "scoring_latency": {
+            "sli": round((latency_good / latency_total * 100.0) if latency_total > 0 else 100.0, 4),
+            "target": settings.slo_scoring_latency_target_percent,
+            "error_budget_remaining": budget_remaining(latency_good, latency_total, settings.slo_scoring_latency_target_percent),
+            "good_count": int(latency_good),
+            "total_count": int(latency_total),
+        },
+        "webhook_delivery": {
+            "sli": round((webhook_good / webhook_total * 100.0) if webhook_total > 0 else 100.0, 4),
+            "target": settings.slo_webhook_delivery_target_percent,
+            "error_budget_remaining": budget_remaining(webhook_good, webhook_total, settings.slo_webhook_delivery_target_percent),
+            "good_count": int(webhook_good),
+            "total_count": int(webhook_total),
+        },
+        "soroban_submission": {
+            "sli": round((soroban_good / soroban_total * 100.0) if soroban_total > 0 else 100.0, 4),
+            "target": settings.slo_soroban_submission_target_percent,
+            "error_budget_remaining": budget_remaining(soroban_good, soroban_total, settings.slo_soroban_submission_target_percent),
+            "good_count": int(soroban_good),
+            "total_count": int(soroban_total),
+        }
+    }
+
+
+@v1_router.get("/admin/slo-status", tags=["Admin"], summary="SLO and error budget status", description="Return the current error budget status for all defined SLOs (admin only).", dependencies=[Depends(require_admin_key)])
+def slo_status() -> dict:
+    """Return the current error budget status for all defined SLOs (admin only)."""
+    return get_slo_status_from_registry()
 
 
 # ---------------------------------------------------------------------------

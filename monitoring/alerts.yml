@@ -31,7 +31,7 @@ groups:
         annotations:
           summary: "p95 scoring latency exceeds 2 seconds"
           description: "The 95th-percentile wallet scoring latency is above 2.0s over the last 10 minutes."
-          runbook: "Check Horizon API latency (HORIZON_URL), model inference load, and DB write throughput. Consider reducing TRADE_HISTORY_LOOKBACK_DAYS or scaling the pipeline."
+          runbook: "Check Horizon API latency (HORIZON_URL), model inference load, and DB write throughput. Consider reducing TRADE_HISTORY_LOOKBACK_DAYS or scaling the pipeline. Acts as a backstop symptom alert alongside SLO burn-rate alerts."
 
       - alert: PipelineStalled
         expr: (time() - ledgerlens_pipeline_run_duration_seconds_created) > 300

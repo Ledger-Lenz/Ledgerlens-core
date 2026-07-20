@@ -180,7 +180,7 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 
 **Condition**: `histogram_quantile(0.95, rate(ledgerlens_scoring_latency_seconds_bucket[10m])) > 2.0` for 5 minutes
 
-**Runbook**: p95 wallet scoring latency exceeds 2 seconds. Check Horizon API latency (`HORIZON_URL`), model inference load, and SQLite write throughput. Consider reducing `TRADE_HISTORY_LOOKBACK_DAYS` or running `async_run()` instead of synchronous `run()`.
+**Runbook**: p95 wallet scoring latency exceeds 2 seconds. Check Horizon API latency (`HORIZON_URL`), model inference load, and SQLite write throughput. Consider reducing `TRADE_HISTORY_LOOKBACK_DAYS` or running `async_run()` instead of synchronous `run()`. Retained alongside new SLO burn-rate rules as a coarse backstop symptom alert.
 
 ---
 
@@ -192,6 +192,16 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 
 ---
 
+### SLO Burn-Rate Alerts
+
+LedgerLens implements multi-window, multi-burn-rate alerting for the core user journeys (scoring latency, webhook delivery, Soroban submission, and score availability). Each journey has two alert rules:
+1. **`<Journey>SLOFastBurn`**: Triggers when current consumption rate will exhaust the 30-day budget in under 2 days. Severity is `page` and routes to on-call operators.
+2. **`<Journey>SLOSlowBurn`**: Triggers when current consumption rate will exhaust the 30-day budget in under 5 days. Severity is `ticket` and routes to Slack / ticketing systems.
+
+See [docs/slo.md](file:///c:/Users/hp/drips/kosiso/Ledgerlens-core/docs/slo.md) for full metrics and alerting math details.
+
+---
+
 ## Environment Variables Reference
 
 | Variable | Default | Description |
@@ -200,6 +210,11 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 | `OTEL_EXPORTER_OTLP_CERTIFICATE` | *(unset)* | CA root cert for mTLS |
 | `OTEL_EXPORTER_OTLP_CLIENT_KEY` | *(unset)* | Client private key for mTLS |
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` | *(unset)* | Client cert for mTLS |
+| `SLO_SCORING_LATENCY_TARGET_SECONDS` | `2.0` | Target response latency threshold (seconds) |
+| `SLO_SCORING_LATENCY_TARGET_PERCENT` | `99.0` | Target percentage of requests matching the latency threshold |
+| `SLO_WEBHOOK_DELIVERY_TARGET_PERCENT` | `99.0` | Target success percentage for webhook delivery |
+| `SLO_SOROBAN_SUBMISSION_TARGET_PERCENT` | `99.0` | Target success percentage for Soroban transaction submission |
+| `SLO_WINDOW_DAYS` | `30` | Rolling window in days over which targets are measured |
 
 See `.env.example` for all configuration variables.
 
