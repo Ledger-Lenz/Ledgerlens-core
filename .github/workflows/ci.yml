@@ -30,6 +30,27 @@ jobs:
       - name: Test
         run: pytest --cov=detection --cov=ingestion --cov=config -q
 
+  go-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -race -count=1
+
   benchmark:
     runs-on: ubuntu-latest
     steps:
