@@ -176,6 +176,12 @@ class Settings(BaseSettings):
     network_passphrase: str = "Test SDF Network ; September 2015"
     soroban_circuit_breaker_threshold: int = 5
     soroban_circuit_reset_seconds: int = 300
+    # Multi‑region configuration
+    ledgerlens_region_name: str = "us-east-1"
+    ledgerlens_region_role: str = "active"  # active | passive | standby
+    soroban_submission_lease_enabled: bool = true
+    soroban_submission_lease_name: str = "ledgerlens-soroban-submitter"
+    soroban_submission_lease_duration_seconds: int = 30
 
     # ── API / security ────────────────────────────────────────────────────────
     ledgerlens_cors_allowed_origins: str = ""
