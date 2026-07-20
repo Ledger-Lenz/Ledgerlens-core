@@ -271,6 +271,16 @@ class Settings(BaseSettings):
     # Number of abuse signals required to trigger rate limit tightening
     adaptive_rate_abuse_threshold: int = 20
 
+    # ── Trace Sampling ──────────────────────────────────────────────────────────
+    # Sampling strategy: "static" (head-based) or "tail" (tail-based)
+    trace_sampling_strategy: str = "static"
+    # Baseline fraction of "boring" traces to keep when using tail sampling
+    trace_tail_baseline_ratio: float = 0.05
+    # Max time to wait for a trace to complete before flushing (tail sampling)
+    trace_tail_buffer_timeout_seconds: float = 30.0
+    # Maximum number of traces to buffer in memory (tail sampling)
+    trace_tail_max_buffered_traces: int = 10_000
+
     # ── Parquet export (ledgerlens-data integration) ──────────────────────────
     # Default root directory for `cli.py export-parquet` output.
     # Resolved relative to the working directory; must remain inside the project.
