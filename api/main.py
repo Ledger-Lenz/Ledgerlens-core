@@ -2498,3 +2498,12 @@ def legacy_governance_proposals_post(request: Request):
 @app.post("/governance/proposals/{proposal_id}/vote", include_in_schema=False)
 def legacy_governance_proposal_vote(proposal_id: str, request: Request):
     return RedirectResponse(url=f"/v1/governance/proposals/{proposal_id}/vote", status_code=302)
+
+# ---------------------------------------------------------------------------
+# GraphQL endpoint (Issue #337)
+# ---------------------------------------------------------------------------
+from api.graphql_schema import schema
+from strawberry.fastapi import GraphQLRouter
+
+graphql_app = GraphQLRouter(schema, graphiql=False)
+app.include_router(graphql_app, prefix="/graphql")
