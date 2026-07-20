@@ -227,10 +227,10 @@ def namespace_filter(
     """FastAPI dependency that resolves the API key to its namespace_id.
 
     Returns the namespace string.  An admin wildcard key returns ``'*'``.
-    Raises ``HTTPException 401`` for unknown / inactive keys and
-    ``HTTPException 503`` when multi-tenant mode is not configured.
+    Raises ``HTTPException 401`` for unknown / inactive keys.
     """
-    if not settings.is_multi_tenant_enabled:
+    multi_tenant = getattr(settings, "ledgerlens_multi_tenant_enabled", False)
+    if not multi_tenant:
         return "default"
 
     if not x_ledgerlens_api_key:

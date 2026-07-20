@@ -231,6 +231,15 @@ class Settings(BaseSettings):
     mlflow_experiment_name: str = "ledgerlens-training"
     mlflow_tracking_enabled: bool = False
 
+    # ── Gateway (consolidated auth/quota/logging middleware) ──────────────────
+    gateway_enabled: bool = True
+    gateway_default_daily_quota: int = 100000
+    gateway_default_namespace_daily_quota: int = 0
+    gateway_default_monthly_quota: int = 0
+    gateway_default_namespace_monthly_quota: int = 0
+    gateway_quota_store: str = "sqlite"
+    gateway_log_body: bool = False
+
     # ── Performance monitoring ────────────────────────────────────────────────
     performance_min_feedback_samples: int = 20
     performance_monitoring_window_days: int = 30
@@ -367,6 +376,21 @@ class Settings(BaseSettings):
         if int(v) < 1:
             raise ValueError("COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR must be >= 1")
         return v
+
+    @field_validator("gateway_default_daily_quota", "gateway_default_namespace_daily_quota", mode="before")
+    @classmethod
+    def non_negative_gateway_quota(cls, v: object) -> object:
+        if int(v) < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    @field_validator("gateway_quota_store", mode="before")
+    @classmethod
+    def valid_gateway_quota_store(cls, v: object) -> object:
+        val = str(v).strip().lower()
+        if val not in ("sqlite", "redis"):
+            raise ValueError(f"GATEWAY_QUOTA_STORE must be 'sqlite' or 'redis', got {v!r}")
+        return val
 
     @field_validator("benford_mad_threshold", "temporal_weight",
                      "sandwich_score_weight", "benford_copula_weight",

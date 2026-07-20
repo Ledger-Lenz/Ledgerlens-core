@@ -1,4 +1,10 @@
-"""API key management endpoints and scope/rate-limit enforcement (Issue #195)."""
+"""API key management endpoints and scope/rate-limit enforcement (Issue #195).
+
+.. deprecated::
+    This router is maintained for backward compatibility. New deployments
+    should use the consolidated :class:`api.gateway.GatewayMiddleware`.
+    See ``docs/api_gateway.md`` for the migration guide.
+"""
 
 from __future__ import annotations
 
@@ -68,7 +74,11 @@ def get_keys() -> list[dict]:
 
 
 def require_scope(required_scope: str):
-    """FastAPI dependency factory: enforce that the request carries a key with the required scope."""
+    """FastAPI dependency factory: enforce that the request carries a key with the required scope.
+
+    .. deprecated::
+        Use :class:`api.gateway.GatewayMiddleware` instead.
+    """
 
     def _dependency(
         x_ledgerlens_api_key: str = Header(default="", alias="X-LedgerLens-Api-Key"),

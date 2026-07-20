@@ -436,6 +436,18 @@ human-readable summary sentence. Supports `model` query parameter:
 [docs/shap_explanation.md](docs/shap_explanation.md) for the full caching
 strategy and TTL.
 
+#### Authentication (Gateway Middleware)
+
+All authenticated routes go through the consolidated **API Gateway**
+(`api/gateway.py`), which resolves auth, enforces quota, and logs every
+request in one pass. See [`docs/api_gateway.md`](docs/api_gateway.md) for
+the full architecture and migration guide.
+
+Authentication is resolved via (in order):
+1. `X-LedgerLens-Admin-Key` — matched against `LEDGERLENS_ADMIN_API_KEY`
+2. `X-LedgerLens-Compliance-Key` — matched against `LEDGERLENS_COMPLIANCE_API_KEY`
+3. `X-LedgerLens-Api-Key` — looked up in the canonical `api_keys` table
+
 #### CORS configuration
 
 The local API defaults to **deny-all** CORS (no browser origins are allowed

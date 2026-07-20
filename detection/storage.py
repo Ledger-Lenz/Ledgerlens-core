@@ -464,6 +464,24 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
 ]
 
+        -- gateway_request_log for consolidated access logging
+        CREATE TABLE IF NOT EXISTS gateway_request_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id TEXT,
+            namespace_id TEXT,
+            method TEXT,
+            path TEXT,
+            status_code INTEGER,
+            latency_ms REAL,
+            scope TEXT,
+            recorded_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_key ON gateway_request_log (key_id);
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_ns ON gateway_request_log (namespace_id);
+        CREATE INDEX IF NOT EXISTS idx_gateway_log_date ON gateway_request_log (recorded_at);
+        """,
+    ),
+]
 
 
 @contextmanager

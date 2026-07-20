@@ -43,6 +43,9 @@ from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
 from api.namespace import list_namespaces
+from api.api_key_router import router as api_key_router, require_scope
+from api.api_keys_router import router as api_keys_router
+from api.gateway import GatewayMiddleware
 from config.settings import settings
 from detection.tracing import (
     configure_tracing,
@@ -354,6 +357,10 @@ app.add_middleware(
     allow_credentials=False,
 )
 
+# ── Gateway middleware (auth, quota, logging) ────────────────────────────────
+app.add_middleware(GatewayMiddleware)
+
+# ── Router registration ──────────────────────────────────────────────────────
 from api.ws_router import router as _ws_router  # noqa: E402
 app.include_router(_ws_router)
 
