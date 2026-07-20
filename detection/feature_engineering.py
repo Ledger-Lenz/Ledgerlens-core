@@ -1012,6 +1012,9 @@ def _build_feature_vector_base(
 GNN_FEATURE_NAMES = [
     "gnn_wash_ring_probability",
     "gnn_neighbor_avg_score",
+    "gnn_asset_mediated_ring_score",
+    "gnn_order_cancel_coordination_score",
+    "gnn_funding_proximity_score",
 ]
 
 # Path-payment cycle features are appended after GNN features so that existing
@@ -1037,6 +1040,9 @@ def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None
     vector.update({
         "gnn_wash_ring_probability": float(feats.get("gnn_wash_ring_probability", 0.0)),
         "gnn_neighbor_avg_score": float(feats.get("gnn_neighbor_avg_score", 0.0)),
+        "gnn_asset_mediated_ring_score": float(feats.get("gnn_asset_mediated_ring_score", 0.0)),
+        "gnn_order_cancel_coordination_score": float(feats.get("gnn_order_cancel_coordination_score", 0.0)),
+        "gnn_funding_proximity_score": float(feats.get("gnn_funding_proximity_score", 0.0)),
     })
     return vector
 
