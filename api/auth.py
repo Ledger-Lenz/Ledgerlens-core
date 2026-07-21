@@ -11,20 +11,25 @@ Provides two dependency factories that delegate to the consolidated
 - :func:`require_admin_key` — delegates to gateway admin-key check.
 - :func:`require_compliance_key` — delegates to gateway compliance-key check.
 
-The gateway migration (see ``docs/api_gateway.md``) replaced the previous
-per-router scoped API key dependency with ``api.gateway.GatewayMiddleware`` /
-``api.gateway.scope_required``; there is no scoped-key dependency here to
-keep in sync with that migration.
+.. note::
+    A third dependency, ``require_api_key_scope``, previously lived here and
+    duplicated the scoped-API-key + rate-limit checks now owned by
+    :func:`api.api_key_router.require_scope` / :class:`api.gateway.GatewayMiddleware`.
+    It was never imported by any router (dead code) and was independently
+    broken — it referenced three functions (``_check_rate_limit_redis``,
+    ``_check_rate_limit_local``, ``_rate_check``) that were never defined
+    anywhere, so calling it would have raised ``NameError``. It was removed
+    rather than fixed: fixing it would have meant standing up a *second*,
+    parallel rate-limit enforcement path when the actual fix (making
+    ``detection.api_key_store.check_rate_limit`` itself distributed, see
+    ``detection/rate_limiter.py``) already covers every real call site.
 """
 
-import logging
 import secrets
 
 from fastapi import Header, HTTPException
 
 from config.settings import settings
-
-logger = logging.getLogger("ledgerlens.auth")
 
 # ---------------------------------------------------------------------------
 # Backward-compatible single-key auth (delegates to gateway)

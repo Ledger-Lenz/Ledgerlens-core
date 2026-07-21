@@ -1,14 +1,13 @@
 import logging
 import os
 import time
-from kubernetes import client, config
-from kubernetes.client.rest import ApiException
+
 from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.soroban_lease")
 
 
-def _load_kube_config() -> None:
+def _load_kube_config(config) -> None:
     """Load in‑cluster config, falling back to the local kube‑config file."""
     try:
         config.load_incluster_config()
@@ -29,12 +28,22 @@ def acquire_submission_lease(region_name: str, lease_duration_seconds: int = 30)
     4. If another region has a fresh lease, return ``False``.
 
     Returns ``True`` when this region successfully holds the lease, ``False`` otherwise.
+
+    The ``kubernetes`` client library is imported lazily (only reached when
+    lease handling is enabled) so that importing this module -- and anything
+    that transitively imports it -- does not hard-require ``kubernetes`` to
+    be installed for deployments that don't run multi-region Soroban
+    submission (matching this codebase's existing lazy-import convention for
+    optional heavy dependencies, e.g. ``dowhy`` in ``detection/causal_engine.py``).
     """
     # Short‑circuit if lease handling is disabled.
     if not getattr(settings, "soroban_submission_lease_enabled", True):
         return True
 
-    _load_kube_config()
+    from kubernetes import client, config
+    from kubernetes.client.rest import ApiException
+
+    _load_kube_config(config)
     api = client.CoordinationV1Api()
     lease_name = settings.soroban_submission_lease_name
     namespace = os.getenv("K8S_NAMESPACE", "default")

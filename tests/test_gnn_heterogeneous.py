@@ -84,6 +84,7 @@ try:
     from detection.gnn_ring_detector import (
         build_heterogeneous_graph,
         HeteroGraphSAGEEncoder,
+        GraphSAGEEncoder,
         GNNRingDetector,
         RingMembershipClassifier,
     )

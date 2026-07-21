@@ -12,6 +12,57 @@ reinstated (tracked in [ROADMAP.md](ROADMAP.md)).
 
 ## [Unreleased]
 
+### Fixed
+- **Distributed per-API-key rate limiting** (`detection/rate_limiter.py`, new): replaces
+  three independent, non-communicating in-process sliding-window dicts
+  (`api/gateway.py`, `detection/api_key_store.py`, each replicated per REST pod and
+  never shared with the separate gRPC process) with a single Redis-backed sliding-window
+  counter shared by every enforcement path (`api/gateway.py`, `api/api_key_router.py`,
+  `api/grpc_scoring_service.py`). Fixes the ~2x same-process REST/gRPC budget bypass and
+  the `configured_limit x N_replicas` bypass under this project's documented 2–10
+  replica Helm topology. Falls back to the old per-process behavior (logged + metered)
+  if Redis is unreachable. See `docs/waf_and_rate_limiting.md`.
+- `config/settings.py`: `soroban_submission_lease_enabled: bool = true` was invalid
+  Python (`NameError` at import time), breaking every import of `config.settings` and
+  transitively the entire API and test suite. Fixed to `= True`.
+- `detection/feature_engineering.py`: a name collision between a new Numba-JIT
+  burst-overlap helper and the pre-existing public `cross_pair_features()` had corrupted
+  the latter's `def` line into `return results -> dict:` (`SyntaxError`), silently merging
+  its body with the JIT helper's. The JIT helper is renamed to
+  `_cross_pair_burst_overlap_by_pair`; `cross_pair_features(account, trades_by_pair,
+  correlated_pairs, cross_pair_wallets)` is restored to its documented signature.
+- `detection/counterfactual_constraints.py` / `detection/counterfactual_translator.py`:
+  added the three heterogeneous-GNN feature names
+  (`gnn_asset_mediated_ring_score`, `gnn_order_cancel_coordination_score`,
+  `gnn_funding_proximity_score`) that were missing from both modules' completeness
+  manifests, which raised `RuntimeError` at import time.
+- `detection/soroban_lease.py`: the `kubernetes` client import was unconditional at
+  module scope despite `kubernetes` never being an installed dependency; made lazy
+  (imported only when `SOROBAN_SUBMISSION_LEASE_ENABLED=true`) and added `kubernetes` to
+  `requirements.txt`, matching this codebase's existing lazy-import convention for
+  optional heavy dependencies.
+- `api/main.py`: updated `GraphQLRouter(schema, graphiql=False)` to the current
+  `strawberry-graphql` API (`graphql_ide=None`); pinned `strawberry-graphql` and `redis`
+  (used by `detection/rate_limiter.py` and already assumed-but-never-declared by
+  `detection/feature_store.py`) in `requirements.txt`.
+- `generated/scoring_pb2.py` / `scoring_pb2_grpc.py`: regenerated against the
+  `protobuf` version now pinned in `requirements.txt` — the checked-in gencode required
+  a newer protobuf runtime than the project's other dependencies (`grpcio-tools`,
+  `databricks-sdk`/mlflow) support, so any import of the gRPC scoring service raised
+  `VersionError`.
+
+  These six fixes were prerequisites, not scope creep: `api/main.py` (and therefore
+  `tests/test_waf_middleware.py`, `tests/test_api_gateway.py`, and the gRPC test suite)
+  could not be imported at all before them.
+
+### Removed
+- `api/adaptive_rate_limiter.py`: unreachable from any real request (its only caller,
+  `api/auth.py`'s `require_api_key_scope`, was itself dead code never imported by any
+  router) and independently broken (referenced three undefined functions). Rewiring it
+  would have required a second, parallel distributed abuse-signal counter; its purpose is
+  largely subsumed by the primary limiter now correctly enforcing configured limits
+  across every replica and protocol. See `docs/waf_and_rate_limiting.md`.
+
 ### Added
 - **Feature Store cold-tier archival to Parquet** (`detection/feature_store.py`):
   `FeatureStoreArchiver.archive_old_features(cutoff_days=30)` moves rows older than

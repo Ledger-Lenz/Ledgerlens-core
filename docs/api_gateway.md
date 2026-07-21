@@ -104,9 +104,16 @@ The gateway enforces two tiers of quota:
 
 | Tier | Granularity | Column | Check |
 |------|-------------|--------|-------|
-| Per-minute rate limit | Per key | `rate_limit_per_minute` | Sliding window, 60-second window |
+| Per-minute rate limit | Per key | `rate_limit_per_minute` | Redis-backed sliding-window counter, shared across every REST replica and the gRPC service — see `docs/waf_and_rate_limiting.md` |
 | Daily request quota | Per key | `daily_quota` | Calendar-day counter via `gateway_request_log` |
 | Daily namespace quota | Per namespace | `namespace_daily_quota` | Calendar-day counter via `gateway_request_log` |
+
+The per-minute check and the daily/monthly SQLite-backed checks have
+different failure-mode behavior: the per-minute check **fails open** to a
+local, per-process fallback if Redis is unreachable (logged + metered, see
+`docs/waf_and_rate_limiting.md`); the daily/monthly SQLite checks are part
+of the gateway's auth/quota resolution and follow the **fails closed** (503)
+behavior described under "Security Considerations" below.
 
 - Keys with `daily_quota=0` or `namespace_daily_quota=0` have unlimited quota.
 - Wildcard namespace (`namespace_id='*'`) keys are **exempt** from
@@ -144,7 +151,7 @@ in production.
 | `GATEWAY_ENABLED` | `true` | Set to `false` to disable the gateway and fall back to per-route Depends |
 | `GATEWAY_DEFAULT_DAILY_QUOTA` | `100000` | Default daily request quota for new API keys (0 = unlimited) |
 | `GATEWAY_DEFAULT_NAMESPACE_DAILY_QUOTA` | `0` | Default per-namespace daily quota (0 = unlimited) |
-| `GATEWAY_QUOTA_STORE` | `sqlite` | `sqlite` (single-process) or `redis` (multi-process) |
+| `GATEWAY_QUOTA_STORE` | `redis` | Per-minute rate-limit backend: `redis` (shared/distributed, required for correct enforcement across replicas — see `docs/waf_and_rate_limiting.md`) or `sqlite` (explicit opt-out, local-only, no Redis dependency) |
 | `GATEWAY_LOG_BODY` | `false` | **Never set to true in production** |
 
 ## Migration Guide

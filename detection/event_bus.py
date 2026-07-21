@@ -158,9 +158,9 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         self._last_publish = None
         self._failures = 0
         
-        import importlib.util
-
-        if importlib.util.find_spec("nats") is None:
+        try:
+            import nats  # noqa: F401 -- availability probe; re-imported properly in _connect()
+        except ImportError:
             logger.warning("nats-py not installed. Degrading NATSRiskScoreBus to NullEventBus behavior.")
             return
             

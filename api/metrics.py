@@ -78,11 +78,19 @@ ledgerlens_waf_blocks_total = Counter(
     ["rule", "namespace_id"],
 )
 
-# Adaptive rate limiting metrics
-ledgerlens_adaptive_rate_limit_tightened_total = Counter(
-    "ledgerlens_adaptive_rate_limit_tightened_total",
-    "Total number of times adaptive rate limiting was tightened per namespace",
-    ["namespace_id"],
+# Distributed rate limiter metrics (detection/rate_limiter.py)
+ledgerlens_rate_limiter_checks_total = Counter(
+    "ledgerlens_rate_limiter_checks_total",
+    "Total per-key rate limit checks performed, by backend",
+    ["backend"],  # "redis" (shared, cross-replica) or "local" (degraded fallback)
+)
+
+ledgerlens_rate_limiter_fallback_total = Counter(
+    "ledgerlens_rate_limiter_fallback_total",
+    "Total rate limit checks served from the in-process fallback because the "
+    "shared Redis backend was unavailable (circuit open or a failed call). "
+    "Sustained non-zero values mean cross-replica/cross-protocol rate limit "
+    "enforcement is degraded to per-process only — see docs/waf_and_rate_limiting.md.",
 )
 
 

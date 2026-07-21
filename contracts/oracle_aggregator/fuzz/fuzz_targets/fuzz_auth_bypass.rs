@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
-use soroban_sdk::{Env, Address, Symbol, BytesN, Vec, testutils::Address as _};
+use soroban_sdk::{Env, Address, BytesN, Vec, testutils::Address as _};
 use oracle_aggregator::{OracleAggregator, OracleAggregatorClient, SignaturePair};
 
 /// Authorization bypass fuzzing - ensure initialize cannot be called multiple times

@@ -96,37 +96,6 @@ def ann(request: Request, routes: list | None = None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# In-process per-minute rate-limit windows (fallback when Redis is unavailable)
-# ---------------------------------------------------------------------------
-
-_rate_windows: dict[str, list[float]] = {}
-_RATE_WINDOW_SECONDS = 60.0
-
-
-def _check_per_minute_rate_limit(
-    key_id: str, limit: int, window: float = _RATE_WINDOW_SECONDS
-) -> tuple[bool, int]:
-    """Sliding-window per-minute rate limit check.
-
-    Returns (allowed, retry_after_seconds).
-    """
-    if limit <= 0:
-        return True, 0
-    now = time.monotonic()
-    cutoff = now - window
-    timestamps = _rate_windows.get(key_id, [])
-    timestamps = [t for t in timestamps if t > cutoff]
-    if len(timestamps) >= limit:
-        oldest = timestamps[0]
-        retry_after = int(window - (now - oldest)) + 1
-        _rate_windows[key_id] = timestamps
-        return False, retry_after
-    timestamps.append(now)
-    _rate_windows[key_id] = timestamps
-    return True, 0
-
-
-# ---------------------------------------------------------------------------
 # Auth resolution
 # ---------------------------------------------------------------------------
 
@@ -211,15 +180,18 @@ def _check_quota(key_meta: dict) -> tuple[bool, dict]:
         check_namespace_quota,
         check_monthly_quota,
         check_namespace_monthly_quota,
+        check_rate_limit,
     )
 
     key_id = key_meta["key_id"]
     namespace_id = key_meta.get("namespace_id", "")
 
-    # Per-minute rate limit (checked first — fastest to fail)
+    # Per-minute rate limit (checked first — fastest to fail). Shared with the
+    # gRPC path and the legacy require_scope dependency via the same
+    # distributed (Redis-backed) counter — see detection/rate_limiter.py.
     rate_limit = key_meta.get("rate_limit_per_minute", 0)
     if rate_limit > 0:
-        allowed, retry_after = _check_per_minute_rate_limit(key_id, rate_limit)
+        allowed, retry_after = check_rate_limit(key_id, rate_limit)
         if not allowed:
             return False, {"Retry-After": str(retry_after)}
 
