@@ -32,6 +32,8 @@ from stellar_sdk import scval
 
 from detection.oracle_coordinator import QuorumSignature
 from detection.risk_score import RiskScore
+from detection.soroban_lease import acquire_submission_lease
+from detection.exceptions import SubmissionLeaseError
 from detection.storage import save_submission, init_db, _connect
 from detection.zk_commitment import (
     generate_salt,
@@ -380,6 +382,10 @@ class SorobanPublisher:
         Raises SorobanSubmissionError on unrecoverable failure.
         Raises SorobanCircuitOpenError when the circuit breaker is open.
         """
+        # Ensure this region holds the submission lease before processing
+        if not acquire_submission_lease(settings.ledgerlens_region_name, settings.soroban_submission_lease_duration_seconds):
+            raise SubmissionLeaseError("Region does not hold the Soroban submission lease.")
+
         try:
             self._check_circuit()
         except SorobanCircuitOpenError as exc:
@@ -533,6 +539,9 @@ class SorobanPublisher:
         transaction hash (success) or an ``"ERROR: ..."`` string (failure).
         """
         results: dict[str, str] = {}
+        # Ensure this region holds the submission lease before batch processing
+        if not acquire_submission_lease(settings.ledgerlens_region_name, settings.soroban_submission_lease_duration_seconds):
+            raise SubmissionLeaseError("Region does not hold the Soroban submission lease.")
         for s in scores:
             key = f"{s.wallet}:{s.asset_pair}"
             try:
