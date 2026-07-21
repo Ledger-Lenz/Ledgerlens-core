@@ -21,15 +21,9 @@ documented in the [README's "LedgerLens Organization" section](README.md#ledgerl
 
 ## Next
 
-- **Close the `core` → `api` handoff.** README's "Open Integration Points"
-  still lists this as unresolved: how `RiskScore` records produced by
-  `run_pipeline.py` reach the API layer (direct DB write, message queue, or
-  an ingestion endpoint) is not yet decided.
-- **Order-book event ingestion.** Needed to unblock `round_trip_trade_frequency`
-  and cancellation-rate features — see the TODOs in
-  `detection/feature_engineering.py`.
-- **Document `ledgerlens-data`'s schema/version contract** — where labelled
-  training data lives and how `detection/model_training.py` should consume it.
+- **Dynamic asset thresholds**: Replace the hardcoded `BENFORD_MAD_THRESHOLD=0.015` with a per-asset-pair dynamic threshold learned over a 30-day trailing window. Highly liquid pairs (XLM/USDC) have much tighter distributions than long-tail tokens; applying the same MAD cutoff across the board is driving up false positives on low-volume pairs.
+- **Federated learning coordinator**: Shift the `federated_dp_epsilon` / `federated_dp_delta` tracking out of the core pipeline into a dedicated coordinator service. The current design requires running the pipeline in "coordinator mode", which mixes concerns and complicates the deployment footprint.
+- **Cross-chain wash detection**: Integrate the `evm_loader` data with the existing `horizon_streamer` data to detect wash rings that route capital across the bridge to obscure the circular flow.
 
 ## Later
 

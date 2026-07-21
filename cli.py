@@ -2068,6 +2068,70 @@ def benford_calibrate(
     )
 
 
+@app.command("publish-backlog")
+def publish_backlog(
+    since: str = typer.Option(
+        ...,
+        help="ISO 8601 timestamp to start replay from (e.g., 2026-07-17T00:00:00Z)",
+    ),
+) -> None:
+    """Replay existing SQLite risk_scores rows onto the event bus.
+
+    Used for bootstrapping a new consumer or recovering from an event bus outage.
+    The event bus backend must be configured (i.e. EVENT_BUS_BACKEND != 'none').
+    """
+    from config.settings import settings
+    from detection.event_bus import get_event_bus
+    from detection.storage import get_scores_since
+
+    if settings.event_bus_backend == "none":
+        logger.error("Cannot publish backlog: EVENT_BUS_BACKEND is 'none'")
+        raise typer.Exit(1)
+
+    try:
+        from dateutil.parser import parse
+        parse(since)
+    except Exception:
+        logger.error("Invalid 'since' timestamp format. Use ISO 8601 (e.g. 2026-07-17T00:00:00Z)")
+        raise typer.Exit(1)
+
+    logger.info("Fetching scores since %s...", since)
+    scores = get_scores_since(since)
+    if not scores:
+        logger.info("No scores found since %s.", since)
+        return
+
+    logger.info("Publishing %d scores to event bus (%s)...", len(scores), settings.event_bus_backend)
+    bus = get_event_bus()
+    
+    # Publish in chunks to avoid memory/timeout issues
+    chunk_size = 1000
+    total_published = 0
+    total_failed = 0
+    
+    for i in range(0, len(scores), chunk_size):
+        chunk = scores[i:i+chunk_size]
+        result = bus.publish(chunk)
+        total_published += result.published
+        total_failed += result.failed
+        
+        logger.info(
+            "Progress: %d / %d (published: %d, failed: %d)",
+            min(i + chunk_size, len(scores)),
+            len(scores),
+            result.published,
+            result.failed
+        )
+
+    bus.close()
+    
+    if total_failed > 0:
+        logger.error("Backlog replay finished with %d failures.", total_failed)
+        raise typer.Exit(1)
+    else:
+        logger.info("Successfully published all %d scores.", total_published)
+
+
 @app.command("dedup-audit")
 def dedup_audit(
     source: str = typer.Option(..., "--source", help="The ingestion source: 'horizon' | 'evm' | 'solana'"),
