@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package ledgerlens.v1;
+
+message ScoreRequest {
+  string wallet = 1;
+  string asset_pair = 2;   // optional; empty = all pairs
+}
+
+message RiskScoreProto {
+  string wallet = 1;
+  string asset_pair = 2;
+  uint32 score = 3;          // 0-100
+  bool benford_flag = 4;
+  bool ml_flag = 5;
+  uint32 confidence = 6;     // 0-100
+  string timestamp = 7;      // RFC3339
+  optional float score_lower = 8;
+  optional float score_upper = 9;
+  optional float coverage_guarantee = 10;
+}
+
+service ScoringService {
+  rpc ScoreWallet(ScoreRequest) returns (RiskScoreProto);
+  rpc BatchScoreWallets(stream ScoreRequest) returns (stream RiskScoreProto);
+}

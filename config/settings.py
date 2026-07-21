@@ -22,8 +22,9 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
         populate_by_name=True,
-        feature_engine_jit_enabled: bool = True
     )
+
+    feature_engine_jit_enabled: bool = True
 
     # ── Horizon ───────────────────────────────────────────────────────────────
     horizon_url: str = "https://horizon.stellar.org"
@@ -358,6 +359,16 @@ class Settings(BaseSettings):
     slo_soroban_submission_target_percent: float = 99.0
     slo_window_days: int = 30
 
+    # ── gRPC Internal Scoring Service ─────────────────────────────────────────
+    grpc_enabled: bool = False
+    grpc_port: int = 50051
+    grpc_max_workers: int = 10
+    grpc_tls_cert_path: str = ""
+    grpc_tls_key_path: str = ""
+    grpc_allow_insecure: bool = False
+    grpc_max_message_size_bytes: int = 4194304
+    grpc_max_batch_wallets: int = 1000
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -368,7 +379,8 @@ class Settings(BaseSettings):
                      "stream_checkpoint_interval", "streamer_queue_maxsize",
                      "historical_loader_concurrency", "historical_max_lookback_days",
                      "analyst_lock_timeout_seconds", "analyst_claim_max_active_per_analyst",
-                     mode="before")
+                     "grpc_max_workers", "grpc_max_message_size_bytes", "grpc_max_batch_wallets",
+                     mode="before", check_fields=False)
     @classmethod
     def must_be_positive(cls, v: object) -> object:
         if int(v) <= 0:
@@ -394,7 +406,7 @@ class Settings(BaseSettings):
             raise ValueError("must be positive")
         return val
 
-    @field_validator("federated_server_port", mode="before")
+    @field_validator("federated_server_port", "grpc_port", mode="before")
     @classmethod
     def valid_port(cls, v: object) -> object:
         port = int(v)
@@ -589,7 +601,7 @@ class Settings(BaseSettings):
         return val
 
     @field_validator("cost_per_vcpu_hour_usd", "cost_per_gb_memory_hour_usd",
-                     "cost_per_gb_storage_month_usd", mode="before")
+                     "cost_per_gb_storage_month_usd", mode="before", check_fields=False)
     @classmethod
     def non_negative_cost(cls, v: object) -> object:
         val = float(v)
@@ -598,7 +610,7 @@ class Settings(BaseSettings):
         return val
 
     @field_validator("capacity_projection_window_days",
-                     "capacity_projection_lead_time_days", mode="before")
+                     "capacity_projection_lead_time_days", mode="before", check_fields=False)
     @classmethod
     def positive_capacity_days(cls, v: object) -> object:
         val = int(v)

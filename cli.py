@@ -2138,5 +2138,16 @@ def dedup_audit(
             typer.echo(f"[{checked_at}] Result={result} Key={key[:16]} Metadata={masked_meta}")
 
 
+@app.command("grpc-serve")
+def grpc_serve(
+    port: int = typer.Option(50051, help="Port to listen on for gRPC requests"),
+) -> None:
+    """Run the gRPC Internal Scoring Service sidecar."""
+    from api.grpc_scoring_service import serve
+
+    serve(port=port)
+
+
 if __name__ == "__main__":
     app()
+

@@ -488,25 +488,6 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
 ]
 
-        -- gateway_request_log for consolidated access logging
-        CREATE TABLE IF NOT EXISTS gateway_request_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id TEXT,
-            namespace_id TEXT,
-            method TEXT,
-            path TEXT,
-            status_code INTEGER,
-            latency_ms REAL,
-            scope TEXT,
-            recorded_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_gateway_log_key ON gateway_request_log (key_id);
-        CREATE INDEX IF NOT EXISTS idx_gateway_log_ns ON gateway_request_log (namespace_id);
-        CREATE INDEX IF NOT EXISTS idx_gateway_log_date ON gateway_request_log (recorded_at);
-        """,
-    ),
-]
-
 
 @contextmanager
 def _connect(db_path: str | None = None):
@@ -871,6 +852,7 @@ def get_latest_scores(
     benford_flag: bool | None = None,
     ml_flag: bool | None = None,
     sort_by: str = "score",
+    asset_pair: str | None = None,
 ) -> list[RiskScore]:
     """Return the most recent score for each (wallet, asset_pair) pair.
 
@@ -904,10 +886,14 @@ def get_latest_scores(
         {limit_offset}
     """
     params: list = []
-    where = ""
+    where_conditions = []
     if wallet is not None:
-        where = "WHERE wallet = ?"
+        where_conditions.append("wallet = ?")
         params.append(wallet)
+    if asset_pair is not None:
+        where_conditions.append("asset_pair = ?")
+        params.append(asset_pair)
+    where = ("WHERE " + " AND ".join(where_conditions)) if where_conditions else ""
 
     outer_conditions = []
     if benford_flag is not None:

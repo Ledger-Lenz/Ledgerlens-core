@@ -569,6 +569,7 @@ python cli.py stream          # stream trades from Horizon SSE and score increme
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py compute-embeddings --window-days 30  # compute and store GNN embeddings for all wallets in the last 30 days
 python cli.py serve           # serve the local API
+python cli.py grpc-serve      # run the gRPC Internal Scoring Service sidecar
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
@@ -1084,7 +1085,7 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 ### Open Integration Points
 
-- How `core` hands `RiskScore` records to `api` (direct DB write, message queue, or `core` calling an `api` ingestion endpoint) — see `run_pipeline.py`. The integration is tested via the cross-repo E2E harness in `tests/e2e_cross_repo/`.
+- How `core` hands `RiskScore` records to `api` (direct DB write, message queue, or `core` calling an `api` ingestion endpoint) — see `run_pipeline.py`. Note that the gRPC Scoring Service (`python cli.py grpc-serve`) provides a low-latency, synchronous read path for external callers (e.g. withdrawal gating), which is distinct from the still-open core→api write-path question.
 - Where labelled training data lives in `ledgerlens-data` and its schema version — see `detection/model_training.py`.
 - Order-book event ingestion (needed for `round_trip_trade_frequency`, cancellation-rate features) — see TODOs in `detection/feature_engineering.py`.
 
