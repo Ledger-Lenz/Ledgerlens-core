@@ -23,11 +23,14 @@ import logging
 import os
 import struct
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import httpx
 
 from ingestion.data_models import Asset, Trade, TradeType
+
+if TYPE_CHECKING:
+    from ingestion.dedup import IdempotencyKeyStore
 
 logger = logging.getLogger("ledgerlens.solana_adapter")
 

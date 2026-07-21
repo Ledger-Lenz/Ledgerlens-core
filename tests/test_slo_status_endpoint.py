@@ -1,4 +1,3 @@
-import pytest
 from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 from api.main import app

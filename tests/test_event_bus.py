@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
 
 from config.settings import settings
 from detection.event_bus import (

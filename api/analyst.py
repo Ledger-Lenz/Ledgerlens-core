@@ -30,7 +30,6 @@ from api.auth import require_admin_key
 from config.settings import settings
 from detection.analyst_store import (
     claim_wallet,
-    expire_stale_locks,
     get_active_claim,
     get_analyst_feedback_since,
     get_analyst_queue,

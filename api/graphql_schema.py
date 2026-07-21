@@ -1,11 +1,9 @@
 import strawberry
-from strawberry.fastapi import GraphQLRouter
 from strawberry.types import Info
 from typing import Optional
 import logging
 
-from api.auth import require_admin_key
-from detection import model_inference, shap_explainer, causal_engine, storage
+from detection import storage
 
 logger = logging.getLogger("ledgerlens.graphql")
 
@@ -63,7 +61,6 @@ class WalletType:
         _require_scope(info, "read:scores")
         from detection.model_registry import get_current_version
         version = get_current_version(model, None) or "unknown"
-        expl = shap_explainer.explain_score(None, {})
         return ShapExplanationType(
             wallet=self.address, model_version=version,
             base_value=0.0, contributions=[], summary_sentence="", model_name=model,
@@ -74,7 +71,7 @@ class WalletType:
         _require_admin(info)
         from api.cross_chain_router import get_links_for_wallet
         links = get_links_for_wallet(self.address)
-        return [CrossChainLinkType(chain=l["chain"], evm_wallet=l["evm_wallet"], confidence=l["confidence"]) for l in links]
+        return [CrossChainLinkType(chain=link["chain"], evm_wallet=link["evm_wallet"], confidence=link["confidence"]) for link in links]
 
 
 @strawberry.type
