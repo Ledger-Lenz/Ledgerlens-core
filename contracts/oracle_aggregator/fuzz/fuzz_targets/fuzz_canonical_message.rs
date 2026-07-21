@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
-use soroban_sdk::{Env, Address, Symbol, testutils::Address as _};
+use soroban_sdk::{Env, Address, testutils::Address as _};
 use oracle_aggregator::{OracleAggregator, OracleAggregatorClient};
 
 /// Fuzz inputs for canonical_message covering boundary cases
@@ -24,14 +24,17 @@ fuzz_target!(|input: FuzzInput| {
     
     let wallet = Address::generate(&env);
     
-    // Create asset pair symbol with bounded length (1-10 chars)
+    // Create asset pair string with bounded length (1-10 chars)
     let asset_len = ((input.asset_pair_len % 10) + 1) as usize;
     let mut asset_str = String::new();
     for i in 0..asset_len {
         let byte = ((input.asset_pair_seed.wrapping_add(i as u64) % 26) + 65) as u8; // A-Z
         asset_str.push(byte as char);
     }
-    let asset_pair = Symbol::new(&env, &asset_str);
+    // canonical_message takes asset_pair: soroban_sdk::String, not Symbol --
+    // fully-qualified here to avoid colliding with std::string::String, used
+    // above to build asset_str char-by-char.
+    let asset_pair = soroban_sdk::String::from_str(&env, &asset_str);
     
     // Test boundary values explicitly
     let test_cases = vec![

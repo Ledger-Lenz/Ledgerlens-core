@@ -16,7 +16,10 @@ oracle_aggregator = { path = ".." }
 # the standard cargo-fuzz pattern), so it has no workspace.dependencies
 # table of its own to inherit from. Pin the same version as the parent
 # workspace's [workspace.dependencies] (root Cargo.toml) explicitly instead.
-soroban-sdk = "21.0"
+# `testutils` gates Address::generate/mock_all_auths/Ledger::set_timestamp,
+# used throughout fuzz_targets/*.rs to build test Envs -- mirrors
+# oracle_aggregator's own [dev-dependencies] soroban-sdk features.
+soroban-sdk = { version = "21.0", features = ["testutils", "alloc"] }
 
 # Prevent this from interfering with workspaces
 [workspace]
