@@ -423,6 +423,7 @@ class TestAssetMediatedLaunderingScenario:
         from detection.gnn_ring_detector import (
             build_transaction_graph,
             build_heterogeneous_graph,
+            GraphSAGEEncoder,
             HeteroGraphSAGEEncoder,
         )
 

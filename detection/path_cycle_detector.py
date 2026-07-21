@@ -17,14 +17,19 @@ trading via path payments past ~6 hops is negligible).
 
 from __future__ import annotations
 
+import logging
+
 import networkx as nx
 import pandas as pd
 
 from detection.graph_engine import add_path_payment_edges
 from ingestion.data_models import PathPayment
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MAX_CYCLE_LENGTH = 6
 DEFAULT_MAX_TIME_WINDOW = pd.Timedelta(hours=24)
+DEFAULT_MAX_COMPONENT_SIZE = 12
 
 
 def path_payments_to_frame(payments: list[PathPayment]) -> pd.DataFrame:
@@ -139,6 +144,7 @@ def detect_path_payment_cycles(
     max_cycle_length: int = DEFAULT_MAX_CYCLE_LENGTH,
     max_time_window: pd.Timedelta = DEFAULT_MAX_TIME_WINDOW,
     min_cycle_xlm: float = 0.0,
+    max_component_size: int = DEFAULT_MAX_COMPONENT_SIZE,
 ) -> list[dict]:
     """Return closed path-payment cycles over the expanded account graph.
 
@@ -147,8 +153,21 @@ def detect_path_payment_cycles(
     associate cluster from `graph_engine`); (2) completes within
     `max_time_window`; and (3) carries cyclic value (bottleneck hop volume) of
     at least `min_cycle_xlm`. Cycles are bounded to `max_cycle_length` hops via
-    the `length_bound` argument to `simple_cycles`, which prunes the search and
-    keeps it well under the 10s / 10k-operation target.
+    the `length_bound` argument to `simple_cycles`.
+
+    A simple cycle can only exist within a single strongly connected
+    component (SCC), so the search runs `simple_cycles` once per SCC instead
+    of once over the whole graph — this bounds each call's search space to
+    that component's node/edge count rather than the full graph, and lets
+    components that don't touch `root_accounts` be skipped before any cycle
+    enumeration happens. `simple_cycles` cost is combinatorial in a
+    component's *density*, not just its size, even at a fixed
+    `max_cycle_length` (real wash rings are exactly this shape: a small,
+    near-complete cluster of colluding wallets); components larger than
+    `max_component_size` are skipped with a warning rather than risking an
+    unbounded enumeration. Real wash rings are small by construction (compare
+    `graph_engine.find_wash_rings`'s `max_ring_size`, default 10), so this
+    bound is not expected to affect realistic detections.
     """
     if max_cycle_length < 2:
         raise ValueError("max_cycle_length must be at least 2")
@@ -156,53 +175,70 @@ def detect_path_payment_cycles(
     cycles: list[dict] = []
     seen: set[frozenset[str]] = set()
 
-    for node_cycle in nx.simple_cycles(graph, length_bound=max_cycle_length):
-        if len(node_cycle) < 2:
+    for component in nx.strongly_connected_components(graph):
+        if len(component) < 2:
             continue
-        if root_accounts is not None and not (set(node_cycle) & root_accounts):
+        if root_accounts is not None and not (component & root_accounts):
+            continue
+        if len(component) > max_component_size:
+            logger.warning(
+                "Skipping path-payment cycle search on a %d-node strongly "
+                "connected component (exceeds max_component_size=%d); "
+                "simple_cycles enumeration cost is combinatorial in "
+                "component density",
+                len(component),
+                max_component_size,
+            )
             continue
 
-        selected = _select_timed_cycle_edges(graph, node_cycle, max_time_window)
-        if selected is None:
-            continue
+        subgraph = graph.subgraph(component)
+        for node_cycle in nx.simple_cycles(subgraph, length_bound=max_cycle_length):
+            if len(node_cycle) < 2:
+                continue
+            if root_accounts is not None and not (set(node_cycle) & root_accounts):
+                continue
 
-        amounts = [hop["amount_xlm"] for hop in selected]
-        cycle_value_xlm = float(min(amounts)) if amounts else 0.0
-        if cycle_value_xlm < min_cycle_xlm:
-            continue
+            selected = _select_timed_cycle_edges(subgraph, node_cycle, max_time_window)
+            if selected is None:
+                continue
 
-        # Dedupe rotations of the same account set/length.
-        signature = frozenset(node_cycle)
-        if (signature, len(node_cycle)) in seen:
-            continue
-        seen.add((signature, len(node_cycle)))  # type: ignore[arg-type]
+            amounts = [hop["amount_xlm"] for hop in selected]
+            cycle_value_xlm = float(min(amounts)) if amounts else 0.0
+            if cycle_value_xlm < min_cycle_xlm:
+                continue
 
-        cycle_path = [hop["source_asset"] for hop in selected]
-        cycle_path.append(cycle_path[0])
+            # Dedupe rotations of the same account set/length.
+            signature = frozenset(node_cycle)
+            if (signature, len(node_cycle)) in seen:
+                continue
+            seen.add((signature, len(node_cycle)))  # type: ignore[arg-type]
 
-        timestamps = [hop["timestamp"] for hop in selected if hop["timestamp"] is not None]
-        if len(timestamps) >= 2:
-            completed_in_seconds = float((max(timestamps) - min(timestamps)).total_seconds())
-        else:
-            completed_in_seconds = 0.0
+            cycle_path = [hop["source_asset"] for hop in selected]
+            cycle_path.append(cycle_path[0])
 
-        intermediate_assets = {
-            hop["source_asset"] for hop in selected if hop["source_asset"]
-        } | {hop["destination_asset"] for hop in selected if hop["destination_asset"]}
+            timestamps = [hop["timestamp"] for hop in selected if hop["timestamp"] is not None]
+            if len(timestamps) >= 2:
+                completed_in_seconds = float((max(timestamps) - min(timestamps)).total_seconds())
+            else:
+                completed_in_seconds = 0.0
 
-        cycles.append(
-            {
-                "accounts": list(node_cycle),
-                "cycle_path": cycle_path,
-                "cycle_value_xlm": cycle_value_xlm,
-                "cycle_length": len(node_cycle),
-                "completed_in_seconds": completed_in_seconds,
-                "asset_diversity": len(intermediate_assets),
-                "transaction_hashes": [
-                    hop["transaction_hash"] for hop in selected if hop["transaction_hash"]
-                ],
-            }
-        )
+            intermediate_assets = {
+                hop["source_asset"] for hop in selected if hop["source_asset"]
+            } | {hop["destination_asset"] for hop in selected if hop["destination_asset"]}
+
+            cycles.append(
+                {
+                    "accounts": list(node_cycle),
+                    "cycle_path": cycle_path,
+                    "cycle_value_xlm": cycle_value_xlm,
+                    "cycle_length": len(node_cycle),
+                    "completed_in_seconds": completed_in_seconds,
+                    "asset_diversity": len(intermediate_assets),
+                    "transaction_hashes": [
+                        hop["transaction_hash"] for hop in selected if hop["transaction_hash"]
+                    ],
+                }
+            )
 
     return sorted(cycles, key=lambda c: c["cycle_value_xlm"], reverse=True)
 
@@ -213,6 +249,7 @@ def detect_cycles_from_payments(
     max_cycle_length: int = DEFAULT_MAX_CYCLE_LENGTH,
     max_time_window: pd.Timedelta = DEFAULT_MAX_TIME_WINDOW,
     min_cycle_xlm: float = 0.0,
+    max_component_size: int = DEFAULT_MAX_COMPONENT_SIZE,
 ) -> list[dict]:
     """Convenience wrapper: build the graph and detect cycles in one call."""
     graph = build_path_payment_graph(payments)
@@ -222,6 +259,7 @@ def detect_cycles_from_payments(
         max_cycle_length=max_cycle_length,
         max_time_window=max_time_window,
         min_cycle_xlm=min_cycle_xlm,
+        max_component_size=max_component_size,
     )
 
 

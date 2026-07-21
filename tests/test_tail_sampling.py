@@ -20,7 +20,7 @@ class TestTailSamplingPolicies(unittest.TestCase):
         # Create a mock span with error status
         class MockSpan:
             def __init__(self, has_error, is_root=True):
-                self.status = type('obj', (object,), {'status_code': has_error and 2 or 1})()
+                self.status = type('obj', (object,), {'status_code': StatusCode.ERROR if has_error else StatusCode.OK})()
                 self.name = "test"
                 self.parent = None if is_root else type('obj', (object,), {'span_id': 123})()
                 self.attributes = {}

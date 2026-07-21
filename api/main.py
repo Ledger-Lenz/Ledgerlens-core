@@ -458,6 +458,22 @@ class VoteBody(BaseModel):
 
 v1_router = APIRouter(prefix="/v1")
 
+_health_feature_store = None
+
+
+def _get_health_feature_store():
+    """Lazily-constructed, process-wide `FeatureStore` singleton for `/health`.
+
+    Cached across requests so the health check reuses the same Redis circuit
+    breaker state (and connection) instead of reconnecting on every poll.
+    """
+    global _health_feature_store
+    if _health_feature_store is None:
+        from detection.feature_store import FeatureStore
+
+        _health_feature_store = FeatureStore()
+    return _health_feature_store
+
 
 @v1_router.get(
     "/health",
@@ -2458,18 +2474,30 @@ def root_compliance_ivms(wallet: str) -> dict:
 
 
 @app.post("/compliance/sar-package", dependencies=[Depends(require_compliance_key)], include_in_schema=False)
-def root_compliance_sar_package(body: SARPackageRequest) -> FileResponse:
+def root_compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)) -> FileResponse:
     import os
     import tempfile
-    from detection.compliance_exporter import generate_sar_package
-    from fastapi.responses import FileResponse as _FileResponse
-    output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
-    pkg_path = generate_sar_package(
-        wallet=body.wallet,
-        start_date=body.start_date,
-        end_date=body.end_date,
-        output_dir=output_dir,
+    from detection.compliance_exporter import (
+        ComplianceRateLimitExceeded,
+        ComplianceScoreTooLow,
+        export_sar_package,
     )
+    from fastapi.responses import FileResponse as _FileResponse
+
+    output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
+    try:
+        pkg_path = export_sar_package(
+            wallet=body.wallet,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            output_dir=output_dir,
+            dry_run=dry_run,
+        )
+    except ComplianceScoreTooLow as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ComplianceRateLimitExceeded:
+        raise HTTPException(status_code=429, detail="Compliance export rate limit exceeded")
+
     return _FileResponse(pkg_path, media_type="application/zip", filename=os.path.basename(pkg_path))
 
 

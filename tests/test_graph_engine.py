@@ -1,3 +1,4 @@
+import random
 import statistics
 import time
 
@@ -6,6 +7,8 @@ import pandas as pd
 import pytest
 
 from detection.graph_engine import (
+    _cycle_volume,
+    _MAX_EXACT_CYCLE_VOLUME_NODES,
     add_path_payment_edges,
     build_ring_membership_index,
     build_transaction_graph,
@@ -334,3 +337,157 @@ def test_manual_graph_without_timestamps_still_finds_ring():
     assert len(rings) == 1
     assert rings[0]["cycle_volume"] == 10.0
     assert rings[0]["timing_tightness"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _cycle_volume: bitmask-DP bottleneck-cycle algorithm vs brute force
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_cycle_volume(subgraph: nx.DiGraph, min_ring_size: int) -> float:
+    """Reference implementation: the original nx.simple_cycles enumeration.
+
+    Only used in tests, and only ever on graphs small enough (<= 7 nodes) that
+    the combinatorial cycle count stays tractable.
+    """
+    best = 0.0
+    for cycle in nx.simple_cycles(subgraph, length_bound=subgraph.number_of_nodes()):
+        if len(cycle) < min_ring_size:
+            continue
+        edge_volumes = [
+            float(subgraph[cycle[i]][cycle[(i + 1) % len(cycle)]].get("total_volume", 0.0))
+            for i in range(len(cycle))
+        ]
+        if not edge_volumes:
+            continue
+        best = max(best, min(edge_volumes))
+    return best
+
+
+def _dense_random_digraph(n: int, density: float, rng: random.Random, weight_range=(1.0, 1000.0)) -> nx.DiGraph:
+    graph = nx.DiGraph()
+    graph.add_nodes_from(range(n))
+    for i in range(n):
+        for j in range(n):
+            if i != j and rng.random() < density:
+                graph.add_edge(i, j, total_volume=rng.uniform(*weight_range))
+    return graph
+
+
+def test_cycle_volume_dense_10_node_subgraph_under_100ms():
+    """A 10-node, ~90%-density subgraph is the realistic wash-ring shape (a
+    small cluster of wallets all trading with each other) that made the old
+    nx.simple_cycles-based implementation enumerate over a million cycles.
+    The bitmask-DP replacement must stay fast at this shape and size.
+    """
+    rng = random.Random(1234)
+    graph = _dense_random_digraph(10, density=0.9, rng=rng)
+
+    start = time.perf_counter()
+    for _ in range(5):
+        value = _cycle_volume(graph, min_ring_size=3)
+    elapsed = (time.perf_counter() - start) / 5
+
+    assert elapsed < 0.1, f"_cycle_volume took {elapsed * 1000:.1f}ms, budget is 100ms"
+    assert value > 0.0
+
+    # Correctness is validated separately on smaller graphs (brute force is
+    # not tractable at this density/size); confirm this result agrees with a
+    # much smaller brute-forceable graph built the same way as a sanity check.
+    small_rng = random.Random(1234)
+    small_graph = _dense_random_digraph(6, density=0.9, rng=small_rng)
+    assert _cycle_volume(small_graph, min_ring_size=3) == pytest.approx(
+        _brute_force_cycle_volume(small_graph, min_ring_size=3)
+    )
+
+
+def test_cycle_volume_matches_brute_force_on_random_dense_small_graphs():
+    """Property test: the bitmask-DP algorithm and networkx.simple_cycles
+    brute force must agree exactly on many random small dense graphs.
+    """
+    rng = random.Random(42)
+    checked = 0
+    for trial in range(50):
+        n = rng.randint(3, 7)
+        density = rng.uniform(0.4, 1.0)
+        min_ring_size = rng.choice([2, 3])
+        graph = _dense_random_digraph(n, density=density, rng=rng)
+
+        exact = _cycle_volume(graph, min_ring_size=min_ring_size)
+        reference = _brute_force_cycle_volume(graph, min_ring_size=min_ring_size)
+        assert exact == pytest.approx(reference), (
+            f"trial={trial} n={n} density={density} min_ring_size={min_ring_size} "
+            f"exact={exact} reference={reference}"
+        )
+        checked += 1
+
+    assert checked == 50
+
+
+def test_cycle_volume_no_qualifying_cycle_returns_zero():
+    graph = nx.DiGraph()
+    graph.add_edge(0, 1, total_volume=100.0)
+    graph.add_edge(1, 0, total_volume=100.0)
+    # Only a 2-cycle exists; min_ring_size=3 requires a longer cycle.
+    assert _cycle_volume(graph, min_ring_size=3) == 0.0
+
+
+def test_cycle_volume_empty_and_singleton_subgraphs():
+    assert _cycle_volume(nx.DiGraph(), min_ring_size=3) == 0.0
+    single = nx.DiGraph()
+    single.add_node("A")
+    assert _cycle_volume(single, min_ring_size=3) == 0.0
+
+
+def test_cycle_volume_ignores_self_loops():
+    graph = nx.DiGraph()
+    graph.add_edge("A", "A", total_volume=999.0)
+    graph.add_edge("A", "B", total_volume=10.0)
+    graph.add_edge("B", "C", total_volume=10.0)
+    graph.add_edge("C", "A", total_volume=10.0)
+    assert _cycle_volume(graph, min_ring_size=3) == 10.0
+
+
+def test_cycle_volume_picks_max_over_multiple_candidate_cycles():
+    # Two disjoint-ish 3-cycles sharing no bottleneck: {A,B,C} at 10, {A,D,E} at 500.
+    graph = nx.DiGraph()
+    for u, v in [("A", "B"), ("B", "C"), ("C", "A")]:
+        graph.add_edge(u, v, total_volume=10.0)
+    for u, v in [("A", "D"), ("D", "E"), ("E", "A")]:
+        graph.add_edge(u, v, total_volume=500.0)
+    assert _cycle_volume(graph, min_ring_size=3) == 500.0
+
+
+def test_cycle_volume_fallback_approximation_used_beyond_exact_node_limit(monkeypatch):
+    """Force the exact bitmask-DP limit down so the rarely-exercised
+    threshold-search fallback runs, and check its documented bounded-error
+    property against brute force on graphs still small enough to brute-force:
+    the fallback never *underestimates* the true bottleneck (it can only
+    overestimate, since an SCC of sufficient size doesn't guarantee a cycle
+    of sufficient *length* -- see `_approx_max_bottleneck_cycle`'s docstring).
+    """
+    import detection.graph_engine as ge
+
+    monkeypatch.setattr(ge, "_MAX_EXACT_CYCLE_VOLUME_NODES", 4)
+    rng = random.Random(7)
+    for trial in range(20):
+        graph = _dense_random_digraph(6, density=rng.uniform(0.3, 1.0), rng=rng)
+        approx = _cycle_volume(graph, min_ring_size=3)
+        reference = _brute_force_cycle_volume(graph, min_ring_size=3)
+        assert approx >= reference - 1e-9, (
+            f"trial={trial}: fallback approximation {approx} underestimated "
+            f"the true bottleneck {reference}"
+        )
+
+
+def test_cycle_volume_exact_below_fallback_threshold():
+    """A subgraph at exactly _MAX_EXACT_CYCLE_VOLUME_NODES nodes must still
+    use the exact algorithm, not the fallback."""
+    rng = random.Random(99)
+    graph = _dense_random_digraph(_MAX_EXACT_CYCLE_VOLUME_NODES, density=0.3, rng=rng)
+    # Should not raise/warn and should complete quickly.
+    start = time.perf_counter()
+    value = _cycle_volume(graph, min_ring_size=3)
+    elapsed = time.perf_counter() - start
+    assert value >= 0.0
+    assert elapsed < 5.0

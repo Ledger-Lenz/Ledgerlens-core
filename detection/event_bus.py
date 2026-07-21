@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -167,7 +168,6 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         # It's better to implement an async publish method or handle event loop inside.
         # But for nats-py which is async, we'll need an event loop.
         # Let's write a synchronous wrapper around it for the pipeline.
-        import asyncio
         self._loop = asyncio.new_event_loop()
         self._loop.run_until_complete(self._connect())
 

@@ -13,8 +13,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 
+from config.settings import settings
 
 try:
     import numba
@@ -49,6 +51,26 @@ if _HAS_NUMBA:
                 count += 1
                 break
         return count
+
+
+def _round_trip_count_python(legs: list, max_trades: int) -> int:
+    """Pure-Python reference implementation of `_round_trip_count_jit`.
+
+    Takes `legs` as a list of `(gave, got)` pairs directly (any hashable/
+    comparable type -- `round_trip_trade_frequency` passes integer-coded ids
+    when using the JIT path and asset-symbol strings here), unlike the JIT
+    kernel which requires two pre-split numeric arrays for Numba compilation.
+    """
+    n = len(legs)
+    round_trips = 0
+    for i in range(n):
+        gave_i, got_i = legs[i]
+        for j in range(i + 1, min(i + 1 + max_trades, n)):
+            gave_j, got_j = legs[j]
+            if gave_j == got_i and got_j == gave_i:
+                round_trips += 1
+                break
+    return round_trips
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import (
@@ -356,6 +378,11 @@ def round_trip_trade_frequency(trades: pd.DataFrame, account: str, max_trades: i
     vice versa when it is the counter side (Horizon's `base_is_seller`
     flag is not consulted). This is sufficient to flag circular routing
     between the same two assets.
+
+    Uses a Numba-JIT two-pointer-free O(n * max_trades) scan when available
+    and enabled (`FEATURE_ENGINE_JIT_ENABLED`), falling back to the pure
+    Python reference implementation otherwise -- see `_round_trip_count_jit`
+    / `_round_trip_count_python`.
     """
     account_trades = _account_trades(trades, account).sort_values("ledger_close_time").reset_index(drop=True)
     n = len(account_trades)
@@ -369,14 +396,16 @@ def round_trip_trade_frequency(trades: pd.DataFrame, account: str, max_trades: i
         else:
             legs.append((_asset_symbol(row["counter_asset"]), _asset_symbol(row["base_asset"])))
 
-    round_trips = 0
-    for i in range(n):
-        gave_i, got_i = legs[i]
-        for j in range(i + 1, min(i + 1 + max_trades, n)):
-            gave_j, got_j = legs[j]
-            if gave_j == got_i and got_j == gave_i:
-                round_trips += 1
-                break
+    if _HAS_NUMBA and settings.feature_engine_jit_enabled:
+        symbol_to_id: dict[str, int] = {}
+        gave_ids = np.empty(n, dtype=np.int64)
+        got_ids = np.empty(n, dtype=np.int64)
+        for i, (gave, got) in enumerate(legs):
+            gave_ids[i] = symbol_to_id.setdefault(gave, len(symbol_to_id))
+            got_ids[i] = symbol_to_id.setdefault(got, len(symbol_to_id))
+        round_trips = _round_trip_count_jit(gave_ids, got_ids, max_trades)
+    else:
+        round_trips = _round_trip_count_python(legs, max_trades)
 
     return round_trips / n
 
