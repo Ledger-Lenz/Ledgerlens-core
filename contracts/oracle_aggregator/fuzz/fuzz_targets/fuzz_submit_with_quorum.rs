@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
-use soroban_sdk::{Env, Address, Symbol, BytesN, Vec, testutils::Address as _};
+use soroban_sdk::{Env, Address, BytesN, Vec, testutils::Address as _};
 use oracle_aggregator::{OracleAggregator, OracleAggregatorClient, SignaturePair};
 
 /// Bounded input structure to prevent unbounded memory allocation during fuzzing
@@ -71,7 +71,10 @@ fuzz_target!(|input: FuzzInput| {
     
     // Generate signatures
     let wallet = Address::generate(&env);
-    let asset_pair = Symbol::new(&env, "XLM-USDC");
+    // submit_with_quorum takes asset_pair: soroban_sdk::String, not Symbol --
+    // fully-qualified here (not imported at module scope) to avoid colliding
+    // with std::string::String, used below for panic-payload downcasting.
+    let asset_pair = soroban_sdk::String::from_str(&env, "XLM-USDC");
     
     let mut signatures = Vec::new(&env);
     for i in 0..signature_count {

@@ -23,7 +23,7 @@ import logging
 import os
 import struct
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 import httpx
 

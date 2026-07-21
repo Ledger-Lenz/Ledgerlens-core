@@ -49,12 +49,23 @@ jinja2>=3.1.0
 rich>=13.0.0
 grpcio>=1.60.0
 grpcio-tools>=1.60.0
-# grpcio-tools 1.81.x (and databricks-sdk, an mlflow transitive dep) cap
-# protobuf at <7.0; generated/scoring_pb2.py must be (re)generated with a
-# grpcio-tools/protobuf toolchain in this range -- see Makefile's
-# `generate-grpc` target. Pinning the floor here keeps pip from resolving an
-# older protobuf than the checked-in generated code's gencode version.
+strawberry-graphql>=0.243.0
+# Pin explicitly: generated/scoring_pb2.py's gencode version must not be newer
+# than this runtime (regenerate via the command in generated/__init__.py if
+# proto/ledgerlens/v1/scoring.proto changes).
 protobuf>=6.33.5,<7.0.0
+
+# Distributed rate limiting / caching (detection/feature_store.py hot tier,
+# detection/rate_limiter.py per-key rate limits). Both fail open to an
+# in-process fallback if unreachable, so this is not a hard runtime
+# requirement, but it must be installed for the shared-state paths to
+# actually engage rather than silently degrade to per-process-only.
+redis>=5.0.0
+
+# Multi-region Soroban submission lease coordination (detection/soroban_lease.py).
+# Only required when SOROBAN_SUBMISSION_LEASE_ENABLED=true; imported lazily so
+# single-region deployments don't need it installed.
+kubernetes>=29.0.0
 
 # Database migrations
 alembic>=1.13.0
@@ -94,5 +105,4 @@ pytest-timeout>=2.3.0
 responses>=0.25.0
 mutmut>=3.0.0
 hypothesis>=6.100.0
-freezegun>=1.5.0
-testcontainers>=4.0.0
+fakeredis[lua]>=2.20.0

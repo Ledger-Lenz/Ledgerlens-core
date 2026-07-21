@@ -1183,6 +1183,7 @@ def db_migrate(
         import sqlite3
 
         from config.settings import settings
+
         from detection.api_key_store import migrate_legacy_api_keys
 
         conn = sqlite3.connect(settings.db_path)

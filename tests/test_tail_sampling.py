@@ -1,8 +1,6 @@
 import time
 import unittest
 
-from opentelemetry.trace import StatusCode
-
 from detection.tracing import TailSamplingSpanProcessor
 
 
@@ -53,7 +51,7 @@ class TestTailSamplingPolicies(unittest.TestCase):
         class MockSpan:
             def __init__(self, trace_id):
                 self.trace_id = trace_id
-                self.status = type('obj', (object,), {'status_code': StatusCode.OK})()
+                self.status = type('obj', (object,), {'status_code': 1})()
                 self.name = "test"
                 self.parent = None
                 self.attributes = {}
