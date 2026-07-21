@@ -34,6 +34,7 @@ def _register_client(
     server: FederatedAggregationServer, client: FederatedClient
 ) -> None:
     pub_der = client.public_key_der
+    server.admit_participant(client.operator_id, max_n_samples=10_000_000)
     server.register_participant(client.operator_id, pub_der)
 
 
