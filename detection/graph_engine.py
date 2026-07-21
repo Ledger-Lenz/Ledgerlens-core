@@ -264,19 +264,175 @@ def _timing_tightness(subgraph: nx.DiGraph) -> float:
     return float(statistics.pstdev(intervals))
 
 
+_MAX_EXACT_CYCLE_VOLUME_NODES = 14
+
+
 def _cycle_volume(subgraph: nx.DiGraph, min_ring_size: int) -> float:
-    best_cycle_volume = 0.0
-    for cycle in nx.simple_cycles(subgraph, length_bound=subgraph.number_of_nodes()):
-        if len(cycle) < min_ring_size:
-            continue
-        edge_volumes = [
-            float(subgraph[cycle[i]][cycle[(i + 1) % len(cycle)]].get("total_volume", 0.0))
-            for i in range(len(cycle))
-        ]
-        if not edge_volumes:
-            continue
-        best_cycle_volume = max(best_cycle_volume, min(edge_volumes))
-    return float(best_cycle_volume)
+    """Maximum bottleneck-weight (min-edge `total_volume`) simple cycle of
+    length >= ``min_ring_size`` within ``subgraph``.
+
+    Computed via bitmask DP (see :func:`_max_bottleneck_cycle`) rather than
+    enumerating every simple cycle with ``networkx.simple_cycles``: the
+    number of simple cycles in a subgraph grows combinatorially with edge
+    density (a 10-node, ~90%-density subgraph -- a typical "bot farm"
+    wash-ring shape -- has over a million), while the DP's cost is a
+    function of node count alone (``O(n^2 * 2^n)``), independent of density.
+    Exact, not an approximation, for any ``subgraph`` this is realistically
+    called with (bounded by ``max_ring_size``, default 10).
+    """
+    nodes = sorted(subgraph.nodes())
+    n = len(nodes)
+    if n < 2 or n < min_ring_size:
+        return 0.0
+
+    index_of = {node: i for i, node in enumerate(nodes)}
+    adjacency: list[list[tuple[int, float]]] = [[] for _ in range(n)]
+    for u, v, data in subgraph.edges(data=True):
+        if u == v:
+            continue  # self-loops cannot participate in a simple cycle of length >= 2
+        adjacency[index_of[u]].append((index_of[v], float(data.get("total_volume", 0.0))))
+
+    if n > _MAX_EXACT_CYCLE_VOLUME_NODES:
+        logger.warning(
+            "_cycle_volume: %d-node subgraph exceeds the exact bitmask-DP "
+            "limit (%d nodes); using a bounded threshold-search approximation "
+            "instead. This should not occur at the default max_ring_size=10 "
+            "-- check for an unusually large max_ring_size configuration.",
+            n,
+            _MAX_EXACT_CYCLE_VOLUME_NODES,
+        )
+        return _approx_max_bottleneck_cycle(adjacency, n, min_ring_size)
+
+    return _max_bottleneck_cycle(adjacency, n, min_ring_size)
+
+
+def _max_bottleneck_cycle(
+    adjacency: list[list[tuple[int, float]]], n: int, min_ring_size: int
+) -> float:
+    """Exact maximum bottleneck-weight simple cycle of length >= ``min_ring_size``.
+
+    Adapts the "maximum bottleneck path" technique (binary-search-on-answer
+    over a shortest-path DP) to the cycle case, where the standard DP does
+    not directly generalise: a cycle must return to its own start, so the
+    subset-DP tracks paths rooted at each candidate start node rather than a
+    single global source.
+
+    For each candidate root ``r`` (0..n-1), computes the best bottleneck of
+    every simple path starting at ``r`` and confined to nodes with index
+    ``>= r``, then checks the closing edge back to ``r``. Restricting
+    participants to index ``>= r`` makes ``r`` the canonical minimum-index
+    node of the cycle, so each simple cycle is considered exactly once (at
+    its minimum-index node) instead of once per rotation -- the same
+    "least node" trick Johnson's algorithm uses to avoid duplicate cycle
+    enumeration.
+
+    Complexity: ``O(n^2 * 2^n)`` time and ``O(2^n)`` space per root in the
+    worst case -- a function of node count alone, independent of edge count
+    or the number of simple cycles. Only tractable for small ``n``; see
+    ``_MAX_EXACT_CYCLE_VOLUME_NODES``.
+    """
+    NEG_INF = float("-inf")
+    POS_INF = float("inf")
+    best = 0.0
+
+    for root in range(n):
+        span = n - root
+        if span < min_ring_size:
+            # span only shrinks as root increases, so no larger root can
+            # reach min_ring_size either.
+            break
+
+        size_states = 1 << span
+        # dp[mask][local_v]: best bottleneck of a simple path root -> local_v
+        # visiting exactly the local-indexed nodes set in `mask` (local index
+        # = global index - root; root is local index 0 and always set).
+        dp = [[NEG_INF] * span for _ in range(size_states)]
+        dp[1][0] = POS_INF
+
+        for mask in range(1, size_states):
+            row = dp[mask]
+            for local_v in range(span):
+                bottleneck = row[local_v]
+                if bottleneck == NEG_INF:
+                    continue
+                global_v = root + local_v
+                for global_w, weight in adjacency[global_v]:
+                    if global_w < root:
+                        continue
+                    local_w = global_w - root
+                    if (mask >> local_w) & 1:
+                        continue  # already visited (includes root itself)
+                    new_mask = mask | (1 << local_w)
+                    candidate = weight if bottleneck == POS_INF else min(bottleneck, weight)
+                    if candidate > dp[new_mask][local_w]:
+                        dp[new_mask][local_w] = candidate
+
+        for mask in range(1, size_states):
+            if not (mask & 1) or mask.bit_count() < min_ring_size:
+                continue
+            row = dp[mask]
+            for local_v in range(1, span):
+                bottleneck = row[local_v]
+                if bottleneck == NEG_INF:
+                    continue
+                global_v = root + local_v
+                for global_w, weight in adjacency[global_v]:
+                    if global_w != root:
+                        continue
+                    closing = weight if bottleneck == POS_INF else min(bottleneck, weight)
+                    if closing > best:
+                        best = closing
+
+    return best
+
+
+def _approx_max_bottleneck_cycle(
+    adjacency: list[list[tuple[int, float]]], n: int, min_ring_size: int
+) -> float:
+    """Bounded, documented approximation used only when a subgraph exceeds
+    ``_MAX_EXACT_CYCLE_VOLUME_NODES`` (i.e. ``max_ring_size`` configured well
+    above the default of 10). Not exercised by any default configuration.
+
+    Binary-searches the largest edge-weight threshold ``t`` such that the
+    subgraph induced by edges with weight ``>= t`` still contains a strongly
+    connected component of at least ``min_ring_size`` nodes, reusing
+    ``networkx.strongly_connected_components`` (already relied on elsewhere
+    in this module) instead of enumerating cycles.
+
+    This is a deliberate approximation, not an exact computation: an SCC of
+    size ``>= min_ring_size`` guarantees *some* cycle exists within it, but
+    not necessarily one whose length is itself ``>= min_ring_size`` (e.g. a
+    "bowtie" of two triangles sharing one node is a single 5-node SCC whose
+    longest simple cycle is length 3). The returned value can therefore be a
+    slight overestimate of the true maximum bottleneck; it is never an
+    underestimate below the true value restricted to any single found SCC.
+    Cost is ``O(log(distinct edge weights) * (V + E))`` -- polynomial in
+    subgraph size, independent of cycle count.
+    """
+    weights = sorted({weight for edges in adjacency for _, weight in edges})
+    if not weights:
+        return 0.0
+
+    def has_scc_at_least(threshold: float) -> bool:
+        g: dict[int, list[int]] = {}
+        for u, edges in enumerate(adjacency):
+            for v, weight in edges:
+                if weight >= threshold:
+                    g.setdefault(u, []).append(v)
+        sccs = IterativeTarjanSCC().run(g)
+        return any(len(scc) >= min_ring_size for scc in sccs)
+
+    lo, hi = 0, len(weights) - 1
+    best_threshold = 0.0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if has_scc_at_least(weights[mid]):
+            best_threshold = weights[mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return float(best_threshold)
 
 
 def _account_outgoing_volumes(

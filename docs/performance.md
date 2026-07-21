@@ -14,9 +14,56 @@ Time is measured with `time.perf_counter()`. Peak RAM is measured with `tracemal
 | ---------------------- | ------ | ------- | ---------- | ------------- | --------- | ------------- |
 | Recursive (networkx)   | 10 K   | 50 K    | 0.2        | 0.5           | 0.7       | ~25           |
 | Iterative (dict adj.)  | 10 K   | 50 K    | 0.2        | 0.3           | 0.5       | ~15           |
-| Iterative + CSR        | 100 K  | 500 K   | 4.5        | 23.0          | ~27.4     | 62.5          |
+| Iterative + CSR        | 100 K  | 500 K   | 3.3        | 12.2          | ~15.4     | 62.5          |
 
 Target: 100 K nodes, 500 K edges in **< 30 s** on a single CPU core with **< 500 MB** peak RAM.
+
+**This benchmark does not exercise cycle-volume computation.** It uses uniformly-random
+edge placement (`numpy.random.default_rng(42).integers(...)`), which produces one giant
+SCC covering ~98% of nodes (truncated, since it exceeds `max_ring_size=10` — see "Ring
+metric computation" below) plus many singleton SCCs (filtered out by `min_ring_size=3`).
+Neither case reaches `_cycle_volume`. Real wash-trading rings are small, dense,
+near-complete clusters of colluding wallets — the opposite shape from this benchmark's
+input — so a separate benchmark below measures that path directly.
+
+## Cycle-volume computation on dense rings
+
+`_cycle_volume` computes the maximum bottleneck-weight (minimum edge `total_volume`)
+simple cycle within a detected ring, for every non-truncated ring (`min_ring_size <=
+len(accounts) <= max_ring_size`). It is exercised on every real wash-ring detection —
+unlike the SCC-finding step above, its cost does not depend on graph size but on the
+*density* of each individual ring, since the number of simple cycles in a subgraph
+grows combinatorially with edge density. A 10-node, ~90%-density subgraph (a typical
+"bot farm" wash-ring: every wallet trading with every other wallet) has 576 855 simple
+cycles of length ≥ 3.
+
+`_cycle_volume` is computed via a bitmask DP (`_max_bottleneck_cycle`, adapted from the
+maximum-bottleneck-path technique) instead of enumerating cycles with
+`networkx.simple_cycles`: its cost is `O(n² · 2ⁿ)`, a function of node count alone,
+independent of edge density or cycle count. It is exact, not an approximation, for any
+subgraph up to `_MAX_EXACT_CYCLE_VOLUME_NODES = 14` nodes (well above the default
+`max_ring_size = 10`); beyond that it falls back to a documented, bounded-error
+threshold-search approximation (see `_approx_max_bottleneck_cycle`'s docstring) that is
+not exercised at default configuration.
+
+**Methodology:** `tests/test_iterative_tarjan.py::test_performance_dense_ring_cycle_volume`
+builds a single 10-node SCC (`max_ring_size` default) at ~90% directed-edge density with
+randomised per-edge volumes — a directed Hamiltonian ring plus random chords, guaranteeing
+strong connectivity regardless of which additional edges land — and runs it through
+`TradeGraph.find_wash_rings()`.
+
+| Metric                                          | Old (`nx.simple_cycles` enumeration) | New (bitmask DP) |
+| ------------------------------------------------ | ------------------------------------- | ----------------- |
+| 10-node, ~90%-density ring, cycle-volume time     | 5.33 s (576 855 cycles enumerated)    | **10.9 ms**        |
+| Speedup                                           | —                                      | **~490×**          |
+| Result                                            | identical (929.9)                     | identical (929.9)  |
+
+Enforced budget (CI-failing): **< 1 s** per ring at `max_ring_size` and worst-case
+(near-complete) density — measured result is ~100× under budget. The old implementation
+would already exceed a 1 s budget on a single ring at this shape, and its cost grows
+combinatorially worse with size/density beyond it (a related 10-node case has been
+measured at over 1.1 million simple cycles / ~4 s for enumeration alone); the new
+implementation's cost is bounded by node count regardless of density.
 
 ## Notes
 
@@ -35,6 +82,25 @@ Memory for the CSR matrix at 500 K edges: ~4 MB data (float64) + ~1 MB indices (
 ### Ring metric computation
 
 For the typical 100 K-node random graph, a single giant SCC containing ~98 % of all nodes is detected and flagged as truncated (exceeds `max_ring_size=10`). Metrics (total volume, timing tightness, avg trade count) are computed with a single O(E) pass over the aggregated edge-data dict, avoiding the overhead of building a full `networkx.DiGraph` for large SCCs. The remaining SCCs are singletons and are skipped by the `min_ring_size=3` filter.
+
+### Path-payment cycle detection (`detection/path_cycle_detector.py`)
+
+`detect_path_payment_cycles` uses the same `nx.simple_cycles` call pattern as the
+pre-fix `_cycle_volume` (bounded to `max_cycle_length` hops, default 6), but needs the
+actual cycle instances — not just a bottleneck scalar — to select per-hop timestamps and
+build alert detail, so it is not a candidate for the bitmask-DP replacement above.
+Instead, cycle search is now scoped to one strongly connected component at a time
+(`nx.strongly_connected_components`) rather than run directly over the whole
+path-payment graph: a simple cycle can only exist within one SCC, so this bounds each
+`simple_cycles` call's search space to that component's size and lets components that
+don't touch `root_accounts` be skipped before any enumeration happens. Components larger
+than `max_component_size` (default 12) are skipped with a warning, since
+`simple_cycles`'s cost is combinatorial in component *density* even at a fixed
+`max_cycle_length` — the same underlying risk `_cycle_volume` had, applied to whole
+graph instead of a pre-isolated ring. Real wash rings are small by construction
+(`graph_engine.find_wash_rings`'s `max_ring_size`, default 10), so this bound does not
+affect realistic detections; `tests/test_path_cycle_detector.py` covers the 10 000-op
+mixed-cycle/acyclic case in well under its 10 s budget.
 
 ### Threshold settings
 

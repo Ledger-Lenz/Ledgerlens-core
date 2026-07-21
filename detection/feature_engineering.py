@@ -537,7 +537,14 @@ def _burst_overlap_count_python(times_a, times_b_sorted, window_us: int) -> int:
     return count
 
 
-def cross_pair_features(trades: pd.DataFrame, account: str, window_us: int = 5_000_000) -> dict:
+def _cross_pair_burst_overlap_counts(
+    trades: pd.DataFrame, account: str, window_us: int = 5_000_000
+) -> dict:
+    """Per-pair count of this account's trades that overlap another active
+    pair's trades within `window_us` microseconds, via a JIT-accelerated
+    two-pointer scan on sorted timestamps (falls back to pure Python when
+    Numba is unavailable or disabled).
+    """
     acct_trades = trades[trades["account"] == account]
     active_pairs = acct_trades["pair"].unique()
 
@@ -562,7 +569,15 @@ def cross_pair_features(trades: pd.DataFrame, account: str, window_us: int = 5_0
 
         results[pair] = total_overlap
 
-    return results -> dict:
+    return results
+
+
+def cross_pair_features(
+    account: str,
+    trades_by_pair: dict[str, pd.DataFrame] | None,
+    correlated_pairs: list[tuple[str, str, float]] | None,
+    cross_pair_wallets: dict[str, list[str]] | None,
+) -> dict:
     """Compute the five cross-pair features for `account`.
 
     All inputs are optional; omitting any yields 0.0 for all five features.

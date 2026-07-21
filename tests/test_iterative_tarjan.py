@@ -369,6 +369,97 @@ def test_trade_graph_cache_invalidated_after_add_trade():
     assert len(rings2) == 1
 
 
+def _dense_ring_trades(n: int, density: float, seed: int) -> list:
+    """A single n-node SCC at the given directed-edge density, plus randomised
+    per-edge volumes -- the "bot farm" wash-ring shape: a small, dense cluster
+    of wallets all trading with each other. A directed Hamiltonian ring
+    A->B->C->...->A is always included first so the component is guaranteed
+    strongly connected regardless of which additional random edges land.
+    """
+    import random
+
+    rng = random.Random(seed)
+    accounts = [f"D{i}" for i in range(n)]
+    trades = []
+    for i in range(n):
+        trades.append(_mock_trade(accounts[i], accounts[(i + 1) % n], rng.uniform(1.0, 1000.0)))
+    for i in range(n):
+        for j in range(n):
+            if i != j and (j != (i + 1) % n) and rng.random() < density:
+                trades.append(_mock_trade(accounts[i], accounts[j], rng.uniform(1.0, 1000.0)))
+    return trades
+
+
+def test_dense_ring_cycle_volume_call_sites_agree():
+    """The module-level find_wash_rings and TradeGraph.find_wash_rings share
+    the same _cycle_volume implementation, but this exercises it on a dense,
+    multi-cycle ring (unlike the existing single-triangle equivalence test)
+    to confirm both call sites still agree once more than one candidate
+    cycle exists.
+    """
+    import pandas as pd
+
+    from detection.graph_engine import build_transaction_graph, find_wash_rings
+
+    trades = _dense_ring_trades(n=8, density=0.7, seed=17)
+    rows = [
+        {
+            "base_account": t.base_account,
+            "counter_account": t.counter_account,
+            "base_amount": t.base_amount,
+            "ledger_close_time": _BASE_TS,
+        }
+        for t in trades
+    ]
+    nx_graph = build_transaction_graph(pd.DataFrame(rows))
+    reference_rings = find_wash_rings(nx_graph)
+
+    tg = TradeGraph()
+    for t in trades:
+        tg.add_trade(t)
+    tg_rings = tg.find_wash_rings()
+
+    assert len(reference_rings) == 1
+    assert len(tg_rings) == 1
+    assert tg_rings[0]["accounts"] == reference_rings[0]["accounts"]
+    assert tg_rings[0]["cycle_volume"] == pytest.approx(reference_rings[0]["cycle_volume"])
+    assert reference_rings[0]["cycle_volume"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Performance — dense ring-shaped subgraphs (real wash-ring bot-farm shape)
+# ---------------------------------------------------------------------------
+#
+# docs/performance.md's existing 100K-node benchmark below uses uniformly
+# random edge placement, which (as documented there) produces one giant
+# truncated SCC plus singletons -- it structurally never calls _cycle_volume.
+# Real wash rings are small, dense, near-complete clusters of colluding
+# wallets, which is exactly the shape that made the old
+# networkx.simple_cycles-based _cycle_volume enumerate combinatorially many
+# cycles. This benchmark exercises that path directly.
+
+
+@pytest.mark.slow
+def test_performance_dense_ring_cycle_volume():
+    max_ring_size = 10
+    tg = TradeGraph()
+    for trade in _dense_ring_trades(n=max_ring_size, density=0.9, seed=99):
+        tg.add_trade(trade)
+
+    start = time.perf_counter()
+    rings = tg.find_wash_rings(max_ring_size=max_ring_size)
+    elapsed = time.perf_counter() - start
+
+    assert len(rings) == 1
+    assert rings[0]["truncated"] is False
+    assert rings[0]["cycle_volume"] > 0.0
+    assert elapsed < 1.0, f"Dense {max_ring_size}-node ring cycle-volume computation took {elapsed:.3f}s (budget 1.0s)"
+    print(
+        f"\n[perf] dense {max_ring_size}-node ring (density=0.9) cycle_volume: "
+        f"{elapsed * 1000:.1f}ms | cycle_volume={rings[0]['cycle_volume']:.1f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Performance — 100 K nodes, 500 K edges in < 30 s and < 500 MB peak RAM
 # ---------------------------------------------------------------------------

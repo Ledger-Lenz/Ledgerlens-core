@@ -192,7 +192,7 @@ class Settings(BaseSettings):
     # Multi‑region configuration
     ledgerlens_region_name: str = "us-east-1"
     ledgerlens_region_role: str = "active"  # active | passive | standby
-    soroban_submission_lease_enabled: bool = true
+    soroban_submission_lease_enabled: bool = True
     soroban_submission_lease_name: str = "ledgerlens-soroban-submitter"
     soroban_submission_lease_duration_seconds: int = 30
 
