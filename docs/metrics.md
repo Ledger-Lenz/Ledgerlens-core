@@ -267,9 +267,13 @@ ledgerlens_dlq_depth > 0
 
 ---
 
-## Recommended Alert Rules
+## Related Documentation
 
 Copy these into your `monitoring/alerts.yml` (see also the pre-built alert rules in `monitoring/alerts.yml`):
+
+For cost and capacity alerting, see also:
+- [docs/cost_and_capacity.md](cost_and_capacity.md) — Cost visibility and capacity projection
+- `monitoring/recording_rules_cost.yml` — Cost and capacity recording rules
 
 ```yaml
 groups:

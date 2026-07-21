@@ -12,6 +12,14 @@ REQUIRED_ALERTS = {
     "FeatureDriftDetected",
     "ScoringLatencyHigh",
     "PipelineStalled",
+    "ScoringLatencySLOFastBurn",
+    "ScoringLatencySLOSlowBurn",
+    "WebhookDeliverySLOFastBurn",
+    "WebhookDeliverySLOSlowBurn",
+    "SorobanSubmissionSLOFastBurn",
+    "SorobanSubmissionSLOSlowBurn",
+    "ScoreAvailabilitySLOFastBurn",
+    "ScoreAvailabilitySLOSlowBurn",
 }
 
 
@@ -35,7 +43,7 @@ def test_alerts_file_is_valid_yaml():
     assert "groups" in doc
 
 
-def test_all_5_alert_rules_present(alerts_doc):
+def test_all_13_alert_rules_present(alerts_doc):
     rules = _collect_rules(alerts_doc)
     names = {r["alert"] for r in rules}
     missing = REQUIRED_ALERTS - names
@@ -58,6 +66,6 @@ def test_each_annotation_has_summary(alerts_doc):
         assert "summary" in annotations, f"Rule {rule.get('alert')} missing annotations.summary"
 
 
-def test_exactly_5_rules(alerts_doc):
+def test_exactly_13_rules(alerts_doc):
     rules = _collect_rules(alerts_doc)
-    assert len(rules) == 5, f"Expected 5 alert rules, got {len(rules)}"
+    assert len(rules) == 13, f"Expected 13 alert rules, got {len(rules)}"

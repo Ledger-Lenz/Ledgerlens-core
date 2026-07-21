@@ -92,6 +92,41 @@ OTEL_EXPORTER_OTLP_CLIENT_KEY=/path/to/client.key
 OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/path/to/client.crt
 ```
 
+### Trace Sampling
+
+LedgerLens supports two sampling strategies:
+
+1. **Static (head-based)** (default): Makes sampling decisions when spans start, using `OTEL_TRACES_SAMPLER`.
+2. **Tail (tail-based)**: Makes sampling decisions after traces complete, based on trace characteristics.
+
+#### Tail Sampling Policies
+
+When `TRACE_SAMPLING_STRATEGY="tail"`, the following policies are applied:
+
+| Policy | Description |
+|---|---|
+| Error | Always keep traces with any span in error state |
+| Slow | Always keep traces with any span taking > 2000ms |
+| Circuit Open | Always keep traces with `soroban.submit_score` spans where `circuit_state != closed` |
+| Baseline | Keep 5% of remaining "boring" traces (configurable with `TRACE_TAIL_BASELINE_RATIO`) |
+
+All kept traces have a `ledgerlens.sampling.reason` attribute indicating why they were kept (`error`, `slow`, `circuit_open`, or `baseline`).
+
+#### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRACE_SAMPLING_STRATEGY` | `static` | Sampling strategy: `static` or `tail` |
+| `TRACE_TAIL_BASELINE_RATIO` | `0.05` | Fraction of "boring" traces to keep |
+| `TRACE_TAIL_BUFFER_TIMEOUT_SECONDS` | `30.0` | Max time to wait for a trace to complete |
+| `TRACE_TAIL_MAX_BUFFERED_TRACES` | `10000` | Max traces to buffer in memory |
+
+#### Memory Management
+
+- Traces are automatically flushed after `TRACE_TAIL_BUFFER_TIMEOUT_SECONDS`
+- If the buffer hits `TRACE_TAIL_MAX_BUFFERED_TRACES`, the oldest trace is dropped
+- The buffer runs in a background thread to avoid blocking application processing
+
 ---
 
 ## Prometheus Metrics
@@ -145,7 +180,7 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 
 **Condition**: `histogram_quantile(0.95, rate(ledgerlens_scoring_latency_seconds_bucket[10m])) > 2.0` for 5 minutes
 
-**Runbook**: p95 wallet scoring latency exceeds 2 seconds. Check Horizon API latency (`HORIZON_URL`), model inference load, and SQLite write throughput. Consider reducing `TRADE_HISTORY_LOOKBACK_DAYS` or running `async_run()` instead of synchronous `run()`.
+**Runbook**: p95 wallet scoring latency exceeds 2 seconds. Check Horizon API latency (`HORIZON_URL`), model inference load, and SQLite write throughput. Consider reducing `TRADE_HISTORY_LOOKBACK_DAYS` or running `async_run()` instead of synchronous `run()`. Retained alongside new SLO burn-rate rules as a coarse backstop symptom alert.
 
 ---
 
@@ -154,6 +189,38 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 **Condition**: `(time() - ledgerlens_pipeline_run_duration_seconds_created) > 300`
 
 **Runbook**: The detection pipeline has not completed a run in over 5 minutes. Check that `python run_pipeline.py` (or `cli.py score`) is still running and not blocked. Review logs for exceptions in Horizon ingestion or model loading. Verify `LEDGERLENS_DB_PATH` is writable.
+
+### CapacityLimitApproaching
+
+**Condition**: `ledgerlens:replica_count_projected_days_to_max < 14 or ledgerlens:pvc_projected_days_to_full < 14` for 1 hour
+
+**Runbook**: Current growth trends indicate API replica count or PVC usage will hit configured limits within 14 days. Review `ledgerlens_wallets_scored_total` growth trend in the cost_capacity dashboard. Consider raising `autoscaling.maxReplicas` or `persistence.size` in `helm/ledgerlens/values.yaml`. Investigate unexpected ingestion volume growth with `GET /metrics` and Horizon SSE metrics. See [docs/cost_and_capacity.md](cost_and_capacity.md) for full runbook.
+
+---
+
+## Cost and Capacity Metrics
+
+LedgerLens includes cost visibility and capacity projection metrics. See [docs/cost_and_capacity.md](cost_and_capacity.md) for configuration and the full Grafana dashboard.
+
+**Key metrics:**
+
+- `ledgerlens:pod_cost_per_hour:usd` — Cost per pod (CPU + memory)
+- `ledgerlens:cost_per_wallet_scored:usd` — Unit economics (cost per scored wallet)
+- `ledgerlens:replica_count_projected_days_to_max` — Days until maxReplicas exhausted
+- `ledgerlens:pvc_projected_days_to_full` — Days until PVC full
+
+**Recording rules:** `monitoring/recording_rules_cost.yml`  
+**Alert:** `CapacityLimitApproaching` (fires 14 days before projected limit)
+
+---
+
+### SLO Burn-Rate Alerts
+
+LedgerLens implements multi-window, multi-burn-rate alerting for the core user journeys (scoring latency, webhook delivery, Soroban submission, and score availability). Each journey has two alert rules:
+1. **`<Journey>SLOFastBurn`**: Triggers when current consumption rate will exhaust the 30-day budget in under 2 days. Severity is `page` and routes to on-call operators.
+2. **`<Journey>SLOSlowBurn`**: Triggers when current consumption rate will exhaust the 30-day budget in under 5 days. Severity is `ticket` and routes to Slack / ticketing systems.
+
+See [docs/slo.md](file:///c:/Users/hp/drips/kosiso/Ledgerlens-core/docs/slo.md) for full metrics and alerting math details.
 
 ---
 
@@ -165,5 +232,16 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 | `OTEL_EXPORTER_OTLP_CERTIFICATE` | *(unset)* | CA root cert for mTLS |
 | `OTEL_EXPORTER_OTLP_CLIENT_KEY` | *(unset)* | Client private key for mTLS |
 | `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` | *(unset)* | Client cert for mTLS |
+| `SLO_SCORING_LATENCY_TARGET_SECONDS` | `2.0` | Target response latency threshold (seconds) |
+| `SLO_SCORING_LATENCY_TARGET_PERCENT` | `99.0` | Target percentage of requests matching the latency threshold |
+| `SLO_WEBHOOK_DELIVERY_TARGET_PERCENT` | `99.0` | Target success percentage for webhook delivery |
+| `SLO_SOROBAN_SUBMISSION_TARGET_PERCENT` | `99.0` | Target success percentage for Soroban transaction submission |
+| `SLO_WINDOW_DAYS` | `30` | Rolling window in days over which targets are measured |
 
 See `.env.example` for all configuration variables.
+
+---
+
+## Model Cards
+
+For model governance, compliance, and auditing, LedgerLens generates Model Cards for each promoted model version, including a Datasheet for the training dataset. For full details, see the [Model Cards documentation](./model_cards.md).

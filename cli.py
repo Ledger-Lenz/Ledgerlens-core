@@ -183,6 +183,37 @@ def train(
     logger.info("Saved models to %s", settings.model_dir)
 
 
+@app.command("generate-model-card")
+def generate_model_card_cli(
+    model: str = typer.Option(..., "--model", help="Model name (e.g., random_forest, xgboost)"),
+    version: str = typer.Option(..., "--version", help="Model version string"),
+    output_dir: str = typer.Option(None, "--output-dir", help="Output directory (default: settings.model_card_dir)"),
+) -> None:
+    """Generate a model card for a specific model version on demand."""
+    from config.settings import settings
+    from detection.model_card import generate_model_card, render_markdown, render_pdf
+    from pathlib import Path
+
+    output_dir = output_dir or settings.model_card_dir
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        card = generate_model_card(model, version)
+        md_path = output_path / f"{model}_{version}.md"
+        md_path.write_text(render_markdown(card))
+        logger.info("Generated model card Markdown at %s", md_path)
+
+        if settings.model_card_pdf_enabled:
+            pdf_path = output_path / f"{model}_{version}.pdf"
+            render_pdf(card, output_path=str(pdf_path))
+
+        typer.echo(f"Model card generated for {model} v{version} at {md_path}")
+    except Exception as e:
+        typer.echo(f"Error generating model card: {e}", err=True)
+        raise typer.Exit(1)
+
+
 @app.command("archive-features")
 def archive_features(
     cutoff_days: int = typer.Option(
@@ -424,6 +455,29 @@ def retrain_check(
         save_models(new_results, training_dataset_path=training_dataset_path)
         if new_shap:
             save_shap_importances(new_shap, settings.model_dir)
+        
+        # Auto-generate model cards if enabled
+        if settings.model_card_auto_generate:
+            from detection.model_card import generate_model_card, render_markdown, render_pdf
+            model_card_dir = Path(settings.model_card_dir)
+            model_card_dir.mkdir(parents=True, exist_ok=True)
+            
+            for model_name in model_names:
+                version = get_current_version(model_name, settings.model_dir)
+                if not version:
+                    continue
+                try:
+                    card = generate_model_card(model_name, version)
+                    md_path = model_card_dir / f"{model_name}_{version}.md"
+                    md_path.write_text(render_markdown(card))
+                    logger.info("Generated model card for %s v%s at %s", model_name, version, md_path)
+                    
+                    if settings.model_card_pdf_enabled:
+                        pdf_path = model_card_dir / f"{model_name}_{version}.pdf"
+                        render_pdf(card, output_path=str(pdf_path))
+                except Exception as e:
+                    logger.warning("Failed to generate model card for %s v%s: %s", model_name, version, e)
+        
         logger.info("Promoted new models to production")
     else:
         logger.info("New models not promoted; keeping previous versions")
@@ -1100,8 +1154,17 @@ def stream(
 @app.command("db-migrate")
 def db_migrate(
     db_path: str = typer.Option(None, "--db-path", help="Path to the SQLite database (defaults to LEDGERLENS_DB_PATH)"),
+    consolidate_api_keys: bool = typer.Option(
+        True, "--consolidate-api-keys/--skip-consolidation",
+        help="Consolidate legacy api_keys tables into the canonical detection.api_key_store schema.",
+    ),
 ) -> None:
-    """Apply any pending schema migrations to the database and report the result."""
+    """Apply any pending schema migrations to the database and report the result.
+
+    Also consolidates legacy API key tables (from ``api/api_keys_router.py``
+    and ``api/namespace.py``) into the canonical ``detection.api_key_store``
+    schema when ``--consolidate-api-keys`` is set (the default).
+    """
     from detection.storage import _connect, get_schema_version, migrate_db
 
     with _connect(db_path) as conn:
@@ -1115,6 +1178,142 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+    if consolidate_api_keys:
+        import json
+        import sqlite3
+
+        from detection.api_key_store import migrate_legacy_api_keys
+        from detection.api_key_store import _init_table as _init_api_keys
+
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            report = migrate_legacy_api_keys(conn)
+            total = report["migrated"]
+            key_id_updated = report["rows_updated_key_id"]
+            scopes_updated = report["rows_updated_scopes"]
+            if total > 0:
+                typer.echo(
+                    f"API key consolidation: {total} change(s) applied "
+                    f"(key_id_populated={key_id_updated}, scopes_updated={scopes_updated})"
+                )
+            else:
+                typer.echo(
+                    "API key consolidation: no changes needed "
+                    f"(key_id_populated={key_id_updated}, scopes_updated={scopes_updated})"
+                )
+        except Exception as exc:
+            typer.echo(f"API key consolidation failed: {exc}", err=True)
+            raise typer.Exit(1)
+        finally:
+            conn.close()
+
+
+@app.command("compute-embeddings")
+def compute_embeddings(
+    window_days: int = typer.Option(30, help="Number of days of recent trades to use for graph construction"),
+    model_path: str = typer.Option(None, help="Path to the trained GNN model (defaults to GNN_MODEL_PATH)"),
+    embedding_store_path: str = typer.Option(None, help="Path to the embedding store database (defaults to EMBEDDING_STORE_PATH)"),
+) -> None:
+    """Compute and store embeddings for all wallets using the trained GNN model."""
+    import sqlite3
+    from types import SimpleNamespace
+    from datetime import datetime, timedelta
+
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+    from detection.gnn_ring_detector import (
+        GNNRingDetector,
+        build_transaction_graph,
+        _HAS_PYG,
+    )
+
+    if not _HAS_PYG:
+        typer.echo("PyTorch Geometric is not available. Cannot compute embeddings.", err=True)
+        raise typer.Exit(1)
+
+    # Load detector
+    detector = GNNRingDetector(
+        model_path=model_path or settings.gnn_model_path,
+        fallback_to_scc=settings.gnn_fallback_to_scc,
+    )
+    detector.load()
+    if not detector._fitted:
+        typer.echo("GNN model not available. Cannot compute embeddings.", err=True)
+        raise typer.Exit(1)
+
+    # Load trades from the last window_days
+    since = (datetime.now() - timedelta(days=window_days)).isoformat()
+    db_path = settings.ledgerlens_db_path
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT base_account, counter_account, base_amount,
+               base_asset_code, counter_asset_code, ledger_close_time
+        FROM trades
+        WHERE ledger_close_time >= ?
+        ORDER BY ledger_close_time DESC
+        """,
+        (since,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        typer.echo(f"No trades found in the last {window_days} days.")
+        return
+
+    typer.echo(f"Loaded {len(rows)} trades from the last {window_days} days.")
+
+    # Convert rows to Trade-like objects
+    trades = []
+    for row in rows:
+        try:
+            ts_str = row["ledger_close_time"]
+            ts = datetime.fromisoformat(ts_str).timestamp() if ts_str else 0.0
+            trades.append(
+                SimpleNamespace(
+                    base_account=row["base_account"],
+                    counter_account=row["counter_account"],
+                    base_amount=float(row["base_amount"] or 0),
+                    ledger_close_time_ts=ts,
+                    base_asset_code=row["base_asset_code"] or "XLM",
+                    counter_asset_code=row["counter_asset_code"] or "XLM",
+                )
+            )
+        except Exception as exc:
+            logger.warning(f"Skipping invalid trade row: {exc}")
+            continue
+
+    # Build graph
+    def node_feature_fn(w: str):
+        import torch
+        h = abs(hash(w)) % 10000
+        return torch.tensor(
+            [h / 10000.0, len(w) / 60.0, float(w.startswith("G")), 0.0],
+            dtype=torch.float,
+        )
+
+    graph = build_transaction_graph(trades, node_feature_fn)
+    typer.echo(f"Built graph with {len(graph['wallet'].wallet_list)} wallets.")
+
+    # Compute embeddings
+    import torch
+    with torch.no_grad():
+        embeddings = detector._encoder(graph["wallet"].x, graph["wallet", "trades", "wallet"].edge_index)
+    embeddings_np = embeddings.cpu().numpy()
+
+    # Store embeddings
+    store = EmbeddingStore(embedding_store_path or settings.embedding_store_path)
+    model_version = "gnn_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    typer.echo(f"Storing embeddings with model version: {model_version}")
+
+    for wallet, embedding in zip(graph["wallet"].wallet_list, embeddings_np):
+        store.upsert_embedding(wallet, model_version, embedding)
+
+    typer.echo(f"Successfully stored embeddings for {len(embeddings_np)} wallets.")
 
 
 @app.command("dlq-replay")
@@ -1369,6 +1568,105 @@ def verify_models(
         typer.echo(f"No .joblib files found in {target_dir}")
 
 
+@app.command("compute-embeddings")
+def compute_embeddings(
+    window_days: int = typer.Option(30, "--window-days", "-w", help="Number of days of trades to include"),
+    model_version: str = typer.Option(None, help="Model version to use for embeddings (defaults to model file basename)"),
+) -> None:
+    """Compute and store GNN embeddings for all wallets in the last N days of trades."""
+    import sqlite3
+    from types import SimpleNamespace
+    from datetime import datetime, timezone, timedelta
+
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+    from detection.gnn_ring_detector import GNNRingDetector, build_transaction_graph
+
+    # Load trades
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=window_days)
+    cutoff = start_time.isoformat()
+    db_path = settings.db_path
+
+    trades = []
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT base_account, counter_account, base_amount,
+                   base_asset_code, counter_asset_code, ledger_close_time
+            FROM trades
+            WHERE ledger_close_time >= ?
+            """,
+            (cutoff,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        for row in rows:
+            try:
+                ts_str = row["ledger_close_time"]
+                ts = datetime.fromisoformat(ts_str).timestamp() if ts_str else 0.0
+                trades.append(
+                    SimpleNamespace(
+                        base_account=row["base_account"],
+                        counter_account=row["counter_account"],
+                        base_amount=float(row["base_amount"] or 0),
+                        ledger_close_time_ts=ts,
+                        base_asset_code=row["base_asset_code"] or "XLM",
+                        counter_asset_code=row["counter_asset_code"] or "XLM",
+                    )
+                )
+            except Exception:
+                continue
+    except Exception as e:
+        typer.echo(f"Error loading trades: {e}", err=True)
+        raise typer.Exit(1)
+
+    if not trades:
+        typer.echo("No trades found in the window.")
+        return
+    typer.echo(f"Loaded {len(trades)} trades from {start_time.date()} to {end_time.date()}")
+
+    # Build graph
+    def node_feature_fn(w: str):
+        import torch
+        h = abs(hash(w)) % 10000
+        return torch.tensor(
+            [h / 10000.0, len(w) / 60.0, float(w.startswith("G")), 0.0],
+            dtype=torch.float,
+        )
+    data = build_transaction_graph(trades, node_feature_fn)
+    typer.echo(f"Built graph with {data['wallet'].num_nodes} wallets")
+
+    # Load detector and compute embeddings
+    detector = GNNRingDetector()
+    detector.load()
+    if not detector._fitted:
+        typer.echo("GNN model not fitted; using SCC fallback only (no embeddings).", err=True)
+        raise typer.Exit(1)
+    
+    embeddings = detector.get_embeddings(data)
+    wallet_ids = data["wallet"].wallet_list
+    # Convert embeddings to numpy array
+    import torch
+    embeddings = embeddings.cpu().numpy()
+    typer.echo(f"Computed embeddings for {len(wallet_ids)} wallets")
+
+    # Determine model version
+    if model_version is None:
+        model_path = settings.gnn_model_path
+        model_version = Path(model_path).stem
+
+    # Store embeddings
+    store = EmbeddingStore()
+    for wallet, embedding in zip(wallet_ids, embeddings):
+        store.upsert_embedding(wallet, model_version, embedding)
+    typer.echo(f"Stored embeddings for {len(wallet_ids)} wallets with version {model_version}")
+
+
 @app.command("webhook-worker")
 def webhook_worker(
     interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
@@ -1379,6 +1677,48 @@ def webhook_worker(
     from detection.webhook_worker import run_delivery_worker
 
     asyncio.run(run_delivery_worker(interval_seconds=interval))
+
+
+@app.command("analyst-lock-sweep")
+def analyst_lock_sweep(
+    interval: float = typer.Option(60.0, "--interval", help="Sweep interval in seconds"),
+) -> None:
+    """Run the analyst case lock expiry sweep as a foreground process.
+
+    Expires stale analyst claims (past ANALYST_LOCK_TIMEOUT_SECONDS) so
+    wallets return to the unassigned queue.  Runs continuously until SIGINT/SIGTERM.
+    """
+    from detection.analyst_store import expire_stale_locks
+    from config.settings import settings as cfg
+
+    sweep_interval = max(interval, 10.0)
+    logger.info(
+        "Starting analyst lock sweep (interval=%ss, lock_timeout=%ss)",
+        sweep_interval,
+        cfg.analyst_lock_timeout_seconds,
+    )
+
+    try:
+        import signal
+        _stop = False
+
+        def _handle_signal(signum, frame):
+            nonlocal _stop
+            logger.info("Shutdown signal received — stopping lock sweep")
+            _stop = True
+
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+
+        while not _stop:
+            released = expire_stale_locks()
+            if released:
+                logger.info("Lock sweep: released %d expired lock(s)", released)
+            time.sleep(sweep_interval)
+    except KeyboardInterrupt:
+        pass
+
+    logger.info("Analyst lock sweep stopped.")
 
 
 backtest_app = typer.Typer(help="Backtesting framework for model evaluation")
@@ -1728,5 +2068,150 @@ def benford_calibrate(
     )
 
 
+@app.command("publish-backlog")
+def publish_backlog(
+    since: str = typer.Option(
+        ...,
+        help="ISO 8601 timestamp to start replay from (e.g., 2026-07-17T00:00:00Z)",
+    ),
+) -> None:
+    """Replay existing SQLite risk_scores rows onto the event bus.
+
+    Used for bootstrapping a new consumer or recovering from an event bus outage.
+    The event bus backend must be configured (i.e. EVENT_BUS_BACKEND != 'none').
+    """
+    from config.settings import settings
+    from detection.event_bus import get_event_bus
+    from detection.storage import get_scores_since
+
+    if settings.event_bus_backend == "none":
+        logger.error("Cannot publish backlog: EVENT_BUS_BACKEND is 'none'")
+        raise typer.Exit(1)
+
+    try:
+        from dateutil.parser import parse
+        parse(since)
+    except Exception:
+        logger.error("Invalid 'since' timestamp format. Use ISO 8601 (e.g. 2026-07-17T00:00:00Z)")
+        raise typer.Exit(1)
+
+    logger.info("Fetching scores since %s...", since)
+    scores = get_scores_since(since)
+    if not scores:
+        logger.info("No scores found since %s.", since)
+        return
+
+    logger.info("Publishing %d scores to event bus (%s)...", len(scores), settings.event_bus_backend)
+    bus = get_event_bus()
+    
+    # Publish in chunks to avoid memory/timeout issues
+    chunk_size = 1000
+    total_published = 0
+    total_failed = 0
+    
+    for i in range(0, len(scores), chunk_size):
+        chunk = scores[i:i+chunk_size]
+        result = bus.publish(chunk)
+        total_published += result.published
+        total_failed += result.failed
+        
+        logger.info(
+            "Progress: %d / %d (published: %d, failed: %d)",
+            min(i + chunk_size, len(scores)),
+            len(scores),
+            result.published,
+            result.failed
+        )
+
+    bus.close()
+    
+    if total_failed > 0:
+        logger.error("Backlog replay finished with %d failures.", total_failed)
+        raise typer.Exit(1)
+    else:
+        logger.info("Successfully published all %d scores.", total_published)
+
+
+@app.command("dedup-audit")
+def dedup_audit(
+    source: str = typer.Option(..., "--source", help="The ingestion source: 'horizon' | 'evm' | 'solana'"),
+    since: str = typer.Option(..., "--since", help="ISO-8601 start datetime (UTC)"),
+) -> None:
+    """Report duplicate-detection statistics and details since a given ISO-8601 datetime."""
+    import json
+    import sqlite3
+    from datetime import datetime, timezone
+    from config.settings import settings
+    from config.correlation import mask_wallet
+    from ingestion.dedup import DeduplicationStats
+
+    try:
+        since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+    except Exception as e:
+        typer.echo(f"Invalid ISO-8601 datetime for --since: {e}", err=True)
+        raise typer.Exit(1)
+
+    since_str = since_dt.isoformat()
+    conn = sqlite3.connect(settings.db_path)
+    try:
+        # Check if table exists
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ingestion_dedup_audit'")
+        if not cursor.fetchone():
+            typer.echo("DeduplicationStats(seen_total=0, duplicate_total=0, replay_rejected_total=0, duplicate_rate=0.0)")
+            return
+
+        rows = conn.execute(
+            """
+            SELECT idempotency_key, result, checked_at, metadata_json 
+            FROM ingestion_dedup_audit 
+            WHERE source = ? AND checked_at >= ?
+            ORDER BY checked_at ASC
+            """,
+            (source, since_str),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    seen_total = len(rows)
+    duplicate_total = sum(1 for r in rows if r[1] == "duplicate")
+    replay_rejected_total = sum(1 for r in rows if r[1] == "replay_rejected")
+    rate = (duplicate_total / seen_total) if seen_total > 0 else 0.0
+
+    stats = DeduplicationStats(
+        seen_total=seen_total,
+        duplicate_total=duplicate_total,
+        replay_rejected_total=replay_rejected_total,
+        duplicate_rate=rate,
+    )
+
+    typer.echo(f"DeduplicationStats(seen_total={stats.seen_total}, duplicate_total={stats.duplicate_total}, replay_rejected_total={stats.replay_rejected_total}, duplicate_rate={stats.duplicate_rate})")
+
+    typer.echo("\nDuplicate/Replay Checked Events Details:")
+    for key, result, checked_at, metadata_json in rows:
+        if result in ("duplicate", "replay_rejected"):
+            meta = json.loads(metadata_json) if metadata_json else {}
+            masked_meta = {}
+            for k, v in meta.items():
+                if isinstance(v, str) and ("wallet" in k.lower() or "account" in k.lower() or k in ("pubkey", "address")):
+                    masked_meta[k] = mask_wallet(v)
+                else:
+                    masked_meta[k] = v
+            typer.echo(f"[{checked_at}] Result={result} Key={key[:16]} Metadata={masked_meta}")
+
+
+@app.command("grpc-serve")
+def grpc_serve(
+    port: int = typer.Option(50051, help="Port to listen on for gRPC requests"),
+) -> None:
+    """Run the gRPC Internal Scoring Service sidecar."""
+    from api.grpc_scoring_service import serve
+
+    serve(port=port)
+
+
 if __name__ == "__main__":
     app()
+

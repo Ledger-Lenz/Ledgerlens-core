@@ -1,0 +1,52 @@
+
+name: Cross-Repo E2E Tests
+
+# Run on schedule (weekly) or manual dispatch only
+# Reason: This test suite depends on sibling repo availability and
+# takes significant time to build/run, so we don't run it on every PR.
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Every Sunday at 00:00 UTC
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  cross_repo_e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout core repo
+        uses: actions/checkout@v4
+
+      - name: Checkout ledgerlens-api
+        uses: actions/checkout@v4
+        with:
+          repository: Ledger-Lenz/ledgerlens-api
+          path: ledgerlens-api
+          ref: main  # Replace with a specific SHA in production
+
+      - name: Checkout ledgerlens-contracts
+        uses: actions/checkout@v4
+        with:
+          repository: Ledger-Lenz/ledgerlens-contracts
+          path: ledgerlens-contracts
+          ref: main  # Replace with a specific SHA in production
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install testcontainers requests
+
+      - name: Run cross-repo E2E tests
+        env:
+          LEDGERLENS_API_REPO_PATH: ./ledgerlens-api
+          LEDGERLENS_CONTRACTS_REPO_PATH: ./ledgerlens-contracts
+          CROSS_REPO_E2E_PINNED_REF: main
+        run: |
+          pytest -m cross_repo_e2e tests/e2e_cross_repo/
+

@@ -1,0 +1,18 @@
+{{- if .Values.costConfig.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ledgerlens.fullname" . }}-cost-config
+  labels:
+    {{- include "ledgerlens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cost-config
+data:
+  # Cost coefficients for cloud resource consumption
+  # Override these values in your values.yaml with your actual cloud pricing
+  COST_PER_VCPU_HOUR_USD: {{ .Values.costConfig.costPerVcpuHourUsd | quote }}
+  COST_PER_GB_MEMORY_HOUR_USD: {{ .Values.costConfig.costPerGbMemoryHourUsd | quote }}
+  COST_PER_GB_STORAGE_MONTH_USD: {{ .Values.costConfig.costPerGbStorageMonthUsd | quote }}
+  CAPACITY_PROJECTION_WINDOW_DAYS: {{ .Values.costConfig.capacityProjectionWindowDays | quote }}
+  CAPACITY_PROJECTION_LEAD_TIME_DAYS: {{ .Values.costConfig.capacityProjectionLeadTimeDays | quote }}
+{{- end }}

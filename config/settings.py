@@ -24,6 +24,8 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
+    feature_engine_jit_enabled: bool = True
+
     # ── Horizon ───────────────────────────────────────────────────────────────
     horizon_url: str = "https://horizon.stellar.org"
     horizon_stream_url: str = "https://horizon.stellar.org"
@@ -103,6 +105,10 @@ class Settings(BaseSettings):
     # ── GNN ring detection ──────────────────────────────────────────────────
     gnn_model_path: str = "models/gnn_ring_detector.pt"
     gnn_fallback_to_scc: bool = True
+    gnn_graph_mode: str = "homogeneous"  # homogeneous | heterogeneous
+    gnn_hetero_conv_type: str = "sage"  # sage | hgt
+    gnn_hetero_model_path: str = "models/gnn_ring_detector_hetero.pt"
+    gnn_hetero_checksum_path: str = "models/gnn_ring_detector_hetero.sha256"
 
     streamer_queue_maxsize: int = 1000  # Hard cap on buffered Horizon trades.
     streamer_overflow_strategy: str = "drop_oldest"  # block/drop_newest/drop_oldest.
@@ -126,6 +132,10 @@ class Settings(BaseSettings):
     feature_store_ttl_hours: int = 48
     feature_store_flush_interval_seconds: int = 300
 
+    # ── Analyst case management (Issue #200 follow-up) ──────────────────────
+    analyst_lock_timeout_seconds: int = 1800  # 30 min soft lock before auto-release
+    analyst_claim_max_active_per_analyst: int = 10  # max concurrent claims per analyst
+
     # ── Detection ─────────────────────────────────────────────────────────────
     benford_mad_threshold: float = 0.015
     risk_score_threshold: int = 70
@@ -146,6 +156,28 @@ class Settings(BaseSettings):
     # ── Storage ───────────────────────────────────────────────────────────────
     model_dir: str = "./models"
     ledgerlens_db_path: str = "./ledgerlens.db"
+    ingestion_dedup_enabled: bool = True
+    idempotency_retention_days: int = 90
+    idempotency_replay_window_seconds: float = 3600.0
+
+    # ── Lineage ───────────────────────────────────────────────────────────────
+    lineage_enabled: bool = False
+    lineage_backend: str = "console"
+    openlineage_url: str = ""
+    openlineage_namespace: str = "ledgerlens-core"
+    lineage_queue_maxsize: int = 1000
+
+    # ── Event Bus (RiskScore Handoff) ─────────────────────────────────────────
+    event_bus_backend: str = "none"  # none | kafka | nats
+    event_bus_kafka_bootstrap_servers: str = "localhost:9092"
+    event_bus_kafka_topic: str = "ledgerlens.riskscore.v1"
+    event_bus_kafka_sasl_password: str = ""
+    event_bus_nats_servers: str = "nats://localhost:4222"
+    event_bus_nats_subject: str = "ledgerlens.riskscore.v1"
+    event_bus_nats_token: str = ""
+    event_bus_publish_timeout_seconds: float = 5.0
+    event_bus_max_retries: int = 3
+    event_bus_retry_backoff_seconds: float = 1.0
 
     # ── Downstream services ───────────────────────────────────────────────────
     ledgerlens_api_url: str = "http://localhost:8000"
@@ -157,6 +189,12 @@ class Settings(BaseSettings):
     network_passphrase: str = "Test SDF Network ; September 2015"
     soroban_circuit_breaker_threshold: int = 5
     soroban_circuit_reset_seconds: int = 300
+    # Multi‑region configuration
+    ledgerlens_region_name: str = "us-east-1"
+    ledgerlens_region_role: str = "active"  # active | passive | standby
+    soroban_submission_lease_enabled: bool = true
+    soroban_submission_lease_name: str = "ledgerlens-soroban-submitter"
+    soroban_submission_lease_duration_seconds: int = 30
 
     # ── API / security ────────────────────────────────────────────────────────
     ledgerlens_cors_allowed_origins: str = ""
@@ -227,6 +265,15 @@ class Settings(BaseSettings):
     mlflow_experiment_name: str = "ledgerlens-training"
     mlflow_tracking_enabled: bool = False
 
+    # ── Gateway (consolidated auth/quota/logging middleware) ──────────────────
+    gateway_enabled: bool = True
+    gateway_default_daily_quota: int = 100000
+    gateway_default_namespace_daily_quota: int = 0
+    gateway_default_monthly_quota: int = 0
+    gateway_default_namespace_monthly_quota: int = 0
+    gateway_quota_store: str = "sqlite"
+    gateway_log_body: bool = False
+
     # ── Performance monitoring ────────────────────────────────────────────────
     performance_min_feedback_samples: int = 20
     performance_monitoring_window_days: int = 30
@@ -243,7 +290,7 @@ class Settings(BaseSettings):
     path_payment_loader_enabled: bool = True
     path_payment_fetch_effects: bool = True
 
-    # ── Prometheus metrics ────────────────────────────────────────────────────
+    # ── Prometheus metrics ─────────────────────────────────────────────────────
     # Set to False to disable all prometheus_client metric collection.  When
     # disabled, ingestion/metrics.py returns a _NoOpCollector and GET /metrics
     # returns HTTP 503.  Useful in lightweight environments where prometheus_client
@@ -252,6 +299,52 @@ class Settings(BaseSettings):
     # URL path at which the Prometheus text metrics are served by the local API.
     # Must start with "/" and contain no dynamic segments.
     metrics_endpoint: str = "/metrics"
+
+    # ── WAF and Adaptive Rate Limiting ──────────────────────────────────────────
+    # Enable the in-process WAF middleware for request validation
+    waf_enabled: bool = True
+    # Maximum allowed request body size in bytes
+    waf_max_body_bytes: int = 1_048_576
+    # Timeout in seconds for slow request mitigation
+    waf_slow_request_timeout_seconds: float = 10.0
+    # Factor by which to tighten rate limits when abuse is detected
+    adaptive_rate_tighten_factor: float = 0.5
+    # Time window in seconds to track abuse signals
+    adaptive_rate_abuse_window_seconds: int = 300
+    # Number of abuse signals required to trigger rate limit tightening
+    adaptive_rate_abuse_threshold: int = 20
+
+    # ── Trace Sampling ──────────────────────────────────────────────────────────
+    # Sampling strategy: "static" (head-based) or "tail" (tail-based)
+    trace_sampling_strategy: str = "static"
+    # Baseline fraction of "boring" traces to keep when using tail sampling
+    trace_tail_baseline_ratio: float = 0.05
+    # Max time to wait for a trace to complete before flushing (tail sampling)
+    trace_tail_buffer_timeout_seconds: float = 30.0
+    # Maximum number of traces to buffer in memory (tail sampling)
+    trace_tail_max_buffered_traces: int = 10_000
+
+    # ── Model Cards ─────────────────────────────────────────────────────────────
+    # Directory to store generated model cards
+    model_card_dir: str = "./model_cards"
+    # Auto-generate model cards when models are promoted
+    model_card_auto_generate: bool = True
+    # Enable PDF rendering for model cards
+    model_card_pdf_enabled: bool = False
+
+    # ── Vector Similarity Search ──────────────────────────────────────────────────────
+    # Vector index backend: faiss_flat | faiss_ivf | pgvector
+    vector_index_backend: str = "faiss_flat"
+    # Dimension of the embedding vectors (64 for GraphSAGE
+    vector_index_dim: int = 64
+    # Number of wallets threshold to switch from flat to IVF index
+    vector_index_ivf_threshold: int = 50000
+    # Seconds between index refresh interval for incremental updates
+    vector_index_refresh_seconds: int = 300
+    # Path to SQLite database for storing embeddings
+    embedding_store_path: str = "./data/wallet_embeddings.db"
+    # Rate limit for similarity queries (per minute)
+    gnn_similarity_rate_limit_per_minute: int = 10
 
     # ── Parquet export (ledgerlens-data integration) ──────────────────────────
     # Default root directory for `cli.py export-parquet` output.
@@ -277,6 +370,23 @@ class Settings(BaseSettings):
     # 90 % of this limit (450 000 rows at the default).
     filter_rejected_trades_max_rows: int = 500_000
 
+    # ── SLO / Alerting targets ────────────────────────────────────────────────
+    slo_scoring_latency_target_seconds: float = 2.0
+    slo_scoring_latency_target_percent: float = 99.0
+    slo_webhook_delivery_target_percent: float = 99.0
+    slo_soroban_submission_target_percent: float = 99.0
+    slo_window_days: int = 30
+
+    # ── gRPC Internal Scoring Service ─────────────────────────────────────────
+    grpc_enabled: bool = False
+    grpc_port: int = 50051
+    grpc_max_workers: int = 10
+    grpc_tls_cert_path: str = ""
+    grpc_tls_key_path: str = ""
+    grpc_allow_insecure: bool = False
+    grpc_max_message_size_bytes: int = 4194304
+    grpc_max_batch_wallets: int = 1000
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -286,14 +396,35 @@ class Settings(BaseSettings):
                      "federated_min_participants", "cursor_flush_events",
                      "stream_checkpoint_interval", "streamer_queue_maxsize",
                      "historical_loader_concurrency", "historical_max_lookback_days",
-                     mode="before")
+                     "analyst_lock_timeout_seconds", "analyst_claim_max_active_per_analyst",
+                     "grpc_max_workers", "grpc_max_message_size_bytes", "grpc_max_batch_wallets",
+                     mode="before", check_fields=False)
     @classmethod
     def must_be_positive(cls, v: object) -> object:
         if int(v) <= 0:
             raise ValueError("must be a positive integer")
         return v
 
-    @field_validator("federated_server_port", mode="before")
+    @field_validator("slo_scoring_latency_target_percent",
+                     "slo_webhook_delivery_target_percent",
+                     "slo_soroban_submission_target_percent",
+                     mode="before")
+    @classmethod
+    def valid_slo_percent(cls, v: object) -> object:
+        val = float(v)
+        if not (0.0 <= val <= 100.0):
+            raise ValueError("must be between 0.0 and 100.0")
+        return val
+
+    @field_validator("slo_scoring_latency_target_seconds", mode="before")
+    @classmethod
+    def positive_slo_seconds(cls, v: object) -> object:
+        val = float(v)
+        if val <= 0:
+            raise ValueError("must be positive")
+        return val
+
+    @field_validator("federated_server_port", "grpc_port", mode="before")
     @classmethod
     def valid_port(cls, v: object) -> object:
         port = int(v)
@@ -330,6 +461,21 @@ class Settings(BaseSettings):
         if int(v) < 1:
             raise ValueError("COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR must be >= 1")
         return v
+
+    @field_validator("gateway_default_daily_quota", "gateway_default_namespace_daily_quota", mode="before")
+    @classmethod
+    def non_negative_gateway_quota(cls, v: object) -> object:
+        if int(v) < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    @field_validator("gateway_quota_store", mode="before")
+    @classmethod
+    def valid_gateway_quota_store(cls, v: object) -> object:
+        val = str(v).strip().lower()
+        if val not in ("sqlite", "redis"):
+            raise ValueError(f"GATEWAY_QUOTA_STORE must be 'sqlite' or 'redis', got {v!r}")
+        return val
 
     @field_validator("benford_mad_threshold", "temporal_weight",
                      "sandwich_score_weight", "benford_copula_weight",
@@ -470,6 +616,24 @@ class Settings(BaseSettings):
         val = int(v)
         if val < 1:
             raise ValueError("FILTER_REJECTED_TRADES_MAX_ROWS must be >= 1")
+        return val
+
+    @field_validator("cost_per_vcpu_hour_usd", "cost_per_gb_memory_hour_usd",
+                     "cost_per_gb_storage_month_usd", mode="before", check_fields=False)
+    @classmethod
+    def non_negative_cost(cls, v: object) -> object:
+        val = float(v)
+        if val < 0:
+            raise ValueError("Cost coefficients must be non-negative")
+        return val
+
+    @field_validator("capacity_projection_window_days",
+                     "capacity_projection_lead_time_days", mode="before", check_fields=False)
+    @classmethod
+    def positive_capacity_days(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("Capacity projection days must be >= 1")
         return val
 
     @model_validator(mode="after")

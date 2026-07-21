@@ -32,6 +32,8 @@ from stellar_sdk import scval
 
 from detection.oracle_coordinator import QuorumSignature
 from detection.risk_score import RiskScore
+from detection.soroban_lease import acquire_submission_lease
+from detection.exceptions import SubmissionLeaseError
 from detection.storage import save_submission, init_db, _connect
 from detection.zk_commitment import (
     generate_salt,
@@ -380,6 +382,10 @@ class SorobanPublisher:
         Raises SorobanSubmissionError on unrecoverable failure.
         Raises SorobanCircuitOpenError when the circuit breaker is open.
         """
+        # Ensure this region holds the submission lease before processing
+        if not acquire_submission_lease(settings.ledgerlens_region_name, settings.soroban_submission_lease_duration_seconds):
+            raise SubmissionLeaseError("Region does not hold the Soroban submission lease.")
+
         try:
             self._check_circuit()
         except SorobanCircuitOpenError as exc:
@@ -398,19 +404,45 @@ class SorobanPublisher:
 
         if dry_run:
             save_submission(score.wallet, score.asset_pair, score.score, "skipped")
+            try:
+                from api.metrics import soroban_submissions_total
+                soroban_submissions_total.labels(status="skipped").inc()
+            except Exception:
+                pass
             return None
+
+        import time
+        start_time = time.perf_counter()
 
         server = SorobanServer(self._soroban_rpc_url)
         try:
             tx_hash = self._execute_with_retries(server, score, zk_bundle=zk_bundle)
             self._record_success()
             save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash)
+            try:
+                from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
+                soroban_submissions_total.labels(status="success").inc()
+                soroban_submission_latency_seconds.observe(time.perf_counter() - start_time)
+            except Exception:
+                pass
             return tx_hash
-        except SorobanSubmissionError:
+        except SorobanSubmissionError as exc:
             save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Submission failed after retries")
+            try:
+                from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
+                soroban_submissions_total.labels(status="failed").inc()
+                soroban_submission_latency_seconds.observe(time.perf_counter() - start_time)
+            except Exception:
+                pass
             raise
-        except Exception:
+        except Exception as exc:
             save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error")
+            try:
+                from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
+                soroban_submissions_total.labels(status="failed").inc()
+                soroban_submission_latency_seconds.observe(time.perf_counter() - start_time)
+            except Exception:
+                pass
             raise
         finally:
             server.close()
@@ -516,6 +548,9 @@ class SorobanPublisher:
         transaction hash (success) or an ``"ERROR: ..."`` string (failure).
         """
         results: dict[str, str] = {}
+        # Ensure this region holds the submission lease before batch processing
+        if not acquire_submission_lease(settings.ledgerlens_region_name, settings.soroban_submission_lease_duration_seconds):
+            raise SubmissionLeaseError("Region does not hold the Soroban submission lease.")
         for s in scores:
             key = f"{s.wallet}:{s.asset_pair}"
             try:

@@ -32,6 +32,8 @@ At a high level, it does three things:
 - **📊 Scores** — assigns each wallet and each trading pair a **LedgerLens Risk Score (0–100)** based on the combined output of its Benford anomaly metrics and ML classifiers, updating continuously as new ledger data is processed
 - **📡 Reports** — exposes risk scores and flagged activity through a public API and lightweight dashboard, making the intelligence accessible to DEX users, protocol teams, wallet providers, and compliance integrators without requiring technical expertise
 
+> 🔒 **Security Model**: LedgerLens incorporates point security controls across webhooks, oracle quorums, model loading, and admin APIs. See the consolidated [STRIDE Threat Model](docs/threat_model.md) for a systematic analysis of trust boundaries.
+
 ## Features
 
 - **Benford's Law Anomaly Engine**: Chi-square, per-digit Z-score, and MAD analysis of transaction amounts across rolling time windows (1h, 4h, 24h, 7d, 30d)
@@ -51,13 +53,20 @@ At a high level, it does three things:
 
 ```mermaid
 graph TB
-    subgraph Ingestion["Layer 1: Data Ingestion"]
+    subgraph External["External Network (Trust Boundary 1: Untrusted)"]
         HOR[Stellar Horizon API]
-        STREAM[horizon_streamer.py]
-        HIST[historical_loader.py]
+        EVM[EVM RPC Providers]
+        SOL[Solana RPC]
     end
 
-    subgraph Detection["Layer 2: Detection Engine"]
+    subgraph Ingestion["Layer 1: Data Ingestion"]
+        STREAM[horizon_streamer.py]
+        HIST[historical_loader.py]
+        EVM_LOAD[evm_loader.py]
+        SOL_ADAPT[solana_adapter.py]
+    end
+
+    subgraph Detection["Layer 2: Detection Engine (Internal Trust)"]
         BENF[benford_engine.py]
         FEAT[feature_engineering.py]
         GRAPH[graph_engine.py]
@@ -67,38 +76,69 @@ graph TB
         SCORE[LedgerLens Risk Score]
     end
 
-    subgraph Output["Layer 3: Contract + API"]
+    subgraph Output["Layer 3: Contract + API (Trust Boundaries 3 & 4)"]
         CONTRACT[Soroban Contract\nledgerlens-score]
         API[FastAPI REST API]
         DASH[Web Dashboard]
         WEBHOOK[Webhook Alerts]
     end
 
-    subgraph Consumers["Ecosystem Consumers"]
+    subgraph Consumers["Ecosystem Consumers (Trust Boundary 2)"]
         AMM[AMMs / Lending Protocols]
         AGG[DEX Aggregators]
         USERS[Traders / Issuers]
+        SUB[Webhook Subscribers]
     end
 
+    subgraph Federation["Federated Learning (Trust Boundary 5)"]
+        FL_SERVER[Federated Aggregation Server]
+        FL_CLIENTS[Federated Learning Participants]
+    end
+
+    subgraph CICD["CI/CD Pipeline (Trust Boundary 6)"]
+        BUILD[CI/CD Build System]
+        MODELS[Models Storage: models/]
+    end
+
+    %% External to Ingestion
     HOR --> STREAM
     HOR --> HIST
+    EVM --> EVM_LOAD
+    SOL --> SOL_ADAPT
+
+    %% Ingestion to Engine
     STREAM --> FEAT
     HIST --> FEAT
+    EVM_LOAD --> FEAT
+    SOL_ADAPT --> FEAT
+
+    %% Engine internal
     FEAT --> BENF
     FEAT --> GRAPH
     GRAPH --> FEAT
     FEAT --> TRAIN
-    TRAIN --> INFER
-    BENF --> SCORE
+    TRAIN -->|Save Joblib| MODELS
+    MODELS -->|Load Joblib| INFER
+    BUILD -->|Build & Sign| MODELS
     INFER --> SCORE
+    BENF --> SCORE
+
+    %% Engine to Output/API
     SCORE --> SHAP
     SCORE --> CONTRACT
     SCORE --> API
+
+    %% Output to consumers
     API --> DASH
     API --> WEBHOOK
     CONTRACT -->|get_score| AMM
     CONTRACT -->|get_score| AGG
     API --> USERS
+    WEBHOOK -.->|Signed Webhook| SUB
+
+    %% Federated Learning
+    FL_CLIENTS <==>|Signed update| FL_SERVER
+    FL_SERVER -->|p_global| FEAT
 ```
 
 ### Core Components
@@ -117,6 +157,8 @@ graph TB
 - **detection/model_inference.py**: Real-time risk scoring
 - **detection/shap_explainer.py**: SHAP-based interpretability layer
 - **detection/causal_engine.py**: DoWhy structural causal model — do-calculus interventions, ATE estimation, counterfactual scores
+- **detection/embedding_store.py**: SQLite-backed store for GNN wallet embeddings (model version, embedding vector, timestamp)
+- **detection/vector_index.py**: FAISS-based approximate nearest neighbor (ANN) index for global similarity search of wallet embeddings
 
 The Soroban contract, REST API, and dashboard live in the
 `ledgerlens-contracts`, `ledgerlens-api`, and `ledgerlens-dashboard` repos
@@ -203,6 +245,8 @@ LedgerLens provides two complementary interpretability layers:
 
 The Soroban contract is the on-chain truth layer for LedgerLens risk scores.
 
+**Fuzzing & Security:** The oracle aggregator and ZK verifier contracts are continuously fuzzed using `cargo-fuzz` to detect integer overflow, authorization bypass, and malformed-input panics. See [docs/contract_fuzzing.md](docs/contract_fuzzing.md) for how to run fuzz targets locally and interpret results. All contract entrypoints are fuzz-tested on every PR (120s per target) and nightly (30min per target) to ensure composability guarantees for downstream AMMs, lending protocols, and aggregators.
+
 ### Contract Functions
 
 - `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)` - Registers a computed risk score on-chain (authorised LedgerLens service account only)
@@ -215,7 +259,7 @@ LedgerLens includes an off-chain dispute and governance mechanism for managing p
 - Committee members vote to resolve disputes; approved disputes remove the score locally and publish a `score=0` override on-chain.
 - Governance proposals allow runtime configuration changes (e.g. `risk_score_threshold`) and committee membership changes.
 
-See `docs/governance_protocol.md` for full details.
+See `docs/governance_protocol.md` for full details and [docs/threat_model.md](docs/threat_model.md) for the Soroban trust boundary analysis.
 
 - `get_score(wallet: Address, asset_pair: Symbol) -> RiskScore` - Read-only; returns the most recent risk score and timestamp for a wallet/asset pair, callable by any other Soroban contract
 
@@ -436,6 +480,18 @@ human-readable summary sentence. Supports `model` query parameter:
 [docs/shap_explanation.md](docs/shap_explanation.md) for the full caching
 strategy and TTL.
 
+#### Authentication (Gateway Middleware)
+
+All authenticated routes go through the consolidated **API Gateway**
+(`api/gateway.py`), which resolves auth, enforces quota, and logs every
+request in one pass. See [`docs/api_gateway.md`](docs/api_gateway.md) for
+the full architecture and migration guide.
+
+Authentication is resolved via (in order):
+1. `X-LedgerLens-Admin-Key` — matched against `LEDGERLENS_ADMIN_API_KEY`
+2. `X-LedgerLens-Compliance-Key` — matched against `LEDGERLENS_COMPLIANCE_API_KEY`
+3. `X-LedgerLens-Api-Key` — looked up in the canonical `api_keys` table
+
 #### CORS configuration
 
 The local API defaults to **deny-all** CORS (no browser origins are allowed
@@ -513,7 +569,9 @@ python cli.py stream          # stream trades from Horizon SSE and score increme
                               #   --overflow-strategy S    block, drop_newest, or drop_oldest
                               #   --reset-cursor           discard the saved Horizon position
 python cli.py retrain-check   # check for distribution drift and retrain if needed
+python cli.py compute-embeddings --window-days 30  # compute and store GNN embeddings for all wallets in the last 30 days
 python cli.py serve           # serve the local API
+python cli.py grpc-serve      # run the gRPC Internal Scoring Service sidecar
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
@@ -750,6 +808,19 @@ The response returns a `subscriber_id` (UUID) used for management.
 | `POST` | `/v1/feedback`      | Submit analyst label correction (admin-key required) |
 | `GET`  | `/v1/feedback`      | Paginated correction history (admin-key required)    |
 
+### Analyst Review Dashboard & Case Management
+
+| Method | Path                                       | Description                                              |
+| ------ | ------------------------------------------ | -------------------------------------------------------- |
+| `GET`  | `/analyst/queue`                           | Top 20 wallets awaiting review (with assignment state)   |
+| `GET`  | `/analyst/wallet/{wallet}`                 | Combined review view (score, SHAP, timeline, rings)      |
+| `POST` | `/analyst/wallet/{wallet}/claim`           | Claim a wallet for review (soft lock, 30 min)            |
+| `POST` | `/analyst/wallet/{wallet}/release`         | Release a claim before verdict                           |
+| `POST` | `/analyst/wallet/{wallet}/feedback`        | Submit verdict (requires active claim)                   |
+| `GET`  | `/analyst/stats`                           | Aggregate review statistics                              |
+| `GET`  | `/analyst/case-stats`                      | SLA metrics (claim/resolution times, queue depth)        |
+| `GET`  | `/analyst/feedback`                        | Export feedback for active learning loop                 |
+
 ### Cross-Chain Link Endpoints
 
 | Method | Path                                          | Description                                                |
@@ -836,11 +907,12 @@ Run as a long-lived foreground process (e.g., under systemd or supervisor).
 
 ## Observability
 
-LedgerLens ships a production-grade observability stack. See [docs/observability.md](docs/observability.md) for full details.
+LedgerLens ships a production-grade observability stack. See [docs/observability.md](docs/observability.md) for full details and [docs/threat_model.md](docs/threat_model.md) for the STRIDE threat model.
 
 - **Structured JSON logging** — every log record is valid JSON with `timestamp`, `level`, `correlation_id`, and `trace_id` fields (via [structlog](https://www.structlog.org/))
 - **Correlation IDs** — each pipeline pass and API request is assigned a UUID4 that threads through all log lines and spans; the `X-Correlation-ID` header is propagated in API responses
 - **OpenTelemetry tracing** — spans for `pipeline.run`, `model.score_batch`, `soroban.submit_score`, and `webhook.deliver`; FastAPI routes are auto-instrumented; export via OTLP gRPC or console fallback
+- **OpenLineage tracking** — START/COMPLETE/FAIL events at ingestion, feature engineering, and model training stages; supports Marquez backend and a built-in admin-only REST API (see [docs/lineage.md](docs/lineage.md))
 - **Prometheus metrics** — 10 metrics covering scoring throughput, latency, Soroban submissions, circuit breaker state, webhook delivery health, drift events, and model AUC-ROC; scraped at `GET /metrics`
 - **Alerting rules** — 5 Prometheus alert rules in `monitoring/alerts.yml` for circuit-breaker open, dead-letter backlog, feature drift, high scoring latency, and pipeline stall
 - **Wallet masking** — Stellar wallet addresses are truncated to `GABC1234...WXYZ` in all log output; no PII in metric labels
@@ -1013,9 +1085,9 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 `core` and `api` must call `submit_score` with `score` already clamped to 0-100 (see `RiskScore.combine` in `detection/risk_score.py`).
 
-### Open Integration Points (not yet implemented)
+### Open Integration Points
 
-- How `core` hands `RiskScore` records to `api` (direct DB write, message queue, or `core` calling an `api` ingestion endpoint) — see `run_pipeline.py`.
+- **[RESOLVED]** How `core` hands `RiskScore` records to `api`: Handled via an Event Bus (Kafka or NATS) configured in `.env`. See [docs/event_bus.md](docs/event_bus.md) for consumer contract details.
 - Where labelled training data lives in `ledgerlens-data` and its schema version — see `detection/model_training.py`.
 - Order-book event ingestion (needed for `round_trip_trade_frequency`, cancellation-rate features) — see TODOs in `detection/feature_engineering.py`.
 

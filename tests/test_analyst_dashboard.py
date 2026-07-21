@@ -1,7 +1,7 @@
 """Tests for the Analyst Review Dashboard API (Issue #200).
 
-Covers: empty queue, queue ordering, feedback submission, stats computation,
-and the active learning feedback export endpoint.
+Covers: empty queue, queue ordering, feedback submission (with claim lifecycle),
+stats computation, and the active learning feedback export endpoint.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from api.main import app
 from api.auth import require_admin_key
+from detection.analyst_store import claim_wallet
 from detection.risk_score import RiskScore
 from detection.storage import save_scores, init_db
 
@@ -22,6 +23,8 @@ from detection.storage import save_scores, init_db
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+ANALYST_KEY = "test_analyst_key_hash"
 
 
 def _noop_admin():
@@ -42,6 +45,8 @@ def client(tmp_path, monkeypatch):
 
     import config.settings as settings_module
     object.__setattr__(settings_module.settings, "db_path", db_path)
+    object.__setattr__(settings_module.settings, "analyst_lock_timeout_seconds", 1800)
+    object.__setattr__(settings_module.settings, "analyst_claim_max_active_per_analyst", 10)
 
     init_db(db_path)
     app.dependency_overrides[require_admin_key] = _noop_admin
@@ -58,6 +63,16 @@ def _make_score(wallet: str, score: int, asset_pair: str = "XLM/USDC") -> RiskSc
         ml_flag=score > 50,
         confidence=80,
         timestamp=datetime.now(timezone.utc),
+    )
+
+
+def _claim_and_feedback(client, wallet: str, verdict: str = "confirmed_wash",
+                        analyst_key: str = ANALYST_KEY, asset_pair: str = "XLM/USDC"):
+    """Helper: claim a wallet then submit feedback."""
+    claim_wallet(wallet, asset_pair, analyst_key, db_path=None)
+    return client.post(
+        f"/analyst/wallet/{wallet}/feedback",
+        json={"verdict": verdict, "analyst_key_hash": analyst_key},
     )
 
 
@@ -110,15 +125,27 @@ def test_analyst_queue_reviewed_wallet_excluded(client):
     wallet = "G" + "D" * 55
     save_scores([_make_score(wallet, 85)], store.settings.db_path)
 
-    # Submit feedback → wallet is now reviewed today
-    client.post(
-        f"/analyst/wallet/{wallet}/feedback",
-        json={"verdict": "confirmed_wash", "analyst_key_hash": "abc123"},
-    )
+    # Claim and submit feedback → wallet is now reviewed today
+    _claim_and_feedback(client, wallet)
 
     queue = client.get("/analyst/queue").json()
     wallets_in_queue = [r["wallet"] for r in queue]
     assert wallet not in wallets_in_queue, "Reviewed wallet must not appear in queue"
+
+
+def test_analyst_queue_assignment_annotations(client):
+    """Queue items include is_assigned, assigned_to, lock_expires_at."""
+    import detection.storage as store
+
+    wallet = "G" + "X" * 55
+    save_scores([_make_score(wallet, 85)], store.settings.db_path)
+
+    queue = client.get("/analyst/queue").json()
+    item = next(q for q in queue if q["wallet"] == wallet)
+    assert "is_assigned" in item
+    assert "assigned_to" in item
+    assert "lock_expires_at" in item
+    assert item["is_assigned"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +160,7 @@ def test_analyst_wallet_view_not_found(client):
 
 
 def test_analyst_wallet_view_all_sections(client):
-    """GET /analyst/wallet/{wallet} returns all six required data sections."""
+    """GET /analyst/wallet/{wallet} returns all required data sections."""
     import detection.storage as store
 
     wallet = "G" + "E" * 55
@@ -146,6 +173,7 @@ def test_analyst_wallet_view_all_sections(client):
     required_sections = {
         "current_score", "shap_top_10", "trade_timeline",
         "ring_membership", "score_trend", "open_alerts",
+        "assignment",
     }
     for section in required_sections:
         assert section in body, f"Missing section: {section}"
@@ -161,7 +189,7 @@ def test_analyst_wallet_view_invalid_address(client):
 
 
 # ---------------------------------------------------------------------------
-# Feedback submission tests
+# Feedback submission tests (with claim lifecycle)
 # ---------------------------------------------------------------------------
 
 
@@ -172,10 +200,7 @@ def test_submit_feedback_confirmed_wash(client):
     wallet = "G" + "F" * 55
     save_scores([_make_score(wallet, 90)], store.settings.db_path)
 
-    resp = client.post(
-        f"/analyst/wallet/{wallet}/feedback",
-        json={"verdict": "confirmed_wash", "notes": "clearly wash trading", "analyst_key_hash": "abc"},
-    )
+    resp = _claim_and_feedback(client, wallet, "confirmed_wash", ANALYST_KEY)
     assert resp.status_code == 201
     body = resp.json()
     assert body["verdict"] == "confirmed_wash"
@@ -189,10 +214,7 @@ def test_submit_feedback_false_positive(client):
     wallet = "G" + "G" * 55
     save_scores([_make_score(wallet, 72)], store.settings.db_path)
 
-    resp = client.post(
-        f"/analyst/wallet/{wallet}/feedback",
-        json={"verdict": "false_positive", "analyst_key_hash": "xyz"},
-    )
+    resp = _claim_and_feedback(client, wallet, "false_positive", ANALYST_KEY)
     assert resp.status_code == 201
     assert resp.json()["verdict"] == "false_positive"
 
@@ -204,10 +226,7 @@ def test_submit_feedback_needs_review(client):
     wallet = "G" + "H" * 55
     save_scores([_make_score(wallet, 65)], store.settings.db_path)
 
-    resp = client.post(
-        f"/analyst/wallet/{wallet}/feedback",
-        json={"verdict": "needs_review", "analyst_key_hash": "xyz"},
-    )
+    resp = _claim_and_feedback(client, wallet, "needs_review", ANALYST_KEY)
     assert resp.status_code == 201
 
 
@@ -218,9 +237,11 @@ def test_submit_feedback_invalid_verdict(client):
     wallet = "G" + "I" * 55
     save_scores([_make_score(wallet, 70)], store.settings.db_path)
 
+    claim_wallet(wallet, "XLM/USDC", ANALYST_KEY, db_path=None)
+
     resp = client.post(
         f"/analyst/wallet/{wallet}/feedback",
-        json={"verdict": "UNKNOWN_VERDICT", "analyst_key_hash": "xyz"},
+        json={"verdict": "UNKNOWN_VERDICT", "analyst_key_hash": ANALYST_KEY},
     )
     assert resp.status_code == 422
 
@@ -232,17 +253,34 @@ def test_submit_feedback_with_review_started_at(client):
     wallet = "G" + "J" * 55
     save_scores([_make_score(wallet, 80)], store.settings.db_path)
 
+    claim_wallet(wallet, "XLM/USDC", ANALYST_KEY, db_path=None)
+
     started = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     resp = client.post(
         f"/analyst/wallet/{wallet}/feedback",
         json={
             "verdict": "confirmed_wash",
-            "analyst_key_hash": "abc",
+            "analyst_key_hash": ANALYST_KEY,
             "review_started_at": started,
         },
     )
     assert resp.status_code == 201
     assert resp.json()["review_started_at"] is not None
+
+
+def test_submit_feedback_without_claim_returns_403(client):
+    """POST returns 403 when no active claim exists."""
+    import detection.storage as store
+
+    wallet = "G" + "W" * 55
+    save_scores([_make_score(wallet, 80)], store.settings.db_path)
+
+    resp = client.post(
+        f"/analyst/wallet/{wallet}/feedback",
+        json={"verdict": "confirmed_wash", "analyst_key_hash": ANALYST_KEY},
+    )
+    assert resp.status_code == 403
+    assert "claim" in resp.json()["detail"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +307,7 @@ def test_analyst_stats_cases_reviewed_today(client):
     for letter in ["K", "L", "M"]:
         w = "G" + letter * 55
         save_scores([_make_score(w, 80)], store.settings.db_path)
-        client.post(
-            f"/analyst/wallet/{w}/feedback",
-            json={"verdict": "confirmed_wash", "analyst_key_hash": "abc"},
-        )
+        _claim_and_feedback(client, w, "confirmed_wash", ANALYST_KEY)
 
     resp = client.get("/analyst/stats")
     assert resp.status_code == 200
@@ -286,10 +321,7 @@ def test_analyst_stats_false_positive_rate(client):
     for letter, verdict in [("N", "false_positive"), ("O", "confirmed_wash"), ("P", "false_positive")]:
         w = "G" + letter * 55
         save_scores([_make_score(w, 80)], store.settings.db_path)
-        client.post(
-            f"/analyst/wallet/{w}/feedback",
-            json={"verdict": verdict, "analyst_key_hash": "abc"},
-        )
+        _claim_and_feedback(client, w, verdict, ANALYST_KEY)
 
     resp = client.get("/analyst/stats")
     # 2 fp / 3 total = ~0.667
@@ -330,6 +362,7 @@ def test_feedback_export_returns_records_since_timestamp(client):
         verdict="confirmed_wash",
         notes=None,
         analyst_key_hash="abc",
+        require_claim=False,
     )
 
     since = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()

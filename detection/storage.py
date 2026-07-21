@@ -100,6 +100,30 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
         CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
+
+        CREATE TABLE IF NOT EXISTS trades (
+            paging_token TEXT PRIMARY KEY,
+            trade_id TEXT NOT NULL,
+            ledger_close_time TEXT NOT NULL,
+            base_account TEXT NOT NULL,
+            counter_account TEXT,
+            base_asset_code TEXT NOT NULL,
+            base_asset_issuer TEXT,
+            counter_asset_code TEXT NOT NULL,
+            counter_asset_issuer TEXT,
+            base_amount REAL NOT NULL,
+            counter_amount REAL NOT NULL,
+            price REAL NOT NULL,
+            base_is_seller INTEGER NOT NULL,
+            trade_type TEXT NOT NULL,
+            liquidity_pool_id TEXT,
+            transaction_hash TEXT,
+            path_payment_id TEXT,
+            hop_index INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_trades_ledger_close_time ON trades (ledger_close_time);
+        CREATE INDEX IF NOT EXISTS idx_trades_base_account ON trades (base_account);
+        CREATE INDEX IF NOT EXISTS idx_trades_counter_account ON trades (counter_account);
         """,
     ),
     (
@@ -421,8 +445,48 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON benford_baselines (asset_pair);
         """,
     ),
-]
+    (
+        16,
+        "add case_assignments table for analyst case management",
+        """
+        CREATE TABLE IF NOT EXISTS case_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            analyst_key_hash TEXT NOT NULL,
+            assigned_at TEXT NOT NULL,
+            lock_expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'assigned'
+                CHECK(status IN ('assigned', 'released', 'resolved')),
+            released_at TEXT,
+            resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_wallet
+            ON case_assignments (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_analyst
+            ON case_assignments (analyst_key_hash, status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_status
+            ON case_assignments (status);
+        CREATE INDEX IF NOT EXISTS idx_case_assignments_lock_expires
+            ON case_assignments (lock_expires_at)
+            WHERE status = 'assigned';
 
+        -- analyst_feedback table for verdicts (distinct from feedback_store's analyst_feedback)
+        CREATE TABLE IF NOT EXISTS analyst_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            notes TEXT,
+            analyst_key_hash TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            review_started_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_wallet ON analyst_feedback (wallet);
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted ON analyst_feedback (submitted_at);
+        """,
+    ),
+]
 
 
 @contextmanager
@@ -788,6 +852,7 @@ def get_latest_scores(
     benford_flag: bool | None = None,
     ml_flag: bool | None = None,
     sort_by: str = "score",
+    asset_pair: str | None = None,
 ) -> list[RiskScore]:
     """Return the most recent score for each (wallet, asset_pair) pair.
 
@@ -821,10 +886,14 @@ def get_latest_scores(
         {limit_offset}
     """
     params: list = []
-    where = ""
+    where_conditions = []
     if wallet is not None:
-        where = "WHERE wallet = ?"
+        where_conditions.append("wallet = ?")
         params.append(wallet)
+    if asset_pair is not None:
+        where_conditions.append("asset_pair = ?")
+        params.append(asset_pair)
+    where = ("WHERE " + " AND ".join(where_conditions)) if where_conditions else ""
 
     outer_conditions = []
     if benford_flag is not None:
@@ -1887,6 +1956,21 @@ def get_score_history(
     ]
 
 
+def get_scores_since(since: str, db_path: str | None = None) -> list[RiskScore]:
+    """Return all risk scores generated at or after ``since`` (ISO 8601 string)."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM risk_scores
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (since,),
+        ).fetchall()
+    return [_row_to_score(row) for row in rows]
+
+
 def save_hop_payment_cycles(
     cycles: list,
     db_path: str | None = None,
@@ -2037,6 +2121,32 @@ def get_krum_aggregation_log(
         }
         for r in rows
     ]
+
+
+def get_active_wallet_override(
+    wallet: str, db_path: str | None = None
+) -> dict | None:
+    """Return any active score override for ``wallet``, or ``None``."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT wallet, asset_pair, override_score, reason, recorded_at
+            FROM score_overrides
+            WHERE wallet = ? AND status = 'active'
+            ORDER BY recorded_at DESC LIMIT 1
+            """,
+            (wallet,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "wallet": row[0],
+        "asset_pair": row[1],
+        "override_score": row[2],
+        "reason": row[3],
+        "recorded_at": row[4],
+    }
 
 
 if __name__ == "__main__":

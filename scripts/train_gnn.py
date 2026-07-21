@@ -4,6 +4,9 @@ Usage
 -----
     python scripts/train_gnn.py --epochs 50 --lr 0.001 --neg-sample-ratio 3
 
+    # Train heterogeneous graph model
+    python scripts/train_gnn.py --graph-mode heterogeneous --conv-type sage
+
 Ground truth
     The ``ring_members`` table (columns: wallet TEXT, confirmed BOOLEAN) is used
     as positive labels.  Negative examples are wallets with risk_score < 20
@@ -18,6 +21,7 @@ Early stopping
 Output
     Saves encoder + classifier state dicts to ``models/gnn_ring_detector.pt``
     and a SHA-256 checksum to ``models/gnn_ring_detector.sha256``.
+    In heterogeneous mode, saves to ``models/gnn_ring_detector_hetero.pt``.
 """
 from __future__ import annotations
 
@@ -178,6 +182,8 @@ def train(
     out_channels: int = 64,
     num_layers: int = 3,
     dropout: float = 0.3,
+    graph_mode: str = "homogeneous",
+    conv_type: str = "sage",
 ):
     """Full training loop for GNNRingDetector.
 
@@ -206,6 +212,10 @@ def train(
         Number of SAGEConv layers.
     dropout:
         Dropout rate.
+    graph_mode:
+        ``"homogeneous"`` (wallet-only) or ``"heterogeneous"`` (wallet+asset+order).
+    conv_type:
+        Convolution type for heterogeneous mode: ``"sage"`` or ``"hgt"``.
     """
     import torch
     from sklearn.metrics import roc_auc_score
@@ -214,6 +224,8 @@ def train(
         GraphSAGEEncoder,
         RingMembershipClassifier,
         build_transaction_graph,
+        HeteroGraphSAGEEncoder,
+        build_heterogeneous_graph,
     )
 
     positives, negatives = _load_labels(db_path, neg_sample_ratio)
@@ -240,10 +252,16 @@ def train(
     logger.info("Train: %d wallets | Val: %d wallets", len(train_wallets), len(val_wallets))
 
     # Build graphs
-    # Re-build with actual trades
-    # In production this would use real trade data from the DB
     all_trades = _make_dummy_trades(list(set(train_wallets + val_wallets)), n_trades=500)
-    full_graph = build_transaction_graph(all_trades, _default_node_feature_fn)
+
+    if graph_mode == "heterogeneous":
+        full_graph = build_heterogeneous_graph(
+            trades=all_trades,
+            node_feature_fn=_default_node_feature_fn,
+        )
+    else:
+        full_graph = build_transaction_graph(all_trades, _default_node_feature_fn)
+
     wlist = full_graph["wallet"].wallet_list
 
     train_labels = []
@@ -264,14 +282,27 @@ def train(
         logger.error("No training nodes found in graph. Check that wallet addresses match.")
         sys.exit(1)
 
-    in_channels = full_graph["wallet"].x.shape[1]
-    encoder = GraphSAGEEncoder(
-        in_channels=in_channels,
-        hidden_channels=hidden_channels,
-        out_channels=out_channels,
-        num_layers=num_layers,
-        dropout=dropout,
-    )
+    # Build encoder and classifier
+    if graph_mode == "heterogeneous":
+        metadata = full_graph.metadata()
+        encoder = HeteroGraphSAGEEncoder(
+            metadata=metadata,
+            hidden_channels=hidden_channels,
+            out_channels=out_channels,
+            num_layers=num_layers,
+            aggr="mean",
+            conv_type=conv_type,
+        )
+    else:
+        in_channels = full_graph["wallet"].x.shape[1]
+        encoder = GraphSAGEEncoder(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            out_channels=out_channels,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
     classifier = RingMembershipClassifier(embedding_dim=out_channels)
 
     optimizer = torch.optim.Adam(
@@ -279,8 +310,6 @@ def train(
     )
     pos_weight = torch.tensor([float(neg_sample_ratio)], dtype=torch.float)
 
-    x = full_graph["wallet"].x
-    edge_index = full_graph["wallet", "trades", "wallet"].edge_index
     y_train = torch.tensor(train_labels, dtype=torch.float)
     train_idx_t = torch.tensor(train_idx, dtype=torch.long)
 
@@ -293,7 +322,17 @@ def train(
         classifier.train()
         optimizer.zero_grad()
 
-        embeddings = encoder(x, edge_index)
+        # Forward pass
+        if graph_mode == "heterogeneous":
+            x_dict = {nt: full_graph[nt].x for nt in full_graph.node_types}
+            edge_index_dict = {et: full_graph[et].edge_index for et in full_graph.edge_types}
+            emb_dict = encoder(x_dict, edge_index_dict)
+            embeddings = emb_dict["wallet"]
+        else:
+            x = full_graph["wallet"].x
+            edge_index = full_graph["wallet", "trades", "wallet"].edge_index
+            embeddings = encoder(x, edge_index)
+
         scores = classifier(embeddings)
         train_scores = scores[train_idx_t]
 
@@ -310,7 +349,11 @@ def train(
         encoder.eval()
         classifier.eval()
         with torch.no_grad():
-            val_embeddings = encoder(x, edge_index)
+            if graph_mode == "heterogeneous":
+                val_emb_dict = encoder(x_dict, edge_index_dict)
+                val_embeddings = val_emb_dict["wallet"]
+            else:
+                val_embeddings = encoder(x, edge_index)
             val_scores = classifier(val_embeddings)
             val_preds = val_scores[torch.tensor(val_idx, dtype=torch.long)].numpy()
 
@@ -348,28 +391,55 @@ def train(
     logger.info("Best validation AUC-ROC: %.4f", best_val_auc)
 
     os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
-    checkpoint = {
-        "encoder": best_state["encoder"],
-        "classifier": best_state["classifier"],
-        "encoder_config": {
-            "in_channels": in_channels,
-            "hidden_channels": hidden_channels,
-            "out_channels": out_channels,
-            "num_layers": num_layers,
-            "dropout": dropout,
-        },
-        "classifier_config": {"embedding_dim": out_channels},
-        "training_meta": {
-            "best_val_auc": best_val_auc,
-            "n_positives": len(positives),
-            "n_negatives": len(negatives),
-            "epochs_run": epoch,
-            "trained_at": datetime.now(timezone.utc).isoformat(),
-        },
-    }
+
+    if graph_mode == "heterogeneous":
+        checkpoint = {
+            "encoder": best_state["encoder"],
+            "classifier": best_state["classifier"],
+            "metadata": full_graph.metadata(),
+            "encoder_config": {
+                "hidden_channels": hidden_channels,
+                "out_channels": out_channels,
+                "num_layers": num_layers,
+                "aggr": "mean",
+                "conv_type": conv_type,
+            },
+            "classifier_config": {"embedding_dim": out_channels},
+            "training_meta": {
+                "best_val_auc": best_val_auc,
+                "n_positives": len(positives),
+                "n_negatives": len(negatives),
+                "epochs_run": epoch,
+                "graph_mode": "heterogeneous",
+                "conv_type": conv_type,
+                "trained_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+    else:
+        checkpoint = {
+            "encoder": best_state["encoder"],
+            "classifier": best_state["classifier"],
+            "encoder_config": {
+                "in_channels": full_graph["wallet"].x.shape[1],
+                "hidden_channels": hidden_channels,
+                "out_channels": out_channels,
+                "num_layers": num_layers,
+                "dropout": dropout,
+            },
+            "classifier_config": {"embedding_dim": out_channels},
+            "training_meta": {
+                "best_val_auc": best_val_auc,
+                "n_positives": len(positives),
+                "n_negatives": len(negatives),
+                "epochs_run": epoch,
+                "graph_mode": "homogeneous",
+                "trained_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
     torch.save(checkpoint, model_path)
     _write_checksum(model_path)
-    logger.info("Model saved to %s (val_auc=%.4f)", model_path, best_val_auc)
+    logger.info("Model saved to %s (val_auc=%.4f, mode=%s)", model_path, best_val_auc, graph_mode)
 
 
 def main():
@@ -446,6 +516,29 @@ def main():
         default=0.3,
         help="Dropout rate in the encoder.",
     )
+    parser.add_argument(
+        "--graph-mode",
+        choices=["homogeneous", "heterogeneous"],
+        default="homogeneous",
+        dest="graph_mode",
+        help=(
+            "Graph construction mode: 'homogeneous' (wallet-only, "
+            "GraphSAGEEncoder) or 'heterogeneous' (wallet+asset+order, "
+            "HeteroGraphSAGEEncoder with asset-mediated and order-lifecycle "
+            "edges)."
+        ),
+    )
+    parser.add_argument(
+        "--conv-type",
+        choices=["sage", "hgt"],
+        default="sage",
+        dest="conv_type",
+        help=(
+            "Convolution type for heterogeneous mode: 'sage' "
+            "(HeteroConv + per-edge-type SAGEConv, fast) or 'hgt' "
+            "(HGTConv with multi-head attention, more expressive)."
+        ),
+    )
     args = parser.parse_args()
 
     _check_pyg()
@@ -461,6 +554,8 @@ def main():
         out_channels=args.out_channels,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        graph_mode=args.graph_mode,
+        conv_type=args.conv_type,
     )
 
 
