@@ -1,14 +1,12 @@
 import sqlite3
 import time
-import json
 from datetime import datetime, timezone, timedelta
 import pytest
 from unittest.mock import MagicMock, patch
 
 from config.settings import settings
-from ingestion.dedup import IdempotencyKeyStore, BridgeEventDeduplicator, DedupResult, DeduplicationStats
+from ingestion.dedup import IdempotencyKeyStore, BridgeEventDeduplicator, DedupResult
 from ingestion.data_models import Trade, Asset, TradeType
-from detection.rolling_window import RollingWindowState
 from detection.storage import RiskScoreStore
 from ingestion.historical_loader import ParallelHistoricalLoader
 from ingestion.solana_adapter import SolanaAdapter

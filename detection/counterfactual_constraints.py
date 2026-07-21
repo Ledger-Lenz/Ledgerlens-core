@@ -210,7 +210,7 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _increasable("pdc_5m", max_val=1.0),
     _increasable("pdc_1h", max_val=1.0),
 
-    # --- T-GNN features (2) -------------------------------------------------
+    # --- T-GNN features (5) -------------------------------------------------
     # gnn_wash_ring_probability is the GNN's own [0, 1] suspicion estimate --
     # decreasable like any other suspicion score, with the same independent-
     # feature simplification noted for evasion_composite_score above.
@@ -218,6 +218,15 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # neighbours; a wallet lowers it by trading with lower-risk counterparties.
     _decreasable("gnn_wash_ring_probability"),
     _decreasable("gnn_neighbor_avg_score"),
+    # gnn_asset_mediated_ring_score, gnn_order_cancel_coordination_score, and
+    # gnn_funding_proximity_score are additional [0, 1] GNN suspicion scores
+    # (asset-mediated ring participation, coordinated order-cancellation
+    # timing, and shared-funding-source proximity respectively) -- each
+    # follows the same "higher = more suspicious" convention as the other GNN
+    # scores above, so all three are decreasable.
+    _decreasable("gnn_asset_mediated_ring_score"),
+    _decreasable("gnn_order_cancel_coordination_score"),
+    _decreasable("gnn_funding_proximity_score"),
     # cross_chain_round_trip_score: lowering this reduces cross-chain
     # round-trip detection signal.
     _decreasable("cross_chain_round_trip_score"),

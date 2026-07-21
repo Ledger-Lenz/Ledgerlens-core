@@ -123,7 +123,7 @@ def claim_wallet(
             (now.isoformat(), wallet, asset_pair, now.isoformat()),
         )
 
-        cur = conn.execute(
+        conn.execute(
             """
             INSERT INTO case_assignments
                 (wallet, asset_pair, analyst_key_hash, assigned_at, lock_expires_at, status)

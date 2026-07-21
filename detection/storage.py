@@ -486,6 +486,22 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted ON analyst_feedback (submitted_at);
         """,
     ),
+    (
+        17,
+        "add compliance_exports table for regulatory export audit trail",
+        """
+        CREATE TABLE IF NOT EXISTS compliance_exports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            export_type TEXT NOT NULL,
+            wallet_hash TEXT NOT NULL,
+            risk_score INTEGER NOT NULL,
+            dry_run INTEGER NOT NULL DEFAULT 0,
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_compliance_exports_timestamp
+            ON compliance_exports (timestamp);
+        """,
+    ),
 ]
 
 
@@ -1916,6 +1932,48 @@ def get_alerts(
         }
         for row in rows
     ]
+
+
+def log_compliance_export(
+    export_type: str,
+    wallet_hash: str,
+    risk_score: int,
+    dry_run: bool = False,
+    db_path: str | None = None,
+) -> None:
+    """Append an entry to the `compliance_exports` regulatory audit trail.
+
+    `wallet_hash` must already be a hashed/anonymised wallet identifier (see
+    `detection.compliance_exporter.hash_wallet`); this table is a legal audit
+    log and must never store a raw wallet address.
+    """
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO compliance_exports
+                (export_type, wallet_hash, risk_score, dry_run, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (export_type, wallet_hash, int(risk_score), int(bool(dry_run)), now),
+        )
+        conn.commit()
+
+
+def count_compliance_exports_since(since: str, db_path: str | None = None) -> int:
+    """Count `compliance_exports` rows with `timestamp >= since` (ISO 8601).
+
+    Used by `detection.compliance_exporter.export_sar_package` to enforce
+    `settings.compliance_export_rate_limit_per_hour`.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM compliance_exports WHERE timestamp >= ?",
+            (since,),
+        ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def get_score_history(

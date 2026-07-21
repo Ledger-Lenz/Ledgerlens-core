@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -157,9 +158,9 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         self._last_publish = None
         self._failures = 0
         
-        try:
-            import nats
-        except ImportError:
+        import importlib.util
+
+        if importlib.util.find_spec("nats") is None:
             logger.warning("nats-py not installed. Degrading NATSRiskScoreBus to NullEventBus behavior.")
             return
             
@@ -167,7 +168,6 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         # It's better to implement an async publish method or handle event loop inside.
         # But for nats-py which is async, we'll need an event loop.
         # Let's write a synchronous wrapper around it for the pipeline.
-        import asyncio
         self._loop = asyncio.new_event_loop()
         self._loop.run_until_complete(self._connect())
 
@@ -182,7 +182,7 @@ class NATSRiskScoreBus(RiskScoreEventBus):
             
             try:
                 await self._js.add_stream(name=self.stream, subjects=[self.subject])
-            except Exception as e:
+            except Exception:
                 # Stream might already exist
                 pass
         except Exception as e:
@@ -200,7 +200,6 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         async def _publish_all():
             nonlocal published, failed, errors
             for score in scores:
-                key = f"{score.wallet}:{score.asset_pair}"
                 value = _serialize_event(score)
                 for attempt in range(settings.event_bus_max_retries):
                     try:

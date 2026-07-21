@@ -8,7 +8,6 @@ from detection.feature_engineering import (
     _burst_overlap_count_jit,
     _burst_overlap_count_python,
     round_trip_trade_frequency,
-    cross_pair_features,
 )
 from config.settings import settings
 
@@ -110,13 +109,22 @@ def test_jit_is_faster_at_10k_trades():
 
 
 def _make_trades_df(n: int = 500):
+    """A Trade-schema DataFrame (see `ingestion.data_models.Trade`) where
+    `"acct_0"` is always the base account, for exercising
+    `round_trip_trade_frequency`.
+    """
     import pandas as pd
+
     rng = np.random.default_rng(0)
     symbols = [f"ASSET{i}" for i in range(10)]
+    base_idx = rng.integers(0, len(symbols), n)
+    counter_idx = rng.integers(0, len(symbols), n)
     return pd.DataFrame({
-        "account": ["acct_0"] * n,
-        "gave": rng.choice(symbols, n),
-        "got": rng.choice(symbols, n),
-        "pair": rng.choice(["PAIR0", "PAIR1"], n),
-        "timestamp_us": np.sort(rng.integers(0, 10**6, n)).astype(np.int64),
+        "base_account": ["acct_0"] * n,
+        "counter_account": [f"cp_{i % 20}" for i in range(n)],
+        "base_asset": [{"code": symbols[i], "issuer": None} for i in base_idx],
+        "counter_asset": [{"code": symbols[i], "issuer": None} for i in counter_idx],
+        "ledger_close_time": pd.to_datetime(
+            np.sort(rng.integers(0, 10**6, n)), unit="s", utc=True
+        ),
     })

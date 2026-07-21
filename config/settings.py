@@ -202,6 +202,10 @@ class Settings(BaseSettings):
     ledgerlens_compliance_api_key: str = ""
     ledgerlens_model_signing_key: str = ""
     ledgerlens_webhook_encryption_key: str = ""
+    # Minimum LedgerLens risk score (0-100) required to export a SAR package.
+    compliance_sar_min_score: int = 70
+    # Hourly cap on regulatory exports (SAR + Travel Rule) per `detection.compliance_exporter`.
+    compliance_export_rate_limit_per_hour: int = 10
 
     # ── ED25519 model signing ────────────────────────────────────────────────
     # Base64-encoded 32-byte ED25519 public key for model artifact signing.

@@ -70,6 +70,20 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
+@pytest.fixture
+def read_scores_headers(client):
+    """`X-LedgerLens-Api-Key` header for a key scoped to `read:scores`.
+
+    `/v1/scores/{wallet}` is gated by `Depends(require_scope("read:scores"))`
+    (kept as defense-in-depth alongside `GatewayMiddleware`, per
+    `tests/test_api_gateway.py`'s migration-regression coverage).
+    """
+    from detection.api_key_store import create_api_key
+
+    key = create_api_key(scopes=["read:scores"])
+    return {"X-LedgerLens-Api-Key": key["plaintext_key"]}
+
+
 def _score(
     wallet,
     asset_pair,
@@ -261,17 +275,17 @@ def test_list_scores_rejects_invalid_sort_by(client):
     assert response.status_code == 422
 
 
-def test_wallet_scores_not_found(client):
-    response = client.get("/v1/scores/G" + "A" * 55)
+def test_wallet_scores_not_found(client, read_scores_headers):
+    response = client.get("/v1/scores/G" + "A" * 55, headers=read_scores_headers)
     assert response.status_code == 404
 
 
-def test_wallet_scores_found(client):
+def test_wallet_scores_found(client, read_scores_headers):
     import detection.storage as storage_module
 
     save_scores([_score("G" + "A" * 55, "XLM/USDC", 80)], storage_module.settings.db_path)
 
-    response = client.get("/v1/scores/G" + "A" * 55)
+    response = client.get("/v1/scores/G" + "A" * 55, headers=read_scores_headers)
     assert response.status_code == 200
     body = response.json()
     assert "scores" in body
@@ -280,49 +294,49 @@ def test_wallet_scores_found(client):
     assert "cross_chain_links" in body
 
 
-def test_wallet_scores_validates_format(client):
+def test_wallet_scores_validates_format(client, read_scores_headers):
     valid_address = "G" + "A" * 55
-    response = client.get(f"/v1/scores/{valid_address}")
+    response = client.get(f"/v1/scores/{valid_address}", headers=read_scores_headers)
     assert response.status_code in (200, 404)
 
 
-def test_wallet_scores_rejects_too_short(client):
-    response = client.get("/v1/scores/G" + "A" * 54)
+def test_wallet_scores_rejects_too_short(client, read_scores_headers):
+    response = client.get("/v1/scores/G" + "A" * 54, headers=read_scores_headers)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
-def test_wallet_scores_rejects_too_long(client):
-    response = client.get("/v1/scores/G" + "A" * 56)
+def test_wallet_scores_rejects_too_long(client, read_scores_headers):
+    response = client.get("/v1/scores/G" + "A" * 56, headers=read_scores_headers)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
-def test_wallet_scores_rejects_non_g_start(client):
-    response = client.get("/v1/scores/" + "A" * 56)
+def test_wallet_scores_rejects_non_g_start(client, read_scores_headers):
+    response = client.get("/v1/scores/" + "A" * 56, headers=read_scores_headers)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
-def test_wallet_scores_rejects_lowercase(client):
-    response = client.get("/v1/scores/G" + "a" * 55)
+def test_wallet_scores_rejects_lowercase(client, read_scores_headers):
+    response = client.get("/v1/scores/G" + "a" * 55, headers=read_scores_headers)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
-def test_wallet_scores_rejects_invalid_character(client):
+def test_wallet_scores_rejects_invalid_character(client, read_scores_headers):
     address = "G" + "A" * 27 + "0" + "A" * 27
-    response = client.get(f"/v1/scores/{address}")
+    response = client.get(f"/v1/scores/{address}", headers=read_scores_headers)
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Stellar wallet address format."
 
 
-def test_wallet_scores_rejects_empty_string(client):
-    response = client.get("/v1/scores/%20")
+def test_wallet_scores_rejects_empty_string(client, read_scores_headers):
+    response = client.get("/v1/scores/%20", headers=read_scores_headers)
     assert response.status_code == 400
 
 
-def test_wallet_scores_cross_chain_links_present_when_bridge_data_exists(client):
+def test_wallet_scores_cross_chain_links_present_when_bridge_data_exists(client, read_scores_headers):
     """GET /scores/{wallet} includes cross_chain_links when bridge transfers exist."""
     import detection.storage as storage_module
     from datetime import datetime, timezone
@@ -346,7 +360,7 @@ def test_wallet_scores_cross_chain_links_present_when_bridge_data_exists(client)
         timestamp=datetime.now(timezone.utc),
     ), db_path=db)
 
-    response = client.get(f"/v1/scores/{stellar_wallet}")
+    response = client.get(f"/v1/scores/{stellar_wallet}", headers=read_scores_headers)
     assert response.status_code == 200
     body = response.json()
 

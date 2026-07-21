@@ -81,13 +81,11 @@ def _default_asset_fn(asset_pair: str):
 
 try:
     import torch
-    from torch_geometric.data import HeteroData
     from detection.gnn_ring_detector import (
         build_heterogeneous_graph,
         HeteroGraphSAGEEncoder,
         GNNRingDetector,
         RingMembershipClassifier,
-        _verify_model_checksum,
     )
     _HAS_PYG = True
 except ImportError:
@@ -265,7 +263,6 @@ class TestHeteroGraphSAGEEncoder:
 
     def test_single_wallet(self):
         """Encoder handles graph with a single wallet."""
-        wallets = [f"G{'E'*55}"]
         trades = []  # no edges
         graph = build_heterogeneous_graph(
             trades=trades,
@@ -408,9 +405,7 @@ class TestAssetMediatedLaunderingScenario:
 
         # Also generate some legitimate trades
         from ingestion.synthetic_data import _stellar_address
-        rng = torch.Generator().manual_seed(123)
         legit_wallets = [_stellar_address(torch.Generator()) for _ in range(20)]
-        from ingestion.synthetic_data import RoundTripProfile, NATIVE, USDC
         import numpy as np
         legit_rng = np.random.default_rng(99)
         legit_trades = []
@@ -427,6 +422,7 @@ class TestAssetMediatedLaunderingScenario:
         from detection.gnn_ring_detector import (
             build_transaction_graph,
             build_heterogeneous_graph,
+            GraphSAGEEncoder,
             HeteroGraphSAGEEncoder,
         )
 

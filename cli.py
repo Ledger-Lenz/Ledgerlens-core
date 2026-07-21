@@ -1180,11 +1180,10 @@ def db_migrate(
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
 
     if consolidate_api_keys:
-        import json
         import sqlite3
 
+        from config.settings import settings
         from detection.api_key_store import migrate_legacy_api_keys
-        from detection.api_key_store import _init_table as _init_api_keys
 
         conn = sqlite3.connect(settings.db_path)
         try:
@@ -1207,113 +1206,6 @@ def db_migrate(
             raise typer.Exit(1)
         finally:
             conn.close()
-
-
-@app.command("compute-embeddings")
-def compute_embeddings(
-    window_days: int = typer.Option(30, help="Number of days of recent trades to use for graph construction"),
-    model_path: str = typer.Option(None, help="Path to the trained GNN model (defaults to GNN_MODEL_PATH)"),
-    embedding_store_path: str = typer.Option(None, help="Path to the embedding store database (defaults to EMBEDDING_STORE_PATH)"),
-) -> None:
-    """Compute and store embeddings for all wallets using the trained GNN model."""
-    import sqlite3
-    from types import SimpleNamespace
-    from datetime import datetime, timedelta
-
-    from config.settings import settings
-    from detection.embedding_store import EmbeddingStore
-    from detection.gnn_ring_detector import (
-        GNNRingDetector,
-        build_transaction_graph,
-        _HAS_PYG,
-    )
-
-    if not _HAS_PYG:
-        typer.echo("PyTorch Geometric is not available. Cannot compute embeddings.", err=True)
-        raise typer.Exit(1)
-
-    # Load detector
-    detector = GNNRingDetector(
-        model_path=model_path or settings.gnn_model_path,
-        fallback_to_scc=settings.gnn_fallback_to_scc,
-    )
-    detector.load()
-    if not detector._fitted:
-        typer.echo("GNN model not available. Cannot compute embeddings.", err=True)
-        raise typer.Exit(1)
-
-    # Load trades from the last window_days
-    since = (datetime.now() - timedelta(days=window_days)).isoformat()
-    db_path = settings.ledgerlens_db_path
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT base_account, counter_account, base_amount,
-               base_asset_code, counter_asset_code, ledger_close_time
-        FROM trades
-        WHERE ledger_close_time >= ?
-        ORDER BY ledger_close_time DESC
-        """,
-        (since,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        typer.echo(f"No trades found in the last {window_days} days.")
-        return
-
-    typer.echo(f"Loaded {len(rows)} trades from the last {window_days} days.")
-
-    # Convert rows to Trade-like objects
-    trades = []
-    for row in rows:
-        try:
-            ts_str = row["ledger_close_time"]
-            ts = datetime.fromisoformat(ts_str).timestamp() if ts_str else 0.0
-            trades.append(
-                SimpleNamespace(
-                    base_account=row["base_account"],
-                    counter_account=row["counter_account"],
-                    base_amount=float(row["base_amount"] or 0),
-                    ledger_close_time_ts=ts,
-                    base_asset_code=row["base_asset_code"] or "XLM",
-                    counter_asset_code=row["counter_asset_code"] or "XLM",
-                )
-            )
-        except Exception as exc:
-            logger.warning(f"Skipping invalid trade row: {exc}")
-            continue
-
-    # Build graph
-    def node_feature_fn(w: str):
-        import torch
-        h = abs(hash(w)) % 10000
-        return torch.tensor(
-            [h / 10000.0, len(w) / 60.0, float(w.startswith("G")), 0.0],
-            dtype=torch.float,
-        )
-
-    graph = build_transaction_graph(trades, node_feature_fn)
-    typer.echo(f"Built graph with {len(graph['wallet'].wallet_list)} wallets.")
-
-    # Compute embeddings
-    import torch
-    with torch.no_grad():
-        embeddings = detector._encoder(graph["wallet"].x, graph["wallet", "trades", "wallet"].edge_index)
-    embeddings_np = embeddings.cpu().numpy()
-
-    # Store embeddings
-    store = EmbeddingStore(embedding_store_path or settings.embedding_store_path)
-    model_version = "gnn_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-    typer.echo(f"Storing embeddings with model version: {model_version}")
-
-    for wallet, embedding in zip(graph["wallet"].wallet_list, embeddings_np):
-        store.upsert_embedding(wallet, model_version, embedding)
-
-    typer.echo(f"Successfully stored embeddings for {len(embeddings_np)} wallets.")
 
 
 @app.command("dlq-replay")
@@ -1651,7 +1543,6 @@ def compute_embeddings(
     embeddings = detector.get_embeddings(data)
     wallet_ids = data["wallet"].wallet_list
     # Convert embeddings to numpy array
-    import torch
     embeddings = embeddings.cpu().numpy()
     typer.echo(f"Computed embeddings for {len(wallet_ids)} wallets")
 

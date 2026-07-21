@@ -5,22 +5,22 @@
     gateway transition (see ``docs/api_gateway.md``). New code should rely
     on :class:`api.gateway.GatewayMiddleware` instead.
 
-Provides three dependency factories that delegate to the consolidated
+Provides two dependency factories that delegate to the consolidated
 :mod:`api.gateway` module:
 
 - :func:`require_admin_key` — delegates to gateway admin-key check.
 - :func:`require_compliance_key` — delegates to gateway compliance-key check.
-- :func:`require_api_key_scope` — delegates to gateway scoped API key check.
+
+The gateway migration (see ``docs/api_gateway.md``) replaced the previous
+per-router scoped API key dependency with ``api.gateway.GatewayMiddleware`` /
+``api.gateway.scope_required``; there is no scoped-key dependency here to
+keep in sync with that migration.
 """
 
-import hashlib
 import logging
 import secrets
-import time
-from collections import defaultdict
-from datetime import datetime, timezone
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Header, HTTPException
 
 from config.settings import settings
 
@@ -58,103 +58,3 @@ def require_compliance_key(x_ledgerlens_compliance_key: str = Header(default="")
         x_ledgerlens_compliance_key, settings.compliance_api_key
     ):
         raise HTTPException(status_code=403, detail="Missing or invalid compliance:read scope")
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatible scoped API key dependency (delegates to gateway)
-# ---------------------------------------------------------------------------
-
-_rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
-_RATE_WINDOW = 60.0
-
-
-def _hash_key(plaintext: str) -> str:
-    return hashlib.blake2b(plaintext.encode(), digest_size=32).hexdigest()
-
-
-def require_api_key_scope(required_scope: str):
-    """Return a FastAPI dependency that validates ``X-LedgerLens-Api-Key``.
-
-    The dependency:
-    1. Hashes the provided key with BLAKE2b-256.
-    2. Looks up the hash in the ``api_keys`` table.
-    3. Checks revocation status → 401 if revoked.
-    4. Checks expiry → 401 if expired.
-    5. Checks scope → 403 if ``required_scope`` not in key's scopes.
-    6. Enforces per-key rate limit (Redis sliding window, local fallback) → 429.
-       Uses adaptive rate limiting if abuse is detected.
-    7. Updates ``last_used_at`` asynchronously.
-
-    A missing header returns 401 so clients know authentication is required.
-    """
-
-    async def _dependency(
-        request: Request,
-        x_ledgerlens_api_key: str = Header(default=""),
-    ) -> None:
-        if not x_ledgerlens_api_key:
-            raise HTTPException(
-                status_code=401,
-                detail="Missing X-LedgerLens-Api-Key header",
-            )
-
-        from detection.api_key_store import get_api_key_by_hash, touch_api_key_last_used
-
-        key_hash = _hash_key(x_ledgerlens_api_key)
-        record = get_api_key_by_hash(key_hash)
-
-        if record is None:
-            raise HTTPException(status_code=401, detail="Invalid API key")
-
-        if record.get("revoked"):
-            raise HTTPException(status_code=401, detail="API key has been revoked")
-
-        if record.get("expires_at"):
-            try:
-                exp = datetime.fromisoformat(record["expires_at"])
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-                if datetime.now(timezone.utc) > exp:
-                    raise HTTPException(status_code=401, detail="API key has expired")
-            except (ValueError, TypeError):
-                pass
-
-        scopes = set(s.strip() for s in record.get("scopes", "").split(",") if s.strip())
-        if required_scope not in scopes and "admin" not in scopes:
-            raise HTTPException(
-                status_code=403,
-                detail=f"API key lacks required scope '{required_scope}'",
-            )
-
-        # Get effective limit with adaptive rate limiting
-        key_id = record["key_id"]
-        namespace_id = record.get("namespace_id", "")
-        from api.adaptive_rate_limiter import get_adaptive_limiter
-        adaptive_limiter = get_adaptive_limiter()
-        limit = adaptive_limiter.effective_limit(key_id, record["rate_limit_per_minute"])
-
-        allowed, retry_after = _check_rate_limit_redis(key_id, limit)
-        if allowed is None:
-            # Redis unavailable — use local fallback
-            allowed, retry_after = _check_rate_limit_local(key_id, limit)
-
-        key_id = record["key_id"]
-        limit = record["rate_limit_per_minute"]
-        allowed, retry_after = _rate_check(key_id, limit)
-        if not allowed:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limit exceeded: {limit} requests per minute",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-        try:
-            touch_api_key_last_used(key_id)
-        except Exception:
-            pass
-
-        # Store key info on request for later response recording
-        request.state.key_id = key_id
-        request.state.namespace_id = namespace_id
-
-    return _dependency

@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import base64
 import os
-import sqlite3
 import threading
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,11 +22,9 @@ from detection.analyst_store import (
     claim_wallet,
     expire_stale_locks,
     get_active_claim,
-    get_analyst_queue,
     get_case_stats,
     release_wallet,
     resolve_claim,
-    submit_analyst_feedback,
 )
 from detection.risk_score import RiskScore
 from detection.storage import init_db, save_scores

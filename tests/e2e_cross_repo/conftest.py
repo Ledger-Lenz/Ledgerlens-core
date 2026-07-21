@@ -1,11 +1,9 @@
 
 import os
 import time
-import json
 import subprocess
 from pathlib import Path
 from typing import Generator
-from urllib.parse import urljoin
 
 import pytest
 import requests

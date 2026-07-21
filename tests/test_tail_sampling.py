@@ -1,7 +1,9 @@
 import time
 import unittest
 
-from detection.tracing import TailSamplingSpanProcessor, _BufferedTrace
+from opentelemetry.trace import StatusCode
+
+from detection.tracing import TailSamplingSpanProcessor
 
 
 class TestTailSamplingPolicies(unittest.TestCase):
@@ -20,7 +22,7 @@ class TestTailSamplingPolicies(unittest.TestCase):
         # Create a mock span with error status
         class MockSpan:
             def __init__(self, has_error, is_root=True):
-                self.status = type('obj', (object,), {'status_code': has_error and 2 or 1})()
+                self.status = type('obj', (object,), {'status_code': StatusCode.ERROR if has_error else StatusCode.OK})()
                 self.name = "test"
                 self.parent = None if is_root else type('obj', (object,), {'span_id': 123})()
                 self.attributes = {}
@@ -50,14 +52,15 @@ class TestTailSamplingPolicies(unittest.TestCase):
 
         class MockSpan:
             def __init__(self, trace_id):
-                self.status = type('obj', (object,), {'status_code': 1})()
+                self.trace_id = trace_id
+                self.status = type('obj', (object,), {'status_code': StatusCode.OK})()
                 self.name = "test"
                 self.parent = None
                 self.attributes = {}
                 self.start_time = time.time_ns()
                 self.end_time = self.start_time + 1_000_000
             def get_span_context(self):
-                return type('obj', (object,), {'trace_id': trace_id})()
+                return type('obj', (object,), {'trace_id': self.trace_id})()
             def set_attribute(self, key, value): pass
 
         # Create many traces
