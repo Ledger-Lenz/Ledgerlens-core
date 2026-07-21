@@ -167,6 +167,18 @@ class Settings(BaseSettings):
     openlineage_namespace: str = "ledgerlens-core"
     lineage_queue_maxsize: int = 1000
 
+    # ── Event Bus (RiskScore Handoff) ─────────────────────────────────────────
+    event_bus_backend: str = "none"  # none | kafka | nats
+    event_bus_kafka_bootstrap_servers: str = "localhost:9092"
+    event_bus_kafka_topic: str = "ledgerlens.riskscore.v1"
+    event_bus_kafka_sasl_password: str = ""
+    event_bus_nats_servers: str = "nats://localhost:4222"
+    event_bus_nats_subject: str = "ledgerlens.riskscore.v1"
+    event_bus_nats_token: str = ""
+    event_bus_publish_timeout_seconds: float = 5.0
+    event_bus_max_retries: int = 3
+    event_bus_retry_backoff_seconds: float = 1.0
+
     # ── Downstream services ───────────────────────────────────────────────────
     ledgerlens_api_url: str = "http://localhost:8000"
     ledgerlens_score_contract_id: str = ""
@@ -177,6 +189,12 @@ class Settings(BaseSettings):
     network_passphrase: str = "Test SDF Network ; September 2015"
     soroban_circuit_breaker_threshold: int = 5
     soroban_circuit_reset_seconds: int = 300
+    # Multi‑region configuration
+    ledgerlens_region_name: str = "us-east-1"
+    ledgerlens_region_role: str = "active"  # active | passive | standby
+    soroban_submission_lease_enabled: bool = true
+    soroban_submission_lease_name: str = "ledgerlens-soroban-submitter"
+    soroban_submission_lease_duration_seconds: int = 30
 
     # ── API / security ────────────────────────────────────────────────────────
     ledgerlens_cors_allowed_origins: str = ""

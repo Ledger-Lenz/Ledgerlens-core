@@ -1,0 +1,36 @@
+[package]
+name = "zk-verifier-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+ledgerlens-zk-verifier = { path = ".." }
+soroban-sdk = { workspace = true }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_submit_score"
+path = "fuzz_targets/fuzz_submit_score.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_verify_threshold"
+path = "fuzz_targets/fuzz_verify_threshold.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_auth_bypass"
+path = "fuzz_targets/fuzz_auth_bypass.rs"
+test = false
+doc = false

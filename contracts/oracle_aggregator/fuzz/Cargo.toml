@@ -1,0 +1,36 @@
+[package]
+name = "oracle-aggregator-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+oracle_aggregator = { path = ".." }
+soroban-sdk = { workspace = true }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_submit_with_quorum"
+path = "fuzz_targets/fuzz_submit_with_quorum.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_canonical_message"
+path = "fuzz_targets/fuzz_canonical_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_auth_bypass"
+path = "fuzz_targets/fuzz_auth_bypass.rs"
+test = false
+doc = false
