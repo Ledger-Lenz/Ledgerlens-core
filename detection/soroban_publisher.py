@@ -466,19 +466,28 @@ class SorobanPublisher:
         try:
             source_account = server.load_account(self._keypair.public_key)
 
-            # Convert signatures to Soroban Vector of pairs
+            # Each signature is a `SignaturePair` struct on the contract side.
+            # A Soroban `#[contracttype]` struct with named fields is encoded as
+            # an SCV_MAP keyed by field-name symbols, sorted lexicographically —
+            # not as a positional vector.
             sig_pairs = []
             for pub, sig in quorum.signatures:
                 sig_pairs.append(
-                    scval.to_vec([
-                        scval.to_bytes(bytes.fromhex(pub)),
-                        scval.to_bytes(bytes.fromhex(sig)),
-                    ])
+                    scval.to_map({
+                        scval.to_symbol("public_key"): scval.to_bytes(bytes.fromhex(pub)),
+                        scval.to_symbol("signature"): scval.to_bytes(bytes.fromhex(sig)),
+                    })
                 )
 
             params = [
                 scval.to_address(wallet),
-                scval.to_symbol(asset_pair),
+                # `asset_pair` must be an SCV_STRING, not an SCV_SYMBOL: real
+                # pairs ("XLM/USDC", "USDC:GABC…/XLM") contain characters
+                # outside the Symbol charset [a-zA-Z0-9_] and can exceed its
+                # 32-character limit. The Python SDK does not validate this, so
+                # a Symbol here is accepted locally and rejected by the host at
+                # simulation time.
+                scval.to_string(asset_pair),
                 scval.to_uint32(max(0, min(100, score))),
                 scval.to_uint64(timestamp),
                 scval.to_vec(sig_pairs),
