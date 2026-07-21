@@ -101,6 +101,10 @@ config:
   RISK_SCORE_THRESHOLD: "70"
   # Feature store
   REDIS_URL: "redis://redis:6379/0"
+  # Per-key rate-limit backend: "redis" is required for correct enforcement
+  # under this chart's default multi-replica topology (replicaCount below,
+  # autoscaling.maxReplicas) — see docs/waf_and_rate_limiting.md.
+  GATEWAY_QUOTA_STORE: "redis"
   FEATURE_STORE_TTL_HOURS: "48"
   FEATURE_STORE_FLUSH_INTERVAL_SECONDS: "300"
   # Model artifacts

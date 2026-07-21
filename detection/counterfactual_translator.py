@@ -157,6 +157,9 @@ _TRANSLATIONS.update(
         "amm_volume_concentration": "Reduce the volume you move through any single AMM pool relative to that pool's liquidity.",
         "amm_tenure_ratio": "Hold AMM liquidity-pool positions for longer instead of depositing and withdrawing in rapid succession.",
         "gnn_wash_ring_prob": "Change your trading-graph neighbourhood and behaviour so it no longer resembles a detected wash-ring pattern.",
+        "gnn_asset_mediated_ring_score": "Change your trading-graph neighbourhood so your trades no longer resemble a ring coordinated through shared assets.",
+        "gnn_order_cancel_coordination_score": "Reduce order placement/cancellation patterns that are coordinated in time with other wallets.",
+        "gnn_funding_proximity_score": "Increase the graph distance between your wallet's funding source and other flagged wallets.",
         "adversarial_feature_score": (
             "Address the underlying evasion signals (timing regularity, counterparty rotation, decoy "
             "trades, and jitter structure) that this composite score is derived from."

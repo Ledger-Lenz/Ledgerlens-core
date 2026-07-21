@@ -46,25 +46,9 @@ def test_waf_blocks_oversized_body():
     assert response.status_code == 413
 
 
-def test_adaptive_rate_limiter():
-    from api.adaptive_rate_limiter import AdaptiveNamespaceRateLimiter
-    limiter = AdaptiveNamespaceRateLimiter(
-        tighten_factor=0.5,
-        abuse_window_seconds=300,
-        abuse_threshold=5
-    )
-    key_id = "test-key-123"
-    namespace_id = "test-namespace"
-    
-    # Initially effective limit should be same as configured
-    assert limiter.effective_limit(key_id, 60) == 60
-    
-    # Record enough abuse signals to trigger tightening
-    for i in range(5):
-        limiter.record_response(key_id, 400, False, namespace_id)
-    
-    # Effective limit should now be 30
-    assert limiter.effective_limit(key_id, 60) == 30
-    
-    # Should not go below 1
-    assert limiter.effective_limit(key_id, 1) == 1
+# NOTE: api/adaptive_rate_limiter.py was removed (see docs/waf_and_rate_limiting.md
+# "Adaptive Rate Limiting (removed)"). It was unreachable from any real request
+# (its only caller, api.auth.require_api_key_scope, was itself dead code) and was
+# independently broken (referenced undefined functions). Distributed per-key
+# rate limiting is now handled by detection/rate_limiter.py; see
+# tests/test_rate_limiter.py.

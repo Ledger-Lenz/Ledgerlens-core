@@ -192,7 +192,7 @@ class Settings(BaseSettings):
     # Multi‑region configuration
     ledgerlens_region_name: str = "us-east-1"
     ledgerlens_region_role: str = "active"  # active | passive | standby
-    soroban_submission_lease_enabled: bool = true
+    soroban_submission_lease_enabled: bool = True
     soroban_submission_lease_name: str = "ledgerlens-soroban-submitter"
     soroban_submission_lease_duration_seconds: int = 30
 
@@ -271,7 +271,17 @@ class Settings(BaseSettings):
     gateway_default_namespace_daily_quota: int = 0
     gateway_default_monthly_quota: int = 0
     gateway_default_namespace_monthly_quota: int = 0
-    gateway_quota_store: str = "sqlite"
+    # "redis": per-key rate limits are enforced via the shared, distributed
+    #   sliding-window counter in detection/rate_limiter.py — required for
+    #   correct enforcement under the documented multi-replica topology
+    #   (helm/ledgerlens/values.yaml: replicaCount 2, autoscaling to 10) and
+    #   across the REST/gRPC process split. Falls back to a local in-process
+    #   window (logged + metered) if Redis is unreachable.
+    # "sqlite": explicit opt-out — always use the local in-process window,
+    #   never attempt Redis. Only correct for a genuine single-process
+    #   deployment (e.g. local dev); named for backward compatibility with
+    #   the pre-existing setting.
+    gateway_quota_store: str = "redis"
     gateway_log_body: bool = False
 
     # ── Performance monitoring ────────────────────────────────────────────────
@@ -300,19 +310,13 @@ class Settings(BaseSettings):
     # Must start with "/" and contain no dynamic segments.
     metrics_endpoint: str = "/metrics"
 
-    # ── WAF and Adaptive Rate Limiting ──────────────────────────────────────────
+    # ── WAF ────────────────────────────────────────────────────────────────────
     # Enable the in-process WAF middleware for request validation
     waf_enabled: bool = True
     # Maximum allowed request body size in bytes
     waf_max_body_bytes: int = 1_048_576
     # Timeout in seconds for slow request mitigation
     waf_slow_request_timeout_seconds: float = 10.0
-    # Factor by which to tighten rate limits when abuse is detected
-    adaptive_rate_tighten_factor: float = 0.5
-    # Time window in seconds to track abuse signals
-    adaptive_rate_abuse_window_seconds: int = 300
-    # Number of abuse signals required to trigger rate limit tightening
-    adaptive_rate_abuse_threshold: int = 20
 
     # ── Trace Sampling ──────────────────────────────────────────────────────────
     # Sampling strategy: "static" (head-based) or "tail" (tail-based)
