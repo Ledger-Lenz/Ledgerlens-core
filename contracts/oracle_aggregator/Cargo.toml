@@ -42,6 +42,14 @@ rand_core = "0.6"
 # Mirrors the Python side's hashlib.sha256 for the cross-language parity vector.
 sha2 = "0.10"
 
+# Passthrough feature so the fuzz sub-crate (contracts/oracle_aggregator/fuzz),
+# which depends on soroban-sdk's `testutils` directly rather than via our own
+# [dev-dependencies], can also request it -- see the `extern crate std` cfg
+# at the top of src/lib.rs for why this is needed. Mirrors the identical
+# feature in contracts/zk_verifier/Cargo.toml.
+[features]
+testutils = ["soroban-sdk/testutils"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

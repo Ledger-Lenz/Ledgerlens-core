@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.3", features = ["derive"] }
-oracle_aggregator = { path = ".." }
+oracle_aggregator = { path = "..", features = ["testutils"] }
 # Deliberately not `{ workspace = true }`: this crate declares its own
 # [workspace] below (to stay isolated from the parent Cargo workspace, per
 # the standard cargo-fuzz pattern), so it has no workspace.dependencies
