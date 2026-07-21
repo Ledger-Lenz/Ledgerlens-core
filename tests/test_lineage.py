@@ -2,7 +2,6 @@ import json
 import logging
 import queue
 import sqlite3
-import time
 import pytest
 from unittest.mock import MagicMock
 

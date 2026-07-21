@@ -14,6 +14,7 @@ data:
   BENFORD_MAD_THRESHOLD: {{ .Values.config.BENFORD_MAD_THRESHOLD | quote }}
   RISK_SCORE_THRESHOLD: {{ .Values.config.RISK_SCORE_THRESHOLD | quote }}
   REDIS_URL: {{ .Values.config.REDIS_URL | quote }}
+  GATEWAY_QUOTA_STORE: {{ .Values.config.GATEWAY_QUOTA_STORE | quote }}
   FEATURE_STORE_TTL_HOURS: {{ .Values.config.FEATURE_STORE_TTL_HOURS | quote }}
   FEATURE_STORE_FLUSH_INTERVAL_SECONDS: {{ .Values.config.FEATURE_STORE_FLUSH_INTERVAL_SECONDS | quote }}
   MODEL_DIR: {{ .Values.config.MODEL_DIR | quote }}

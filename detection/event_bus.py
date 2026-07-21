@@ -158,7 +158,7 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         self._failures = 0
         
         try:
-            import nats
+            import nats  # noqa: F401 -- availability probe; re-imported properly in _connect()
         except ImportError:
             logger.warning("nats-py not installed. Degrading NATSRiskScoreBus to NullEventBus behavior.")
             return
@@ -182,7 +182,7 @@ class NATSRiskScoreBus(RiskScoreEventBus):
             
             try:
                 await self._js.add_stream(name=self.stream, subjects=[self.subject])
-            except Exception as e:
+            except Exception:
                 # Stream might already exist
                 pass
         except Exception as e:
@@ -200,7 +200,6 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         async def _publish_all():
             nonlocal published, failed, errors
             for score in scores:
-                key = f"{score.wallet}:{score.asset_pair}"
                 value = _serialize_event(score)
                 for attempt in range(settings.event_bus_max_retries):
                     try:

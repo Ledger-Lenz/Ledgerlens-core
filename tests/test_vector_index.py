@@ -1,4 +1,3 @@
-import pytest
 import numpy as np
 
 from detection.vector_index import create_vector_index, FaissVectorIndex

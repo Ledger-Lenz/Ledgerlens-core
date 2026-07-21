@@ -8,7 +8,6 @@ from detection.feature_engineering import (
     _burst_overlap_count_jit,
     _burst_overlap_count_python,
     round_trip_trade_frequency,
-    cross_pair_features,
 )
 from config.settings import settings
 

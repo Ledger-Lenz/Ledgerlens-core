@@ -1,21 +1,25 @@
 """API key management with scoped permissions and per-key rate limiting (Issue #195).
 
 Keys are stored as BLAKE2b hashes — the plaintext is returned once on creation and
-never persisted. Per-key rate limiting uses an in-process sliding window counter
-(no Redis dependency required for the store itself).
+never persisted. Per-key rate limiting delegates to :mod:`detection.rate_limiter`,
+a Redis-backed distributed sliding-window counter (with an in-process fallback
+when Redis is unreachable) shared by every enforcement path — the REST gateway
+(``api/gateway.py``), the legacy ``require_scope`` dependency (``api/api_key_router.py``),
+and the gRPC scoring service (``api/grpc_scoring_service.py``). See
+``docs/waf_and_rate_limiting.md`` for the distributed design and its
+consistency/failure-mode tradeoffs.
 """
 
 import hashlib
 import logging
 import secrets
 import sqlite3
-import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from threading import Lock
 from typing import Optional
 
 from config.settings import settings
+from detection.rate_limiter import check_rate_limit as _distributed_check_rate_limit
 
 logger = logging.getLogger("ledgerlens.api_key_store")
 
@@ -41,10 +45,6 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_namespace ON api_keys (namespace_id);
 """
 
 _VALID_SCOPES = {"read:scores", "write:suppressions", "admin"}
-
-# In-process sliding window: {key_id -> [timestamps]}
-_rate_windows: dict[str, list[float]] = {}
-_rate_lock = Lock()
 
 
 @contextmanager
@@ -200,22 +200,16 @@ def lookup_key(plaintext: str) -> Optional[dict]:
 
 
 def check_rate_limit(key_id: str, limit_per_minute: int) -> tuple[bool, int]:
-    """Check sliding-window rate limit. Returns (allowed, retry_after_seconds)."""
-    now = time.monotonic()
-    window = 60.0
-    cutoff = now - window
+    """Check the per-key per-minute rate limit. Returns (allowed, retry_after_seconds).
 
-    with _rate_lock:
-        timestamps = _rate_windows.get(key_id, [])
-        timestamps = [t for t in timestamps if t > cutoff]
-        if len(timestamps) >= limit_per_minute:
-            oldest = timestamps[0]
-            retry_after = int(window - (now - oldest)) + 1
-            _rate_windows[key_id] = timestamps
-            return False, retry_after
-        timestamps.append(now)
-        _rate_windows[key_id] = timestamps
-        return True, 0
+    Delegates to :func:`detection.rate_limiter.check_rate_limit` — a Redis-backed
+    sliding-window counter shared across every replica and both protocols (REST
+    and gRPC), falling back to a local in-process window only while Redis is
+    unreachable. This is the single, canonical rate-limit check: every
+    enforcement path (``api/gateway.py``, ``api/api_key_router.py``,
+    ``api/grpc_scoring_service.py``) calls this same function.
+    """
+    return _distributed_check_rate_limit(key_id, limit_per_minute)
 
 
 def list_api_keys() -> list[dict]:

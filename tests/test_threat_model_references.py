@@ -1,4 +1,3 @@
-import os
 import re
 import pathlib
 
@@ -66,6 +65,6 @@ def test_threat_model_file_references():
                 missing_files.append((ref, str(target_path)))
                 
     assert not missing_files, (
-        f"The following file references in docs/threat_model.md are broken:\n"
+        "The following file references in docs/threat_model.md are broken:\n"
         + "\n".join([f"- '{ref}' (resolved to '{resolved}')" for ref, resolved in missing_files])
     )

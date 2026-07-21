@@ -262,6 +262,15 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # scorer -- decreasable for the same reason.
     _decreasable("gnn_wash_ring_prob"),
 
+    # --- Heterogeneous GNN graph scores (3) -----------------------------------
+    # asset-mediated ring / order-cancellation-coordination / funding-proximity
+    # probabilities from the heterogeneous GraphSAGE/HGT model
+    # (detection/feature_engineering.py). Same [0, 1] "higher = more
+    # suspicious" semantics as gnn_wash_ring_prob -- decreasable.
+    _decreasable("gnn_asset_mediated_ring_score"),
+    _decreasable("gnn_order_cancel_coordination_score"),
+    _decreasable("gnn_funding_proximity_score"),
+
     # --- Adversarial composite (1) --------------------------------------------
     # adversarial_feature_score is a direct copy of evasion_composite_score
     # (see detection/feature_engineering.py); same constraint applies.

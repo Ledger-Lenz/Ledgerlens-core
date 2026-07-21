@@ -426,7 +426,7 @@ class SorobanPublisher:
             except Exception:
                 pass
             return tx_hash
-        except SorobanSubmissionError as exc:
+        except SorobanSubmissionError:
             save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Submission failed after retries")
             try:
                 from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
@@ -435,7 +435,7 @@ class SorobanPublisher:
             except Exception:
                 pass
             raise
-        except Exception as exc:
+        except Exception:
             save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error")
             try:
                 from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds

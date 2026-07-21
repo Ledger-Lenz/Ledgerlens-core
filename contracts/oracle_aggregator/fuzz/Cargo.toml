@@ -11,7 +11,15 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.3", features = ["derive"] }
 oracle_aggregator = { path = ".." }
-soroban-sdk = { workspace = true }
+# Deliberately not `{ workspace = true }`: this crate declares its own
+# [workspace] below (to stay isolated from the parent Cargo workspace, per
+# the standard cargo-fuzz pattern), so it has no workspace.dependencies
+# table of its own to inherit from. Pin the same version as the parent
+# workspace's [workspace.dependencies] (root Cargo.toml) explicitly instead.
+# `testutils` gates Address::generate/mock_all_auths/Ledger::set_timestamp,
+# used throughout fuzz_targets/*.rs to build test Envs -- mirrors
+# oracle_aggregator's own [dev-dependencies] soroban-sdk features.
+soroban-sdk = { version = "21.0", features = ["testutils", "alloc"] }
 
 # Prevent this from interfering with workspaces
 [workspace]

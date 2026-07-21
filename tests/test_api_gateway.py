@@ -14,15 +14,12 @@ Covers:
 
 from __future__ import annotations
 
-import json
-import re
 import sqlite3
-import time
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from config.settings import settings as _settings
@@ -213,7 +210,6 @@ def test_gateway_per_minute_rate_limit(app, db_path):
 
 def test_gateway_daily_quota(app, db_path):
     """A request exceeding the daily quota returns 429 with X-LedgerLens-Quota-Reset."""
-    from detection.api_key_store import create_api_key, log_gateway_request
 
     key_id = "test-quota-key"
     plaintext = f"ll_{'a' * 43}"
@@ -261,7 +257,7 @@ def test_gateway_daily_quota(app, db_path):
 
 def test_migration_consolidation(db_path):
     """The migration adds canonical columns and populates key_id for all existing rows."""
-    from detection.api_key_store import migrate_legacy_api_keys, _init_table, _connect
+    from detection.api_key_store import migrate_legacy_api_keys, _init_table
     import hashlib
 
     _init_table()
@@ -327,11 +323,10 @@ def test_migration_consolidation(db_path):
     conn.commit()
 
     # Run migration — adds canonical columns, populates key_id
-    mig_result = migrate_legacy_api_keys(conn)
+    migrate_legacy_api_keys(conn)
     conn.close()
 
     conn2 = sqlite3.connect(_settings.db_path)
-    canonical_count = conn2.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
     columns = {r[1] for r in conn2.execute("PRAGMA table_info(api_keys)").fetchall()}
     conn2.close()
     assert "daily_quota" in columns, "Canonical schema should have daily_quota column"
@@ -366,7 +361,7 @@ def test_migration_idempotent(db_path):
     conn.commit()
 
     # Run migration twice — should not raise
-    report1 = migrate_legacy_api_keys(conn)
+    migrate_legacy_api_keys(conn)
     report2 = migrate_legacy_api_keys(conn)
     conn.close()
 
@@ -506,7 +501,6 @@ def test_correlation_id_in_response(app, canonical_api_key, db_path):
 def test_gateway_key_created_via_different_router_still_works(app, db_path):
     """A key created via the deprecated api_keys_router schema should still work
     after migration through the canonical store."""
-    from detection.api_key_store import _hash_key as canonical_hash
     from detection.api_key_store import migrate_legacy_api_keys
     import hashlib
 

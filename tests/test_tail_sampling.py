@@ -1,7 +1,7 @@
 import time
 import unittest
 
-from detection.tracing import TailSamplingSpanProcessor, _BufferedTrace
+from detection.tracing import TailSamplingSpanProcessor
 
 
 class TestTailSamplingPolicies(unittest.TestCase):
@@ -50,6 +50,7 @@ class TestTailSamplingPolicies(unittest.TestCase):
 
         class MockSpan:
             def __init__(self, trace_id):
+                self.trace_id = trace_id
                 self.status = type('obj', (object,), {'status_code': 1})()
                 self.name = "test"
                 self.parent = None
@@ -57,7 +58,7 @@ class TestTailSamplingPolicies(unittest.TestCase):
                 self.start_time = time.time_ns()
                 self.end_time = self.start_time + 1_000_000
             def get_span_context(self):
-                return type('obj', (object,), {'trace_id': trace_id})()
+                return type('obj', (object,), {'trace_id': self.trace_id})()
             def set_attribute(self, key, value): pass
 
         # Create many traces

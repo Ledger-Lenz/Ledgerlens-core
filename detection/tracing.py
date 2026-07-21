@@ -29,7 +29,6 @@ import os
 import random
 import threading
 import time
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, AsyncGenerator, Callable, Generator
 
@@ -45,7 +44,6 @@ try:
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-    from opentelemetry.sdk.trace.sampling import Sampler, SamplingResult, Decision
     from opentelemetry.trace import StatusCode
 
     _OTEL_AVAILABLE = True

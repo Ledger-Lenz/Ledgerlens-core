@@ -1,6 +1,5 @@
 import time
 import requests
-from typing import Tuple
 
 HEALTH_URL = "http://localhost:8000/health"
 METRICS_URL = "http://localhost:8000/metrics"

@@ -525,9 +525,7 @@ if _HAS_PYG:
                 else:
                     conv_dict: dict = {}
                     for edge_type in edge_types:
-                        # Determine in_channels for source node type
-                        src_type = edge_type[0]
-                        # Use -1 to let SAGEConv auto-infer from input
+                        # Use -1 to let SAGEConv auto-infer in_channels from input
                         conv_dict[edge_type] = SAGEConv((-1, -1), hidden_channels)
                     conv = HeteroConv(conv_dict, aggr=aggr)
                 self.convs.append(conv)
