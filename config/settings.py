@@ -222,6 +222,21 @@ class Settings(BaseSettings):
     federated_noise_multiplier: float = 0.0
     federated_server_host: str = "127.0.0.1"
     federated_server_port: int = 8001
+    # Require operator admission (detection.federated.admission) before a
+    # participant_id may register a key at all. Secure by default; disabling
+    # this restores the old fully-open self-service registration behaviour
+    # and is strongly discouraged outside of local/offline testing.
+    federated_admission_required: bool = True
+    # No single participant's aggregation weight may exceed this fraction of
+    # a round's total weight, regardless of its (admission-capped) claimed
+    # n_samples -- an interim, defense-in-depth bound on top of admission
+    # control; see docs/federated_learning.md. 1.0 disables it.
+    federated_max_participant_weight_fraction: float = 0.5
+    # A participant's newly claimed n_samples may not exceed this multiple of
+    # its own historical accepted maximum without being flagged/excluded for
+    # that round (cross-round consistency check). Only applies from a
+    # participant's second accepted round onward.
+    federated_max_n_samples_growth_factor: float = 3.0
 
     # ── Cross-chain Bayesian linking ─────────────────────────────────────────
     cross_chain_timing_sigma_seconds: float = 300.0
@@ -464,6 +479,23 @@ class Settings(BaseSettings):
     def valid_export_rate_limit(cls, v: object) -> object:
         if int(v) < 1:
             raise ValueError("COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR must be >= 1")
+        return v
+
+    @field_validator("federated_max_participant_weight_fraction", mode="before")
+    @classmethod
+    def valid_max_participant_weight_fraction(cls, v: object) -> object:
+        val = float(v)
+        if not (0.0 < val <= 1.0):
+            raise ValueError(
+                f"FEDERATED_MAX_PARTICIPANT_WEIGHT_FRACTION {val} must be in (0.0, 1.0]"
+            )
+        return v
+
+    @field_validator("federated_max_n_samples_growth_factor", mode="before")
+    @classmethod
+    def valid_max_n_samples_growth_factor(cls, v: object) -> object:
+        if float(v) <= 1.0:
+            raise ValueError("FEDERATED_MAX_N_SAMPLES_GROWTH_FACTOR must be > 1.0")
         return v
 
     @field_validator("gateway_default_daily_quota", "gateway_default_namespace_daily_quota", mode="before")

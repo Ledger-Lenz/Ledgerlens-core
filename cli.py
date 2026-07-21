@@ -1682,6 +1682,32 @@ def federated_server(
     uvicorn.run(fl_app, host=bind_host, port=bind_port)
 
 
+@federated_app.command("admit")
+def federated_admit(
+    participant_id: str = typer.Argument(..., help="Identifier the operator will register with"),
+    max_n_samples: int = typer.Option(..., "--max-n-samples", help="Ceiling on this participant's claimed dataset size, enforced server-side on every round"),
+    admitted_by: str = typer.Option("operator", "--admitted-by", help="Free-text note recording who approved this admission (for audit)"),
+    db_path: str = typer.Option(None, "--db-path", help="Federated server's SQLite path (defaults to LEDGERLENS_DB_PATH)"),
+) -> None:
+    """Authorize a participant_id to register with the federated server.
+
+    Must be run (by an operator, out-of-band, e.g. after verifying the
+    institution's identity and roughly how much data it holds) before that
+    identity can call `federated join` or POST /federated/register --
+    registration is closed by default (FEDERATED_ADMISSION_REQUIRED=true).
+    `--max-n-samples` bounds the aggregation weight this identity can ever
+    claim, regardless of what it reports in a signed update; see
+    docs/federated_learning.md's "Participant Admission & Weight Bounding".
+    """
+    from detection.federated.admission import admit_participant
+
+    record = admit_participant(participant_id, max_n_samples, admitted_by, db_path=db_path)
+    typer.echo(
+        f"Admitted {record.participant_id!r}: max_n_samples={record.max_n_samples}, "
+        f"admitted_by={record.admitted_by!r}, admitted_at={record.admitted_at}"
+    )
+
+
 @federated_app.command("join")
 def federated_join(
     rounds: int = typer.Option(1, "--rounds", "-r", help="Number of federated rounds to participate in"),
@@ -1733,6 +1759,14 @@ def federated_join(
             "participant_id": operator_id,
             "public_key_der_b64": pub_der_b64,
         })
+        if resp.status_code == 403:
+            typer.echo(
+                f"Registration rejected: {resp.json().get('detail', resp.text)}\n"
+                f"An operator must run `cli.py federated admit {operator_id} "
+                f"--max-n-samples <N>` (or POST /federated/admit) first.",
+                err=True,
+            )
+            raise typer.Exit(1)
         resp.raise_for_status()
         logger.info("Registered with federated server as %s", operator_id)
 
