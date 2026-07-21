@@ -2,37 +2,75 @@
 
 ## Horizon cursor checkpointing
 
-The live Horizon trade consumer persists the last successfully processed
-`paging_token` to `CURSOR_CHECKPOINT_PATH` (default
-`./data/horizon_cursor.json`). On restart it resumes from that token; when no
-valid checkpoint exists it uses `HORIZON_DEFAULT_CURSOR` (default `now`).
+`python cli.py stream` persists two things that must never durably desync:
+the last successfully processed Horizon `paging_token` (the resume position
+for the SSE stream) and the per-wallet rolling-window state the wash-trading
+detector scores against. Before this was a single checkpoint, the two were
+flushed independently — the cursor on a time-or-count trigger, the window
+state on a count-only trigger. Under sustained throughput below the
+count threshold, the cursor's timer kept advancing while the window-state
+flush stalled indefinitely; a crash in that gap meant restarting from a
+cursor *ahead of* the trades the detector's windows actually reflected,
+silently and permanently dropping them from detection.
 
-Checkpoint writes occur after `CURSOR_FLUSH_EVENTS` processed events (default
-100) or `CURSOR_FLUSH_SECONDS` elapsed seconds (default 10), whichever happens
-first. A final checkpoint is written on a clean stream exit. The writer creates
-a sibling temporary file with mode `0600`, then atomically replaces the live
-JSON file. A sidecar advisory lock serializes readers and writers on POSIX.
+`ingestion/stream_checkpoint.py`'s `StreamCheckpointCoordinator` replaces
+both triggers with one unified SQLite checkpoint (`stream_checkpoint` table,
+same database as `rolling_window_checkpoints`): each flush writes the cursor
+and every wallet's window state in a single `BEGIN IMMEDIATE` transaction, so
+either both land durably or neither does. The cursor can therefore never be
+ahead of the window state it depends on, by construction rather than by
+narrowing a timing window.
 
-The checkpoint contains only the paging token, recording time, and optional
-ledger sequence. It contains no account, wallet, or API credentials.
+Flushes are triggered by `STREAM_CHECKPOINT_INTERVAL` processed trades
+(default 100, previously the window-state-only batch size) or
+`CURSOR_FLUSH_SECONDS` elapsed seconds (default 10, previously the
+cursor-only durability bound), whichever happens first — preserving the
+pre-fix checkpoint cadence under high throughput while closing the low
+throughput crash gap. A final checkpoint is written on clean exit and on
+`SIGTERM`/`SIGINT`.
+
+### Migration from the legacy JSON cursor file
+
+Deployments upgrading from before the unified checkpoint keep their existing
+`CURSOR_CHECKPOINT_PATH` JSON file (default `./data/horizon_cursor.json`) as
+a one-time seed: if no unified checkpoint row exists yet, its cursor is read
+once, logged, and used to resume. The legacy file is never written to again
+once the first unified checkpoint is written, and never read again after
+that. It also still backs the existing "delete stale checkpoint on HTTP
+404/410" fallback used while reconnecting mid-stream.
 
 ### Failure and recovery
 
-- Missing, empty, unreadable, malformed, or invalid-token files are logged and
-  treated as absent. Streaming starts from `HORIZON_DEFAULT_CURSOR`.
-- A checkpoint with permissions wider than `0600` produces a warning.
-- A failed temporary write or replacement leaves the prior checkpoint intact;
-  ingestion continues and retries at the next flush.
-- If Horizon returns HTTP 404 or 410 for a saved position, the streamer deletes
-  the unusable checkpoint and reconnects with `cursor=now`.
+- Missing, empty, unreadable, malformed, or invalid-token legacy checkpoints
+  are logged and treated as absent; streaming starts from
+  `HORIZON_DEFAULT_CURSOR` (default `now`) when no unified checkpoint exists
+  either.
+- A malformed cursor passed to the unified checkpoint's `flush()` is refused
+  (logged, not written); the prior durable checkpoint is left intact.
+- A failed unified-checkpoint write (e.g. `OSError`, `sqlite3.Error`) is
+  logged and returns rather than raising — the stream keeps running on the
+  prior durable checkpoint and retries at the next flush.
+- If Horizon returns HTTP 404 or 410 for a saved position, the streamer
+  deletes the legacy checkpoint file and reconnects with `cursor=now`.
 - `CURSOR_CHECKPOINT_PATH` must resolve inside `DATA_DIR`, preventing an
   environment-provided path from escaping the runtime data directory.
-- Run `python cli.py stream --reset-cursor` to intentionally delete the saved
-  position before startup.
+- Run `python cli.py stream --reset-cursor` to delete both the legacy file
+  and the unified checkpoint row before startup.
+- **Desync detection (defense in depth):** on load, the wallet count
+  recorded in the unified checkpoint is compared against the wallet count
+  actually loaded from `rolling_window_checkpoints`. A mismatch can only
+  happen if the database was altered outside the atomic transaction (manual
+  editing, filesystem-level corruption); it is logged at `ERROR` and
+  incremented on `ledgerlens_checkpoint_desync_detected_total` rather than
+  raised, since the checkpoint layer treats storage corruption as a
+  recoverable, operator-visible condition. A nonzero counter means manual
+  reconciliation against Horizon ledger history is recommended before
+  trusting the detector's window state.
 
 The durability window is bounded by the flush policy. A hard crash can replay
 at most the events processed since the latest checkpoint; it does not skip
-events after the durable token.
+events after the durable token, and the rolling-window state it scores
+against is always consistent with that token.
 
 ## Flow control and backpressure
 

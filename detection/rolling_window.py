@@ -26,7 +26,7 @@ import sqlite3
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, Iterator, List, Optional
 
 from config.settings import settings
 from ingestion.data_models import Asset, Trade, TradeType
@@ -187,23 +187,44 @@ class RollingWindowStore:
             conn.executescript(_CHECKPOINT_SCHEMA)
             conn.commit()
 
-    def save_state(self, wallet: str, window: WalletWindow) -> None:
-        """Upsert *window* for *wallet*."""
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a raw connection to this store's database file.
+
+        For callers (see :mod:`ingestion.stream_checkpoint`) that need to
+        compose additional writes into the same atomic transaction as a
+        window-state checkpoint — e.g. persisting a Horizon cursor alongside
+        it so the two can never durably desync.
+        """
+        with _connect(self._db_path) as conn:
+            yield conn
+
+    def save_state(
+        self, wallet: str, window: WalletWindow, conn: sqlite3.Connection | None = None
+    ) -> None:
+        """Upsert *window* for *wallet*.
+
+        When *conn* is omitted, opens and commits its own connection (prior
+        behavior, unchanged). When *conn* is supplied, writes on it without
+        committing — the caller owns the transaction boundary.
+        """
         data = json.dumps(window.to_dict())
         now = datetime.now(timezone.utc).isoformat()
-        with _connect(self._db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO rolling_window_checkpoints (wallet, trades_json, last_score, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(wallet) DO UPDATE SET
-                    trades_json = excluded.trades_json,
-                    last_score  = excluded.last_score,
-                    updated_at  = excluded.updated_at
-                """,
-                (wallet, data, window._last_score, now),
-            )
-            conn.commit()
+        sql = """
+            INSERT INTO rolling_window_checkpoints (wallet, trades_json, last_score, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(wallet) DO UPDATE SET
+                trades_json = excluded.trades_json,
+                last_score  = excluded.last_score,
+                updated_at  = excluded.updated_at
+        """
+        params = (wallet, data, window._last_score, now)
+        if conn is not None:
+            conn.execute(sql, params)
+            return
+        with _connect(self._db_path) as owned_conn:
+            owned_conn.execute(sql, params)
+            owned_conn.commit()
 
     def load_state(self, wallet: str) -> Optional[WalletWindow]:
         """Return the persisted :class:`WalletWindow` for *wallet*, or ``None``."""
@@ -223,10 +244,27 @@ class RollingWindowStore:
         ww._last_score = row[1]
         return ww
 
-    def save_all(self, state: RollingWindowState) -> None:
-        """Checkpoint every wallet in *state*."""
-        for wallet, window in state.wallets().items():
-            self.save_state(wallet, window)
+    def save_all(
+        self, state: RollingWindowState, conn: sqlite3.Connection | None = None
+    ) -> None:
+        """Checkpoint every wallet in *state*.
+
+        When *conn* is omitted, all wallets are written and committed as a
+        single transaction on one connection (rather than one connection and
+        commit per wallet), so a crash mid-checkpoint can never leave a
+        partial mix of updated and stale wallet rows. When *conn* is
+        supplied, all writes land on it without committing, so the caller can
+        fold them into a larger atomic transaction (see
+        :mod:`ingestion.stream_checkpoint`).
+        """
+        if conn is not None:
+            for wallet, window in state.wallets().items():
+                self.save_state(wallet, window, conn=conn)
+            return
+        with _connect(self._db_path) as owned_conn:
+            for wallet, window in state.wallets().items():
+                self.save_state(wallet, window, conn=owned_conn)
+            owned_conn.commit()
 
     def load_all(self, state: RollingWindowState) -> None:
         """Populate *state* from all persisted checkpoints."""

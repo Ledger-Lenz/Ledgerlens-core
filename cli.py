@@ -1032,6 +1032,7 @@ def stream(
     from detection.webhook_registry import get_matching_subscribers
     from ingestion.checkpoint import CursorCheckpoint, FlushPolicy, resolve_checkpoint_path
     from ingestion.horizon_streamer import stream_trades_with_cursor
+    from ingestion.stream_checkpoint import StreamCheckpointCoordinator
     import api.main as api_main
 
     _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
@@ -1047,27 +1048,51 @@ def stream(
             "must be block, drop_newest, or drop_oldest",
             param_hint="--overflow-strategy",
         )
+    # `cursor_checkpoint` (the legacy JSON file) is kept for two purposes only:
+    # seeding the initial cursor when upgrading a deployment that predates the
+    # unified checkpoint (see StreamCheckpointCoordinator.load_cursor), and the
+    # existing "delete stale checkpoint on HTTP 404/410" fallback inside
+    # stream_trades_with_cursor. It is no longer written by this command —
+    # the SQLite-backed unified checkpoint below is authoritative for cursor
+    # durability. See docs/ingestion.md for the full migration path.
     cursor_checkpoint = CursorCheckpoint(
         resolve_checkpoint_path(cfg.cursor_checkpoint_path, cfg.data_dir)
-    )
-    if reset_cursor:
-        cursor_checkpoint.delete()
-        logger.info("Reset Horizon cursor checkpoint")
-    stored_cursor = cursor_checkpoint.load()
-    cursor = stored_cursor or cfg.horizon_default_cursor
-    if stored_cursor:
-        logger.info("Resuming from cursor %s", cursor)
-    else:
-        logger.info("Starting fresh from cursor %s", cursor)
-    cursor_flush_policy = FlushPolicy(
-        max_events=cfg.cursor_flush_events,
-        max_seconds=cfg.cursor_flush_seconds,
     )
 
     init_db()
     checkpoint_store = RollingWindowStore()
     window_state = RollingWindowState()
+
+    # Persists the Horizon cursor and the rolling-window state in a single
+    # atomic SQLite transaction, so the cursor can never be durably ahead of
+    # the window state it depends on — see ingestion/stream_checkpoint.py.
+    # The event-count bound reuses `checkpoint_interval` (previously the
+    # window-state-only batch size, preserving amortized-cost checkpointing
+    # under high load); the time bound reuses `cursor_flush_seconds`
+    # (previously the cursor-only durability latency bound), which now also
+    # bounds the combined checkpoint under sustained low/moderate throughput.
+    stream_checkpoint = StreamCheckpointCoordinator(
+        rolling_store=checkpoint_store,
+        flush_policy=FlushPolicy(
+            max_events=_chk_interval, max_seconds=cfg.cursor_flush_seconds
+        ),
+        legacy_cursor_checkpoint=cursor_checkpoint,
+    )
+
+    if reset_cursor:
+        cursor_checkpoint.delete()
+        stream_checkpoint.reset()
+        logger.info("Reset Horizon cursor checkpoint (legacy file and unified checkpoint)")
+
     checkpoint_store.load_all(window_state)
+    stored_cursor = stream_checkpoint.load_cursor(
+        actual_wallet_count=window_state.active_wallets
+    )
+    cursor = stored_cursor or cfg.horizon_default_cursor
+    if stored_cursor:
+        logger.info("Resuming from cursor %s", cursor)
+    else:
+        logger.info("Starting fresh from cursor %s", cursor)
 
     try:
         models = load_models(cfg.model_dir)
@@ -1084,19 +1109,19 @@ def stream(
     )
 
     stop_event = threading.Event()
+    last_cursor = cursor
 
+    # Defined and read by `_shutdown` via closure. State it depends on
+    # (`last_cursor`, `scorer`, `stream_checkpoint`) must be initialized
+    # before the signal handlers are registered below, so a signal arriving
+    # before the main loop starts can't observe an undefined value.
     def _shutdown(signum, frame):
-        logger.info("Shutdown signal received — checkpointing all window states…")
-        checkpoint_store.save_all(scorer.window_state)
+        logger.info("Shutdown signal received — checkpointing cursor and window state…")
+        stream_checkpoint.flush(last_cursor, scorer.window_state)
         stop_event.set()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-
-    trades_since_checkpoint = 0
-    cursor_events_since_flush = 0
-    last_cursor_flush = time.monotonic()
-    last_cursor = cursor
 
     logger.info(
         "Starting incremental stream (checkpoint_interval=%d, score_delta=%d, "
@@ -1129,25 +1154,15 @@ def stream(
                 logger.warning("Webhook dispatch error: %s", exc)
 
         last_cursor = event_cursor
-        cursor_events_since_flush += 1
-        now = time.monotonic()
-        if cursor_flush_policy.should_flush(
-            cursor_events_since_flush, last_cursor_flush, now
-        ):
-            cursor_checkpoint.save(last_cursor)
-            cursor_events_since_flush = 0
-            last_cursor_flush = now
-
-        trades_since_checkpoint += 1
-        if trades_since_checkpoint >= _chk_interval:
-            checkpoint_store.save_all(scorer.window_state)
-            trades_since_checkpoint = 0
-            logger.debug("Checkpointed %d wallet windows", scorer.window_state.active_wallets)
+        if stream_checkpoint.on_trade_processed(event_cursor, scorer.window_state):
+            logger.debug(
+                "Checkpointed cursor %s and %d wallet windows",
+                event_cursor,
+                scorer.window_state.active_wallets,
+            )
 
     # Final checkpoint on clean exit
-    checkpoint_store.save_all(scorer.window_state)
-    if cursor_events_since_flush:
-        cursor_checkpoint.save(last_cursor)
+    stream_checkpoint.flush(last_cursor, scorer.window_state)
     logger.info("Stream stopped. Final checkpoint written.")
 
 

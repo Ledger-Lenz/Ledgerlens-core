@@ -144,6 +144,7 @@ class _NoOpCollector:
     ledger_close_to_score_seconds = _NoOpMetric()
     dlq_entries_total = _NoOpMetric()
     dlq_depth = _NoOpMetric()
+    checkpoint_desync_detected_total = _NoOpMetric()
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +190,14 @@ class IngestionMetricsCollector:
     **Dead-letter queue**
       - ``ledgerlens_dlq_entries_total`` — records sent to the DLQ.
       - ``ledgerlens_dlq_depth`` — current DLQ depth gauge.
+
+    **Stream checkpoint coordination** (``ingestion/stream_checkpoint.py``)
+      - ``ledgerlens_checkpoint_desync_detected_total`` — incremented when
+        the unified stream checkpoint's recorded wallet count diverges from
+        the rolling-window store's actual wallet count on load. Should stay
+        at zero under normal operation, since the two are written in one
+        atomic transaction; a nonzero value indicates storage-layer
+        corruption or manual tampering outside that transaction.
 
     Security
     --------
@@ -272,6 +281,14 @@ class IngestionMetricsCollector:
         self.dlq_depth = Gauge(
             "ledgerlens_dlq_depth",
             "Current number of pending DLQ entries",
+        )
+
+        # ── Stream checkpoint coordination ────────────────────────────────
+        self.checkpoint_desync_detected_total = Counter(
+            "ledgerlens_checkpoint_desync_detected_total",
+            "Total times the unified stream checkpoint's recorded wallet "
+            "count diverged from the rolling-window store's actual wallet "
+            "count on load",
         )
 
     @classmethod
