@@ -1,0 +1,22 @@
+replicaCount: 1
+image:
+  repository: pingcap/chaos-mesh
+  tag: v2.6.1
+  pullPolicy: IfNotPresent
+serviceAccount:
+  create: true
+  name: chaos-mesh
+rbac:
+  create: true
+  podSecurityPolicy:
+    enabled: false
+controllerManager:
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+ui:
+  enabled: false

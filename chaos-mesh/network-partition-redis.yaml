@@ -1,0 +1,20 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: ledgerlens-redis-partition
+  namespace: chaos-mesh
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces: ["ledgerlens"]
+    labelSelectors:
+      "app.kubernetes.io/component": api
+  direction: to
+  target:
+    selector:
+      namespaces: ["ledgerlens"]
+      labelSelectors:
+        "app.kubernetes.io/name": redis
+    mode: all
+  duration: "60s"

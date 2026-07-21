@@ -245,6 +245,8 @@ LedgerLens provides two complementary interpretability layers:
 
 The Soroban contract is the on-chain truth layer for LedgerLens risk scores.
 
+**Fuzzing & Security:** The oracle aggregator and ZK verifier contracts are continuously fuzzed using `cargo-fuzz` to detect integer overflow, authorization bypass, and malformed-input panics. See [docs/contract_fuzzing.md](docs/contract_fuzzing.md) for how to run fuzz targets locally and interpret results. All contract entrypoints are fuzz-tested on every PR (120s per target) and nightly (30min per target) to ensure composability guarantees for downstream AMMs, lending protocols, and aggregators.
+
 ### Contract Functions
 
 - `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)` - Registers a computed risk score on-chain (authorised LedgerLens service account only)
