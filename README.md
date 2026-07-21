@@ -571,6 +571,7 @@ python cli.py stream          # stream trades from Horizon SSE and score increme
 python cli.py retrain-check   # check for distribution drift and retrain if needed
 python cli.py compute-embeddings --window-days 30  # compute and store GNN embeddings for all wallets in the last 30 days
 python cli.py serve           # serve the local API
+python cli.py grpc-serve      # run the gRPC Internal Scoring Service sidecar
 python cli.py webhook-worker  # run the webhook delivery worker
 python cli.py db-migrate      # apply any pending SQLite schema migrations
 ```
