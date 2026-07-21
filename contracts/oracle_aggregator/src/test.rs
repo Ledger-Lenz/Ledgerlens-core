@@ -207,3 +207,42 @@ fn test_rejects_unknown_oracle_key() {
     
     assert!(!client.submit_with_quorum(&wallet, &asset_pair, &score, &timestamp, &signatures));
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn test_double_initialization_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, OracleAggregator);
+    let client = OracleAggregatorClient::new(&env, &contract_id);
+    
+    let mut oracle_keys = Vec::new(&env);
+    oracle_keys.push_back(BytesN::from_array(&env, &[1u8; 32]));
+    let score_contract = Address::generate(&env);
+    
+    client.initialize(&1, &oracle_keys, &score_contract);
+    // Second initialization should panic
+    client.initialize(&2, &oracle_keys, &score_contract);
+}
+
+#[test]
+fn test_canonical_message_boundary_values() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, OracleAggregator);
+    let client = OracleAggregatorClient::new(&env, &contract_id);
+    
+    let wallet = Address::generate(&env);
+    let asset_pair = Symbol::new(&env, "XLM-USDC");
+    
+    // Test max values don't panic
+    let msg1 = client.canonical_message(&wallet, &asset_pair, &u32::MAX, &u64::MAX);
+    assert!(msg1.len() > 0);
+    
+    // Test min values
+    let msg2 = client.canonical_message(&wallet, &asset_pair, &0, &0);
+    assert!(msg2.len() > 0);
+    
+    // Test mixed boundary
+    let msg3 = client.canonical_message(&wallet, &asset_pair, &u32::MAX, &0);
+    assert!(msg3.len() > 0);
+}
