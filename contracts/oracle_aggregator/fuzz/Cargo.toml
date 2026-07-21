@@ -20,6 +20,17 @@ oracle_aggregator = { path = ".." }
 # used throughout fuzz_targets/*.rs to build test Envs -- mirrors
 # oracle_aggregator's own [dev-dependencies] soroban-sdk features.
 soroban-sdk = { version = "21.0", features = ["testutils", "alloc"] }
+# Defense-in-depth pin -- see contracts/oracle_aggregator/Cargo.toml for the
+# full explanation of the underlying soroban-env-host/ed25519-dalek 3.0
+# incompatibility. IMPORTANT: this line alone does not fix it (verified: a
+# real `cargo build`/`cargo fuzz run` here still failed with only this pin
+# in place, even as a direct edge). The actual fix is the *committed*
+# Cargo.lock in this directory, generated via
+# `cargo update -p ed25519-dalek@3.0.0 --precise 2.2.0` -- this isolated
+# fuzz workspace (see `[workspace]` below) has its own separate lockfile
+# from the main repo workspace, so that fix had to be applied and committed
+# here independently too.
+ed25519-dalek = "=2.2.0"
 
 # Prevent this from interfering with workspaces
 [workspace]
