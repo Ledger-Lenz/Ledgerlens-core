@@ -32,6 +32,7 @@ from detection.graph_engine import build_ring_membership_index, build_transactio
 from detection.model_inference import load_calibration, load_models, score_feature_matrix, score_feature_vector, score_with_uncertainty
 from detection.path_cycle_detector import detect_cycles_from_payments, path_payment_cycles_to_alerts
 from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.event_bus import get_event_bus
 from detection.risk_score import RiskScore
 from detection.storage import (
     save_alerts,
@@ -396,6 +397,8 @@ def run(
                 logger.exception("Failed to record scored features for drift detection")
 
         save_scores(scores)
+        if scores and settings.event_bus_backend != "none":
+            get_event_bus().publish(scores)
         save_rings(all_rings)
 
         # Persist feature vectors and compute+cache SHAP values using XGBoost model.
@@ -617,6 +620,8 @@ async def async_run(
             logger.exception("Failed to record scored features for drift detection")
 
     save_scores(scores)
+    if scores and settings.event_bus_backend != "none":
+        get_event_bus().publish(scores)
     save_rings(all_rings)
     _enqueue_webhook_alerts(scores)
     _submit_on_chain(scores)
@@ -773,6 +778,8 @@ def _flush_streaming_buffer(
             logger.exception("Failed to record scored features in streaming flush")
 
     save_scores(scores)
+    if scores and settings.event_bus_backend != "none":
+        get_event_bus().publish(scores)
 
     # Persist cursor for resumption after restart.
     cursor_path = Path(settings.cursor_path)

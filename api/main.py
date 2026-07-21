@@ -546,6 +546,15 @@ def health() -> JSONResponse:
     if any(state != CircuitState.CLOSED.value for state in circuits.values()):
         degraded = True
 
+    # --- Event Bus ---
+    if settings.event_bus_backend != "none":
+        from detection.event_bus import get_event_bus
+        bus_health = get_event_bus().get_health()
+        if bus_health:
+            status["event_bus"] = bus_health
+            if bus_health.get("status") != "ok":
+                degraded = True
+
     if healthy:
         status["status"] = "degraded" if degraded else "ok"
         http_status = 200

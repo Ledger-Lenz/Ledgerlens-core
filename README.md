@@ -1084,7 +1084,7 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 ### Open Integration Points
 
-- How `core` hands `RiskScore` records to `api` (direct DB write, message queue, or `core` calling an `api` ingestion endpoint) — see `run_pipeline.py`. The integration is tested via the cross-repo E2E harness in `tests/e2e_cross_repo/`.
+- **[RESOLVED]** How `core` hands `RiskScore` records to `api`: Handled via an Event Bus (Kafka or NATS) configured in `.env`. See [docs/event_bus.md](docs/event_bus.md) for consumer contract details.
 - Where labelled training data lives in `ledgerlens-data` and its schema version — see `detection/model_training.py`.
 - Order-book event ingestion (needed for `round_trip_trade_frequency`, cancellation-rate features) — see TODOs in `detection/feature_engineering.py`.
 

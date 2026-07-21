@@ -1970,6 +1970,21 @@ def get_score_history(
     ]
 
 
+def get_scores_since(since: str, db_path: str | None = None) -> list[RiskScore]:
+    """Return all risk scores generated at or after ``since`` (ISO 8601 string)."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM risk_scores
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (since,),
+        ).fetchall()
+    return [_row_to_score(row) for row in rows]
+
+
 def save_hop_payment_cycles(
     cycles: list,
     db_path: str | None = None,
