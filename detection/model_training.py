@@ -259,6 +259,7 @@ def _train_ensemble_base(
     adversarial_hardening: bool = False,
     imbalance_strategy: str = "smote",
     sample_weights: np.ndarray | None = None,
+    causal_feature_selection: bool = False,
     **kwargs,
 ) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
@@ -300,6 +301,14 @@ def _train_ensemble_base(
         df = pd.concat(augment_dfs, ignore_index=True)
 
     X, y = _split_features_labels(df)
+
+    _causal_features: list[str] | None = None
+    if causal_feature_selection:
+        from detection.causal_engine import CausalFeatureSelector
+        selector = CausalFeatureSelector()
+        _causal_features = selector.fit(X.values, y.values, list(X.columns))
+        if _causal_features:
+            X = X[_causal_features]
 
     # Temporal splitting: use timestamps when available, otherwise fall back
     # to random splitting.  SMOTE is applied AFTER the split, on training only.
@@ -401,6 +410,12 @@ def _train_ensemble_base(
         "xgboost": XGBClassifier(eval_metric="logloss", random_state=random_state),
         "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1),
     }
+
+    # Per-model hyperparameters/metrics/artifacts are only worth logging when
+    # there's an actual run to attach them to (e.g. `train_ensemble`'s
+    # wrapping `mlflow_run()`) -- callers like `compare_oversamplers` that
+    # invoke this function directly have no such run.
+    _active_run = mlflow.active_run() is not None
 
     if _active_run:
         for mname, m in models.items():
@@ -820,38 +835,6 @@ def save_models(
             logger.warning("Failed to update training_metadata.json with meta-learner metrics: %s", exc)
 
 
-if __name__ == "__main__":
-    # The ledgerlens-data repo does not yet provide a labelled dataset, so
-    # default to a synthetic one for local training/testing.
-    import logging
-
-    from detection.dataset import build_training_dataset
-    from ingestion.synthetic_data import generate_synthetic_dataset
-
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("ledgerlens.model_training")
-
-    trades, account_metadata, order_book_events, labels = generate_synthetic_dataset(
-        n_normal_accounts=60, n_wash_rings=10, ring_size=3
-    )
-    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=order_book_events)
-
-    results = train_ensemble(df)  # noqa: F821
-    for name, result in results.items():
-        if name == "_calib":
-            continue
-        logger.info(
-            "%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f",
-            name,
-            result["auc_roc"],
-            result["pr_auc"],
-            result["f1"],
-        )
-
-    save_models(results)
-    logger.info("Saved models to %s", settings.model_dir)
-
-
 from detection.gnn_model import TGATWashRingDetector, save_gnn_checkpoint, _HAS_PYG  # noqa: E402
 from detection.mlflow_tracker import (  # noqa: E402
     log_metrics,
@@ -951,3 +934,35 @@ def _log_train_test_split_params(random_state: int, calibrate: bool) -> None:
     """Log the train/test/calibration split configuration."""
     mlflow.log_param("test_split_ratio", 0.2)
     mlflow.log_param("calibration_split_ratio", 0.1 if calibrate else 0.0)
+
+
+if __name__ == "__main__":
+    # The ledgerlens-data repo does not yet provide a labelled dataset, so
+    # default to a synthetic one for local training/testing.
+    import logging
+
+    from detection.dataset import build_training_dataset
+    from ingestion.synthetic_data import generate_synthetic_dataset
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("ledgerlens.model_training")
+
+    trades, account_metadata, order_book_events, labels = generate_synthetic_dataset(
+        n_normal_accounts=60, n_wash_rings=10, ring_size=3
+    )
+    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=order_book_events)
+
+    results = train_ensemble(df)
+    for name, result in results.items():
+        if name == "_calib":
+            continue
+        logger.info(
+            "%s: AUC-ROC=%.3f PR-AUC=%.3f F1=%.3f",
+            name,
+            result["auc_roc"],
+            result["pr_auc"],
+            result["f1"],
+        )
+
+    save_models(results)
+    logger.info("Saved models to %s", settings.model_dir)

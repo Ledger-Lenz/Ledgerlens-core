@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
 from detection.rolling_window import RollingWindowState, RollingWindowStore
-from ingestion.checkpoint import FlushPolicy
+from ingestion.checkpoint import CursorCheckpoint, FlushPolicy
 from ingestion.data_models import Asset, Trade
 from ingestion.stream_checkpoint import StreamCheckpointCoordinator
 
@@ -144,6 +147,97 @@ class TestHighThroughputCadence:
             # checkpoint cadence matches the pre-fix window-state-only
             # cadence exactly -- no added flushes, no throughput regression.
             assert flush_count == 10
+
+
+# ---------------------------------------------------------------------------
+# Acceptance criterion 2 (measured): wall-clock throughput vs. a
+# reconstruction of the pre-fix dual-checkpoint flow
+# ---------------------------------------------------------------------------
+
+
+class TestHighThroughputWallClockBenchmark:
+    """Quantifies the fix's performance impact against a reconstruction of
+    the literal pre-fix ``cli.py`` loop (see the issue's ``Current behavior``
+    section): an independent cursor `FlushPolicy` writing
+    `CursorCheckpoint.save` (JSON file), and a count-only window-state flush
+    that upserts each wallet on its own connection + commit -- exactly what
+    `RollingWindowStore.save_all` did before this fix batched it into one
+    connection (see the ``conn`` parameter added to `save_state`/`save_all`).
+
+    Both flows use the same event-count flush threshold (100) at a
+    throughput far above the 100-trades/10s floor named in the issue's
+    acceptance criteria, so the count trigger -- not the timer -- dominates
+    in both, matching the "sustained high load" scenario the constraint
+    describes. This does not rely on a fake clock: every flush hits a real
+    temp-file SQLite database, so the measured elapsed time reflects actual
+    I/O cost, not just flush cadence.
+    """
+
+    @pytest.mark.benchmark
+    def test_unified_checkpoint_not_slower_than_prefix_dual_checkpoint(self, tmp_path):
+        num_wallets = 20
+        num_trades = 1000  # 10 flushes at the 100-event threshold
+        flush_policy = FlushPolicy(max_events=100, max_seconds=10.0)
+
+        def run_prefix_dual_checkpoint(db_path, cursor_path) -> None:
+            store = RollingWindowStore(db_path=str(db_path))
+            cursor_checkpoint = CursorCheckpoint(cursor_path)
+            state = RollingWindowState()
+            cursor_events_since_flush = 0
+            last_cursor_flush = time.monotonic()
+            trades_since_checkpoint = 0
+            for i in range(num_trades):
+                wallet = f"GWALLET{i % num_wallets}"
+                state.add_trade(wallet, _trade(wallet, i))
+
+                cursor_events_since_flush += 1
+                now = time.monotonic()
+                if flush_policy.should_flush(cursor_events_since_flush, last_cursor_flush, now):
+                    cursor_checkpoint.save(_cursor(i))
+                    cursor_events_since_flush = 0
+                    last_cursor_flush = now
+
+                trades_since_checkpoint += 1
+                if trades_since_checkpoint >= 100:
+                    # Pre-fix `save_all`: one connection + commit per wallet.
+                    for wallet_id, window in state.wallets().items():
+                        store.save_state(wallet_id, window)
+                    trades_since_checkpoint = 0
+
+        def run_unified_checkpoint(db_path) -> None:
+            store = RollingWindowStore(db_path=str(db_path))
+            state = RollingWindowState()
+            coordinator = StreamCheckpointCoordinator(rolling_store=store, flush_policy=flush_policy)
+            for i in range(num_trades):
+                wallet = f"GWALLET{i % num_wallets}"
+                state.add_trade(wallet, _trade(wallet, i))
+                coordinator.on_trade_processed(_cursor(i), state)
+
+        start = time.perf_counter()
+        run_prefix_dual_checkpoint(tmp_path / "old.db", tmp_path / "old_cursor.json")
+        prefix_elapsed = time.perf_counter() - start
+
+        start = time.perf_counter()
+        run_unified_checkpoint(tmp_path / "new.db")
+        unified_elapsed = time.perf_counter() - start
+
+        print(
+            f"\n{num_trades} trades / {num_wallets} wallets -- "
+            f"pre-fix dual checkpoint: {prefix_elapsed:.3f}s; "
+            f"unified checkpoint: {unified_elapsed:.3f}s"
+        )
+
+        # The unified checkpoint folds every wallet upsert plus the cursor
+        # upsert into a single connection + commit per flush, versus one
+        # connection + commit per wallet (num_wallets of them) in the
+        # pre-fix flow -- so it should be at least as fast, not slower. A
+        # generous 50% tolerance absorbs machine noise without masking a
+        # real regression.
+        assert unified_elapsed <= prefix_elapsed * 1.5, (
+            f"unified checkpoint ({unified_elapsed:.3f}s) regressed more than "
+            f"50% over the reconstructed pre-fix dual-checkpoint baseline "
+            f"({prefix_elapsed:.3f}s) at {num_trades} trades / {num_wallets} wallets"
+        )
 
 
 # ---------------------------------------------------------------------------
