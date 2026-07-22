@@ -142,6 +142,14 @@ class Settings(BaseSettings):
     committee_quorum: int = 3
     committee_vote_deadline_days: int = 14
 
+    # ── Graph sharding ─────────────────────────────────────────────────────────
+    # When MAX_GRAPH_NODES would be exceeded, automatically shard the trade graph
+    # across multiple workers using community-detection-based partitioning.
+    graph_shard_enabled: bool = True
+    graph_shard_count: int = 8
+    graph_shard_overlap_hops: int = 1
+    graph_shard_max_workers: int = 8
+
     # ── Ensemble weights ──────────────────────────────────────────────────────
     ensemble_weight_rf: float = 0.25
     ensemble_weight_xgb: float = 0.50
@@ -472,6 +480,22 @@ class Settings(BaseSettings):
         if not (0 <= val <= 100):
             raise ValueError(f"RISK_SCORE_THRESHOLD {val} must be 0-100")
         return v
+
+    @field_validator("graph_shard_count", "graph_shard_max_workers", mode="before")
+    @classmethod
+    def valid_shard_count(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("must be >= 1")
+        return val
+
+    @field_validator("graph_shard_overlap_hops", mode="before")
+    @classmethod
+    def valid_overlap_hops(cls, v: object) -> object:
+        val = int(v)
+        if not (0 <= val <= 3):
+            raise ValueError("GRAPH_SHARD_OVERLAP_HOPS must be 0-3")
+        return val
 
     @field_validator("soroban_circuit_breaker_threshold", mode="before")
     @classmethod
