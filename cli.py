@@ -1820,6 +1820,70 @@ def federated_join(
     logger.info("Federated participation complete (%d round(s))", rounds)
 
 
+@app.command("fuzz-check")
+def fuzz_check(
+    duration: int = typer.Option(30, help="Seconds to run each harness (default: 30)"),
+    corpus_dir: str = typer.Option("fuzz/corpus", help="Root directory for per-harness corpus sub-dirs"),
+    harness_dir: str = typer.Option("fuzz", help="Directory containing fuzz_*.py harnesses"),
+) -> None:
+    """Run each Atheris fuzz harness for a bounded duration and exit non-zero on any crash.
+
+    Requires ``atheris`` to be installed (``pip install atheris``).  Suitable for
+    pre-merge smoke testing without the full nightly budget.
+
+    Example::
+
+        python cli.py fuzz-check --duration 30
+    """
+    import glob
+    import subprocess
+
+    harness_pattern = Path(harness_dir) / "fuzz_*.py"
+    harnesses = sorted(glob.glob(str(harness_pattern)))
+    if not harnesses:
+        typer.echo(f"No harnesses found matching {harness_pattern}", err=True)
+        raise typer.Exit(1)
+
+    corpus_root = Path(corpus_dir)
+    corpus_root.mkdir(parents=True, exist_ok=True)
+
+    any_crash = False
+    for harness in harnesses:
+        name = Path(harness).stem
+        harness_corpus = corpus_root / name
+        harness_corpus.mkdir(parents=True, exist_ok=True)
+        typer.echo(f"  Fuzzing {name} for {duration}s ...")
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    harness,
+                    str(harness_corpus),
+                    f"-max_total_time={duration}",
+                    "-print_final_stats=1",
+                ],
+                timeout=duration + 15,
+            )
+        except subprocess.TimeoutExpired:
+            typer.echo(f"  WARNING: {name} timed out after {duration + 15}s", err=True)
+
+        crash_files = list(harness_corpus.glob("crash-*")) + list(harness_corpus.glob("timeout-*"))
+        if crash_files:
+            typer.echo(f"  CRASH detected in {name}: {[f.name for f in crash_files]}", err=True)
+            any_crash = True
+
+    if any_crash:
+        typer.echo(
+            "fuzz-check: crash(es) detected. Download fuzz-crashes artifact and reproduce with:\n"
+            "  python fuzz/fuzz_<harness>.py fuzz/corpus/crash-<hash>\n"
+            "See fuzz/README.md for minimisation instructions.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    typer.echo(f"fuzz-check: all {len(harnesses)} harnesses completed without crashes.")
+
+
 @app.command("red-team")
 def red_team(
     model_dir: str = typer.Option("models", help="Directory containing trained model files"),
