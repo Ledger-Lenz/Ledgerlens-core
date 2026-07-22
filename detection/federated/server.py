@@ -9,9 +9,12 @@ Design rationale (Option B — Knowledge Distillation):
      (seed=0) and is identical for every participant.
   2. Each participant runs their *private* ensemble on the public dataset and
      sends the resulting soft-label vector  p_i ∈ [0,1]^N  to the server.
-  3. The server computes the weighted FedAvg of soft labels:
+  3. The server selects this round's Krum/Multi-Krum survivors (peer-distance
+     outlier exclusion; see `_select_krum_survivors`), then computes the
+     weighted FedAvg of soft labels over the survivors:
          p_global = Σ (n_i / N_total) × p_i
-  4. The "gradient" used for norm-clipping and cosine-outlier detection is
+  4. The "gradient" used for norm-clipping, cosine-outlier detection, and
+     Krum peer-distance comparison is
          delta_i = p_i - p_global_prev  (difference from the previous round).
   5. Participants receive p_global and retrain their local ensembles using
      the public dataset annotated with the distilled labels as an augmentation
@@ -70,6 +73,7 @@ from detection.federated.audit import (
     save_audit_record,
     sign_record,
 )
+from detection.federated.krum import KrumAggregator
 from detection.federated.weighting import apply_weight_share_cap
 
 logger = logging.getLogger("ledgerlens.federated.server")
@@ -123,6 +127,7 @@ class FederatedAggregationServer:
         admission_required: bool | None = None,
         max_participant_weight_fraction: float | None = None,
         max_n_samples_growth_factor: float | None = None,
+        use_krum: bool | None = None,
     ) -> None:
         self.min_participants = min_participants if min_participants is not None else settings.federated_min_participants
         self.gradient_clip_threshold = gradient_clip_threshold if gradient_clip_threshold is not None else settings.gradient_clip_threshold
@@ -145,6 +150,10 @@ class FederatedAggregationServer:
             max_n_samples_growth_factor if max_n_samples_growth_factor is not None
             else settings.federated_max_n_samples_growth_factor
         )
+        # Per-round Krum/Multi-Krum peer-distance defense; see
+        # _select_krum_survivors for how f/m are derived from the live
+        # participant count each round rather than a static config value.
+        self.use_krum = use_krum if use_krum is not None else settings.federated_use_krum
         # noise_multiplier > 0 enables the RDP accounting path (σ = clip_norm × nm).
         # 0.0 keeps the legacy linear ε-accumulation for backward compatibility.
         self.noise_multiplier = (
@@ -463,9 +472,114 @@ class FederatedAggregationServer:
         with self._lock:
             return self._aggregate_locked()
 
+    def _select_krum_survivors(
+        self, valid_updates: list[_ParticipantUpdate]
+    ) -> tuple[list[_ParticipantUpdate], list[str]]:
+        """Exclude the most peer-distant updates via Krum/Multi-Krum, on top of
+        (not instead of) the historical-cosine heuristic already applied in
+        `submit_update`.
+
+        Ordering rationale (see docs/byzantine_resilience.md): clipping and the
+        cosine-heuristic exclusion already happened per-update in
+        `submit_update`, *before* this runs, so Krum computes peer distances
+        over already-norm-bounded deltas -- an unclipped malicious delta could
+        otherwise distort every pairwise distance in the round. Krum selection
+        itself runs *before* the server-side DP noise added later in
+        `_aggregate_locked`: noise is only ever added to the single released
+        aggregate (unchanged from the pre-Krum design), so this wiring adds no
+        new privacy-budget surface -- Krum's data-dependent selection is
+        reflected only in the (already-audited) list of excluded participant
+        ids, not in any additional noised quantity. Adding DP noise *before*
+        Krum instead would let noise push an honest update's measured distance
+        closer to a malicious one, weakening the Byzantine-robustness
+        guarantee, so noise must come last.
+
+        Unlike the cosine heuristic (which compares each round's aggregate
+        direction to a *historical rolling mean* and is skipped entirely on
+        the first round), Krum compares updates against their *same-round*
+        peers, so it runs from round 1 onward -- closing the "boiling frog"
+        gap where a colluding coalition gradually drags the historical
+        baseline over successive rounds.
+
+        `f` (Byzantine tolerance) and the `2f + 2 < n` safety margin are
+        derived from `n = len(valid_updates)`, the actual live count of valid
+        updates *this round* -- never a static config value -- so the
+        guarantee genuinely holds for the round being aggregated even as
+        participants join, drop out, or get excluded by the cosine heuristic.
+
+        Falls back to plain FedAvg over all of `valid_updates` (with a loud
+        warning, per the documented fallback policy) when there are too few
+        live participants this round for Krum to offer any tolerance at all.
+
+        Returns:
+            (survivors, krum_excluded_participant_ids)
+        """
+        n = len(valid_updates)
+        if not self.use_krum:
+            return valid_updates, []
+        if n < 3:
+            if n > 0:
+                logger.warning(
+                    "Krum skipped this round: only %d valid update(s), need >= 3 "
+                    "for any Byzantine tolerance -- falling back to plain FedAvg "
+                    "with no per-round peer-distance defense",
+                    n,
+                )
+            return valid_updates, []
+
+        f = n // 3
+        while f > 0 and 2 * f + 2 >= n:
+            f -= 1
+        if 2 * f + 2 >= n:
+            logger.warning(
+                "Krum skipped this round: n=%d too small to satisfy 2f+2 < n "
+                "even at f=0 -- falling back to plain FedAvg with no per-round "
+                "peer-distance defense",
+                n,
+            )
+            return valid_updates, []
+
+        m = n - f
+        deltas = [u.delta for u in valid_updates]
+        selected, excluded, scores = KrumAggregator(f=f).select(deltas, m=m)
+
+        survivors = [valid_updates[i] for i in selected]
+        excluded_ids = [valid_updates[i].participant_id for i in excluded]
+        if excluded_ids:
+            hashed_ids = [
+                __import__("hashlib").sha256(pid.encode()).hexdigest()[:16]
+                for pid in excluded_ids
+            ]
+            logger.warning(
+                "Krum round: excluded %d/%d update(s) as same-round peer-distance "
+                "outliers (f=%d, m=%d): %s",
+                len(excluded_ids), n, f, m, hashed_ids,
+            )
+
+        try:
+            from detection.storage import log_krum_aggregation
+            log_krum_aggregation(
+                round_number=self._round_number + 1,
+                n_clients=n,
+                f_tolerance=f,
+                m_selected=m,
+                selected_indices=selected,
+                excluded_indices=excluded,
+                krum_scores=scores.tolist(),
+                db_path=self.db_path,
+            )
+        except Exception:
+            logger.debug("Could not persist Krum aggregation log", exc_info=True)
+
+        return survivors, excluded_ids
+
     def _aggregate_locked(self) -> np.ndarray | None:
         """Must be called while holding self._lock."""
         valid_updates = [u for u in self._pending_updates.values() if not u.excluded]
+        if not valid_updates:
+            return None
+
+        valid_updates, krum_excluded_ids = self._select_krum_survivors(valid_updates)
         if not valid_updates:
             return None
 
@@ -530,7 +644,9 @@ class FederatedAggregationServer:
 
         # Audit record
         accepted_ids = [u.participant_id for u in valid_updates]
-        excluded_ids = [u.participant_id for u in self._pending_updates.values() if u.excluded]
+        excluded_ids = [
+            u.participant_id for u in self._pending_updates.values() if u.excluded
+        ] + krum_excluded_ids
         record = build_record(
             round_id=self._current_round_id,
             participant_ids=accepted_ids,

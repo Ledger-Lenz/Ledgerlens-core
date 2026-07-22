@@ -120,6 +120,12 @@ class KrumStrategy:
         multi_krum_m: If None (default), use standard Krum (m=1).
                       If set, average the top-m selected updates (Multi-Krum).
         min_clients: Minimum clients per round; used for the ``2f+2 < n`` check.
+            Default is 5 -- the smallest `n` for which the default
+            `f = floor(n / 3)` derivation is self-consistent (`floor(3/3)=1`
+            and `floor(4/3)=1` both give `2f+2=4`, which is not `< n` for
+            `n=3` or `n=4`; `n=5` is the first value where `2*1+2=4 < 5`
+            holds). Do not lower this default without re-deriving `f` from
+            `2f+2 < min_clients` for the new value.
         db_path: SQLite path for aggregation log.  Uses settings default if None.
     """
 
@@ -127,7 +133,7 @@ class KrumStrategy:
         self,
         f: int | None = None,
         multi_krum_m: int | None = None,
-        min_clients: int = 3,
+        min_clients: int = 5,
         db_path: str | None = None,
     ) -> None:
         effective_f = f if f is not None else math.floor(min_clients / 3)
