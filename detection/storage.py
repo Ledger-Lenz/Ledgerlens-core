@@ -502,6 +502,11 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON compliance_exports (timestamp);
         """,
     ),
+    (
+        18,
+        "add proof_system column to on_chain_submissions",
+        "ALTER TABLE on_chain_submissions ADD COLUMN proof_system TEXT DEFAULT 'sigma';",
+    ),
 ]
 
 
@@ -824,6 +829,7 @@ def save_submission(
     tx_hash: str | None = None,
     error_message: str | None = None,
     db_path: str | None = None,
+    proof_system: str = "sigma",
 ) -> None:
     """Insert a row into the ``on_chain_submissions`` audit table."""
     init_db(db_path)
@@ -831,8 +837,8 @@ def save_submission(
         conn.execute(
             """
             INSERT INTO on_chain_submissions
-                (wallet, asset_pair, score, tx_hash, status, error_message, submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (wallet, asset_pair, score, tx_hash, status, error_message, proof_system, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 wallet,
@@ -841,10 +847,12 @@ def save_submission(
                 tx_hash,
                 status,
                 error_message,
+                proof_system,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
         conn.commit()
+
 
 
 def _row_to_score(row: tuple) -> RiskScore:

@@ -136,24 +136,129 @@ def lookup_namespace(
     ensure_namespace_tables(db_path)
     db_path = db_path or _get_db_path()
     key_hash = _hash_key(api_key)
+    now = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+        if "status" not in existing:
+            row = conn.execute(
+                "SELECT namespace_id, is_active FROM api_keys WHERE api_key_hash = ?",
+                (key_hash,),
+            ).fetchone()
+            if row is None or not row[1]:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or deactivated API key",
+                )
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE api_key_hash = ?",
+                (now, key_hash),
+            )
+            conn.commit()
+            return row[0]
+
         row = conn.execute(
-            "SELECT namespace_id, is_active FROM api_keys WHERE api_key_hash = ?",
+            "SELECT namespace_id, is_active, status, rotation_deadline FROM api_keys WHERE api_key_hash = ?",
             (key_hash,),
         ).fetchone()
-    if row is None or not row[1]:
+
+    if row is None:
         raise HTTPException(
             status_code=401,
             detail="Invalid or deactivated API key",
         )
-    # Touch last_used_at
+
+    is_active = row[1]
+    status = row[2]
+    rotation_deadline = row[3]
+
+    if not is_active or status == "revoked":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or deactivated API key",
+        )
+
+    if status == "rotating" and rotation_deadline and rotation_deadline < now:
+        raise HTTPException(
+            status_code=401,
+            detail="API key has expired after grace period",
+        )
+
     with _connect(db_path) as conn:
         conn.execute(
             "UPDATE api_keys SET last_used_at = ? WHERE api_key_hash = ?",
-            (datetime.now(timezone.utc).isoformat(), key_hash),
+            (now, key_hash),
         )
         conn.commit()
     return row[0]
+
+
+def rotate_namespace_key(
+    namespace_id: str,
+    grace_period_seconds: int = 604800,
+    db_path: str | None = None,
+) -> dict:
+    """Rotate the namespace key. Marks the old one rotating, creates a new one."""
+    import secrets
+    ensure_namespace_tables(db_path)
+    db_path = db_path or _get_db_path()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    from datetime import timedelta
+    deadline = (now_dt + timedelta(seconds=grace_period_seconds)).isoformat()
+
+    with _connect(db_path) as conn:
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+        if "status" not in existing:
+            conn.execute("ALTER TABLE api_keys ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            conn.execute("ALTER TABLE api_keys ADD COLUMN rotated_from TEXT")
+            conn.execute("ALTER TABLE api_keys ADD COLUMN rotated_to TEXT")
+            conn.execute("ALTER TABLE api_keys ADD COLUMN rotation_deadline TEXT")
+            conn.commit()
+
+        row = conn.execute(
+            "SELECT api_key_hash, description, id FROM api_keys "
+            "WHERE namespace_id = ? AND is_active = 1 AND (status = 'active' OR status IS NULL) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (namespace_id,)
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No active API key found for namespace {namespace_id}")
+
+        old_hash = row[0]
+        description = row[1] or ""
+        old_id = row[2]
+
+        plaintext = f"ll_{secrets.token_urlsafe(32)}"
+        new_hash = _hash_key(plaintext)
+
+        conn.execute(
+            "UPDATE api_keys SET status = 'rotating', rotation_deadline = ?, rotated_to = ? WHERE id = ?",
+            (deadline, str(new_hash), old_id)
+        )
+
+        conn.execute(
+            "INSERT INTO api_keys (namespace_id, api_key_hash, description, is_active, created_at, status, rotated_from) "
+            "VALUES (?, ?, ?, 1, ?, 'active', ?)",
+            (namespace_id, new_hash, description, now, old_hash)
+        )
+        conn.commit()
+
+    try:
+        from api.metrics import ledgerlens_secret_rotation_total
+        if ledgerlens_secret_rotation_total is not None:
+            ledgerlens_secret_rotation_total.labels(secret_type="namespace_key", result="success").inc()
+    except Exception:
+        pass
+
+    return {
+        "namespace_id": namespace_id,
+        "plaintext_key": plaintext,
+        "description": description,
+        "created_at": now,
+        "status": "active",
+        "rotated_from_hash": old_hash,
+    }
 
 
 def list_namespaces(db_path: str | None = None) -> list[dict]:

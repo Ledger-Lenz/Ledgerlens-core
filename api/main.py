@@ -569,6 +569,31 @@ def _model_file_ok(path: str) -> bool:
         return False
 
 
+@v1_router.get(
+    "/health/drift",
+    tags=["System"],
+    summary="Streaming drift-detector health",
+    description=(
+        "Returns per-feature ADWIN / Page-Hinkley detector state (Issue-385): "
+        "whether drift was recently detected, per-feature detector internals, "
+        "and whether conformal recalibration is currently gated active. "
+        "Complements the slower, batch PSI mechanism (see `detection/drift_monitor.py` "
+        "and `cli.py retrain-check`), which is not real-time."
+    ),
+)
+def health_drift() -> JSONResponse:
+    """Always returns 200; this endpoint reports observability state, not liveness."""
+    from detection.drift_detectors import get_drift_registry
+
+    return JSONResponse(content=get_drift_registry().state(), status_code=200)
+
+
+@app.get("/health/drift", include_in_schema=False)
+def health_drift_unversioned() -> JSONResponse:
+    """Unversioned alias, matching the `/health` and `/health/ready` convention."""
+    return health_drift()
+
+
 @app.get("/health/ready")
 def health_ready() -> JSONResponse:
     """Kubernetes readiness probe. Returns 503 during shutdown."""
@@ -641,6 +666,16 @@ def submit_analyst_feedback(payload: FeedbackSubmission, request: Request):
 
     scores = get_latest_scores(wallet=payload.wallet, limit=1)
     original_score = scores[0].score if scores else 0
+
+    if scores:
+        try:
+            from detection.model_inference import record_feedback_and_adapt
+            record_feedback_and_adapt(
+                predicted_score_0_100=float(original_score),
+                true_label=payload.analyst_label,
+            )
+        except Exception:
+            logger.exception("Drift-coupled conformal adaptation failed for feedback submission")
 
     record = store.add_correction(
         wallet=payload.wallet,
@@ -1662,6 +1697,21 @@ def admin_namespaces() -> list[dict]:
     required to see cross-namespace data.
     """
     return list_namespaces()
+
+
+@app.post("/admin/namespaces/{namespace_id}/rotate-key", dependencies=[Depends(require_admin_key)])
+def admin_rotate_namespace_key(
+    namespace_id: str,
+    grace_period_seconds: int = 604800,
+) -> dict:
+    """Rotate the namespace key. Marks the old one rotating, creates a new one.
+
+    Admin-only (requires the ``LEDGERLENS_ADMIN_API_KEY`` header).
+    """
+    from api.namespace import rotate_namespace_key
+    if grace_period_seconds <= 0:
+        raise HTTPException(status_code=422, detail="Grace period must be positive")
+    return rotate_namespace_key(namespace_id, grace_period_seconds=grace_period_seconds)
 
 
 # ---------------------------------------------------------------------------

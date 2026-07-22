@@ -142,6 +142,14 @@ class Settings(BaseSettings):
     committee_quorum: int = 3
     committee_vote_deadline_days: int = 14
 
+    # ── Graph sharding ─────────────────────────────────────────────────────────
+    # When MAX_GRAPH_NODES would be exceeded, automatically shard the trade graph
+    # across multiple workers using community-detection-based partitioning.
+    graph_shard_enabled: bool = True
+    graph_shard_count: int = 8
+    graph_shard_overlap_hops: int = 1
+    graph_shard_max_workers: int = 8
+
     # ── Ensemble weights ──────────────────────────────────────────────────────
     ensemble_weight_rf: float = 0.25
     ensemble_weight_xgb: float = 0.50
@@ -202,6 +210,9 @@ class Settings(BaseSettings):
     ledgerlens_compliance_api_key: str = ""
     ledgerlens_model_signing_key: str = ""
     ledgerlens_webhook_encryption_key: str = ""
+    ledgerlens_webhook_encryption_key_previous: str = ""
+    api_key_rotation_grace_seconds: int = 604800
+    api_key_max_age_days: int = 90
     # Minimum LedgerLens risk score (0-100) required to export a SAR package.
     compliance_sar_min_score: int = 70
     # Hourly cap on regulatory exports (SAR + Travel Rule) per `detection.compliance_exporter`.
@@ -237,6 +248,16 @@ class Settings(BaseSettings):
     # that round (cross-round consistency check). Only applies from a
     # participant's second accepted round onward.
     federated_max_n_samples_growth_factor: float = 3.0
+    # Default-on: use Krum/Multi-Krum peer-distance selection (see
+    # detection/federated/krum.py, docs/byzantine_resilience.md) at
+    # aggregation time to exclude the most outlying updates *within the same
+    # round*, on top of (not instead of) the existing historical-cosine
+    # heuristic. `f` (Byzantine tolerance) is derived each round from the
+    # live count of valid updates, never a static config value -- see
+    # `FederatedAggregationServer._select_krum_survivors`. Disabling this
+    # falls back to plain weighted FedAvg with no per-round peer-distance
+    # defense (the cosine heuristic still applies if enabled).
+    federated_use_krum: bool = True
 
     # ── Cross-chain Bayesian linking ─────────────────────────────────────────
     cross_chain_timing_sigma_seconds: float = 300.0
@@ -410,6 +431,13 @@ class Settings(BaseSettings):
     grpc_max_message_size_bytes: int = 4194304
     grpc_max_batch_wallets: int = 1000
 
+    # ── ZK-SNARK Configuration ────────────────────────────────────────────────
+    zk_proof_system: str = "sigma"                      # "sigma" | "snark"
+    zk_snark_circuit_path: str = "circuits/score_range_proof.circom"
+    zk_snark_proving_key_path: str = "circuits/keys/score_range_proof.zkey"
+    zk_snark_verification_key_path: str = "circuits/keys/verification_key.json"
+    zk_snark_prover_timeout_seconds: float = 10.0
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -462,6 +490,22 @@ class Settings(BaseSettings):
         if not (0 <= val <= 100):
             raise ValueError(f"RISK_SCORE_THRESHOLD {val} must be 0-100")
         return v
+
+    @field_validator("graph_shard_count", "graph_shard_max_workers", mode="before")
+    @classmethod
+    def valid_shard_count(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("must be >= 1")
+        return val
+
+    @field_validator("graph_shard_overlap_hops", mode="before")
+    @classmethod
+    def valid_overlap_hops(cls, v: object) -> object:
+        val = int(v)
+        if not (0 <= val <= 3):
+            raise ValueError("GRAPH_SHARD_OVERLAP_HOPS must be 0-3")
+        return val
 
     @field_validator("soroban_circuit_breaker_threshold", mode="before")
     @classmethod
@@ -582,6 +626,15 @@ class Settings(BaseSettings):
                 or s.startswith("redis://") or s.startswith("rediss://")):
             raise ValueError(f"{s!r} is not a valid URL (expected http/https/redis scheme)")
         return s
+
+    @field_validator("zk_proof_system", mode="before")
+    @classmethod
+    def valid_zk_proof_system(cls, v: object) -> object:
+        s = str(v).strip().lower()
+        if s not in {"sigma", "snark"}:
+            raise ValueError("zk_proof_system must be 'sigma' or 'snark'")
+        return s
+
 
     @field_validator("network", mode="before")
     @classmethod

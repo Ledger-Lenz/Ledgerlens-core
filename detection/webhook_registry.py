@@ -81,12 +81,23 @@ def _encrypt_secret(plaintext: str) -> str:
     return base64.b64encode(nonce + ct).decode()
 
 
-def _decrypt_secret(encrypted: str) -> str:
-    key = _get_encryption_key()
+def _decrypt_with_key(encrypted: str, key: bytes) -> str:
     data = base64.b64decode(encrypted)
     nonce, ct = data[:12], data[12:]
     aesgcm = AESGCM(key)
     return aesgcm.decrypt(nonce, ct, None).decode()
+
+
+def _decrypt_secret(encrypted: str) -> str:
+    for key_env in ("LEDGERLENS_WEBHOOK_ENCRYPTION_KEY", "LEDGERLENS_WEBHOOK_ENCRYPTION_KEY_PREVIOUS"):
+        key_b64 = os.environ.get(key_env)
+        if not key_b64:
+            continue
+        try:
+            return _decrypt_with_key(encrypted, base64.b64decode(key_b64))
+        except Exception:
+            continue
+    raise RuntimeError("Unable to decrypt secret with current or previous encryption key")
 
 
 # ---------------------------------------------------------------------------
