@@ -1,7 +1,5 @@
 import base64
 import os
-import sqlite3
-from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -10,13 +8,9 @@ from fastapi.testclient import TestClient
 
 from config.settings import settings as _settings
 from detection.api_key_store import (
-    _hash_key,
     create_api_key,
-    get_api_key_by_hash,
-    lookup_key,
     rotate_api_key,
     sweep_expired_api_keys,
-    get_overdue_api_keys_count,
 )
 from api.namespace import rotate_namespace_key, lookup_namespace
 from detection.webhook_registry import _encrypt_secret, _decrypt_secret, register_subscriber, get_subscriber
@@ -135,8 +129,7 @@ def test_namespace_key_rotation(db_path):
         assert lookup_namespace(plaintext_new) == "my-ns"
 
         # Expired namespace rotation deadline
-        rotated_expired = rotate_namespace_key("my-ns", grace_period_seconds=-1)
-        plaintext_expired = rotated_expired["plaintext_key"]
+        rotate_namespace_key("my-ns", grace_period_seconds=-1)
 
         # Old key should now fail lookup after deadline
         from fastapi import HTTPException
@@ -190,7 +183,6 @@ def test_webhook_encryption_rotation_fallback(db_path):
 
 def test_rotate_api_key_endpoint_and_prometheus(db_path, app):
     """Test end-to-end rotation endpoint, admin gating, and metrics."""
-    from api.metrics import ledgerlens_secret_rotation_total
 
     client = TestClient(app)
 
