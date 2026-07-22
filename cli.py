@@ -992,7 +992,7 @@ def serve(
 def stream(
     batch_size: int = typer.Option(500, "--batch-size", help="Number of trades to accumulate before scoring"),
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
-    checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
+    checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist cursor + window state together every N trades (default from settings)"),
     score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
     queue_depth: int = typer.Option(
         None,
@@ -1017,8 +1017,11 @@ def stream(
 
     Maintains per-wallet rolling windows (1h/4h/24h), recomputes features on
     each trade, and emits a RiskScore when the score changes by >= score_delta
-    points. Window state is checkpointed to SQLite every checkpoint_interval
-    trades. Graceful shutdown (SIGTERM/SIGINT) persists all in-memory state.
+    points. The Horizon cursor and window state are checkpointed together in
+    one atomic SQLite transaction every checkpoint_interval trades or
+    cursor_flush_seconds elapsed, whichever comes first — see
+    docs/ingestion.md for why the two must never desync. Graceful shutdown
+    (SIGTERM/SIGINT) persists all in-memory state.
     """
     import signal
     import threading

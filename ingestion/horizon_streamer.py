@@ -567,8 +567,19 @@ class HorizonStreamer:
             self._last_flush_time = self._clock()
 
     async def stream_events(self) -> AsyncIterator[dict]:
-        """Yield raw parsed SSE data dicts, handling reconnection and rate limiting."""
+        """Yield raw parsed SSE data dicts, handling reconnection and rate limiting.
+
+        ``_running`` is checked at the top of the reconnect loop, not just
+        inside the inner line-iteration loop: a reconnect whose SSE response
+        closes without ever yielding a line (e.g. immediately after
+        `_connect()` re-establishes a connection following a 404/410 cursor
+        reset, or any connection that opens then EOFs with zero lines) would
+        otherwise never re-check `_running` and spin forever reconnecting,
+        ignoring `stop()`.
+        """
         while True:
+            if not self._running:
+                return
             try:
                 client = await self._connect()
                 async with client:
