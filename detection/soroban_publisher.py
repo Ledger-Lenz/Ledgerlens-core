@@ -389,7 +389,7 @@ class SorobanPublisher:
         try:
             self._check_circuit()
         except SorobanCircuitOpenError as exc:
-            save_submission(score.wallet, score.asset_pair, score.score, "skipped", error_message="Circuit breaker open")
+            save_submission(score.wallet, score.asset_pair, score.score, "skipped", error_message="Circuit breaker open", proof_system=settings.zk_proof_system)
             self._write_dead_letter(
                 wallet=score.wallet,
                 asset_pair=score.asset_pair,
@@ -403,7 +403,7 @@ class SorobanPublisher:
         zk_bundle = self._build_zk_bundle(score, features) if features else None
 
         if dry_run:
-            save_submission(score.wallet, score.asset_pair, score.score, "skipped")
+            save_submission(score.wallet, score.asset_pair, score.score, "skipped", proof_system=settings.zk_proof_system)
             try:
                 from api.metrics import soroban_submissions_total
                 soroban_submissions_total.labels(status="skipped").inc()
@@ -418,7 +418,7 @@ class SorobanPublisher:
         try:
             tx_hash = self._execute_with_retries(server, score, zk_bundle=zk_bundle)
             self._record_success()
-            save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash)
+            save_submission(score.wallet, score.asset_pair, score.score, "submitted", tx_hash=tx_hash, proof_system=settings.zk_proof_system)
             try:
                 from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
                 soroban_submissions_total.labels(status="success").inc()
@@ -427,7 +427,7 @@ class SorobanPublisher:
                 pass
             return tx_hash
         except SorobanSubmissionError:
-            save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Submission failed after retries")
+            save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Submission failed after retries", proof_system=settings.zk_proof_system)
             try:
                 from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
                 soroban_submissions_total.labels(status="failed").inc()
@@ -436,7 +436,7 @@ class SorobanPublisher:
                 pass
             raise
         except Exception:
-            save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error")
+            save_submission(score.wallet, score.asset_pair, score.score, "failed", error_message="Unexpected submission error", proof_system=settings.zk_proof_system)
             try:
                 from api.metrics import soroban_submissions_total, soroban_submission_latency_seconds
                 soroban_submissions_total.labels(status="failed").inc()
@@ -459,7 +459,7 @@ class SorobanPublisher:
         try:
             self._check_circuit()
         except SorobanCircuitOpenError:
-            save_submission(wallet, asset_pair, score, "skipped", error_message="Circuit breaker open")
+            save_submission(wallet, asset_pair, score, "skipped", error_message="Circuit breaker open", proof_system=settings.zk_proof_system)
             return False
 
         server = SorobanServer(self._soroban_rpc_url)
@@ -526,7 +526,7 @@ class SorobanPublisher:
             for _ in range(30):
                 get_result = server.get_transaction(tx_hash)
                 if get_result.status == "SUCCESS":
-                    save_submission(wallet, asset_pair, score, "submitted", tx_hash=tx_hash)
+                    save_submission(wallet, asset_pair, score, "submitted", tx_hash=tx_hash, proof_system=settings.zk_proof_system)
                     return True
                 if get_result.status == "FAILED":
                     logger.error("Transaction failed: %s", get_result)
@@ -580,20 +580,66 @@ class SorobanPublisher:
         salt = generate_salt()
         threshold = self._default_threshold
 
-        comm_hex, (px, py), proof = generate_threshold_proof(
-            wallet=score.wallet,
-            score=score.score,
-            features=features,
-            salt=salt,
-            threshold=threshold,
-        )
-        return {
-            "commitment_hex": comm_hex,
-            "pedersen_x": px,
-            "pedersen_y": py,
-            "proof": proof,
-            "salt": salt,
-        }
+        if settings.zk_proof_system == "snark":
+            from detection.zk_commitment import pedersen_commit, serialize_point, score_commitment
+            from detection.zk_snark_prover import generate_snark_range_proof
+            import secrets
+            from py_ecc.bn128 import curve_order
+
+            blinding = secrets.randbelow(curve_order)
+            pt = pedersen_commit(score.score, blinding)
+            px, py = serialize_point(pt)
+
+            comm_hex = score_commitment(
+                wallet=score.wallet,
+                score=score.score,
+                features=features,
+                salt=salt,
+                score_commit_x=px,
+                score_commit_y=py,
+            )
+
+            snark_proof = generate_snark_range_proof(
+                score=score.score,
+                blinding=blinding,
+                commit=(px, py),
+                threshold=threshold,
+            )
+
+            # Serialize to 256 bytes (Little Endian for Fq::from_bytes)
+            proof_bytes = b"".join([
+                snark_proof.proof_a[0].to_bytes(32, "little"),
+                snark_proof.proof_a[1].to_bytes(32, "little"),
+                snark_proof.proof_b[0][0].to_bytes(32, "little"),
+                snark_proof.proof_b[0][1].to_bytes(32, "little"),
+                snark_proof.proof_b[1][0].to_bytes(32, "little"),
+                snark_proof.proof_b[1][1].to_bytes(32, "little"),
+                snark_proof.proof_c[0].to_bytes(32, "little"),
+                snark_proof.proof_c[1].to_bytes(32, "little"),
+            ])
+
+            return {
+                "commitment_hex": comm_hex,
+                "pedersen_x": px,
+                "pedersen_y": py,
+                "proof": proof_bytes,
+                "salt": salt,
+            }
+        else:
+            comm_hex, (px, py), proof = generate_threshold_proof(
+                wallet=score.wallet,
+                score=score.score,
+                features=features,
+                salt=salt,
+                threshold=threshold,
+            )
+            return {
+                "commitment_hex": comm_hex,
+                "pedersen_x": px,
+                "pedersen_y": py,
+                "proof": proof,
+                "salt": salt,
+            }
 
     def _execute_with_retries(
         self,

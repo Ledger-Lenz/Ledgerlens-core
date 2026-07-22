@@ -10,7 +10,6 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-sdk-derive = "21.0.0"
 # Pinned explicitly so the fuzz sub-crate (contracts/zk_verifier/fuzz),
 # which depends on this crate via `path = ".."` and therefore shares this
 # dependency graph, resolves the same 2.x-compatible ed25519-dalek/rand_core

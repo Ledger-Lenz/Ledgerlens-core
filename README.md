@@ -245,6 +245,11 @@ LedgerLens provides two complementary interpretability layers:
 
 The Soroban contract is the on-chain truth layer for LedgerLens risk scores.
 
+### Zero-Knowledge Proof Systems
+LedgerLens supports two ZK backends for proving that a score meets a threshold:
+- **Pedersen Sigma-Protocol (Default):** Setup-free, verification logic is run directly on-chain. Best for general deployments.
+- **Groth16 zk-SNARK (Alternative):** Constant proof size (~256 bytes) and cheap on-chain pairing verification, requiring a trusted setup ceremony. See [docs/zk_snark_range_proof.md](docs/zk_snark_range_proof.md) for design, setup, and key rotation details.
+
 **Fuzzing & Security:** The oracle aggregator and ZK verifier contracts are continuously fuzzed using `cargo-fuzz` to detect integer overflow, authorization bypass, and malformed-input panics. See [docs/contract_fuzzing.md](docs/contract_fuzzing.md) for how to run fuzz targets locally and interpret results. All contract entrypoints are fuzz-tested on every PR (120s per target) and nightly (30min per target) to ensure composability guarantees for downstream AMMs, lending protocols, and aggregators.
 
 ### Contract Functions

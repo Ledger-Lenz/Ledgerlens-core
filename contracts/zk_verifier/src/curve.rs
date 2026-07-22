@@ -403,4 +403,17 @@ impl Fq {
         }
         result
     }
+
+    /// Check if this field element is strictly less than the BN254 field modulus
+    pub fn is_valid(&self) -> bool {
+        const FIELD_MODULUS_LO: u128 = 201382436151624795304958197775988587847;
+        const FIELD_MODULUS_HI: u128 = 64352033668853702584149021272023910493;
+        if self.1 < FIELD_MODULUS_HI {
+            return true;
+        }
+        if self.1 == FIELD_MODULUS_HI && self.0 < FIELD_MODULUS_LO {
+            return true;
+        }
+        false
+    }
 }
