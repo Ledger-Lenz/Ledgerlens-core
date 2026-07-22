@@ -5,7 +5,7 @@ from unittest import mock
 import pytest
 import json
 
-from detection.zk_commitment import pedersen_commit, serialize_point, generate_salt
+from detection.zk_commitment import generate_salt
 from detection.zk_prover import generate_threshold_proof
 from detection.zk_snark_prover import generate_snark_range_proof
 
@@ -70,6 +70,6 @@ def test_zk_proof_benchmark():
     # Assert SNARK proof size stays under 256 bytes limit
     assert snark_bytes <= 256
 
-    print(f"\n--- ZK Benchmark Results ---")
+    print("\n--- ZK Benchmark Results ---")
     print(f"Sigma Proof Size: {sigma_bytes} bytes | Prover Time: {sigma_duration * 1000:.2f} ms")
     print(f"SNARK Proof Size: {snark_bytes} bytes | Prover Time: {snark_duration * 1000:.2f} ms")

@@ -13,7 +13,6 @@ the harness that found it (see "Regression cases" at the bottom).
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
