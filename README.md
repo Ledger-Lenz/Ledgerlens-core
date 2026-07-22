@@ -281,6 +281,8 @@ pub struct RiskScore {
 
 This composability lets AMMs, lending protocols, and DEX aggregators on Stellar query LedgerLens scores natively — for example, gating liquidity provision from wallets above a configurable risk threshold — without an external oracle.
 
+For step-by-step procedures on rotating the service account key and other software-managed credentials, see the [Secret Rotation Runbook](docs/secret_rotation.md).
+
 ### Soroban Integration (`detection/soroban_publisher.py`)
 
 After each pipeline run, all `RiskScore` records above `RISK_SCORE_THRESHOLD` are submitted on-chain via `SorobanPublisher.submit_batch()`. This transforms LedgerLens from a standalone detection tool into composable on-chain financial infrastructure.

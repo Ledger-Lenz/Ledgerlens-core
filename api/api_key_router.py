@@ -64,6 +64,25 @@ def revoke_key(key_id: str) -> dict:
     return {"key_id": key_id, "status": "revoked"}
 
 
+@router.post(
+    "/{key_id}/rotate",
+    status_code=200,
+    summary="Rotate API key",
+    description="Rotate an active API key with an overlapping validity window.",
+)
+def rotate_key_endpoint(
+    key_id: str,
+    grace_period_seconds: int = 604800,
+) -> dict:
+    from detection.api_key_store import rotate_api_key
+    try:
+        if grace_period_seconds <= 0:
+            raise HTTPException(status_code=422, detail="Grace period must be positive")
+        return rotate_api_key(key_id, grace_period_seconds=grace_period_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.get(
     "",
     summary="List API keys",

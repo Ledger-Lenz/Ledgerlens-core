@@ -1664,6 +1664,21 @@ def admin_namespaces() -> list[dict]:
     return list_namespaces()
 
 
+@app.post("/admin/namespaces/{namespace_id}/rotate-key", dependencies=[Depends(require_admin_key)])
+def admin_rotate_namespace_key(
+    namespace_id: str,
+    grace_period_seconds: int = 604800,
+) -> dict:
+    """Rotate the namespace key. Marks the old one rotating, creates a new one.
+
+    Admin-only (requires the ``LEDGERLENS_ADMIN_API_KEY`` header).
+    """
+    from api.namespace import rotate_namespace_key
+    if grace_period_seconds <= 0:
+        raise HTTPException(status_code=422, detail="Grace period must be positive")
+    return rotate_namespace_key(namespace_id, grace_period_seconds=grace_period_seconds)
+
+
 # ---------------------------------------------------------------------------
 # Model weights
 # ---------------------------------------------------------------------------
