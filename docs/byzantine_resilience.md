@@ -4,6 +4,66 @@ LedgerLens's federated aggregation server supports Krum and Multi-Krum —
 Byzantine-fault-tolerant aggregation rules that protect gradient updates
 against poisoning from malicious or compromised federation participants.
 
+## Production wiring
+
+`FederatedAggregationServer._aggregate_locked()` (`detection/federated/server.py`)
+runs Multi-Krum peer-distance selection on every round via
+`_select_krum_survivors()`, **default-on** (`settings.federated_use_krum = True`,
+constructor override `use_krum=`). This supplements — does not replace — the
+existing historical-cosine heuristic in `submit_update()`.
+
+### Pipeline order
+
+1. **Clip** (`submit_update`): each participant's delta is norm-clipped to
+   `gradient_clip_threshold` before anything else touches it.
+2. **Historical-cosine heuristic** (`submit_update`): flags/excludes updates
+   whose delta direction diverges from the previous rounds' mean delta.
+   Skipped on round 1 (no history yet) — this is exactly the gap Krum closes.
+3. **Krum/Multi-Krum select** (`_aggregate_locked`, after quorum): computes
+   pairwise distances over the (already clipped, already cosine-filtered)
+   deltas of this round's valid updates and excludes the peer-distance
+   outliers. Runs from round 1 onward.
+4. **Weighted FedAvg** over the Krum survivors only, with the existing
+   n_samples weighting and weight-share cap.
+5. **Server-side DP noise**, added once to the final released aggregate —
+   unchanged position from before Krum was wired in.
+
+This ordering is a deliberate choice, not incidental:
+
+- Clipping must precede Krum because an unbounded malicious delta would
+  distort every pairwise distance in the round, defeating Krum's own
+  guarantee before it runs.
+- Krum must precede DP noise: noise added *before* Krum could push an honest
+  update's measured distance closer to a malicious one (weakening the
+  Byzantine-robustness guarantee), and Krum's data-dependent selection is
+  only ever reflected downstream as a list of excluded participant ids (an
+  already-audited quantity) rather than in any additional noised value — so
+  running it before noising introduces no new privacy-budget surface, and
+  the existing (ε, δ) accounting in `detection/federated/privacy_utils.py`
+  and the RDP accountant in `server.py` are untouched.
+- The cosine heuristic and Krum are kept **both active**: the cosine
+  heuristic is cheap and catches sustained directional drift across rounds,
+  while Krum is the structural fix for same-round collusion and the
+  first-round gap. Neither subsumes the other's failure mode, so both stay.
+
+### Quorum / `f` derivation (per round, not static)
+
+`f` (Byzantine tolerance) and the `2f + 2 < n` safety margin are computed in
+`_select_krum_survivors` from `n = len(valid_updates)` — the actual number of
+non-excluded updates *in that round* — never from a static config value. This
+keeps the guarantee valid even as participants join, drop out, or get
+filtered by the cosine heuristic between rounds. Multi-Krum's `m` is set to
+`n - f` (survive as many updates as the tolerance budget allows) so the
+weighted FedAvg still benefits from the full non-outlier set rather than
+collapsing to a single gradient.
+
+**Fallback when the round is too small for any tolerance**: if `n < 3`, or no
+`f >= 0` satisfies `2f + 2 < n` (i.e. `n <= 2`), Krum is skipped entirely for
+that round with a `WARNING` log, and the round falls back to plain weighted
+FedAvg with no per-round peer-distance defense (the cosine heuristic, if not
+itself skipped, still applies). This is a documented, logged fallback rather
+than a crash or a silent, invalid tolerance claim.
+
 ## Background
 
 Plain FedAvg is broken by a single Byzantine client: one malicious
@@ -20,8 +80,21 @@ a single one, offering a bias-variance tradeoff.
 ## Choosing `f`
 
 `f` is the number of Byzantine clients you expect.  The default is
-`floor(n / 3)`.  The hard constraint is `2f + 2 < n`; the server raises a
-`ValueError` at startup if this is violated.
+`floor(n / 3)`.  The hard constraint is `2f + 2 < n`.
+
+In production (`FederatedAggregationServer`), `f` is derived automatically
+each round from the live participant count (see "Quorum / `f` derivation"
+above) — there is nothing to configure.
+
+The standalone `KrumStrategy` class (`detection/federated/krum.py`, used
+directly by tests and for offline/experimental aggregation outside the live
+server) instead fixes `f` from a `min_clients` argument at construction, and
+raises `ValueError` at construction if `2f + 2 < min_clients` doesn't hold.
+Its default `min_clients` is **5** — the smallest `n` for which the default
+`f = floor(min_clients / 3)` derivation is self-consistent (`floor(3/3)=1`
+and `floor(4/3)=1` both give `2f+2=4`, which fails `< n` for `n=3` or `n=4`;
+`n=5` is the first value where `2×1+2=4 < 5` holds). `KrumStrategy()` with no
+arguments is guaranteed to construct successfully.
 
 | `n` clients | Max safe `f` | Reasoning               |
 |-------------|-------------|-------------------------|
@@ -71,27 +144,35 @@ curl -H "X-LedgerLens-Admin-Key: $LEDGERLENS_ADMIN_API_KEY" \
 
 ## Persistent Byzantine-Actor Detection
 
-`KrumStrategy` tracks per-client exclusion rates across rounds.  If a client
-is excluded in more than 50% of consecutive rounds, a `WARNING` is logged:
+`KrumStrategy` (standalone use) tracks per-client exclusion rates across
+rounds.  If a client is excluded in more than 50% of consecutive rounds, a
+`WARNING` is logged:
 
 ```
 Client <id> has been excluded in 60% of rounds — possible persistent Byzantine actor
 ```
 
 Investigate that client's data pipeline or consider rotating it out of the
-federation.
+federation. In production, look for repeated "Krum round: excluded ..."
+warnings from `FederatedAggregationServer._select_krum_survivors` for the
+same participant across rounds.
 
 ## Security Notes
 
 - **Score logging only**: Krum scores (scalars) and client indices are logged.
   Gradient vectors are never persisted — they can be inverted to reconstruct
   private training data.
-- **f validation**: enforced at `KrumStrategy` construction; a misconfigured
-  `f` fails fast rather than silently providing weaker guarantees.
-- **Mid-round dropout**: if the number of submitted gradients falls below
-  `2f + 2 + 1` (e.g., clients drop out after the round starts), `krum_scores`
-  raises a `ValueError`.  The calling code should fall back to FedAvg or abort
-  the round depending on the operator's risk tolerance.
+- **f validation**: `KrumStrategy` (standalone use) validates `f` at
+  construction; a misconfigured `f` fails fast rather than silently providing
+  weaker guarantees. In production, `FederatedAggregationServer` instead
+  derives `f` fresh each round from the live participant count, so there is
+  no static value to misconfigure — see "Quorum / `f` derivation" above.
+- **Mid-round dropout**: standalone `KrumAggregator.krum_scores` raises
+  `ValueError` if the number of submitted gradients falls below `2f + 2 + 1`
+  (e.g., clients drop out after the round starts). In production this is
+  handled, not raised: `_select_krum_survivors` computes `f` from the live
+  count and falls back to plain FedAvg with a `WARNING` (see "Fallback when
+  the round is too small" above) instead of crashing or aborting the round.
 
 ## References
 

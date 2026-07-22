@@ -248,6 +248,16 @@ class Settings(BaseSettings):
     # that round (cross-round consistency check). Only applies from a
     # participant's second accepted round onward.
     federated_max_n_samples_growth_factor: float = 3.0
+    # Default-on: use Krum/Multi-Krum peer-distance selection (see
+    # detection/federated/krum.py, docs/byzantine_resilience.md) at
+    # aggregation time to exclude the most outlying updates *within the same
+    # round*, on top of (not instead of) the existing historical-cosine
+    # heuristic. `f` (Byzantine tolerance) is derived each round from the
+    # live count of valid updates, never a static config value -- see
+    # `FederatedAggregationServer._select_krum_survivors`. Disabling this
+    # falls back to plain weighted FedAvg with no per-round peer-distance
+    # defense (the cosine heuristic still applies if enabled).
+    federated_use_krum: bool = True
 
     # ── Cross-chain Bayesian linking ─────────────────────────────────────────
     cross_chain_timing_sigma_seconds: float = 300.0
