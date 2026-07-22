@@ -7,7 +7,6 @@ import pytest
 
 from detection.zk_prover import ProofError
 from detection.zk_snark_prover import generate_snark_range_proof, SnarkProof
-from config.settings import settings
 
 
 @pytest.fixture

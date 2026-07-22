@@ -51,6 +51,16 @@ def _fresh_circuit(monkeypatch):
     """Each test gets its own breaker instance so state never leaks across tests."""
     fresh = CircuitBreaker(name="horizon", failure_threshold=3, recovery_timeout=0.05)
     monkeypatch.setattr(horizon_streamer, "horizon_circuit", fresh)
+
+    # `stream_trades_with_cursor` dedups trades through an `IdempotencyKeyStore`
+    # persisted at the real, shared `settings.db_path` -- not per-test state.
+    # `_OneTradeThenStopsSSEClient` always yields the same hardcoded trade id,
+    # so once any run of this suite has durably marked it "seen", every
+    # subsequent run sees it rejected as a replay and yields zero trades.
+    # These tests exercise circuit-breaker behavior, not dedup, so disable it.
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "ingestion_dedup_enabled", False)
     return fresh
 
 

@@ -1,7 +1,5 @@
 import base64
 import os
-import sqlite3
-from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -10,13 +8,9 @@ from fastapi.testclient import TestClient
 
 from config.settings import settings as _settings
 from detection.api_key_store import (
-    _hash_key,
     create_api_key,
-    get_api_key_by_hash,
-    lookup_key,
     rotate_api_key,
     sweep_expired_api_keys,
-    get_overdue_api_keys_count,
 )
 from api.namespace import rotate_namespace_key, lookup_namespace
 from detection.webhook_registry import _encrypt_secret, _decrypt_secret, register_subscriber, get_subscriber
@@ -116,33 +110,31 @@ def test_rotate_revoked_key_raises_error(db_path):
 
 def test_namespace_key_rotation(db_path):
     """Test namespace key rotation preserves namespace visibility and validates grace periods."""
-    with patch.object(_settings, "ledgerlens_multi_tenant_enabled", True):
-        # Create namespace key
-        import secrets
-        plaintext_old = f"ll_{secrets.token_urlsafe(32)}"
-        from api.namespace import register_api_key
-        register_api_key(plaintext_old, namespace_id="my-ns", description="Old Key")
+    # Create namespace key
+    import secrets
+    plaintext_old = f"ll_{secrets.token_urlsafe(32)}"
+    from api.namespace import register_api_key
+    register_api_key(plaintext_old, namespace_id="my-ns", description="Old Key")
 
-        # Confirm lookup works
-        assert lookup_namespace(plaintext_old) == "my-ns"
+    # Confirm lookup works
+    assert lookup_namespace(plaintext_old) == "my-ns"
 
-        # Rotate key
-        rotated = rotate_namespace_key("my-ns", grace_period_seconds=5)
-        plaintext_new = rotated["plaintext_key"]
+    # Rotate key
+    rotated = rotate_namespace_key("my-ns", grace_period_seconds=5)
+    plaintext_new = rotated["plaintext_key"]
 
-        # Both new and old work
-        assert lookup_namespace(plaintext_old) == "my-ns"
-        assert lookup_namespace(plaintext_new) == "my-ns"
+    # Both new and old work
+    assert lookup_namespace(plaintext_old) == "my-ns"
+    assert lookup_namespace(plaintext_new) == "my-ns"
 
-        # Expired namespace rotation deadline
-        rotated_expired = rotate_namespace_key("my-ns", grace_period_seconds=-1)
-        plaintext_expired = rotated_expired["plaintext_key"]
+    # Expired namespace rotation deadline
+    rotate_namespace_key("my-ns", grace_period_seconds=-1)
 
-        # Old key should now fail lookup after deadline
-        from fastapi import HTTPException
-        with pytest.raises(HTTPException) as exc:
-            lookup_namespace(plaintext_new)
-        assert exc.value.status_code == 401
+    # Old key should now fail lookup after deadline
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        lookup_namespace(plaintext_new)
+    assert exc.value.status_code == 401
 
 
 def test_webhook_encryption_rotation_fallback(db_path):
@@ -166,7 +158,7 @@ def test_webhook_encryption_rotation_fallback(db_path):
         # 3. Register subscriber with previous key
         # In order to simulate DB rows under the old key, we'll temporarily set old key as primary
         with patch.dict(os.environ, {"LEDGERLENS_WEBHOOK_ENCRYPTION_KEY": key_previous}):
-            sub_id = register_subscriber("https://valid-domain.com/webhook", "super_secret_hmac", db_path=db_path)
+            sub_id = register_subscriber("https://example.com/webhook", "super_secret_hmac", db_path=db_path)
 
         # Retrieve subscriber (uses fallback, should succeed)
         sub = get_subscriber(sub_id, db_path=db_path)
@@ -190,7 +182,6 @@ def test_webhook_encryption_rotation_fallback(db_path):
 
 def test_rotate_api_key_endpoint_and_prometheus(db_path, app):
     """Test end-to-end rotation endpoint, admin gating, and metrics."""
-    from api.metrics import ledgerlens_secret_rotation_total
 
     client = TestClient(app)
 
@@ -198,12 +189,15 @@ def test_rotate_api_key_endpoint_and_prometheus(db_path, app):
     key = create_api_key(scopes=["read:scores"], namespace_id="ns1")
     key_id = key["key_id"]
 
-    # Attempt rotation without admin key (401)
-    resp = client.post(f"/admin/api-keys/{key_id}/rotate?grace_period_seconds=10")
-    assert resp.status_code == 401
-
-    # Rotate with admin key (200)
+    # Admin key must be configured for "missing header" to return 401 rather
+    # than 503 ("admin key not configured" -- require_admin_key fails closed
+    # and checks this first).
     with patch.object(_settings, "ledgerlens_admin_api_key", "admin-key-123"):
+        # Attempt rotation without admin key (401)
+        resp = client.post(f"/admin/api-keys/{key_id}/rotate?grace_period_seconds=10")
+        assert resp.status_code == 401
+
+        # Rotate with admin key (200)
         resp = client.post(
             f"/admin/api-keys/{key_id}/rotate?grace_period_seconds=10",
             headers={"X-LedgerLens-Admin-Key": "admin-key-123"}

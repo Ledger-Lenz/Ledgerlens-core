@@ -49,7 +49,7 @@ from api.namespace import list_namespaces
 from api.api_key_router import router as api_key_router, require_scope
 from api.api_keys_router import router as api_keys_router
 from api.gateway import GatewayMiddleware
-from config.settings import settings
+from config.settings import get_runtime_risk_score_threshold, settings
 from detection.tracing import (
     configure_tracing,
     extract_context_from_headers,
@@ -77,7 +77,13 @@ from detection.storage import (
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
 from detection.feedback_store import AnalystFeedbackStore
-from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
+from detection.governance import (
+    GovernanceEngine,
+    GovernanceError,
+    create_proposal,
+    list_open_proposals,
+    cast_proposal_vote,
+)
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
@@ -479,7 +485,7 @@ def _get_health_feature_store():
     "/health",
     tags=["System"],
     summary="Health check",
-    description="Returns 200 (ok/degraded) or 503. Checks DB, model files, and circuit breakers.",
+    description="Returns 200 (ok/degraded) or 503. Checks DB, model files, circuit breakers, and governed config version.",
 )
 def health() -> JSONResponse:
     """Returns 200 when healthy, 503 when any hard-failure component check fails.
@@ -492,6 +498,12 @@ def health() -> JSONResponse:
       circuit marks the response "degraded" but keeps returning 200 (the
       service is still serving traffic in a reduced-functionality state,
       not failed) — only DB/model failures return 503.
+    - Governed config: `status["config"]` reports this process's currently
+      active `risk_score_threshold` and the `runtime_config` row's
+      `updated_at` as its version, so operators can confirm a governance
+      proposal (or `PATCH /admin/config`) has actually propagated to this
+      process rather than assuming it did. See
+      `docs/governance_protocol.md` for the propagation consistency model.
 
     Returns 503 when any check fails or when soroban_circuit_status=="open",
     drift_status=="drifted", or webhook_dead_letter_count > 0.
@@ -551,6 +563,10 @@ def health() -> JSONResponse:
             status["event_bus"] = bus_health
             if bus_health.get("status") != "ok":
                 degraded = True
+
+    # --- Governed config (governance / PATCH /admin/config propagation) ---
+    from config.settings import get_governed_config_status
+    status["config"] = get_governed_config_status()
 
     if healthy:
         status["status"] = "degraded" if degraded else "ok"
@@ -1051,7 +1067,7 @@ def wallet_counterfactual(
 
     from detection.model_inference import score_feature_vector
 
-    resolved_target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
+    resolved_target_score = target_score if target_score is not None else get_runtime_risk_score_threshold() - 1
     with start_span("model.inference", attributes={"wallet": wallet}):
         current_probability, _confidence = score_feature_vector(_models, feature_vector)
     current_score = round(current_probability * 100)
@@ -1314,7 +1330,7 @@ def alerts(
         return get_alerts(alert_type=alert_type, limit=limit, offset=offset)
 
     scores = get_latest_scores(limit=limit, offset=offset)
-    return [s for s in scores if s.score >= settings.risk_score_threshold]
+    return [s for s in scores if s.score >= get_runtime_risk_score_threshold()]
 
 
 
@@ -1971,6 +1987,42 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
     return p.model_dump()
 
 
+@v1_router.post(
+    "/governance/proposals/{proposal_id}/execute",
+    dependencies=[Depends(require_admin_key)],
+    tags=["Governance"],
+    summary="Execute proposal",
+    description=(
+        "Execute a passed governance proposal (admin only): applies the "
+        "change and propagates it to every process. See "
+        "docs/governance_protocol.md for the consistency model and "
+        "propagation latency."
+    ),
+)
+def execute_proposal_endpoint(proposal_id: str):
+    """Delegates to `GovernanceEngine.execute_proposal` (the canonical
+    engine, not the legacy create/list/vote shim above -- there is no
+    legacy execute equivalent). Documented as existing since this
+    module's inception but never actually wired up; this closes that gap.
+    """
+    try:
+        pid = int(proposal_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="proposal_id must be an integer")
+
+    try:
+        p = GovernanceEngine().execute_proposal(pid)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "proposal_id": p.id,
+        "status": p.status,
+        "executed_at": p.executed_at.isoformat() if p.executed_at else None,
+        "execution_error": p.execution_error,
+    }
+
+
 # ------------------------------------------------------------------
 # Regulatory compliance export layer
 #
@@ -2345,7 +2397,7 @@ def causal_explanation(
     counterfactual_score_value: Optional[float] = None
     if override_parsed is not None:
         feature_name, feature_value = override_parsed
-        wallet_features = get_feature_vector_for_wallet(wallet, scores[0].asset_pair)
+        wallet_features = get_feature_vector(wallet, scores[0].asset_pair)
         if wallet_features is not None:
             counterfactual_score_value = engine.counterfactual_score(
                 wallet_features=wallet_features,

@@ -5,7 +5,6 @@ import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import Any
 
 from config.settings import settings
 from detection.zk_prover import ProofError

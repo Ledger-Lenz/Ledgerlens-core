@@ -1,5 +1,3 @@
-import importlib
-
 import pytest
 
 import config.settings as settings_module
@@ -21,7 +19,7 @@ def test_defaults_when_env_unset(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
 
-    settings = importlib.reload(settings_module).settings
+    settings = settings_module.Settings()
 
     assert settings.horizon_url == "https://horizon.stellar.org"
     assert settings.benford_mad_threshold == 0.015
@@ -43,15 +41,13 @@ def test_env_overrides_are_applied(monkeypatch):
     monkeypatch.setenv("ENSEMBLE_WEIGHT_XGB", "3")
     monkeypatch.setenv("ENSEMBLE_WEIGHT_LGBM", "5")
 
-    settings = importlib.reload(settings_module).settings
+    settings = settings_module.Settings()
 
     assert settings.risk_score_threshold == 85
     assert settings.db_path == "/tmp/custom.db"
     assert settings.ensemble_weight_rf == 2
     assert settings.ensemble_weight_xgb == 3
     assert settings.ensemble_weight_lgbm == 5
-
-    importlib.reload(settings_module)
 
 
 def test_negative_ensemble_weight_raises(monkeypatch):

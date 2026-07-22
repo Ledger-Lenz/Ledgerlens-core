@@ -11,7 +11,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
-from config.settings import settings
+from config.settings import get_runtime_risk_score_threshold, settings
 
 logger = logging.getLogger("ledgerlens.alert_engine")
 
@@ -75,7 +75,7 @@ class AlertDeduplicator:
 
     def __init__(self, db_path: Optional[str] = None, threshold: Optional[int] = None):
         self._db_path = db_path or settings.db_path
-        self._threshold = threshold if threshold is not None else settings.risk_score_threshold
+        self._threshold = threshold if threshold is not None else get_runtime_risk_score_threshold()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)

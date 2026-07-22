@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 import pandas as pd
 
-from config.settings import settings
+from config.settings import get_runtime_risk_score_threshold, settings
 from config.correlation import set_correlation_id
 from config.telemetry import get_tracer
 from detection.cross_pair_engine import (
@@ -383,7 +383,7 @@ def run(
 
                     _elapsed = time.monotonic() - _t_acct
                     scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
-                    _result = "above_threshold" if score.score >= settings.risk_score_threshold else "below_threshold"
+                    _result = "above_threshold" if score.score >= get_runtime_risk_score_threshold() else "below_threshold"
                     wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
                 r.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="feature_distribution_snapshots"))
 
@@ -470,7 +470,7 @@ def _submit_on_chain(scores: list[RiskScore], no_submit: bool = False) -> None:
             circuit_breaker_threshold=settings.soroban_circuit_breaker_threshold,
             circuit_reset_seconds=settings.soroban_circuit_reset_seconds,
         )
-        high_risk = [s for s in scores if s.score >= settings.risk_score_threshold]
+        high_risk = [s for s in scores if s.score >= get_runtime_risk_score_threshold()]
         if high_risk:
             results = publisher.submit_batch(high_risk)
             success_count = sum(

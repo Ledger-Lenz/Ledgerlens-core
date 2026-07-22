@@ -507,6 +507,59 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         "add proof_system column to on_chain_submissions",
         "ALTER TABLE on_chain_submissions ADD COLUMN proof_system TEXT DEFAULT 'sigma';",
     ),
+    (
+        19,
+        "fix governance_proposals schema for GovernanceEngine (Issue #150) and "
+        "add the governance_votes/governance_committee tables it requires",
+        """
+        -- Migration 7's `governance_proposals` (proposal_id, proposed_value,
+        -- proposed_by_key_hash, votes_for_json, votes_against_json, created_at,
+        -- expires_at) predates `detection.governance.GovernanceEngine` and was
+        -- never actually compatible with it: every real column
+        -- `GovernanceEngine` reads/writes (payload, proposer, submitted_at,
+        -- voting_ends_at, executed_at, execution_error) is missing, so
+        -- `submit_proposal()` raised `OperationalError: table
+        -- governance_proposals has no column named payload` on any database
+        -- that had run migration 7 -- i.e. every real deployment, since
+        -- `init_db()` runs unconditionally at startup. No governance proposal
+        -- could ever have been successfully submitted against the old schema
+        -- (the very first write would have crashed), so there is no data to
+        -- preserve; dropping and recreating is safe. `governance_votes` and
+        -- `governance_committee` were never created by any migration at all --
+        -- `cast_vote`/`_is_committee_member` would fail with "no such table"
+        -- on a fresh database. This does not touch `committee_members`, which
+        -- is a distinct, still-used table for the score-dispute committee
+        -- (see detection/dispute_store.py), not the governance committee.
+        DROP TABLE IF EXISTS governance_proposals;
+
+        CREATE TABLE governance_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            proposer TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            submitted_at TIMESTAMP NOT NULL,
+            voting_ends_at TIMESTAMP NOT NULL,
+            executed_at TIMESTAMP,
+            execution_error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS governance_votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id INTEGER NOT NULL,
+            voter TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK(decision IN ('for','against','abstain')),
+            cast_at TIMESTAMP NOT NULL,
+            UNIQUE(proposal_id, voter)
+        );
+
+        CREATE TABLE IF NOT EXISTS governance_committee (
+            member TEXT PRIMARY KEY,
+            added_at TIMESTAMP NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        """,
+    ),
 ]
 
 

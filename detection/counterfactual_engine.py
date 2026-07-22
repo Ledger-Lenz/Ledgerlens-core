@@ -181,9 +181,9 @@ def generate_counterfactuals(
     Returns an empty list if `feature_vector` already scores below `target_score`,
     or if no feasible counterfactual exists within `FEATURE_CONSTRAINTS`.
     """
-    from config.settings import settings
+    from config.settings import get_runtime_risk_score_threshold
 
-    target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
+    target_score = target_score if target_score is not None else get_runtime_risk_score_threshold() - 1
 
     current_score = _predicted_score(models, feature_vector)
     if current_score < target_score:

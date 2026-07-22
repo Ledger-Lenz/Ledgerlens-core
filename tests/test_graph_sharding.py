@@ -1,9 +1,7 @@
 """Tests for the adaptive sharded graph engine (Issue #348)."""
 
-import copy
 from unittest.mock import patch
 
-import networkx as nx
 import pytest
 
 from detection.graph_engine import (
@@ -11,7 +9,7 @@ from detection.graph_engine import (
     ShardedTradeGraph,
     TradeGraph,
 )
-from detection.graph_sharding import GraphShardPartitioner, ShardAssignment
+from detection.graph_sharding import GraphShardPartitioner
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +296,6 @@ def test_ring_beyond_overlap_buffer_missed():
     for ring in rings:
         ring_set = frozenset(ring["accounts"])
         assert ring_set != full_ring, (
-            f"Ring spanning beyond overlap buffer was unexpectedly detected. "
-            f"This is a documented limitation of the sharded graph engine."
+            "Ring spanning beyond overlap buffer was unexpectedly detected. "
+            "This is a documented limitation of the sharded graph engine."
         )

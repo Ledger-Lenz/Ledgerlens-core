@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import config.settings as settings_module
 from detection.governance import (
     GovernanceEngine,
     GovernanceError,
@@ -18,6 +19,31 @@ from detection.governance import (
     Vote,
     _connect,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_risk_score_threshold():
+    """Save/restore governance-mutable global state around every test.
+
+    Before the config-propagation fix, `SettingsReloader.apply()`'s in-process
+    live-apply silently no-op'd (the `_default_risk_score_threshold` property
+    had no setter), so `TestSettingsReloader`'s real (unmocked) `.apply()`
+    calls below never actually touched the global `settings` singleton. Now
+    that the setter works, those calls durably mutate `settings.risk_score_
+    threshold` for the rest of the pytest session unless restored.
+
+    Also invalidates `config.settings`'s module-level `_default_runtime_cache`
+    on both sides: it's a wall-clock-TTL cache keyed by nothing but time, not
+    `db_path`, so a `runtime_config` write in one test (this file writes to a
+    fresh `tmp_path` db per test) can otherwise leak a stale cached value into
+    an unrelated test elsewhere in the suite that happens to run within the
+    same ~60s TTL window and also calls `get_runtime_risk_score_threshold()`.
+    """
+    settings_module.invalidate_runtime_config_cache()
+    original = settings_module.settings.risk_score_threshold
+    yield
+    object.__setattr__(settings_module.settings, "risk_score_threshold", original)
+    settings_module.invalidate_runtime_config_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -337,5 +363,33 @@ class TestSettingsReloader:
             content = (tmp_path / ".env").read_text()
             assert "RISK_SCORE_THRESHOLD=90" in content
             assert content.count("RISK_SCORE_THRESHOLD=") == 1
+        finally:
+            os.chdir(orig)
+
+    def test_live_apply_actually_changes_in_process_settings(self, tmp_path):
+        """Direct repro/confirmation of the object.__setattr__ crash fix.
+
+        `_default_risk_score_threshold` (config/settings.py) used to be a
+        read-only `@property` with no setter -- `object.__setattr__(settings,
+        "_default_risk_score_threshold", parsed)` raised `AttributeError`,
+        silently swallowed by `apply()`'s `except (AttributeError, TypeError):
+        pass`, so the executing process's own live settings value never
+        changed. This asserts the live in-process value actually changes
+        immediately after `apply()` runs -- no restart, no other process
+        involved.
+        """
+        orig = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            original = settings_module.settings.risk_score_threshold
+            assert original != 92, "test fixture assumption: default isn't already 92"
+
+            with patch("detection.governance._connect") as mc:
+                mc.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                mc.return_value.__exit__ = MagicMock(return_value=False)
+                SettingsReloader().apply("RISK_SCORE_THRESHOLD", "92")
+
+            assert settings_module.settings.risk_score_threshold == 92
+            assert settings_module.settings._default_risk_score_threshold == 92
         finally:
             os.chdir(orig)
