@@ -932,6 +932,7 @@ Covers:
 - ✅ RiskScore combination logic and SQLite storage
 - ✅ Local API and CLI
 - ✅ Horizon HTTP retry/backoff behaviour
+- ✅ Fuzz-tested ingestion parsers (Atheris coverage-guided harnesses in `fuzz/`; see [docs/testing_guide.md](docs/testing_guide.md))
 
 ## Roadmap
 
