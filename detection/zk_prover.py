@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 from typing import Any
 
 from py_ecc.bn128 import FQ, G1, curve_order, neg as bn_neg, multiply, add as bn_add
@@ -25,6 +26,17 @@ from detection.zk_commitment import (
 MAX_SCORE = 100
 NUM_BITS = 7  # 2^7 = 128 >= 100
 
+# Wire format version for serialize_proof_bytes/deserialize_proof_bytes. Bump
+# this (and the matching constant in contracts/zk_verifier/src/lib.rs) on any
+# layout change; the Rust side rejects any other version byte.
+PROOF_WIRE_VERSION = 1
+
+# Fixed record size in bytes: 6 x 32-byte big-endian field/scalar elements
+# per bit (commit_x, commit_y, c0, c1, s0, s1).
+_BIT_RECORD_LEN = 6 * 32
+# 1 version byte + 2 x 32-byte score-commitment coordinates + NUM_BITS records.
+PROOF_WIRE_LEN = 1 + 2 * 32 + NUM_BITS * _BIT_RECORD_LEN
+
 
 class ProofError(Exception):
     """Raised when proof generation or verification fails."""
@@ -38,7 +50,9 @@ def _mod(a: int) -> int:
     return a % curve_order
 
 
-def _rand_scalar() -> int:
+def _rand_scalar(rng: random.Random | None = None) -> int:
+    if rng is not None:
+        return rng.getrandbits(256) % curve_order
     return int.from_bytes(os.urandom(32), "big") % curve_order
 
 
@@ -86,6 +100,7 @@ def _prove_bit(
     blinding: int,
     B: tuple[FQ, FQ],
     context: bytes,
+    rng: random.Random | None = None,
 ) -> dict[str, int]:
     """Non-interactive Sigma OR-proof that *B* commits to 0 or 1.
 
@@ -98,10 +113,10 @@ def _prove_bit(
 
     if bit == 0:
         # Real proof for statement 0 (B = r*H), simulated for statement 1
-        c1 = _rand_scalar()
-        s1 = _rand_scalar()
-        t0 = _rand_scalar()
-        s0 = _rand_scalar()
+        c1 = _rand_scalar(rng)
+        s1 = _rand_scalar(rng)
+        t0 = _rand_scalar(rng)
+        s0 = _rand_scalar(rng)
 
         R0 = multiply(H, t0)  # t0 * H
 
@@ -122,10 +137,10 @@ def _prove_bit(
 
     else:
         # bit == 1: Real proof for statement 1 (B - G = r*H), simulated for statement 0
-        c0 = _rand_scalar()
-        s0 = _rand_scalar()
-        t1 = _rand_scalar()
-        s1 = _rand_scalar()
+        c0 = _rand_scalar(rng)
+        s0 = _rand_scalar(rng)
+        t1 = _rand_scalar(rng)
+        s1 = _rand_scalar(rng)
 
         # R0 = s0 * H - c0 * B  (simulated)
         term0_r0 = multiply(H, s0)
@@ -160,6 +175,15 @@ def generate_threshold_proof(
 ) -> tuple[str, tuple[int, int], dict[str, Any]]:
     """Generate a ZK proof that ``score >= threshold``.
 
+    Parameters
+    ----------
+    _rng_seed:
+        When provided, all blinding factors and Sigma-protocol randomness are
+        drawn from a seeded ``random.Random(_rng_seed)`` instead of
+        ``os.urandom`` — for reproducible test/cross-language fixture
+        generation only. Leave ``None`` for real proof generation, which
+        must use OS randomness.
+
     Returns
     -------
     (commitment_hex, score_commit_coords, proof_dict)
@@ -174,13 +198,15 @@ def generate_threshold_proof(
     if score < threshold:
         raise ProofError("Cannot generate proof: score below threshold")
 
+    rng = random.Random(_rng_seed) if _rng_seed is not None else None
+
     d = score - threshold
 
     # 1. Decompose d into bits
     bits = [(d >> i) & 1 for i in range(NUM_BITS)]
 
     # 2. Generate bit commitments with random blindings
-    r_i_list = [_rand_scalar() for _ in range(NUM_BITS)]
+    r_i_list = [_rand_scalar(rng) for _ in range(NUM_BITS)]
     H = h_generator()
     bit_commits: list[tuple[FQ, FQ]] = []
     for b_i, r_i in zip(bits, r_i_list):
@@ -202,7 +228,7 @@ def generate_threshold_proof(
 
     bit_proofs: list[dict[str, int]] = []
     for b_i, r_i, C_i in zip(bits, r_i_list, bit_commits):
-        bp = _prove_bit(b_i, r_i, C_i, context)
+        bp = _prove_bit(b_i, r_i, C_i, context, rng)
         bit_proofs.append(bp)
 
     # 5. Compute SHA-256 commitment (includes Pedersen point in hash)
@@ -213,6 +239,106 @@ def generate_threshold_proof(
     proof = _serialize_proof(P, bit_commits, bit_proofs)
 
     return comm, (p_x, p_y), proof
+
+
+# ---------------------------------------------------------------------------
+# Wire format: fixed-layout bytes for on-chain submission
+# ---------------------------------------------------------------------------
+#
+# Nothing previously serialised a proof dict to actual bytes -- the Soroban
+# contract's ``verify_threshold`` takes a raw ``Bytes`` argument, and the
+# only Rust-side deserialiser was an unconditional stub. This defines that
+# missing wire format (versioned, so a future layout change is detectable
+# rather than silently misparsed) and its exact Rust-side counterpart in
+# ``contracts/zk_verifier/src/lib.rs::deserialise_proof``.
+#
+# Layout (all integers big-endian, matching every other byte encoding in
+# this module -- ``x.to_bytes(32, "big")`` throughout):
+#
+#     offset  size  field
+#     0       1     version (must equal PROOF_WIRE_VERSION)
+#     1       32    score_commit_x
+#     33      32    score_commit_y
+#     65      192   bit record 0  (commit_x, commit_y, c0, c1, s0, s1; 32B each)
+#     257     192   bit record 1
+#     ...           (NUM_BITS records total)
+#
+# Total length is fixed (PROOF_WIRE_LEN) since NUM_BITS is a protocol
+# constant shared by both sides -- the Rust side rejects any other length.
+
+
+def serialize_proof_bytes(proof: dict[str, Any]) -> bytes:
+    """Encode a proof dict (as returned by :func:`generate_threshold_proof`)
+    into the fixed-layout wire format ``verify_threshold`` expects on-chain.
+
+    Raises ``ProofError`` if *proof* is missing required fields or has the
+    wrong number of bit records -- this is an encoding step for a proof this
+    process just generated, so any such failure indicates a caller bug, not
+    an adversarial input (compare :func:`deserialize_proof_bytes`, which
+    must tolerate untrusted bytes).
+    """
+    try:
+        bits = proof["bits"]
+        if len(bits) != NUM_BITS:
+            raise ProofError(f"Proof must have exactly {NUM_BITS} bit records, got {len(bits)}")
+
+        out = bytearray()
+        out.append(PROOF_WIRE_VERSION)
+        out += int(proof["score_commit_x"]).to_bytes(32, "big")
+        out += int(proof["score_commit_y"]).to_bytes(32, "big")
+        for b in bits:
+            out += int(b["commit_x"]).to_bytes(32, "big")
+            out += int(b["commit_y"]).to_bytes(32, "big")
+            out += int(b["c0"]).to_bytes(32, "big")
+            out += int(b["c1"]).to_bytes(32, "big")
+            out += int(b["s0"]).to_bytes(32, "big")
+            out += int(b["s1"]).to_bytes(32, "big")
+        assert len(out) == PROOF_WIRE_LEN
+        return bytes(out)
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
+        raise ProofError(f"Cannot serialise proof: {e}") from e
+
+
+def deserialize_proof_bytes(data: bytes) -> dict[str, Any]:
+    """Decode :func:`serialize_proof_bytes`'s wire format back into a proof
+    dict compatible with :func:`verify_threshold_proof`.
+
+    Raises ``ProofError`` on malformed input (wrong length, wrong version) --
+    unlike serialisation, this DOES need to tolerate adversarial/malformed
+    bytes gracefully (mirrors the Rust side's ``deserialise_proof``, which
+    returns ``None``/rejects rather than panics on bad input).
+    """
+    if len(data) != PROOF_WIRE_LEN:
+        raise ProofError(f"Expected {PROOF_WIRE_LEN} bytes, got {len(data)}")
+    if data[0] != PROOF_WIRE_VERSION:
+        raise ProofError(f"Unsupported proof wire version {data[0]}")
+
+    def _u256(offset: int) -> int:
+        return int.from_bytes(data[offset:offset + 32], "big")
+
+    score_commit_x = _u256(1)
+    score_commit_y = _u256(33)
+
+    bits = []
+    base = 65
+    for _ in range(NUM_BITS):
+        bits.append(
+            {
+                "commit_x": _u256(base),
+                "commit_y": _u256(base + 32),
+                "c0": _u256(base + 64),
+                "c1": _u256(base + 96),
+                "s0": _u256(base + 128),
+                "s1": _u256(base + 160),
+            }
+        )
+        base += _BIT_RECORD_LEN
+
+    return {
+        "score_commit_x": score_commit_x,
+        "score_commit_y": score_commit_y,
+        "bits": bits,
+    }
 
 
 # ---------------------------------------------------------------------------
