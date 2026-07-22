@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import logging
+import multiprocessing
 import os
 import statistics
 from typing import Any, Optional
@@ -477,6 +479,13 @@ def _ring_metadata_precedes(candidate: dict, current: dict) -> bool:
 GRAPH_MMAP_THRESHOLD: int = int(os.getenv("GRAPH_MMAP_THRESHOLD", "50000"))
 MAX_GRAPH_NODES: int = int(os.getenv("MAX_GRAPH_NODES", "1000000"))
 
+GRAPH_SHARD_ENABLED: bool = os.getenv("GRAPH_SHARD_ENABLED", "true").strip().lower() == "true"
+GRAPH_SHARD_COUNT: int = int(os.getenv("GRAPH_SHARD_COUNT", "8"))
+GRAPH_SHARD_OVERLAP_HOPS: int = int(os.getenv("GRAPH_SHARD_OVERLAP_HOPS", "1"))
+GRAPH_SHARD_MAX_WORKERS: int = int(os.getenv("GRAPH_SHARD_MAX_WORKERS", "8"))
+
+_SHARDED_GRAPH_INSTANCE: Optional[ShardedTradeGraph] = None
+
 
 class GraphTooLargeError(Exception):
     """Raised when a graph exceeds MAX_GRAPH_NODES nodes."""
@@ -680,7 +689,9 @@ class TradeGraph:
         ``counter_account`` is ``None`` are silently skipped.
 
         Raises :class:`GraphTooLargeError` when adding this trade would push
-        the node count above ``MAX_GRAPH_NODES``.
+        the node count above ``MAX_GRAPH_NODES`` and sharding is disabled.
+        When sharding is enabled, transparently routes to
+        :class:`ShardedTradeGraph`.
         """
         base = getattr(trade, "base_account", None)
         counter = getattr(trade, "counter_account", None)
@@ -691,10 +702,29 @@ class TradeGraph:
         self._node_index.add(counter)
 
         n = len(self._node_index)
-        if n > MAX_GRAPH_NODES:
-            raise GraphTooLargeError(
-                f"Graph has {n} nodes which exceeds MAX_GRAPH_NODES={MAX_GRAPH_NODES}"
-            )
+        if isinstance(self, ShardedTradeGraph):
+            pass
+        elif n > MAX_GRAPH_NODES:
+            if GRAPH_SHARD_ENABLED:
+                logger.warning(
+                    "Graph has %d nodes exceeding MAX_GRAPH_NODES=%d; "
+                    "transparently routing to ShardedTradeGraph. "
+                    "See docs/performance.md for accuracy tradeoffs.",
+                    n, MAX_GRAPH_NODES,
+                )
+                sharded = ShardedTradeGraph(
+                    shard_count=GRAPH_SHARD_COUNT,
+                    overlap_hops=GRAPH_SHARD_OVERLAP_HOPS,
+                    max_workers=GRAPH_SHARD_MAX_WORKERS,
+                )
+                sharded._node_index = self._node_index
+                sharded._edge_data = self._edge_data
+                self.__class__ = ShardedTradeGraph
+                self.__dict__.update(sharded.__dict__)
+            else:
+                raise GraphTooLargeError(
+                    f"Graph has {n} nodes which exceeds MAX_GRAPH_NODES={MAX_GRAPH_NODES}"
+                )
 
         key = (base, counter)
         amount = float(getattr(trade, "base_amount", 0) or 0)
@@ -892,3 +922,143 @@ class TradeGraph:
                 best = metadata
 
         return best
+
+
+class ShardedTradeGraph(TradeGraph):
+    """A :class:`TradeGraph`-API-compatible façade that shards oversized graphs.
+
+    Partitions the graph using community detection (:mod:`detection.graph_sharding`),
+    runs :meth:`find_wash_rings` per shard in parallel via
+    :class:`multiprocessing.Pool`, and merges results with de-duplication.
+
+    Activated automatically when ``GRAPH_SHARD_ENABLED=true`` (default) and the
+    node count exceeds ``MAX_GRAPH_NODES``.
+    """
+
+    def __init__(
+        self,
+        shard_count: int = 8,
+        overlap_hops: int = 1,
+        max_workers: int = 8,
+    ) -> None:
+        super().__init__()
+        self._shard_count = shard_count
+        self._overlap_hops = overlap_hops
+        self._max_workers = max_workers
+        self._shard_assignment: Optional[Any] = None
+        global _SHARDED_GRAPH_INSTANCE
+        _SHARDED_GRAPH_INSTANCE = self
+
+    def find_wash_rings(
+        self,
+        min_ring_size: int = 3,
+        max_ring_size: int = 10,
+        min_cycle_volume: float = 0.0,
+    ) -> list[dict]:
+        from detection.graph_sharding import GraphShardPartitioner
+
+        cache_key = (min_ring_size, max_ring_size, min_cycle_volume)
+        if self._rings_cache is not None and self._rings_cache[0] == cache_key:
+            return self._rings_cache[1]
+
+        partitioner = GraphShardPartitioner(
+            shard_count=self._shard_count,
+            overlap_hops=self._overlap_hops,
+        )
+        assignment = partitioner.partition(self._edge_data)
+        self._shard_assignment = assignment
+
+        shard_edge_data: list[dict[tuple[str, str], list]] = [
+            {} for _ in range(assignment.shard_count)
+        ]
+        for (base, counter), data in self._edge_data.items():
+            target_shards: set[int] = set()
+            base_shard = assignment.node_to_shard.get(base)
+            counter_shard = assignment.node_to_shard.get(counter)
+            if base_shard is not None:
+                target_shards.add(base_shard)
+            if counter_shard is not None:
+                target_shards.add(counter_shard)
+            base_boundary = assignment.boundary_nodes.get(base, set())
+            counter_boundary = assignment.boundary_nodes.get(counter, set())
+            target_shards.update(base_boundary)
+            target_shards.update(counter_boundary)
+            for s in target_shards:
+                if 0 <= s < assignment.shard_count:
+                    shard_edge_data[s][(base, counter)] = data
+
+        worker_inputs = [
+            (i, sed, self._node_index, min_ring_size, max_ring_size, min_cycle_volume)
+            for i, sed in enumerate(shard_edge_data)
+        ]
+
+        pool_size = min(self._max_workers, assignment.shard_count)
+        if pool_size > 1:
+            with multiprocessing.Pool(pool_size) as pool:
+                shard_results = pool.map(_run_shard_find_rings, worker_inputs)
+        else:
+            shard_results = [_run_shard_find_rings(w) for w in worker_inputs]
+
+        all_rings: list[dict] = []
+        seen_account_sets: list[frozenset[str]] = []
+        for shard_id, rings in shard_results:
+            for ring in rings:
+                ring["shard_ids"] = [shard_id]
+                account_set = frozenset(ring.get("accounts", []))
+                merged = False
+                for i, existing in enumerate(seen_account_sets):
+                    if account_set == existing:
+                        all_rings[i]["shard_ids"].append(shard_id)
+                        merged = True
+                        break
+                    if account_set < existing:
+                        merged = True
+                        break
+                    if existing < account_set:
+                        all_rings[i] = dict(ring)
+                        all_rings[i]["shard_ids"] = [shard_id]
+                        seen_account_sets[i] = account_set
+                        merged = True
+                        break
+                if not merged:
+                    seen_account_sets.append(account_set)
+                    all_rings.append(ring)
+
+        result = sorted(
+            all_rings,
+            key=lambda r: (r.get("total_volume", 0), r.get("cycle_volume", 0)),
+            reverse=True,
+        )
+        self._rings_cache = (cache_key, result)
+        return result
+
+    @property
+    def shard_topology(self) -> dict:
+        if self._shard_assignment is None:
+            return {"shard_count": 0, "modularity": 0.0, "shards": []}
+        shards: list[dict] = []
+        for i in range(self._shard_assignment.shard_count):
+            members = [
+                n for n, s in self._shard_assignment.node_to_shard.items() if s == i
+            ]
+            shards.append({"shard_id": i, "node_count": len(members)})
+        return {
+            "shard_count": self._shard_assignment.shard_count,
+            "modularity": self._shard_assignment.modularity,
+            "shards": shards,
+        }
+
+
+def _run_shard_find_rings(
+    worker_input: tuple,
+) -> tuple[int, list[dict]]:
+    shard_id, edge_data, node_index, min_ring_size, max_ring_size, min_cycle_volume = worker_input
+    local = TradeGraph()
+    local._node_index = copy.deepcopy(node_index)
+    local._edge_data = edge_data
+    rings = local.find_wash_rings(
+        min_ring_size=min_ring_size,
+        max_ring_size=max_ring_size,
+        min_cycle_volume=min_cycle_volume,
+    )
+    return shard_id, rings
