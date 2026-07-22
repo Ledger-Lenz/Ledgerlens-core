@@ -36,7 +36,7 @@ with atheris.instrument_imports():
 
     from pydantic import ValidationError
 
-    from ingestion.data_models import Asset, Trade
+    from ingestion.data_models import Trade
 
 
 def TestOneInput(data: bytes) -> None:  # noqa: N802 — required by atheris convention

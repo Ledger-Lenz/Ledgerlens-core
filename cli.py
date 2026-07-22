@@ -2231,9 +2231,6 @@ def rotate_sweep() -> None:
 @app.command("re-encrypt-webhook-secrets")
 def re_encrypt_webhook_secrets() -> None:
     """Decrypt webhook secrets using either current or previous keys, and re-encrypt under the current key."""
-    import sqlite3
-    import base64
-    from config.settings import settings
     from detection.webhook_registry import _decrypt_secret, _encrypt_secret, _connect, init_db
     
     init_db()
