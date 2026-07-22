@@ -418,6 +418,13 @@ class Settings(BaseSettings):
     grpc_max_message_size_bytes: int = 4194304
     grpc_max_batch_wallets: int = 1000
 
+    # ── ZK-SNARK Configuration ────────────────────────────────────────────────
+    zk_proof_system: str = "sigma"                      # "sigma" | "snark"
+    zk_snark_circuit_path: str = "circuits/score_range_proof.circom"
+    zk_snark_proving_key_path: str = "circuits/keys/score_range_proof.zkey"
+    zk_snark_verification_key_path: str = "circuits/keys/verification_key.json"
+    zk_snark_prover_timeout_seconds: float = 10.0
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -606,6 +613,15 @@ class Settings(BaseSettings):
                 or s.startswith("redis://") or s.startswith("rediss://")):
             raise ValueError(f"{s!r} is not a valid URL (expected http/https/redis scheme)")
         return s
+
+    @field_validator("zk_proof_system", mode="before")
+    @classmethod
+    def valid_zk_proof_system(cls, v: object) -> object:
+        s = str(v).strip().lower()
+        if s not in {"sigma", "snark"}:
+            raise ValueError("zk_proof_system must be 'sigma' or 'snark'")
+        return s
+
 
     @field_validator("network", mode="before")
     @classmethod

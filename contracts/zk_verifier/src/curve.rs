@@ -600,4 +600,17 @@ impl Point {
         let z2z2z2 = z2z2.mul(&other.z);
         self.y.mul(&z2z2z2) == other.y.mul(&z1z1z1)
     }
+
+    /// Check if this field element is strictly less than the BN254 field modulus
+    pub fn is_valid(&self) -> bool {
+        const FIELD_MODULUS_LO: u128 = 201382436151624795304958197775988587847;
+        const FIELD_MODULUS_HI: u128 = 64352033668853702584149021272023910493;
+        if self.1 < FIELD_MODULUS_HI {
+            return true;
+        }
+        if self.1 == FIELD_MODULUS_HI && self.0 < FIELD_MODULUS_LO {
+            return true;
+        }
+        false
+    }
 }
