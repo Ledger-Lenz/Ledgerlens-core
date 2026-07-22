@@ -96,13 +96,16 @@ For example, `zk_verifier/fuzz_auth_bypass.rs`:
 
 ```rust
 // DELIBERATELY do NOT call env.mock_all_auths()
-let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    client.submit_score(&admin, &wallet, &score, &commitment_hash, &pedersen_x, &pedersen_y);
-}));
+let result = client.try_submit_score(&admin, &wallet, &score, &commitment_hash, &pedersen_x, &pedersen_y);
 
-// Expected: result is Err (panic from require_auth failing)
-// If it succeeded without panicking, that's an authorization bypass bug
+// Expected: Err, because require_auth() rejects the call. Ok would mean
+// submit_score stored a score with no authorization at all.
+if let Ok(_) = result {
+    panic!("Authorization bypass detected: submit_score returned Ok without any auth");
+}
 ```
+
+Note this uses the client's non-panicking `try_submit_score` variant, not `std::panic::catch_unwind` around the panicking `submit_score`. `cargo-fuzz` binaries are always built with `panic=abort` (a libFuzzer requirement), so `catch_unwind` can never actually catch anything there — a panic from a correctly-rejected auth check would abort the whole process, and libFuzzer would report that as a crash even though the underlying behavior (rejecting the call) is correct. An earlier revision of this harness used `catch_unwind` and produced exactly that false positive; it was replaced with the `try_` client method, which surfaces the rejection as a plain `Err` instead of a panic.
 
 This ensures that every `require_auth()` call site is actually present and functioning.
 

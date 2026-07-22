@@ -29,8 +29,14 @@ drift_reports/
 # MkDocs build output
 site/
 
+# Rust build output
+target/
+test_snapshots/
+
+# cargo-fuzz crash artifacts (corpus/ seed files ARE committed; artifacts/ are not)
+fuzz/artifacts/
+
 # Editors
-.vscode/
 .idea/
 
 # Project specific
@@ -39,3 +45,7 @@ somzilla.md
 
 *.nbi
 *.nbc
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

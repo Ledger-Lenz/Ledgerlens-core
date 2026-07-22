@@ -1,4 +1,13 @@
 #![no_std]
+
+// #[contracttype], under the `testutils` feature (active for `cargo test` and
+// for the fuzz sub-crate), additionally derives `arbitrary::Arbitrary`, whose
+// generated code references `std` unconditionally even in a `#![no_std]`
+// crate. Not activated by a plain build/release build. See the identical fix
+// in contracts/zk_verifier/src/lib.rs.
+#[cfg(any(test, feature = "testutils"))]
+extern crate std;
+
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
 /// Domain separator. Must stay byte-identical to `detection/oracle_node.py`.
