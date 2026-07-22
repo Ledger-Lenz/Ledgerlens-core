@@ -110,6 +110,60 @@ mixed-cycle/acyclic case in well under its 10 s budget.
 | `MAX_GRAPH_NODES`     | 1 000 000| Hard cap; `GraphTooLargeError` is raised above this limit       |
 
 
+## Sharded Graph Engine
+
+When the node count would exceed `MAX_GRAPH_NODES` (default 1,000,000), an
+adaptive sharded graph engine can be activated instead of raising
+`GraphTooLargeError`. This is controlled by `GRAPH_SHARD_ENABLED` (default `true`).
+
+### How it works
+
+1. **Community-detection partitioning**: The full node set is processed by
+   `GraphShardPartitioner` (in `detection/graph_sharding.py`) which runs Louvain
+   community detection on the undirected projection of the trade graph. Densely
+   connected clusters (wash rings) are assigned to the same shard, keeping most
+   rings intact within a single partition.
+
+2. **Boundary-overlap buffer**: Accounts within `GRAPH_SHARD_OVERLAP_HOPS` hops
+   (default 1) of a shard boundary are replicated into neighbouring shards. This
+   ensures that cycles crossing the boundary by a small number of hops are still
+   detected in at least one shard.
+
+3. **Parallel per-shard SCC**: Each shard runs `TradeGraph.find_wash_rings`
+   independently via a `multiprocessing.Pool` (size = `GRAPH_SHARD_MAX_WORKERS`).
+   Results are merged with de-duplication — rings whose account set is a subset
+   of an already-seen ring from another shard (via a replicated boundary node)
+   keep only the larger/higher-volume ring.
+
+### Accuracy tradeoff at boundaries
+
+A ring whose accounts are split across a shard boundary **beyond** the overlap-hop
+buffer will **not** be detected as a complete ring. Each shard sees only its
+partial view of the ring, and no individual shard's SCC detection will find the
+full cycle.
+
+**Worked example**: Consider a 5-node wash ring `{A, B, C, D, E}` where
+partitioning assigns `{A, B, C}` to shard 0 and `{D, E}` to shard 1, with
+`GRAPH_SHARD_OVERLAP_HOPS=1`. If the only cross-boundary edge is `C -> D` (1 hop
+from the boundary), then `D` is replicated into shard 0 and the full ring is
+detected there. If instead the cross-boundary edges are `A -> D` and neither
+side has an edge within 1 hop of the boundary, then neither shard sees the full
+ring: shard 0 sees `{A, B, C}` as a 3-node SCC, and shard 1 sees `{D, E}` as
+a 2-node SCC (filtered by `min_ring_size=3`). This is a documented, accepted
+limitation: wash rings are, by construction, locally dense (tight cycles of a
+handful to a few dozen accounts trading repeatedly with each other), so
+community-detection partitioning keeps most rings intact within a single shard.
+
+### Configuration
+
+| Variable                     | Default  | Description                                                        |
+| ---------------------------- | -------- | ------------------------------------------------------------------ |
+| `GRAPH_SHARD_ENABLED`        | true     | Auto-route to sharding when `MAX_GRAPH_NODES` would be exceeded    |
+| `GRAPH_SHARD_COUNT`          | 8        | Number of partitions; each targets `MAX_GRAPH_NODES // count`      |
+| `GRAPH_SHARD_OVERLAP_HOPS`   | 1        | Hop-distance boundary replication buffer (0-3)                     |
+| `GRAPH_SHARD_MAX_WORKERS`    | 8        | `multiprocessing.Pool` size for per-shard SCC computation          |
+
+
 ## Numba JIT for feature engineering
 
 `round_trip_trade_frequency` and `cross_pair_features` in `detection/feature_engineering.py`
