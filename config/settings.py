@@ -5,6 +5,7 @@ field or type/range violation aborts startup immediately with a human-readable
 error listing every problem at once.
 """
 
+import logging
 import time
 from pathlib import Path
 
@@ -927,6 +928,10 @@ class Settings(BaseSettings):
     def _default_risk_score_threshold(self) -> int:
         return self.risk_score_threshold
 
+    @_default_risk_score_threshold.setter
+    def _default_risk_score_threshold(self, value: int) -> None:
+        object.__setattr__(self, "risk_score_threshold", value)
+
     @property
     def _runtime_cache_ttl_seconds(self) -> int:
         return self.runtime_config_ttl_seconds
@@ -934,33 +939,203 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+logger = logging.getLogger("ledgerlens.config")
+
 
 # ── Runtime config cache ──────────────────────────────────────────────────────
-_runtime_cache: dict = {"ts": 0, "config": {}}
+#
+# Consistency model: EVENTUALLY CONSISTENT.
+#
+# `runtime_config` (SQLite, same database as everything else) is the durable
+# source of truth, written by governance proposal execution
+# (`detection.governance.SettingsReloader.apply`) and by `PATCH
+# /admin/config`. Every process independently polls it through a local TTL
+# cache (`RUNTIME_CONFIG_TTL_SECONDS`, default 60s) so a governance-approved
+# change is guaranteed visible to every process within that many seconds --
+# a hard, documented worst-case bound -- even with no other infrastructure
+# configured.
+#
+# When `REDIS_URL` is configured and reachable, propagation is bounded far
+# tighter than the TTL: every write bumps a shared Redis counter
+# (`bump_config_version`), and each process's next config read compares its
+# last-seen counter value against the shared one -- a single cheap Redis GET,
+# not a new poll cycle -- and re-reads `runtime_config` immediately if the
+# counter moved, regardless of how much local TTL remains. In practice this
+# means propagation completes on the very next scoring call / API request /
+# ingestion batch in any process that reads governed settings, typically
+# well under a second.
+#
+# This is a versioned-config-epoch pattern (not literal pub/sub): no
+# background subscriber thread is needed, which matters because several
+# consumers (`run_pipeline.py`, CLI batch jobs) are not long-running daemons
+# and could never host a subscriber loop anyway. It degrades gracefully --
+# falling back to TTL-only polling, identical to this module's pre-existing
+# behavior -- when Redis is unconfigured or unreachable (e.g. local
+# docker-compose's default profile, which does not run Redis at all).
+
+_CONFIG_VERSION_REDIS_KEY = "ledgerlens:config:version"
+_CONFIG_VERSION_FAILURE_THRESHOLD = 3
+_CONFIG_VERSION_RECOVERY_TIMEOUT_SECONDS = 30.0
+
+_config_redis_client = None
+_config_redis_attempted = False
+_config_redis_circuit = None
+
+
+def _get_config_redis_client():
+    """Lazily connect to Redis for the config-version counter.
+
+    Returns ``None`` (and keeps returning ``None`` for the rest of the
+    process's life -- connection is attempted at most once, matching this
+    codebase's existing Redis-client conventions in
+    ``detection.feature_store`` / ``detection.rate_limiter``) when
+    ``redis_url`` isn't configured or the connection fails. Callers must
+    treat ``None`` as "no fast-path available, use the TTL fallback," not as
+    an error.
+    """
+    global _config_redis_client, _config_redis_attempted, _config_redis_circuit
+
+    if _config_redis_attempted:
+        return _config_redis_client
+    _config_redis_attempted = True
+
+    redis_url = getattr(settings, "redis_url", None)
+    if not redis_url:
+        return None
+
+    from utils.circuit_breaker import CircuitBreaker
+
+    _config_redis_circuit = CircuitBreaker(
+        name="config_propagation_redis",
+        failure_threshold=_CONFIG_VERSION_FAILURE_THRESHOLD,
+        recovery_timeout=_CONFIG_VERSION_RECOVERY_TIMEOUT_SECONDS,
+    )
+    try:
+        import redis
+
+        client = redis.from_url(redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
+        client.ping()
+        _config_redis_client = client
+        logger.info("Config propagation: connected to Redis at %s", redis_url)
+    except Exception as exc:
+        logger.warning(
+            "Config propagation: Redis connection failed (%s); falling back to "
+            "%ds TTL-only polling for runtime_config",
+            exc,
+            settings.runtime_config_ttl_seconds,
+        )
+        _config_redis_client = None
+    return _config_redis_client
+
+
+def _get_remote_config_version() -> int | None:
+    """Return the shared config-version counter, or ``None`` if unavailable."""
+    client = _get_config_redis_client()
+    if client is None or _config_redis_circuit is None or not _config_redis_circuit.allow_request():
+        return None
+    try:
+        raw = client.get(_CONFIG_VERSION_REDIS_KEY)
+        _config_redis_circuit.record_success()
+        return int(raw) if raw is not None else 0
+    except Exception as exc:
+        _config_redis_circuit.record_failure()
+        logger.warning("Config propagation: Redis version check failed (%s)", exc)
+        return None
+
+
+def bump_config_version() -> None:
+    """Signal every process to bypass its local TTL and re-poll ``runtime_config``.
+
+    Call this after any write to the ``runtime_config`` table (governance
+    proposal execution, ``PATCH /admin/config``). No-ops silently when Redis
+    isn't configured/reachable -- those processes still converge, just
+    bounded by ``runtime_config_ttl_seconds`` instead of near-instantly.
+    """
+    client = _get_config_redis_client()
+    if client is None:
+        return
+    try:
+        client.incr(_CONFIG_VERSION_REDIS_KEY)
+        if _config_redis_circuit is not None:
+            _config_redis_circuit.record_success()
+    except Exception as exc:
+        if _config_redis_circuit is not None:
+            _config_redis_circuit.record_failure()
+        logger.warning("Config propagation: failed to bump version (%s)", exc)
+
+
+class _RuntimeConfigCache:
+    """TTL-cached view of the ``runtime_config`` table.
+
+    Invalidated early by the shared Redis version counter when available
+    (see the module-level consistency-model docstring above). Each instance
+    holds independent local state (``_ts``/``_config``/``_seen_version``),
+    so multiple instances constructed against the same backing SQLite
+    database and Redis behave like independent OS processes sharing only
+    that backing store -- this is what lets tests simulate the real
+    multi-replica topology without spawning real processes.
+    """
+
+    def __init__(self) -> None:
+        self._ts = 0.0
+        self._config: dict[str, str] = {}
+        self._seen_version: int | None = None
+
+    def get(self) -> dict[str, str]:
+        now = time.time()
+        ttl = settings._runtime_cache_ttl_seconds
+
+        remote_version = _get_remote_config_version()
+        stale = remote_version is not None and remote_version != self._seen_version
+
+        if not stale and self._ts + ttl > now and self._config:
+            return self._config
+
+        import sqlite3
+
+        config: dict[str, str] = {}
+        try:
+            conn = sqlite3.connect(settings.db_path)
+            cur = conn.execute("SELECT key, value FROM runtime_config")
+            for k, v in cur.fetchall():
+                config[k] = v
+            conn.close()
+        except Exception:
+            config = {}
+
+        self._ts = now
+        self._config = config
+        if remote_version is not None:
+            self._seen_version = remote_version
+        return config
+
+    def invalidate(self) -> None:
+        """Force the next `get()` call to re-read from the DB immediately."""
+        self._ts = 0.0
+        self._config = {}
+
+
+_default_runtime_cache = _RuntimeConfigCache()
 
 
 def load_runtime_config() -> dict:
-    """Load runtime overrides from the `runtime_config` table with a TTL cache."""
-    now = time.time()
-    ttl = settings._runtime_cache_ttl_seconds
-    if _runtime_cache.get("ts", 0) + ttl > now and _runtime_cache.get("config"):
-        return _runtime_cache["config"]
+    """Load runtime overrides from the `runtime_config` table with a TTL cache.
 
-    import sqlite3
+    See the consistency-model docstring above `_CONFIG_VERSION_REDIS_KEY` for
+    the full propagation-latency guarantee.
+    """
+    return _default_runtime_cache.get()
 
-    config: dict = {}
-    try:
-        conn = sqlite3.connect(settings.db_path)
-        cur = conn.execute("SELECT key, value FROM runtime_config")
-        for k, v in cur.fetchall():
-            config[k] = v
-        conn.close()
-    except Exception:
-        config = {}
 
-    _runtime_cache["ts"] = now
-    _runtime_cache["config"] = config
-    return config
+def invalidate_runtime_config_cache() -> None:
+    """Force this process's next `load_runtime_config()` call to re-read the DB.
+
+    Call this immediately after writing to `runtime_config` directly (e.g.
+    `PATCH /admin/config`) so the writing process itself doesn't have to wait
+    out its own local TTL. Pair with `bump_config_version()` to also notify
+    other processes.
+    """
+    _default_runtime_cache.invalidate()
 
 
 def get_runtime_risk_score_threshold() -> int:
@@ -969,3 +1144,34 @@ def get_runtime_risk_score_threshold() -> int:
         return int(cfg["risk_score_threshold"])
     except (KeyError, ValueError):
         return settings._default_risk_score_threshold
+
+
+def get_governed_config_status() -> dict:
+    """Return this process's currently-active governed config state.
+
+    Exposed via ``GET /health`` so operators can confirm a governance-
+    approved change (or a ``PATCH /admin/config`` change) has actually
+    propagated to *this* process, rather than assuming it did.
+    ``risk_score_threshold_version`` is the ``runtime_config`` row's
+    ``updated_at`` timestamp -- ``None`` means no override has ever been
+    written and this process is still running the env-configured default.
+    """
+    import sqlite3
+
+    threshold = get_runtime_risk_score_threshold()
+    version: str | None = None
+    try:
+        conn = sqlite3.connect(settings.db_path)
+        row = conn.execute(
+            "SELECT updated_at FROM runtime_config WHERE key = 'risk_score_threshold'"
+        ).fetchone()
+        conn.close()
+        if row:
+            version = row[0]
+    except Exception:
+        pass
+
+    return {
+        "risk_score_threshold": threshold,
+        "risk_score_threshold_version": version,
+    }

@@ -165,7 +165,7 @@ def test_promote_cold_to_hot_with_redis_mock(sample_state, tmp_path):
     db_path = str(tmp_path / "test.db")
     save_feature_state(sample_state, db_path=db_path)
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         mock_client = fakeredis.FakeStrictRedis()
         mock_redis.return_value = mock_client
         

@@ -29,7 +29,7 @@ def test_feature_store_redis_set_get(sample_state):
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         mock_client = fakeredis.FakeStrictRedis()
         mock_redis.return_value = mock_client
         
@@ -54,7 +54,7 @@ def test_feature_store_redis_ttl(sample_state):
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis, \
+    with patch("redis.from_url") as mock_redis, \
          patch("detection.feature_store.settings") as mock_settings:
         mock_client = fakeredis.FakeStrictRedis()
         mock_redis.return_value = mock_client
@@ -78,7 +78,7 @@ def test_feature_store_redis_scan_all_keys(sample_state):
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         mock_client = fakeredis.FakeStrictRedis()
         mock_redis.return_value = mock_client
         
@@ -106,7 +106,7 @@ def test_feature_store_redis_fallback_on_connection_error():
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         # Simulate connection error
         mock_redis.side_effect = Exception("Connection refused")
         
@@ -124,7 +124,7 @@ def test_feature_store_redis_fallback_on_ping_error():
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         mock_client = MagicMock()
         mock_client.ping.side_effect = Exception("Ping failed")
         mock_redis.return_value = mock_client
@@ -157,7 +157,7 @@ def test_feature_store_delete_state_redis(sample_state):
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         mock_client = fakeredis.FakeStrictRedis()
         mock_redis.return_value = mock_client
         
@@ -197,19 +197,24 @@ def test_feature_store_fallback_to_dict_on_redis_error(sample_state):
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         mock_client = MagicMock()
         mock_client.ping.return_value = True
-        # Make get() raise an error
+        # Make get() and setex() raise -- set_state/get_state only fall back
+        # to the dict when their *own* Redis call fails (it's a hot-or-cold
+        # cache, not a write-through mirror), so a get()-only failure after a
+        # successful Redis-backed set_state() would never have populated the
+        # fallback dict to retrieve from.
         mock_client.get.side_effect = Exception("Redis error")
+        mock_client.setex.side_effect = Exception("Redis error")
         mock_redis.return_value = mock_client
-        
+
         fs = FeatureStore(redis_url="redis://localhost:6379/0")
         assert fs._using_redis  # Initially connected
-        
+
         # set_state should fall back to dict
         fs.set_state(sample_state)
-        
+
         # get_state should fall back to dict
         retrieved = fs.get_state(sample_state.wallet, sample_state.asset_pair)
         assert retrieved is not None
@@ -226,7 +231,7 @@ def test_is_using_redis():
     except ImportError:
         pytest.skip("fakeredis not installed")
     
-    with patch("detection.feature_store.redis.from_url") as mock_redis:
+    with patch("redis.from_url") as mock_redis:
         mock_client = fakeredis.FakeStrictRedis()
         mock_redis.return_value = mock_client
         
