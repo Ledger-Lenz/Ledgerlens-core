@@ -50,13 +50,19 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from cryptography.exceptions import InvalidSignature
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from dp_accounting import dp_event as _dp_event
 from dp_accounting.rdp import rdp_privacy_accountant as _rdp_pa
 
+from api.auth import require_admin_key
 from config.settings import settings
+from detection.federated.admission import (
+    AdmissionError,
+    admit_participant as _admit_participant,
+    get_admission,
+)
 from detection.federated.audit import (
     build_record,
     get_cumulative_epsilon,
@@ -64,6 +70,7 @@ from detection.federated.audit import (
     save_audit_record,
     sign_record,
 )
+from detection.federated.weighting import apply_weight_share_cap
 
 logger = logging.getLogger("ledgerlens.federated.server")
 
@@ -74,6 +81,7 @@ class _ParticipantUpdate:
     noisy_soft_labels: np.ndarray
     delta: np.ndarray
     n_samples: int
+    claimed_n_samples: int
     excluded: bool = False
     exclusion_reason: str = ""
 
@@ -82,7 +90,15 @@ class _ParticipantUpdate:
 class _Participant:
     participant_id: str
     public_key: Ed25519PublicKey
+    # Admission-approved ceiling on claimed n_samples; math.inf when admission
+    # control is disabled (federated_admission_required=False).
+    max_n_samples: float
     n_samples_last_round: int = 0
+    # Largest *accepted* (non-excluded) effective n_samples this participant
+    # has ever claimed, used by the cross-round consistency check. 0 means
+    # "no accepted round yet" -- the check is skipped for a participant's
+    # first round since there is no history to compare against.
+    n_samples_history_max: int = 0
 
 
 class FederatedAggregationServer:
@@ -104,6 +120,9 @@ class FederatedAggregationServer:
         server_private_key: Ed25519PrivateKey | None = None,
         noise_multiplier: float | None = None,
         target_delta: float | None = None,
+        admission_required: bool | None = None,
+        max_participant_weight_fraction: float | None = None,
+        max_n_samples_growth_factor: float | None = None,
     ) -> None:
         self.min_participants = min_participants if min_participants is not None else settings.federated_min_participants
         self.gradient_clip_threshold = gradient_clip_threshold if gradient_clip_threshold is not None else settings.gradient_clip_threshold
@@ -112,6 +131,20 @@ class FederatedAggregationServer:
         self.dp_delta = dp_delta if dp_delta is not None else settings.federated_dp_delta
         self.dp_max_epsilon = dp_max_epsilon if dp_max_epsilon is not None else settings.federated_dp_max_epsilon
         self.db_path = db_path
+        # Sybil / weight-inflation defenses (see detection/federated/admission.py
+        # and detection/federated/weighting.py for the full threat model).
+        self.admission_required = (
+            admission_required if admission_required is not None
+            else settings.federated_admission_required
+        )
+        self.max_participant_weight_fraction = (
+            max_participant_weight_fraction if max_participant_weight_fraction is not None
+            else settings.federated_max_participant_weight_fraction
+        )
+        self.max_n_samples_growth_factor = (
+            max_n_samples_growth_factor if max_n_samples_growth_factor is not None
+            else settings.federated_max_n_samples_growth_factor
+        )
         # noise_multiplier > 0 enables the RDP accounting path (σ = clip_norm × nm).
         # 0.0 keeps the legacy linear ε-accumulation for backward compatibility.
         self.noise_multiplier = (
@@ -151,16 +184,61 @@ class FederatedAggregationServer:
     # ------------------------------------------------------------------
 
     def register_participant(self, participant_id: str, public_key_der: bytes) -> None:
-        """Register an operator's Ed25519 public key."""
+        """Register an operator's Ed25519 public key.
+
+        Requires `participant_id` to have been admitted by an operator first
+        (see :func:`detection.federated.admission.admit_participant`) unless
+        `admission_required` is False. Admission assigns the ceiling that
+        bounds this participant's claimed `n_samples` in every future round
+        (see `submit_update`) -- registration without admission would let
+        any actor mint an unlimited number of participant identities with no
+        cap on the aggregation weight each can claim.
+
+        Raises AdmissionError if admission is required and this
+        participant_id has not been admitted (or was revoked).
+        """
         pub = load_der_public_key(public_key_der)
         if not isinstance(pub, Ed25519PublicKey):
             raise ValueError("Expected Ed25519 public key")
+
+        if self.admission_required:
+            record = get_admission(participant_id, self.db_path)
+            if record is None or record.revoked:
+                raise AdmissionError(
+                    f"Participant {participant_id!r} is not admitted. An operator "
+                    "must call FederatedAggregationServer.admit_participant() (or "
+                    "`cli.py federated admit` / POST /federated/admit) before this "
+                    "identity may register."
+                )
+            max_n_samples: float = record.max_n_samples
+        else:
+            # Admission disabled: explicitly insecure (see settings docstring for
+            # federated_admission_required) -- no ceiling is enforced.
+            max_n_samples = math.inf
+
         with self._lock:
             self._participants[participant_id] = _Participant(
                 participant_id=participant_id,
                 public_key=pub,
+                max_n_samples=max_n_samples,
             )
-        logger.info("Registered participant %s", participant_id)
+        logger.info(
+            "Registered participant %s (max_n_samples=%s)",
+            participant_id,
+            "unbounded" if math.isinf(max_n_samples) else int(max_n_samples),
+        )
+
+    def admit_participant(
+        self, participant_id: str, max_n_samples: int, admitted_by: str = "operator"
+    ):
+        """Convenience wrapper: admit a participant using this server's db_path.
+
+        Equivalent to calling `detection.federated.admission.admit_participant`
+        directly; provided so callers that already hold a server instance
+        don't need a second import. Must be called before `register_participant`
+        for this `participant_id` when `admission_required` is True.
+        """
+        return _admit_participant(participant_id, max_n_samples, admitted_by, db_path=self.db_path)
 
     # ------------------------------------------------------------------
     # Round management
@@ -276,6 +354,53 @@ class FederatedAggregationServer:
                         excluded = True
                         exclusion_reason = f"cosine_sim={cosine_sim:.4f} < threshold"
 
+            # n_samples ceiling: clamp the claimed value at this participant's
+            # admission-approved ceiling. This is what actually stops a single
+            # registered identity from claiming an arbitrarily large aggregation
+            # weight -- unlike norm-clip/cosine-similarity above, which bound the
+            # *gradient's* magnitude/direction and say nothing about weight.
+            claimed_n_samples = n_samples
+            effective_n_samples = min(n_samples, participant.max_n_samples)
+            if effective_n_samples < claimed_n_samples:
+                hashed_id = __import__("hashlib").sha256(participant_id.encode()).hexdigest()[:16]
+                logger.warning(
+                    "Participant %s claimed n_samples=%d exceeding its admitted "
+                    "ceiling of %d — clamping to the ceiling for aggregation weight",
+                    hashed_id,
+                    claimed_n_samples,
+                    int(participant.max_n_samples),
+                )
+            effective_n_samples = int(effective_n_samples)
+
+            # Cross-round consistency: flag a sudden large jump in a participant's
+            # claimed n_samples relative to its own accepted history -- catches an
+            # already-admitted identity (with a legitimately large ceiling) that
+            # starts claiming far more than its established pattern, e.g. because
+            # it was compromised. Skipped on a participant's first accepted round
+            # (n_samples_history_max == 0), since there is no history yet.
+            if not excluded and participant.n_samples_history_max > 0:
+                growth_limit = self.max_n_samples_growth_factor * participant.n_samples_history_max
+                if effective_n_samples > growth_limit:
+                    hashed_id = __import__("hashlib").sha256(participant_id.encode()).hexdigest()[:16]
+                    logger.warning(
+                        "Participant %s claimed n_samples=%d, more than %.1fx its "
+                        "historical accepted max of %d — flagging as a possible "
+                        "weight-inflation attempt",
+                        hashed_id,
+                        effective_n_samples,
+                        self.max_n_samples_growth_factor,
+                        participant.n_samples_history_max,
+                    )
+                    excluded = True
+                    growth_reason = (
+                        f"n_samples={effective_n_samples} > "
+                        f"{self.max_n_samples_growth_factor}x historical max "
+                        f"{participant.n_samples_history_max}"
+                    )
+                    exclusion_reason = (
+                        f"{exclusion_reason}; {growth_reason}" if exclusion_reason else growth_reason
+                    )
+
             # Reconstruct soft labels from the (possibly clipped) delta so the
             # aggregation step always operates on norm-bounded updates.
             effective_soft_labels = np.clip(prev + delta, 0.0, 1.0)
@@ -284,12 +409,17 @@ class FederatedAggregationServer:
                 participant_id=participant_id,
                 noisy_soft_labels=effective_soft_labels,
                 delta=delta,
-                n_samples=n_samples,
+                n_samples=effective_n_samples,
+                claimed_n_samples=claimed_n_samples,
                 excluded=excluded,
                 exclusion_reason=exclusion_reason,
             )
             self._pending_updates[participant_id] = update
-            participant.n_samples_last_round = n_samples
+            participant.n_samples_last_round = effective_n_samples
+            if not excluded:
+                participant.n_samples_history_max = max(
+                    participant.n_samples_history_max, effective_n_samples
+                )
 
             n_valid = sum(1 for u in self._pending_updates.values() if not u.excluded)
             status = {
@@ -297,6 +427,8 @@ class FederatedAggregationServer:
                 "reason": exclusion_reason if excluded else "ok",
                 "pending_valid": n_valid,
                 "quorum": self.min_participants,
+                "n_samples_effective": effective_n_samples,
+                "n_samples_clamped": effective_n_samples < claimed_n_samples,
             }
 
             # Auto-aggregate when quorum is reached
@@ -341,10 +473,27 @@ class FederatedAggregationServer:
         if n_total == 0:
             return None
 
-        # Weighted FedAvg on soft labels
+        # Weighted FedAvg on soft labels, with a per-round cap on any single
+        # participant's weight share (defense-in-depth on top of the
+        # admission-ceiling clamp already applied to each u.n_samples in
+        # submit_update -- see detection/federated/weighting.py).
+        raw_weights = np.array([u.n_samples for u in valid_updates], dtype=float)
+        weights = apply_weight_share_cap(raw_weights, self.max_participant_weight_fraction)
+        raw_fractions = raw_weights / raw_weights.sum()
+        capped_participant_ids = [
+            u.participant_id
+            for u, w, raw_w in zip(valid_updates, weights, raw_fractions)
+            if w < raw_w - 1e-9
+        ]
+        if capped_participant_ids:
+            logger.warning(
+                "Weight-share cap (%.2f) applied to %d participant(s) this round",
+                self.max_participant_weight_fraction,
+                len(capped_participant_ids),
+            )
+
         agg = np.zeros_like(valid_updates[0].noisy_soft_labels, dtype=float)
-        for u in valid_updates:
-            weight = u.n_samples / n_total
+        for u, weight in zip(valid_updates, weights):
             agg += weight * u.noisy_soft_labels
 
         # Server-side DP noise (defence-in-depth).
@@ -391,6 +540,7 @@ class FederatedAggregationServer:
             excluded_participant_ids=excluded_ids,
             dp_delta=self.target_delta,
             noise_multiplier=self.noise_multiplier,
+            weight_capped_participant_ids=capped_participant_ids,
         )
         sig = sign_record(record, self._private_key)
         save_audit_record(record, sig, self.db_path)
@@ -462,14 +612,42 @@ class UpdateRequest(BaseModel):
     signature_b64: str
 
 
+class AdmitParticipantRequest(BaseModel):
+    participant_id: str
+    max_n_samples: int
+    admitted_by: str = "operator"
+
+
 @federated_app.post("/federated/register")
 def http_register(req: RegisterRequest) -> dict:
     pub_der = base64.b64decode(req.public_key_der_b64)
     try:
         get_server().register_participant(req.participant_id, pub_der)
+    except AdmissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "registered"}
+
+
+@federated_app.post("/federated/admit")
+def http_admit_participant(
+    req: AdmitParticipantRequest, _auth: None = Depends(require_admin_key)
+) -> dict:
+    """Operator-only: authorize a participant_id to register, with a ceiling
+    on the n_samples it may ever claim (see detection/federated/admission.py).
+    """
+    try:
+        record = get_server().admit_participant(
+            req.participant_id, req.max_n_samples, req.admitted_by
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "status": "admitted",
+        "participant_id": record.participant_id,
+        "max_n_samples": record.max_n_samples,
+    }
 
 
 @federated_app.post("/federated/update")
