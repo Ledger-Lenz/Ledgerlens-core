@@ -159,16 +159,6 @@ async def test_fast_producer_slow_consumer_stays_bounded(
 
 @pytest.mark.asyncio
 async def test_metrics_snapshot_tracks_run_paths(tmp_path, monkeypatch):
-    # HorizonStreamer's dedup store (when enabled) persists to the real,
-    # shared `settings.db_path` -- not a per-test tmp_path -- keyed on the
-    # trades' fixed synthetic ledger/tx values below. Across repeated runs in
-    # a persistent dev/CI environment those keys accumulate and eventually
-    # get replayed trades rejected as duplicates, starving `events_queued`.
-    # This test isn't exercising dedup behavior, so disable it for isolation.
-    from config.settings import settings
-
-    monkeypatch.setattr(settings, "ingestion_dedup_enabled", False)
-
     queue = BoundedTradeQueue(maxsize=1, overflow_strategy="drop_newest")
     streamer = HorizonStreamer(
         queue,

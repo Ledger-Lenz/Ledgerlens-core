@@ -44,39 +44,12 @@ def _unregister_ledgerlens_metrics():
         pass
 
 
-def _resync_cached_metrics_refs():
-    """Re-point already-imported modules' cached ``_metrics`` at the current singleton.
-
-    ``ingestion.horizon_streamer`` and ``ingestion.http_client`` each do
-    ``_metrics = get_metrics()`` once at import time -- a deliberate,
-    process-lifetime-stable pattern in production, where the collector
-    singleton is created exactly once and never reset. Resetting the
-    singleton between tests (below) breaks that assumption: whichever test
-    first imports either module leaves it holding a reference to that
-    test's collector, so a later test patching a metric on a freshly
-    obtained ``IngestionMetricsCollector.instance()`` patches an object the
-    real code never touches -- the patch silently no-ops. Re-binding both
-    modules' ``_metrics`` after every reset keeps them in lockstep with
-    ``.instance()``.
-    """
-    import sys
-
-    from ingestion.metrics import IngestionMetricsCollector
-
-    fresh = IngestionMetricsCollector.instance()
-    for modname in ("ingestion.horizon_streamer", "ingestion.http_client"):
-        mod = sys.modules.get(modname)
-        if mod is not None:
-            mod._metrics = fresh
-
-
 @pytest.fixture(autouse=True)
 def isolate_registry():
     """Clear the IngestionMetricsCollector singleton and unregister metrics before each test."""
     from ingestion.metrics import IngestionMetricsCollector
     IngestionMetricsCollector.reset_for_testing()
     _unregister_ledgerlens_metrics()
-    _resync_cached_metrics_refs()
     yield
     from ingestion.metrics import IngestionMetricsCollector
     IngestionMetricsCollector.reset_for_testing()
@@ -90,10 +63,7 @@ def isolate_registry():
 class TestNormaliseEndpoint:
     def test_stellar_address_replaced(self):
         from ingestion.metrics import _normalise_endpoint
-        # Stellar G-addresses are base32: A-Z and 2-7 only (no 0/1/8/9), so
-        # the account id here must stick to that alphabet or the regex
-        # correctly refuses to treat it as one.
-        url = "https://horizon.stellar.org/accounts/GABC234567ABC234567ABC234567ABC234567ABC234567ABC234567A/transactions"
+        url = "https://horizon.stellar.org/accounts/GABC12345678901234567890123456789012345678901234567890123456/transactions"
         result = _normalise_endpoint(url)
         assert "{account_id}" in result
         assert "GABC" not in result
@@ -519,16 +489,8 @@ class TestHttpClientInstrumentation:
             m.observe = cap_obs
             return m
 
-        # A plain MagicMock, not AsyncMock: httpx.Response attributes (.headers,
-        # .status_code, .json()) are synchronous -- only the client's `.get()`
-        # call itself is async, and `patch.object` below already auto-detects
-        # that and wraps it in an AsyncMock. Using AsyncMock here instead would
-        # make `mock_response.headers` an AsyncMock too, so `.headers.get(...)`
-        # (called synchronously by VersionGuard.check) returns an unawaited
-        # coroutine instead of `None`/a string.
-        mock_response = MagicMock()
+        mock_response = AsyncMock()
         mock_response.status_code = 200
-        mock_response.headers = {}
         mock_response.json = MagicMock(return_value={"_embedded": {"records": []}})
         mock_response.raise_for_status = MagicMock()
 
