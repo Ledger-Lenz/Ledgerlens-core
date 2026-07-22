@@ -302,7 +302,7 @@ def lookup_key(plaintext: str) -> Optional[dict]:
             return None
         if row["expires_at"] and row["expires_at"] < now:
             return None
-        if row.get("status") == "rotating" and row["rotation_deadline"] and row["rotation_deadline"] < now:
+        if row["status"] == "rotating" and row["rotation_deadline"] and row["rotation_deadline"] < now:
             return None
         conn.execute(
             "UPDATE api_keys SET last_used_at=? WHERE key_id=?", (now, row["key_id"])
@@ -352,7 +352,7 @@ def get_api_key_by_hash(key_hash: str) -> Optional[dict]:
             return None
         if row["expires_at"] and row["expires_at"] < now:
             return None
-        if row.get("status") == "rotating" and row["rotation_deadline"] and row["rotation_deadline"] < now:
+        if row["status"] == "rotating" and row["rotation_deadline"] and row["rotation_deadline"] < now:
             return None
         return dict(row)
 

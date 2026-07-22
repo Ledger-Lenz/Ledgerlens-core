@@ -60,7 +60,7 @@ def ensure_namespace_tables(db_path: str | None = None) -> None:
     """Create the api_keys table if it does not exist."""
     db_path = db_path or _get_db_path()
     with _connect(db_path) as conn:
-        conn.execute(_NAMESPACE_SCHEMA_SQL)
+        conn.executescript(_NAMESPACE_SCHEMA_SQL)
         conn.commit()
 
 
