@@ -210,6 +210,9 @@ class Settings(BaseSettings):
     ledgerlens_compliance_api_key: str = ""
     ledgerlens_model_signing_key: str = ""
     ledgerlens_webhook_encryption_key: str = ""
+    ledgerlens_webhook_encryption_key_previous: str = ""
+    api_key_rotation_grace_seconds: int = 604800
+    api_key_max_age_days: int = 90
     # Minimum LedgerLens risk score (0-100) required to export a SAR package.
     compliance_sar_min_score: int = 70
     # Hourly cap on regulatory exports (SAR + Travel Rule) per `detection.compliance_exporter`.

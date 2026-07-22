@@ -256,7 +256,7 @@ impl ZkVerifier {
         }
 
         let map: Map<Address, ScoreCommitment> =
-            env.storage().instance().get(&COMMITMENTS).unwrap_or(Map::new(&env));
+            env.storage().instance().get(&commitments_key(&env)).unwrap_or(Map::new(&env));
         let Some(entry) = map.get(wallet) else {
             return false;
         };
@@ -270,7 +270,7 @@ impl ZkVerifier {
             let bytes_slice = proof.slice(offset..offset + 32);
             let bytes_n = BytesN::try_from(&bytes_slice).ok()?;
             offset += 32;
-            Some(Fq::from_bytes(&bytes_n))
+            Some(Fq::from_bytesn(&bytes_n))
         };
 
         let Some(a_x) = get_fq(&proof) else { return false; };
@@ -291,8 +291,8 @@ impl ZkVerifier {
         }
 
         // Reconstruct expected commitment coordinates from storage
-        let p_x = Fq::from_bytes(&entry.pedersen_x);
-        let p_y = Fq::from_bytes(&entry.pedersen_y);
+        let p_x = Fq::from_bytesn(&entry.pedersen_x);
+        let p_y = Fq::from_bytesn(&entry.pedersen_y);
 
         // Structural Pairing Check:
         // Enforce that the proof coordinates A match the committed Pedersen point

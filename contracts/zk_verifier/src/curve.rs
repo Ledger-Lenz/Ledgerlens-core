@@ -390,6 +390,10 @@ impl Fq {
     pub fn invert(&self) -> Fq {
         Fq(inv_mod(self.0, FIELD_MODULUS))
     }
+
+    pub fn is_valid(&self) -> bool {
+        self.0 < FIELD_MODULUS
+    }
 }
 
 impl core::ops::Rem<U256> for U256 {

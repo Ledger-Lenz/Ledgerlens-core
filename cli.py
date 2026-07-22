@@ -2202,6 +2202,42 @@ def grpc_serve(
     serve(port=port)
 
 
+@app.command("rotate-sweep")
+def rotate_sweep() -> None:
+    """Revoke keys whose rotation grace period has elapsed."""
+    from detection.api_key_store import sweep_expired_api_keys
+    revoked_count = sweep_expired_api_keys()
+    typer.echo(f"Secret rotation sweep completed. Revoked {revoked_count} expired rotating keys.")
+
+
+@app.command("re-encrypt-webhook-secrets")
+def re_encrypt_webhook_secrets() -> None:
+    """Decrypt webhook secrets using either current or previous keys, and re-encrypt under the current key."""
+    import sqlite3
+    import base64
+    from config.settings import settings
+    from detection.webhook_registry import _decrypt_secret, _encrypt_secret, _connect, init_db
+    
+    init_db()
+    reencrypted_count = 0
+    with _connect() as conn:
+        rows = conn.execute("SELECT id, secret_encrypted FROM webhook_subscribers").fetchall()
+        for row_id, encrypted_secret in rows:
+            try:
+                # Decrypts trying current first, then previous
+                plaintext = _decrypt_secret(encrypted_secret)
+                # Encrypts strictly under current key
+                new_encrypted = _encrypt_secret(plaintext)
+                if new_encrypted != encrypted_secret:
+                    conn.execute("UPDATE webhook_subscribers SET secret_encrypted = ? WHERE id = ?", (new_encrypted, row_id))
+                    reencrypted_count += 1
+            except Exception as e:
+                typer.echo(f"Failed to re-encrypt subscriber row ID {row_id}: {e}")
+                
+        conn.commit()
+    typer.echo(f"Re-encryption complete. Successfully re-encrypted {reencrypted_count} webhook secrets under the current encryption key.")
+
+
 if __name__ == "__main__":
     app()
 
