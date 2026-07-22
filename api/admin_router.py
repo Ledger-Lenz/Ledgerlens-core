@@ -446,3 +446,21 @@ def get_model_card_pdf(model_name: str, version: str):
         media_type="application/pdf",
         headers={"Content-Disposition": f"inline; filename={model_name}_{version}.pdf"}
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/graph-shards  (Issue #348)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/graph-shards", include_in_schema=False)
+def get_graph_shards() -> dict:
+    """Return shard topology and per-shard timing/ring counts.
+
+    Reads the latest shard assignment from the global ShardedTradeGraph
+    instance if one was created during the current process lifetime.
+    """
+    from detection.graph_engine import _SHARDED_GRAPH_INSTANCE
+    if _SHARDED_GRAPH_INSTANCE is None:
+        return {"shard_count": 0, "modularity": 0.0, "shards": [], "message": "No sharded graph active"}
+    return _SHARDED_GRAPH_INSTANCE.shard_topology

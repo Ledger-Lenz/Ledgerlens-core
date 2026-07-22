@@ -196,6 +196,8 @@ Wash-ring discovery uses **iterative Tarjan's SCC algorithm** (`IterativeTarjanS
 
 For graphs exceeding `GRAPH_MMAP_THRESHOLD` nodes (default 50 000), the adjacency list is represented as a `scipy.sparse.csr_matrix` (Compressed Sparse Row), which stores edges contiguously in memory and has lower per-object overhead than a Python dict. The threshold and a hard cap (`MAX_GRAPH_NODES`, default 1 000 000) are configurable via environment variables (see `.env.example`).
 
+Beyond `MAX_GRAPH_NODES`, the pipeline can transparently fall back to an **adaptive sharded graph engine** (`ShardedTradeGraph`) that partitions the graph across multiple workers using community-detection-based sharding (Louvain modularity maximisation), keeping densely-connected wash rings intact within a single shard. Each shard runs `find_wash_rings` independently via a `multiprocessing.Pool` and results are merged with de-duplication. A configurable boundary-overlap buffer replicates accounts near shard boundaries to detect cycles that cross partitions by a small number of hops. See [docs/performance.md#sharded-graph-engine](docs/performance.md#sharded-graph-engine) for accuracy tradeoffs and configuration.
+
 **Scale targets** (single CPU core, measured on synthetic random graphs — see [docs/performance.md](docs/performance.md)):
 
 | Graph size          | Time    | Peak RAM |
@@ -203,7 +205,7 @@ For graphs exceeding `GRAPH_MMAP_THRESHOLD` nodes (default 50 000), the adjacenc
 | 10 K nodes, 50 K edges  | < 1 s   | < 25 MB  |
 | 100 K nodes, 500 K edges | ~27 s  | ~63 MB   |
 
-The `TradeGraph` class provides an incremental public API (`add_trade`, `find_wash_rings`, `get_ring_members`) that selects the CSR or dict representation automatically based on graph size.
+The `TradeGraph` class provides an incremental public API (`add_trade`, `find_wash_rings`, `get_ring_members`) that selects the CSR or dict representation automatically based on graph size, and transparently routes to `ShardedTradeGraph` when the node count would exceed `MAX_GRAPH_NODES` (if sharding is enabled).
 
 The four graph-structural ML features are:
 
@@ -937,6 +939,7 @@ Covers:
 - ✅ RiskScore combination logic and SQLite storage
 - ✅ Local API and CLI
 - ✅ Horizon HTTP retry/backoff behaviour
+- ✅ Fuzz-tested ingestion parsers (Atheris coverage-guided harnesses in `fuzz/`; see [docs/testing_guide.md](docs/testing_guide.md))
 
 ## Roadmap
 
