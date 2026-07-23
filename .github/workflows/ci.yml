@@ -68,6 +68,46 @@ jobs:
       - name: Run scoring pipeline benchmarks
         run: make benchmark-check
 
+  rust-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: crates/ledgerlens-sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: rustfmt, clippy
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-sdk-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo check (default features)
+        run: cargo check
+
+      - name: cargo check (zk-verify)
+        run: cargo check --features zk-verify
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
   fuzz:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
