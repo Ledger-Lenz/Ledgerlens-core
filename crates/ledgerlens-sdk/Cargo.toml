@@ -1,0 +1,34 @@
+[package]
+name = "ledgerlens-sdk"
+version = "0.1.0"
+description = "Rust client SDK for the LedgerLens risk scoring API with optional ZK proof verification"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Derry255/Ledgerlens-core"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+
+# ZK verification (arkworks suite)
+ark-bn254 = { version = "0.4", optional = true }
+ark-ec = { version = "0.4", optional = true }
+ark-serialize = { version = "0.4", optional = true }
+ark-ff = { version = "0.4", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = ["async"]
+async = ["tokio"]
+zk-verify = ["ark-bn254", "ark-ec", "ark-serialize", "ark-ff", "sha2"]
+
+[package.metadata.docs.rs]
+features = ["async", "zk-verify"]

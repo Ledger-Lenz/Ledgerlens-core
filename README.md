@@ -965,7 +965,7 @@ Covers:
 ### Phase 3 — Ecosystem Integration _(Months 5–6)_
 
 - [ ] Mainnet deployment
-- [ ] SDK for protocol integrations (Python + JavaScript)
+- [x] SDK for protocol integrations (Python, TypeScript, Go, Rust)
 - [ ] Webhook alert system for asset issuers and protocol teams
 - [ ] Open dataset release: labelled SDEX wash trade patterns
 - [ ] Community feedback and model refinement cycle
