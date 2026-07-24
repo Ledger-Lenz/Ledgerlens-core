@@ -32,7 +32,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from api.auth import require_admin_key, require_compliance_key
 from api.api_key_router import router as api_key_router, require_scope
@@ -2134,9 +2134,18 @@ _CAUSAL_FEATURE_NAMES_SET: frozenset[str] = frozenset([
 _FEATURE_OVERRIDE_MIN = -1000.0
 _FEATURE_OVERRIDE_MAX = 1000.0
 
-# Refutation gate: if more than this many features have placebo p-value < 0.05,
-# refuse to serve the ATE table and return 503.
-_MAX_FAILING_REFUTATIONS = 3
+# Refutation gate: refuse to serve the ATE table and return 503 if more than
+# this FRACTION of all conducted refutation tests (across every feature that
+# has a genuine DoWhy-identified causal estimate) return p < 0.05.
+#
+# This is fraction-based, not a fixed count, because refutation coverage now
+# scales with the number of causally-identified features (see
+# CausalEngine.all_feature_refutation_tests) — a fixed count threshold would
+# either be trivially unreachable (if set >= max possible failures, as the
+# original _MAX_FAILING_REFUTATIONS = 3 bug did when exactly 3 tests were
+# ever run) or arbitrary (if raised without regard to coverage). A fraction
+# remains meaningful regardless of how many features/tests are in scope.
+_MAX_FAILING_REFUTATION_FRACTION = 1.0 / 3.0
 
 
 class CausalExplanationResponse(BaseModel):
@@ -2148,6 +2157,17 @@ class CausalExplanationResponse(BaseModel):
     top_causal_features: list[tuple[str, float]]
     counterfactual_score: Optional[float]
     coverage_note: str
+    # --- Fields below are additive (default to empty) for backward compatibility. ---
+    # Per-feature provenance: "causal" (genuine DoWhy-identified estimate) or
+    # "correlational_fallback" (OLS coefficient substituted after DoWhy could
+    # not identify/estimate the effect). See detection.causal_engine.ATEEstimate.
+    estimation_method: dict[str, str] = Field(default_factory=dict)
+    # Human-readable reason for each feature present in estimation_method with
+    # value "correlational_fallback" (e.g. non-identifiable, dowhy missing).
+    estimation_notes: dict[str, str] = Field(default_factory=dict)
+    # Features that actually underwent DoWhy refutation testing this request
+    # (i.e. the subset of feature_ate_table with estimation_method == "causal").
+    refutation_coverage: list[str] = Field(default_factory=list)
 
 
 def _parse_feature_override(raw: str | None) -> tuple[str, float] | None:
@@ -2308,6 +2328,16 @@ def causal_explanation(
     - ``counterfactual_score``: predicted score if ``feature_override`` were
       applied (only present when ``feature_override`` is supplied).
     - ``coverage_note``: advisory note about sample size and estimate quality.
+    - ``estimation_method``: per-feature ``"causal"`` (genuine DoWhy-identified
+      estimate) or ``"correlational_fallback"`` (OLS coefficient substituted
+      because DoWhy could not identify or estimate the effect). Consumers
+      must not treat these two as interchangeable.
+    - ``estimation_notes``: reason for each fallback entry in
+      ``estimation_method`` (e.g. non-identifiable, DoWhy not installed).
+    - ``refutation_coverage``: features that actually underwent DoWhy
+      refutation testing this request — i.e. the ``"causal"`` subset of
+      ``estimation_method``. See docs/causal_inference.md for the refutation
+      gate's coverage scope and rejection threshold.
 
     Security
     --------
@@ -2354,31 +2384,57 @@ def causal_explanation(
             ),
         )
 
-    # Fetch the ATE table (uses cache when available)
-    ate_table = engine.feature_ate_table(use_cache=True)
+    # Fetch the ATE table (uses cache when available), tagged with provenance
+    # so genuine causal estimates can never be confused with correlational
+    # fallbacks under the same schema.
+    from detection.causal_engine import ESTIMATION_CAUSAL
 
-    # Refutation gate: if the model appears misspecified, refuse to serve ATEs
+    detailed_ate = engine.feature_ate_table_detailed(use_cache=True)
+    ate_table = {feat: est.value for feat, est in detailed_ate.items()}
+    estimation_method = {feat: est.method for feat, est in detailed_ate.items()}
+    estimation_notes = {
+        feat: est.reason for feat, est in detailed_ate.items() if est.reason
+    }
+    causally_identified_features = [
+        feat for feat, est in detailed_ate.items() if est.method == ESTIMATION_CAUSAL
+    ]
+
+    # Refutation gate: if the model appears misspecified, refuse to serve ATEs.
+    # Coverage now spans every causally-identified feature (not just a single
+    # hardcoded treatment), and the threshold is a fraction of tests actually
+    # run — so rejection is mathematically reachable at any coverage size.
     try:
-        refutation_results = engine.refutation_tests()
-        failing = sum(
-            1 for k, pval in refutation_results.items()
-            if k == "placebo_treatment_refuter" and pval < 0.05
+        refutation_results = (
+            engine.all_feature_refutation_tests(features=causally_identified_features)
+            if causally_identified_features
+            else {}
         )
-        # A stricter check: if any refutation test fails for more than
-        # _MAX_FAILING_REFUTATIONS features, refuse
-        all_failing = sum(1 for pval in refutation_results.values() if pval < 0.05)
-        if all_failing > _MAX_FAILING_REFUTATIONS:
+        total_tests = sum(len(tests) for tests in refutation_results.values())
+        failing = sum(
+            1
+            for tests in refutation_results.values()
+            for pval in tests.values()
+            if pval < 0.05
+        )
+        if total_tests > 0 and (failing / total_tests) > _MAX_FAILING_REFUTATION_FRACTION:
+            failing_fraction = failing / total_tests
             logger.error(
-                "Causal model refutation gate triggered: %d tests have p < 0.05 "
-                "(threshold: %d). Refusing to serve ATE table.",
-                all_failing,
-                _MAX_FAILING_REFUTATIONS,
+                "Causal model refutation gate triggered: %d/%d refutation tests "
+                "(%.1f%%) have p < 0.05 across %d features (threshold: %.1f%%). "
+                "Refusing to serve ATE table.",
+                failing,
+                total_tests,
+                failing_fraction * 100,
+                len(refutation_results),
+                _MAX_FAILING_REFUTATION_FRACTION * 100,
             )
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    f"Causal model appears misspecified: {all_failing} refutation tests "
-                    f"returned p < 0.05 (threshold: {_MAX_FAILING_REFUTATIONS}). "
+                    f"Causal model appears misspecified: {failing}/{total_tests} "
+                    f"refutation tests ({failing_fraction:.0%}) returned p < 0.05 "
+                    f"across {len(refutation_results)} feature(s) "
+                    f"(threshold: {_MAX_FAILING_REFUTATION_FRACTION:.0%}). "
                     "The causal graph may not fit the current data distribution. "
                     "Please retrain or investigate model specification."
                 ),
@@ -2431,6 +2487,9 @@ def causal_explanation(
         top_causal_features=top_causal_features,
         counterfactual_score=counterfactual_score_value,
         coverage_note=coverage_note,
+        estimation_method=estimation_method,
+        estimation_notes=estimation_notes,
+        refutation_coverage=causally_identified_features,
     )
 # Mount versioned router and register legacy 302 redirect aliases
 # ---------------------------------------------------------------------------
