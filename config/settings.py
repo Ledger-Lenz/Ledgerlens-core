@@ -359,6 +359,16 @@ class Settings(BaseSettings):
     # Timeout in seconds for slow request mitigation
     waf_slow_request_timeout_seconds: float = 10.0
 
+    # ── Audit log ──────────────────────────────────────────────────────────────
+    # When True, scoring event chains are verified on every read (GET /audit/wallet/{wallet}).
+    # Disabled by default for performance; admins can enable it when chain integrity
+    # is suspected but no explicit /verify call has been made.
+    audit_verify_on_read: bool = False
+    # Maximum number of feature keys included in the scoring event snapshot.
+    # If a feature snapshot exceeds this count, it is truncated to the first N keys
+    # to keep the chain hash size bounded.
+    audit_feature_snapshot_max_keys: int = 50
+
     # ── Trace Sampling ──────────────────────────────────────────────────────────
     # Sampling strategy: "static" (head-based) or "tail" (tail-based)
     trace_sampling_strategy: str = "static"

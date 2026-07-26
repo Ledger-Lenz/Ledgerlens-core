@@ -34,34 +34,33 @@ logger = logging.getLogger("ledgerlens.api.audit")
 
 router = APIRouter(prefix="/audit", tags=["Audit Log"])
 
-_STELLAR_ADDRESS_PATTERN = re.compile(r"^G[A-Z2-7]{55}$")
+# Stellar addresses are 56 characters, starting with 'G', base32 encoded
+_STELLAR_ADDRESS_PATTERN = re.compile(r"^G[A-Z2-7]{56}$")
+
 
 # ---------------------------------------------------------------------------
-# Lazy singletons
+# Store / verifier factories (testable via lru_cache.clear)
 # ---------------------------------------------------------------------------
-
-_store = None
-_verifier = None
 
 
 def _get_store():
-    global _store
-    if _store is None:
-        from audit.scoring_events import ScoringEventStore
-
-        db_path = getattr(settings, "ledgerlens_db_path", "ledgerlens.db")
-        max_keys = getattr(settings, "audit_feature_snapshot_max_keys", 50)
-        _store = ScoringEventStore(db_path=db_path, max_feature_keys=max_keys)
-    return _store
+    from audit.scoring_events import ScoringEventStore
+    max_keys = getattr(settings, "audit_feature_snapshot_max_keys", 50)
+    return ScoringEventStore(db_path=settings.db_path, max_feature_keys=max_keys)
 
 
 def _get_verifier():
-    global _verifier
-    if _verifier is None:
-        from audit.scoring_events import ChainHashVerifier
+    from audit.scoring_events import ChainHashVerifier
+    return ChainHashVerifier(_get_store())
 
-        _verifier = ChainHashVerifier(_get_store())
-    return _verifier
+
+def _verify_on_read_enabled() -> bool:
+    """Check if on-read chain verification is enabled.
+
+    Uses ``settings.audit_verify_on_read`` when available (configurable via
+    env var ``AUDIT_VERIFY_ON_READ``), otherwise defaults to ``False``.
+    """
+    return getattr(settings, "audit_verify_on_read", False)
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +124,7 @@ async def get_wallet_audit_log(
     store = _get_store()
     events = await store.replay(wallet, since=since, limit=limit)
 
-    verify_on_read = getattr(settings, "audit_verify_on_read", False)
-    if verify_on_read and events:
+    if _verify_on_read_enabled() and events:
         verifier = _get_verifier()
         result = await verifier.verify(wallet)
         if result.status == "tampered":
@@ -175,7 +173,13 @@ async def verify_wallet_chain(
         )
     verifier = _get_verifier()
     result = await verifier.verify(wallet)
-    return ChainVerificationResponse(**result.to_dict())
+    return ChainVerificationResponse(
+        wallet=result.wallet,
+        status=result.status,
+        total_events=result.total_events,
+        first_tampered_event_id=result.first_tampered_event_id,
+        verified_at=result.verified_at.isoformat(),
+    )
 
 
 @router.get(
@@ -192,4 +196,8 @@ async def get_audit_summary(
 ) -> AuditSummaryResponse:
     store = _get_store()
     stats = await store.summary()
-    return AuditSummaryResponse(**stats)
+    return AuditSummaryResponse(
+        events_last_24h=int(stats.get("events_last_24h", 0)),
+        unique_wallets_scored=int(stats.get("unique_wallets_scored", 0)),
+        integrity_violations=int(stats.get("integrity_violations", 0)),
+    )

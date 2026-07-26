@@ -10,9 +10,19 @@
     guide at ``docs/api_gateway.md``.
 
     This router will be removed in a future release.
+
+.. note::
+    This legacy module uses SHA-256 for key hashing, while the canonical
+    ``detection.api_key_store`` uses BLAKE2b. This divergence is intentional
+    for backward compatibility — the legacy ``api_keys`` table (created by
+    ``_ensure_table`` below) is a separate table from the canonical one
+    managed by ``detection.api_key_store._init_table``. Both tables share
+    the name ``api_keys`` but the migration logic in
+    ``detection.api_key_store.migrate_legacy_api_keys`` reconciles them.
 """
 
 import hashlib
+import logging
 import secrets
 import sqlite3
 import time
@@ -25,6 +35,8 @@ from pydantic import BaseModel
 from api.auth import require_admin_key
 from config.settings import settings
 
+logger = logging.getLogger("ledgerlens.api.api_keys_router")
+
 router = APIRouter(prefix="/admin/api-keys", tags=["API Keys"])
 
 _DEPRECATION_HEADER = {"Deprecation": "True", "Sunset": "Sat, 31 Jan 2027 00:00:00 GMT"}
@@ -34,16 +46,54 @@ VALID_SCOPES = {"read:scores", "write:suppressions", "admin"}
 
 # In-memory sliding window counters: {key_hash: [timestamps]}
 _rate_windows: dict[str, list[float]] = {}
+_RATE_WINDOW_STALE_SECONDS = 300  # 5 minutes
+_LAST_CLEANUP: float = 0.0
 
 
-def _add_deprecation_headers(response: dict | None = None) -> dict:
-    """Add RFC 8594 Deprecation headers to the response."""
+def _cleanup_stale_rate_windows() -> None:
+    """Evict entries from ``_rate_windows`` that haven't been touched in 5 minutes.
+
+    Prevents unbounded memory growth from keys that are no longer active.
+    Runs at most once per minute to avoid excessive iteration.
+    """
+    global _LAST_CLEANUP
+    now = time.monotonic()
+    if now - _LAST_CLEANUP < 60.0:
+        return
+    _LAST_CLEANUP = now
+    cutoff = now - _RATE_WINDOW_STALE_SECONDS
+    stale_keys = [
+        kh for kh, timestamps in _rate_windows.items()
+        if not timestamps or timestamps[-1] < cutoff
+    ]
+    for kh in stale_keys:
+        _rate_windows.pop(kh, None)
+    if stale_keys:
+        logger.debug("Cleaned up %d stale rate window entries", len(stale_keys))
+
+
+def clear_rate_windows() -> None:
+    """Clear all in-memory rate window counters (useful for testing)."""
+    _rate_windows.clear()
+
+
+def _add_deprecation_headers() -> dict:
+    """Add RFC 8594 Deprecation headers to the response.
+
+    Returns a dict suitable for passing as ``headers`` to ``HTTPException``.
+    """
     headers = dict(_DEPRECATION_HEADER)
     headers["Link"] = f'<{_MIGRATION_GUIDE}>; rel="deprecation"'
     return headers
 
 
 def _hash_key(plaintext: str) -> str:
+    """Hash an API key with SHA-256.
+
+    .. note::
+        This legacy module uses SHA-256. The canonical ``detection.api_key_store``
+        uses BLAKE2b. See module docstring for details on this divergence.
+    """
     return hashlib.sha256(plaintext.encode()).hexdigest()
 
 
@@ -79,6 +129,7 @@ def get_api_key_record(key_hash: str) -> Optional[dict]:
 
 
 def check_rate_limit(key_hash: str, limit: int) -> None:
+    _cleanup_stale_rate_windows()
     now = time.monotonic()
     window = _rate_windows.setdefault(key_hash, [])
     _rate_windows[key_hash] = [t for t in window if now - t < 60.0]
@@ -212,6 +263,13 @@ def create_api_key(body: CreateKeyRequest) -> CreateKeyResponse:
 def revoke_api_key(key_id: int) -> dict:
     with sqlite3.connect(settings.db_path) as conn:
         _ensure_table(conn)
+
+        # First, get the key_hash for this key_id to clean up rate window
+        row = conn.execute(
+            "SELECT key_hash FROM api_keys WHERE id = ?", (key_id,)
+        ).fetchone()
+        key_hash = row[0] if row else None
+
         cur = conn.execute(
             "UPDATE api_keys SET revoked = 1 WHERE id = ? AND revoked = 0",
             (key_id,),
@@ -223,7 +281,13 @@ def revoke_api_key(key_id: int) -> dict:
                 headers=_add_deprecation_headers(),
             )
 
-    _rate_windows.pop(str(key_id), None)
+    # Remove the key's rate window entries using the actual key_hash
+    if key_hash:
+        _rate_windows.pop(key_hash, None)
+    else:
+        # Fallback: try to remove by key_id (string) in case the DB lookup failed
+        _rate_windows.pop(str(key_id), None)
 
     response = {"revoked": True, "id": key_id}
     return response
+
