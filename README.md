@@ -618,6 +618,7 @@ python cli.py retrain-check
 - `--psi-threshold 0.20`: PSI threshold for marking a feature as drifted (default 0.20)
 - `--min-drifted-features 3`: Minimum number of drifted features to trigger retraining (default 3)
 - `--force-retrain`: Force retraining even if no drift detected (useful for manual updates)
+- `--force-promote`: Override SHAP stability & fairness checks and promote models anyway
 
 **What happens:**
 
@@ -626,7 +627,9 @@ python cli.py retrain-check
 3. Compares new models' AUC-ROC scores against previous models
 4. **Promotes** new models only if AUC-ROC ≥ previous version (safer rollout)
 5. **Reverts** to previous version if new models underperform
-6. Writes a drift report to `./drift_reports/YYYYMMDD_HHMM.json` with PSI values and promotion decision
+6. **SHAP stability gate**: checks whether feature importance rankings (Spearman ρ) shifted significantly between old and new models. Blocks promotion if unstable (unless `--force-promote`)
+7. **Fairness / bias audit gate**: runs proxy-cohort fairness metrics (demographic parity, equalised odds, cold-start bias) across volume tier, account age, and network centrality. Blocks promotion if any cohort disparity exceeds `FAIRNESS_DISPARITY_THRESHOLD` (default 0.15), configurable via environment variables. See [docs/fairness_audit.md](docs/fairness_audit.md) for details.
+8. Writes a drift report to `./drift_reports/YYYYMMDD_HHMM.json` with PSI values and promotion decision
 
 ### Model Versioning and Rollback
 

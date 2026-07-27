@@ -67,6 +67,7 @@ from detection.storage import (
     get_bridge_transfers,
     get_circular_routes,
     get_drift_reports,
+    get_fairness_reports,
     get_feature_vector,
     get_latest_scores,
     get_liquidity_pool_trades,
@@ -1604,6 +1605,18 @@ def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     return get_drift_reports(limit=limit)
 
 
+@v1_router.get("/admin/fairness-reports", tags=["Admin"], summary="Fairness audit reports", description="Return the most recent fairness/bias audit reports. Response contains only aggregate cohort-level rates, never per-wallet cohort assignments.", dependencies=[Depends(require_admin_key)])
+def fairness_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
+    """Return the most recent fairness audit reports recorded by `cli.py retrain-check`.
+
+    .. warning::
+       The response contains *only* aggregate cohort-level rates, never
+       per-wallet cohort assignments, to avoid the audit report itself
+       becoming a wallet-deanonymisation tool.
+    """
+    return get_fairness_reports(limit=limit)
+
+
 @v1_router.get("/admin/robustness-report", tags=["Admin"], summary="Latest robustness report", description="Return the latest adversarial robustness evaluation report (admin only).", dependencies=[Depends(require_admin_key)])
 def robustness_report() -> dict:
     """Return the latest RobustnessReport from the database (admin only)."""
@@ -2423,6 +2436,13 @@ def legacy_delete_webhook(subscriber_id: str, request: Request):
 def legacy_admin_drift_reports(request: Request):
     qs = request.url.query
     target = "/v1/admin/drift-reports" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/admin/fairness-reports", include_in_schema=False)
+def legacy_admin_fairness_reports(request: Request):
+    qs = request.url.query
+    target = "/v1/admin/fairness-reports" + (f"?{qs}" if qs else "")
     return RedirectResponse(url=target, status_code=302)
 
 

@@ -502,6 +502,22 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON compliance_exports (timestamp);
         """,
     ),
+    (
+        18,
+        "add fairness_audit_reports table for model fairness / bias audit",
+        """
+        CREATE TABLE IF NOT EXISTS fairness_audit_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_name TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            significant_disparity INTEGER NOT NULL,
+            findings_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_fairness_audit_computed_at
+            ON fairness_audit_reports (computed_at);
+        """,
+    ),
 ]
 
 
@@ -1280,6 +1296,73 @@ def get_latest_robustness_report(db_path: str | None = None) -> dict | None:
     if row is None:
         return None
     return json.loads(row[0])
+
+
+# ---------------------------------------------------------------------------
+# Fairness audit reports
+# ---------------------------------------------------------------------------
+
+
+def save_fairness_report(
+    model_name: str,
+    model_version: str,
+    significant_disparity: bool,
+    findings_json: str,
+    computed_at: str,
+    db_path: str | None = None,
+) -> int:
+    """Persist a fairness audit report; returns its row id."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO fairness_audit_reports
+                (model_name, model_version, significant_disparity, findings_json, computed_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                model_name,
+                model_version,
+                int(significant_disparity),
+                findings_json,
+                computed_at,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def _row_to_fairness_report(row: tuple) -> dict:
+    return {
+        "id": row[0],
+        "model_name": row[1],
+        "model_version": row[2],
+        "significant_disparity": bool(row[3]),
+        "findings": json.loads(row[4]),
+        "computed_at": row[5],
+    }
+
+
+def get_fairness_reports(limit: int = 50, db_path: str | None = None) -> list[dict]:
+    """Return the most recent fairness audit reports, newest first.
+
+    .. warning::
+       The response contains *only* aggregate cohort-level rates, never
+       per-wallet cohort assignments, to avoid the audit report itself
+       becoming a wallet-deanonymisation tool.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, model_name, model_version, significant_disparity, findings_json, computed_at
+            FROM fairness_audit_reports
+            ORDER BY computed_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_row_to_fairness_report(row) for row in rows]
 
 
 def _asset_pair_symbol(asset: dict) -> str:

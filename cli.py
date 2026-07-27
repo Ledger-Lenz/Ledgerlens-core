@@ -247,7 +247,7 @@ def retrain_check(
     psi_threshold: float = typer.Option(0.20, help="PSI threshold for drift detection"),
     min_drifted_features: int = typer.Option(3, help="Minimum number of drifted features to trigger retraining"),
     force_retrain: bool = typer.Option(False, help="Force retraining even if no drift detected"),
-    force_promote: bool = typer.Option(False, "--force-promote", help="Override SHAP stability check and promote models anyway"),
+    force_promote: bool = typer.Option(False, "--force-promote", help="Override SHAP stability & fairness checks and promote models anyway"),
 ) -> None:
     """Check for distribution drift and retrain the ensemble if detected.
 
@@ -446,6 +446,87 @@ def retrain_check(
     # Block promotion if stability check failed and --force-promote not set
     if not stability.stable and not force_promote:
         promoted = False
+
+    # ── Fairness / bias audit ───────────────────────────────────────────────
+    fairness_report = None
+    fairness_report_id = None
+    if settings.fairness_audit_enabled:
+        try:
+            from detection.fairness_audit import run_fairness_audit
+            from detection.storage import save_fairness_report
+            from sklearn.metrics import roc_auc_score
+
+            # Build ensemble predictions using the training dataset
+            feature_cols_for_pred = [c for c in df.columns if c in _feat_names]
+            X_eval = df[feature_cols_for_pred].fillna(0.0).values
+            y_eval = df["label"].values.astype(int)
+
+            # Average probabilities across available models
+            ensemble_probas = np.zeros(len(X_eval))
+            n_models_active = 0
+            for name in model_names:
+                model_obj = new_results[name].get("model")
+                if model_obj is not None and hasattr(model_obj, "predict_proba"):
+                    try:
+                        probas = model_obj.predict_proba(X_eval)
+                        if probas.shape[1] >= 2:
+                            ensemble_probas += probas[:, 1]
+                            n_models_active += 1
+                        else:
+                            ensemble_probas += probas[:, 0]
+                            n_models_active += 1
+                    except Exception as mp_exc:
+                        logger.warning("Could not get predictions from %s: %s", name, mp_exc)
+
+            if n_models_active > 0:
+                ensemble_probas /= n_models_active
+            else:
+                logger.warning("No models available for fairness audit predictions")
+                ensemble_probas = np.zeros(len(X_eval))
+
+            fairness_report = run_fairness_audit(
+                scores=ensemble_probas,
+                y_true=y_eval,
+                feature_df=df,
+                model_name="ensemble",
+                model_version="new",
+                disparity_threshold=settings.fairness_disparity_threshold,
+                cold_start_age_days=settings.fairness_cold_start_age_days,
+                risk_score_threshold=settings.risk_score_threshold,
+            )
+
+            if fairness_report.significant_disparity:
+                flagged_dimensions = [
+                    f.dimension for f in fairness_report.findings if f.flagged
+                ]
+                logger.warning(
+                    "Fairness audit FAILED: %s show significant disparity. "
+                    "Gap threshold=%.2f.",
+                    flagged_dimensions,
+                    settings.fairness_disparity_threshold,
+                )
+                if settings.fairness_block_promotion and not force_promote:
+                    promoted = False
+                    logger.info("Skipping promotion due to fairness audit failure")
+                elif force_promote:
+                    logger.warning(
+                        "Fairness audit disparity overridden by --force-promote. "
+                        "Flagged dimensions: %s",
+                        flagged_dimensions,
+                    )
+            else:
+                logger.info("Fairness audit PASSED — no significant disparity detected")
+
+            # Persist the report
+            fairness_report_id = save_fairness_report(
+                model_name="ensemble",
+                model_version="new",
+                significant_disparity=fairness_report.significant_disparity,
+                findings_json=json.dumps(fairness_report.to_dict()),
+                computed_at=fairness_report.computed_at.isoformat(),
+            )
+        except Exception as fa_exc:
+            logger.warning("Fairness audit failed (%s); continuing without fairness gate", fa_exc)
 
     # Save models and metadata
     training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")

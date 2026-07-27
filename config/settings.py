@@ -363,6 +363,16 @@ class Settings(BaseSettings):
     # Enable PDF rendering for model cards
     model_card_pdf_enabled: bool = False
 
+    # ── Fairness / Bias Audit ─────────────────────────────────────────────────────────
+    fairness_audit_enabled: bool = True
+    """Enable the fairness/bias audit as a promotion gate in ``retrain-check``."""
+    fairness_disparity_threshold: float = 0.15
+    """Maximum allowed gap in flag rate / TPR / FPR between cohorts (0.0–1.0)."""
+    fairness_cold_start_age_days: int = 7
+    """Wallets younger than this (in days) are considered "cold-start" and checked for bias."""
+    fairness_block_promotion: bool = True
+    """If ``True``, the audit blocks model promotion when significant disparity is detected."""
+
     # ── Vector Similarity Search ──────────────────────────────────────────────────────
     # Vector index backend: faiss_flat | faiss_ivf | pgvector
     vector_index_backend: str = "faiss_flat"
