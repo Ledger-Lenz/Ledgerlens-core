@@ -69,6 +69,7 @@ from detection.storage import (
     get_drift_reports,
     get_fairness_reports,
     get_feature_vector,
+    get_flash_loan_alerts,
     get_latest_scores,
     get_liquidity_pool_trades,
     get_pair_correlations,
@@ -1370,6 +1371,26 @@ def pool_risk(pool_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"No pool trades found for pool {pool_id}")
     risk = pool_risk_from_trade_rows(rows)
     return {"pool_id": pool_id, **risk}
+
+
+@v1_router.get(
+    "/amm/flash-loan-alerts",
+    tags=["Detection"],
+    summary="Flash-loan manipulation alerts",
+    description=(
+        "Return detected flash-loan price-manipulation candidates, most recent first. "
+        "Optionally filter by wallet address."
+    ),
+)
+def flash_loan_alerts(
+    wallet: str | None = Query(None, description="Filter by wallet address"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
+    """Return flash-loan price-manipulation alerts, most recent first."""
+    if wallet is not None:
+        validate_stellar_address(wallet)
+    return get_flash_loan_alerts(wallet=wallet, limit=limit, offset=offset)
 
 
 @v1_router.get(

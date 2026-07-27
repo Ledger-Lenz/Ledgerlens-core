@@ -373,6 +373,16 @@ class Settings(BaseSettings):
     fairness_block_promotion: bool = True
     """If ``True``, the audit blocks model promotion when significant disparity is detected."""
 
+    # ── Flash-Loan Price-Manipulation Detection ───────────────────────────────────────
+    flash_loan_price_deviation_sigma: float = 4.0
+    """Number of standard-deviations from trailing band that flags a manipulation trade."""
+    flash_loan_reversal_window_blocks: int = 1
+    """Max ledger/block gap within which a reversal must occur to be considered flash-loan."""
+    flash_loan_reversal_tolerance_pct: float = 0.05
+    """Net position after reversal must be within this fraction of pre-manipulation size."""
+    flash_loan_min_pool_share_pct: float = 0.10
+    """Manipulating trade must move at least this fraction of pool depth."""
+
     # ── Vector Similarity Search ──────────────────────────────────────────────────────
     # Vector index backend: faiss_flat | faiss_ivf | pgvector
     vector_index_backend: str = "faiss_flat"

@@ -187,6 +187,7 @@ Benford signals alone are insufficient (legitimate market makers can also be non
 - **Volume and timing features (4)**: volume-to-unique-counterparty ratio, intra-minute clustering, off-hours activity ratio, volume spike frequency
 - **Wallet graph features (7)**: funding source similarity, network centrality within the trading graph, account age, wash-ring membership, largest ring size, cycle volume ratio, and timing tightness score
 - **Cross-pair features (5)**: cross-pair activity count, synchrony score, burst overlap ratio, shared wallet cluster size, and volume concentration
+- **AMM pool features (6)**: pool trade ratio, round-trip ratio, share concentration, tenure ratio, volume concentration, and flash-loan manipulation score
 
 ## Graph-Based Ring Detection
 
@@ -445,7 +446,8 @@ python cli.py serve --reload
 ```
 
 Exposes `/health`, `/scores`, `/scores/{wallet}`, `/scores/{wallet}/explain`,
-`/alerts`, `/assets/risk-ranking`, `/correlations`, and `/rings` over the
+`/alerts`, `/assets/risk-ranking`, `/correlations`, `/rings`,
+and `/amm/flash-loan-alerts` over the
 locally stored `RiskScore` records — a stand-in for `ledgerlens-api` during
 local development.
 

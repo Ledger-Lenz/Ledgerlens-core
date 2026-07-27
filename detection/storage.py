@@ -2017,6 +2017,25 @@ def get_alerts(
     ]
 
 
+def get_flash_loan_alerts(
+    wallet: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Convenience: return flash-loan manipulation alerts, most recent first.
+
+    Filters by ``wallet`` when provided, and returns up to ``limit`` results.
+    """
+    return get_alerts(
+        alert_type="FLASH_LOAN_MANIPULATION",
+        wallet=wallet,
+        limit=limit,
+        offset=offset,
+        db_path=db_path,
+    )
+
+
 def log_compliance_export(
     export_type: str,
     wallet_hash: str,

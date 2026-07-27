@@ -173,6 +173,7 @@ AMM_FEATURE_NAMES = [
     "pool_share_concentration",
     "amm_tenure_ratio",
     "amm_volume_concentration",
+    "flash_loan_manipulation_score",  # flash-loan price-manipulation detector score
 ]
 
 PATH_PAYMENT_FEATURE_NAMES = [
@@ -730,12 +731,25 @@ def amm_features(
     if amm_engine is not None:
         amm_feats = amm_engine.get_features(account)
 
+    # Flash-loan manipulation score
+    flash_loan_score = 0.0
+    try:
+        from detection.oracle_manipulation_engine import (
+            compute_flash_loan_manipulation_score,
+        )
+        flash_loan_score = compute_flash_loan_manipulation_score(
+            trades, account, liquidity_pools
+        )
+    except Exception:
+        flash_loan_score = 0.0
+
     return {
         "pool_trade_ratio": pool_trade_ratio,
         "pool_round_trip_ratio": avg_round_trip,
         "pool_share_concentration": avg_concentration,
         "amm_tenure_ratio": amm_feats.get("amm_tenure_ratio", 0.0),
         "amm_volume_concentration": amm_feats.get("amm_volume_concentration", 0.0),
+        "flash_loan_manipulation_score": flash_loan_score,
     }
 
 
