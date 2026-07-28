@@ -9,12 +9,9 @@ GET /analyst/feedback?since=<ISO_TIMESTAMP>.
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from typing import Literal
 
 from detection.storage import _connect, init_db
 from config.settings import settings
-
-VerdictType = Literal["confirmed_wash", "false_positive", "needs_review"]
 
 _VALID_VERDICTS: frozenset[str] = frozenset(
     ["confirmed_wash", "false_positive", "needs_review"]

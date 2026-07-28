@@ -28,6 +28,8 @@ def acquire_submission_lease(region_name: str, lease_duration_seconds: int = 30)
     4. If another region has a fresh lease, return ``False``.
 
     Returns ``True`` when this region successfully holds the lease, ``False`` otherwise.
+    If lease handling is disabled via ``settings.soroban_submission_lease_enabled``,
+    returns ``True`` immediately without acquiring a lease.
 
     The ``kubernetes`` client library is imported lazily (only reached when
     lease handling is enabled) so that importing this module -- and anything
@@ -37,7 +39,11 @@ def acquire_submission_lease(region_name: str, lease_duration_seconds: int = 30)
     optional heavy dependencies, e.g. ``dowhy`` in ``detection/causal_engine.py``).
     """
     # Short‑circuit if lease handling is disabled.
-    if not getattr(settings, "soroban_submission_lease_enabled", True):
+    lease_enabled = getattr(settings, "soroban_submission_lease_enabled", None)
+    if lease_enabled is None:
+        logger.warning("soroban_submission_lease_enabled not set in config; defaulting to enabled")
+        lease_enabled = True
+    if not lease_enabled:
         return True
 
     from kubernetes import client, config
@@ -68,7 +74,7 @@ def acquire_submission_lease(region_name: str, lease_duration_seconds: int = 30)
                 logger.exception("Failed to create lease %s", lease_name)
                 return False
         else:
-            logger.exception("Error reading lease %s: %s", lease_name, exc)
+            logger.error("Error reading lease %s: %s", lease_name, exc)
             return False
 
     holder = lease.spec.holder_identity
@@ -79,7 +85,8 @@ def acquire_submission_lease(region_name: str, lease_duration_seconds: int = 30)
     if renew_time:
         try:
             last_renew_ts = renew_time.timestamp()
-        except Exception:
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.warning("Failed to parse renew_time: %s", e)
             last_renew_ts = None
 
     # Determine if lease is stale.

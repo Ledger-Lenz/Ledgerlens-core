@@ -65,7 +65,6 @@ from __future__ import annotations
 import logging
 import time
 from threading import Lock
-from typing import Optional
 
 from config.settings import settings
 from utils.circuit_breaker import CircuitBreaker
@@ -161,7 +160,7 @@ class DistributedRateLimiter:
     observable degraded mode rather than the only mode that ever existed.
     """
 
-    def __init__(self, redis_url: Optional[str] = None, quota_store: Optional[str] = None):
+    def __init__(self, redis_url: str | None = None, quota_store: str | None = None):
         self.redis_url = redis_url or getattr(settings, "redis_url", None)
         self.quota_store = (quota_store or getattr(settings, "gateway_quota_store", "redis")).lower()
 
@@ -307,7 +306,7 @@ def _emit_check_metric(backend: str) -> None:
 # pattern as detection.feature_store's module-level FeatureStore usage)
 # ---------------------------------------------------------------------------
 
-_limiter: Optional[DistributedRateLimiter] = None
+_limiter: DistributedRateLimiter | None = None
 _limiter_lock = Lock()
 
 

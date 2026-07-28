@@ -8,6 +8,7 @@ account's oldest `create_account` operation.
 
 import asyncio
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ import httpx
 
 from config.settings import settings
 from ingestion.http_client import AsyncHorizonClient, get_with_retry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,7 +85,8 @@ class AccountMetadataCache:
                     "signer_keys_json,fetched_at FROM account_metadata_cache WHERE account_id=?",
                     (account,),
                 ).fetchone()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            logger.debug("Cache lookup failed for account %s: %s", account, exc)
             return None
         if row is None:
             return None
@@ -122,9 +126,6 @@ class AccountMetadataCache:
     def load_all_enriched(self, accounts: list[str], concurrency: int = 10) -> "dict[str, AccountMetadata]":
         """Fetch metadata for all accounts in parallel, using cache for fresh entries."""
         result: dict[str, AccountMetadata] = {}
-        missing = [a for a in accounts if not (cached := self.get(a)) or not result.update({a: cached})]  # type: ignore[func-returns-value]
-        # Re-do cleanly:
-        result = {}
         missing = []
         for a in accounts:
             cached = self.get(a)
@@ -163,16 +164,9 @@ def get_account_creation_info(account: str) -> dict:
 
     with httpx.Client(timeout=30.0) as client:
         response = get_with_retry(client, url, params=params)
-        records = response.json()["_embedded"]["records"]
+        data = response.json()
 
-    if not records or records[0]["type"] != "create_account":
-        return {"funding_source": None, "created_at": None}
-
-    record = records[0]
-    return {
-        "funding_source": record["funder"],
-        "created_at": datetime.fromisoformat(record["created_at"].replace("Z", "+00:00")),
-    }
+    return _parse_creation_info(data)
 
 
 def load_account_metadata(accounts: list[str]) -> dict[str, dict]:

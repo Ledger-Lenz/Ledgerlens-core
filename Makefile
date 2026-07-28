@@ -1,4 +1,4 @@
-.PHONY: install test lint mutation-test generate-data train serve
+.PHONY: install test lint mutation-test generate-data train serve fuzz-quick
 
 install:
 	pip install -r requirements.txt
@@ -48,3 +48,26 @@ docs-serve:
 
 benchmark-check:
 	pytest -m benchmark -q --no-header 2>&1 || true
+
+# ── Fuzz testing ─────────────────────────────────────────────────────────────
+# Runs each Atheris harness for 30 seconds — a quick pre-merge smoke check.
+# Requires: pip install atheris
+# Exits non-zero if any harness reports a crash.
+fuzz-quick:
+	@echo "Running fuzz harnesses for 30s each..."
+	@failed=0; \
+	for harness in fuzz/fuzz_*.py; do \
+	  name=$$(basename "$$harness" .py); \
+	  mkdir -p fuzz/corpus/$$name; \
+	  echo "  $$name ..."; \
+	  python "$$harness" "fuzz/corpus/$$name" -max_total_time=30 -print_final_stats=1 2>&1 || failed=1; \
+	  if find "fuzz/corpus/$$name" -name 'crash-*' | grep -q .; then \
+	    echo "  CRASH detected in $$name"; \
+	    failed=1; \
+	  fi; \
+	done; \
+	if [ "$$failed" -eq 1 ]; then \
+	  echo "fuzz-quick: one or more harnesses reported a crash. See fuzz/README.md to reproduce."; \
+	  exit 1; \
+	fi
+	@echo "fuzz-quick: all harnesses completed without crashes."

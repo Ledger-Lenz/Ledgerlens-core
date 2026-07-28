@@ -112,6 +112,20 @@ class SettingsReloader:
         """Validate and apply a config change; write to .env atomically.
 
         Raises ValueError for disallowed keys or unparseable values.
+
+        Does NOT write `runtime_config` or signal cross-process propagation
+        itself -- when called via `GovernanceEngine.execute_proposal` (the
+        only real caller), that method performs the `runtime_config` write
+        on its own already-open `BEGIN EXCLUSIVE` connection, atomically with
+        the `status='executed'` transition, and calls `bump_config_version()`
+        after committing. A second, independent connection opened here would
+        deadlock against that exclusive lock (verified: it silently failed
+        every time, swallowed by an overly broad `except Exception: pass`,
+        which is exactly why "the mechanism was wired to a function nothing
+        calls" -- the write never even landed). A caller using
+        `SettingsReloader` standalone, outside `execute_proposal`, gets only
+        the in-process live-apply and `.env` write below; it will not
+        propagate to `runtime_config` or other processes.
         """
         if key not in self.ALLOWED_SETTINGS:
             raise GovernanceError(
@@ -159,17 +173,6 @@ class SettingsReloader:
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.writelines(env_lines)
         os.replace(tmp_path, env_path)
-
-        # Also update runtime_config table for hot-reload
-        try:
-            with _connect() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO runtime_config (key, value, updated_at) VALUES (?, ?, ?)",
-                    (key.lower(), str(parsed), datetime.now(timezone.utc).isoformat()),
-                )
-                conn.commit()
-        except Exception:
-            pass  # Best-effort; .env is the authoritative write
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +494,22 @@ class GovernanceEngine:
                     new_value = str(payload["new_value"])
                     self._reloader.apply(key, new_value)
 
+                    # Propagate to every process via `runtime_config`, on this
+                    # same EXCLUSIVE connection/transaction -- atomic with the
+                    # 'executed' transition below, and immune to the deadlock
+                    # a second connection would hit against the lock this
+                    # transaction already holds (see `SettingsReloader.apply`'s
+                    # docstring). A write failure here fails the whole
+                    # proposal (status='failed') rather than reaching
+                    # 'executed' without actually propagating, per this
+                    # issue's requirement that a governance-approved change
+                    # must actually take effect, not just be recorded as if
+                    # it had.
+                    conn.execute(
+                        "INSERT OR REPLACE INTO runtime_config (key, value, updated_at) VALUES (?, ?, ?)",
+                        (key.lower(), new_value, datetime.now(timezone.utc).isoformat()),
+                    )
+
                 elif proposal_type == "committee_update":
                     action = payload["action"]
                     member = payload["member"]
@@ -536,6 +555,19 @@ class GovernanceEngine:
             result = _row_to_proposal(row)
         finally:
             conn.close()
+
+        # Signal every other process to re-poll `runtime_config` immediately
+        # rather than waiting out their local TTL (see config/settings.py's
+        # consistency-model docstring). Only after the commit above, so a
+        # woken process's re-read is guaranteed to see the durable value.
+        # Best-effort: Redis being unavailable must not affect the proposal
+        # outcome already committed above.
+        if result.status == "executed" and proposal_type == "config_change":
+            try:
+                from config.settings import bump_config_version
+                bump_config_version()
+            except Exception:
+                pass
 
         return result
 

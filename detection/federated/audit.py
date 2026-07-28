@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS federated_audit_log (
     record_json         TEXT NOT NULL,
     signature           BLOB NOT NULL,
     dp_delta            REAL NOT NULL DEFAULT 0.0,
-    noise_multiplier    REAL NOT NULL DEFAULT 0.0
+    noise_multiplier    REAL NOT NULL DEFAULT 0.0,
+    weight_capped_participants_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS federated_state (
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS federated_state (
 _MIGRATIONS = [
     ("dp_delta", "REAL NOT NULL DEFAULT 0.0"),
     ("noise_multiplier", "REAL NOT NULL DEFAULT 0.0"),
+    ("weight_capped_participants_json", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 
@@ -81,6 +83,7 @@ def build_record(
     excluded_participant_ids: list[str] | None = None,
     dp_delta: float = 0.0,
     noise_multiplier: float = 0.0,
+    weight_capped_participant_ids: list[str] | None = None,
 ) -> dict:
     """Build an unsigned audit record dict (all participant IDs are hashed)."""
     return {
@@ -92,6 +95,9 @@ def build_record(
         "cumulative_epsilon": cumulative_epsilon,
         "dp_delta": dp_delta,
         "noise_multiplier": noise_multiplier,
+        "weight_capped_participants": [
+            hash_participant_id(p) for p in (weight_capped_participant_ids or [])
+        ],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -127,8 +133,8 @@ def save_audit_record(
                 (round_id, participants_json, aggregated_update_norm,
                  dp_epsilon_consumed, cumulative_epsilon, timestamp,
                  excluded_participants_json, record_json, signature,
-                 dp_delta, noise_multiplier)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 dp_delta, noise_multiplier, weight_capped_participants_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["round_id"],
@@ -142,6 +148,7 @@ def save_audit_record(
                 signature,
                 record.get("dp_delta", 0.0),
                 record.get("noise_multiplier", 0.0),
+                json.dumps(record.get("weight_capped_participants", [])),
             ),
         )
         conn.commit()

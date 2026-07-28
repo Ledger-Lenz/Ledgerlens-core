@@ -37,7 +37,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -259,9 +259,9 @@ def _chi_sq_from_counts(observed: np.ndarray, expected: np.ndarray) -> float:
 
 
 def bootstrap_chi_square_pvalue(
-    observed_counts: np.ndarray,
+    observed_counts: "np.ndarray",
     n_bootstrap: int = 10_000,
-    seed: Optional[int] = None,
+    seed: int | None = None,
 ) -> float:
     """Monte Carlo bootstrap p-value for the Benford chi-square test.
 
@@ -306,9 +306,9 @@ def bootstrap_chi_square_pvalue(
 
 @lru_cache(maxsize=512)
 def _cached_bootstrap_pvalue(
-    counts_tuple: tuple,
+    counts_tuple: tuple[int, ...],
     n_bootstrap: int,
-    seed: Optional[int],
+    seed: int | None,
 ) -> float:
     """LRU-cached wrapper around bootstrap_chi_square_pvalue.
 
@@ -321,7 +321,7 @@ def _cached_bootstrap_pvalue(
     return bootstrap_chi_square_pvalue(counts, n_bootstrap, seed)
 
 
-def compute_chi_square_pvalue(counts: np.ndarray, N: int) -> tuple[float, str]:
+def compute_chi_square_pvalue(counts: "np.ndarray", N: int) -> tuple[float, str]:
     """Return (p_value, method) for the Benford chi-square test.
 
     Selects bootstrap when N < BENFORD_BOOTSTRAP_THRESHOLD (asymptotic
@@ -377,6 +377,8 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
     if n == 0:
         return {
             "chi_square": 0.0,
+            "chi_square_pvalue": 1.0,
+            "pvalue_method": "bootstrap",
             "mad": 0.0,
             "z_scores": {d: 0.0 for d in DIGITS},
             "observed_distribution": observed,
@@ -397,7 +399,7 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
     }
 
 
-def is_anomalous(metrics: dict, mad_threshold: float = 0.015) -> bool:
+def is_anomalous(metrics: dict[str, object], mad_threshold: float = 0.015) -> bool:
     """Whether a `compute_benford_metrics` result exceeds the MAD threshold."""
     return metrics["mad"] > mad_threshold
 
@@ -430,7 +432,7 @@ class KuiperResult:
     valid: bool = False
 
 
-def compute_ks_statistic(digit_counts: np.ndarray) -> KSResult:
+def compute_ks_statistic(digit_counts: "np.ndarray") -> KSResult:
     """One-sample KS test of observed digit distribution against Benford CDF.
 
     ``digit_counts`` must be a length-9 array of non-negative integers (counts
@@ -476,7 +478,7 @@ def _ks_pvalue(lam: float) -> float:
     return p
 
 
-def compute_kuiper_statistic(digit_counts: np.ndarray) -> KuiperResult:
+def compute_kuiper_statistic(digit_counts: "np.ndarray") -> KuiperResult:
     """Kuiper test of observed digit distribution against Benford CDF.
 
     The Kuiper V-statistic is V = D_plus + D_minus where
@@ -536,7 +538,7 @@ def _kuiper_pvalue(V: float, N: int) -> float:
     return p
 
 
-def compute_benford_ks_kuiper(amounts: List[float]) -> dict:
+def compute_benford_ks_kuiper(amounts: list[float]) -> dict[str, object]:
     """Compute KS and Kuiper statistics for a list of trade amounts.
 
     Returns a dict with ks_stat, ks_pval, ks_flag, kuiper_stat, kuiper_pval,
@@ -608,7 +610,7 @@ def _canonical_asset_pair(base: str, counter: str) -> str:
     return f"{parts[0]}/{parts[1]}"
 
 
-def _extract_digit_histogram(amounts: List[float]) -> Tuple[np.ndarray, int]:
+def _extract_digit_histogram(amounts: list[float]) -> tuple["np.ndarray", int]:
     """Extract a 9-element digit frequency histogram from amounts.
 
     Returns (histogram, n_valid). Caches only the histogram, not raw amounts.
@@ -625,7 +627,7 @@ def _extract_digit_histogram(amounts: List[float]) -> Tuple[np.ndarray, int]:
     return counts, n
 
 
-def compute_stratum_benford(asset_pair: str, amounts: List[float]) -> BenfordResult:
+def compute_stratum_benford(asset_pair: str, amounts: list[float]) -> BenfordResult:
     """Compute Benford statistics for a single asset-pair stratum."""
     counts, n = _extract_digit_histogram(amounts)
 
@@ -657,7 +659,7 @@ def compute_stratum_benford(asset_pair: str, amounts: List[float]) -> BenfordRes
 
 
 def stratified_benford_analysis(
-    trades: List | pd.DataFrame,
+    trades: list[object] | pd.DataFrame,
     min_stratum_size: int = MIN_STRATUM_SIZE,
 ) -> StratifiedBenfordSummary:
     """Group trades by canonical asset pair and compute per-stratum Benford stats.
@@ -673,14 +675,14 @@ def stratified_benford_analysis(
     if not grouped:
         return StratifiedBenfordSummary(fallback_global=True)
 
-    results: Dict[str, BenfordResult] = {}
+    results: dict[str, BenfordResult] = {}
     for pair, amounts in grouped.items():
         results[pair] = compute_stratum_benford(pair, amounts)
 
     valid_results = [r for r in results.values() if r.valid]
 
     if not valid_results:
-        all_amounts: List[float] = []
+        all_amounts: list[float] = []
         for amounts in grouped.values():
             all_amounts.extend(amounts)
         global_result = compute_stratum_benford("__global__", all_amounts)
@@ -714,9 +716,9 @@ def stratified_benford_analysis(
     )
 
 
-def _group_trades_df(trades: pd.DataFrame) -> Dict[str, List[float]]:
+def _group_trades_df(trades: pd.DataFrame) -> dict[str, list[float]]:
     """Group a trades DataFrame by canonical asset pair."""
-    grouped: Dict[str, List[float]] = {}
+    grouped: dict[str, list[float]] = {}
     if trades.empty:
         return grouped
 
@@ -748,9 +750,9 @@ def _group_trades_df(trades: pd.DataFrame) -> Dict[str, List[float]]:
     return grouped
 
 
-def _group_trades_list(trades: list) -> Dict[str, List[float]]:
+def _group_trades_list(trades: list[object]) -> dict[str, list[float]]:
     """Group a list of Trade model objects by canonical asset pair."""
-    grouped: Dict[str, List[float]] = {}
+    grouped: dict[str, list[float]] = {}
     for trade in trades:
         base_sym = trade.base_asset.pair_symbol
         counter_sym = trade.counter_asset.pair_symbol

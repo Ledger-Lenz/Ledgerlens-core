@@ -236,6 +236,7 @@ def test_sparse_trade_graph_build_from_trades_skips_null_counter():
 def test_graph_too_large_error_trade_graph(monkeypatch):
     import detection.graph_engine as ge
     monkeypatch.setattr(ge, "MAX_GRAPH_NODES", 2)
+    monkeypatch.setattr(ge, "GRAPH_SHARD_ENABLED", False)
 
     tg = TradeGraph()
     tg.add_trade(_make_trade("A", "B"))  # 2 unique nodes — exactly at limit, OK

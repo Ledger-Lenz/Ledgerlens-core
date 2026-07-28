@@ -1,14 +1,9 @@
 """Prometheus metrics for the LedgerLens detection pipeline."""
 
-from __future__ import annotations
-
 from prometheus_client import (
     Counter,
     Gauge,
     Histogram,
-    REGISTRY,
-    generate_latest,
-    CONTENT_TYPE_LATEST,
 )
 
 # ---------------------------------------------------------------------------
@@ -94,6 +89,27 @@ ledgerlens_rate_limiter_fallback_total = Counter(
 )
 
 
+ledgerlens_secret_rotation_total = Counter(
+    "ledgerlens_secret_rotation_total",
+    "Total secret rotation attempts",
+    ["secret_type", "result"],
+)
+
+def get_overdue_count():
+    try:
+        from detection.api_key_store import get_overdue_api_keys_count
+        return get_overdue_api_keys_count()
+    except (ImportError, AttributeError, RuntimeError):
+        return 0
+
+ledgerlens_secret_rotation_overdue = Gauge(
+    "ledgerlens_secret_rotation_overdue",
+    "Number of active API keys that have exceeded their maximum age without rotation",
+)
+ledgerlens_secret_rotation_overdue.set_function(get_overdue_count)
+
+
 def metrics_response():
     """Return (body_bytes, content_type) for the /metrics endpoint."""
+    from prometheus_client import REGISTRY, generate_latest, CONTENT_TYPE_LATEST
     return generate_latest(REGISTRY), CONTENT_TYPE_LATEST

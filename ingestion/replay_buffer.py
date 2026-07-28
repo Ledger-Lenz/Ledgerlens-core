@@ -14,9 +14,21 @@ from ingestion.data_models import OrderBookEvent
 
 logger = logging.getLogger("ledgerlens.replay_buffer")
 
+__all__ = ["OrderBookReplayBuffer"]
 
-def _sort_key(token: str) -> tuple:
-    """Return a comparable key: numeric tokens sort numerically, others lexicographically."""
+
+def _sort_key(token: str) -> tuple[int, int, str]:
+    """Return a comparable key: numeric tokens sort numerically, others lexicographically.
+
+    Returns a 3-tuple ``(regime, numeric_value, string_value)`` where:
+
+    * ``regime == 0`` for purely numeric tokens (sorted by integer value),
+    * ``regime == 1`` for all other tokens (sorted lexicographically via
+      ``string_value``).
+
+    Mixing regimes is safe because tuples compare left-to-right: all numeric
+    tokens sort before all non-numeric tokens.
+    """
     try:
         return (0, int(token), "")
     except ValueError:
@@ -34,18 +46,27 @@ class OrderBookReplayBuffer:
         max_size: Maximum events to buffer before forcing a flush.
         gap_timeout_seconds: Seconds to wait for a gap to be filled before
             emitting out-of-order events anyway.
+
+    Notes:
+        Numeric paging tokens (e.g. Horizon cursor values) are compared by
+        integer value so that "100" < "99" does not occur.  Non-numeric tokens
+        fall back to lexicographic ordering via :func:`_sort_key`.
+
+        Gap detection is only enforced for numeric tokens in strict consecutive
+        order.  Non-numeric tokens are emitted in heap-min order without gap
+        checking, since there is no natural predecessor relationship.
     """
 
     def __init__(self, max_size: int = 1000, gap_timeout_seconds: float = 30.0) -> None:
         self._max_size = max_size
         self._gap_timeout = gap_timeout_seconds
         # Min-heap entries: (_sort_key(token), token)
-        self._heap: list[tuple] = []
+        self._heap: list[tuple[tuple[int, int, str], str]] = []
         self._events: dict[str, OrderBookEvent] = {}
         self._ingested_at: dict[str, float] = {}
         # Tracks the last token *emitted* so we can detect gaps against it.
         # None means nothing has been emitted yet.
-        self._last_emitted_key: tuple | None = None
+        self._last_emitted_key: tuple[int, int, str] | None = None
 
     def ingest(self, event: OrderBookEvent) -> None:
         """Add an event to the buffer."""
@@ -110,13 +131,19 @@ class OrderBookReplayBuffer:
         return ready
 
     def flush_all(self) -> list[OrderBookEvent]:
-        """Force-flush all buffered events in sorted order (e.g. on shutdown)."""
+        """Force-flush all buffered events in sorted order (e.g. on shutdown).
+
+        Drains the heap unconditionally, cleaning up both ``_events`` and
+        ``_ingested_at`` per event so no stale entries remain.
+        """
         result: list[OrderBookEvent] = []
         while self._heap:
             key, token = heapq.heappop(self._heap)
             if token in self._events:
                 result.append(self._events.pop(token))
+                self._ingested_at.pop(token, None)
                 self._last_emitted_key = key
+        # Defensive: clear any _ingested_at remnants from orphaned heap entries.
         self._ingested_at.clear()
         return result
 

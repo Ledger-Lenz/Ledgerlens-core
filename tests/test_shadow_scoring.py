@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from detection.shadow_scoring import (
+    _nearest_rank_percentile,
     get_shadow_model_version,
     get_shadow_report,
     store_shadow_score,
@@ -80,3 +81,9 @@ class TestShadowReport:
         assert len(high) == 1
         assert high[0]["wallet"] == "GABC1"
         assert high[0]["divergence"] == pytest.approx(0.4)
+
+
+def test_nearest_rank_percentile_uses_expected_rank():
+    values = [0.01 * i for i in range(1, 21)]
+
+    assert _nearest_rank_percentile(values, 0.95) == pytest.approx(0.19)

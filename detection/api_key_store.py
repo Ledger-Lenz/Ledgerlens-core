@@ -14,9 +14,9 @@ import hashlib
 import logging
 import secrets
 import sqlite3
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
 
 from config.settings import settings
 from detection.rate_limiter import check_rate_limit as _distributed_check_rate_limit
@@ -37,7 +37,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at TEXT NOT NULL,
     expires_at TEXT,
     last_used_at TEXT,
-    revoked INTEGER NOT NULL DEFAULT 0
+    revoked INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    rotated_from TEXT,
+    rotated_to TEXT,
+    rotation_deadline TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_revoked ON api_keys (revoked);
@@ -86,6 +90,10 @@ def _init_table() -> None:
         _ensure_column(conn, existing, "expires_at", "TEXT")
         _ensure_column(conn, existing, "last_used_at", "TEXT")
         _ensure_column(conn, existing, "revoked", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, existing, "status", "TEXT NOT NULL DEFAULT 'active'")
+        _ensure_column(conn, existing, "rotated_from", "TEXT")
+        _ensure_column(conn, existing, "rotated_to", "TEXT")
+        _ensure_column(conn, existing, "rotation_deadline", "TEXT")
 
         # Ensure indexes exist
         _ensure_index(conn, "idx_api_keys_hash", "api_keys", "key_hash")
@@ -123,7 +131,7 @@ def create_api_key(
     scopes: list[str],
     namespace_id: str = "",
     rate_limit_per_minute: int = 60,
-    expires_at: Optional[str] = None,
+    expires_at: str | None = None,
 ) -> dict:
     """Create a new API key. Returns the plaintext key once — it is not stored."""
     _init_table()
@@ -131,7 +139,6 @@ def create_api_key(
     if invalid:
         raise ValueError(f"Invalid scopes: {sorted(invalid)}. Valid: {sorted(_VALID_SCOPES)}")
 
-    import uuid
     key_id = str(uuid.uuid4())
     plaintext = f"ll_{secrets.token_urlsafe(32)}"
     key_hash = _hash_key(plaintext)
@@ -172,13 +179,112 @@ def revoke_api_key(key_id: str) -> bool:
     _init_table()
     with _connect() as conn:
         cur = conn.execute(
-            "UPDATE api_keys SET revoked=1 WHERE key_id=? AND revoked=0", (key_id,)
+            "UPDATE api_keys SET revoked=1, status='revoked' WHERE key_id=? AND revoked=0", (key_id,)
         )
         conn.commit()
         return cur.rowcount > 0
 
 
-def lookup_key(plaintext: str) -> Optional[dict]:
+def rotate_api_key(key_id: str, grace_period_seconds: int = 604800) -> dict:
+    """Issue a replacement key inheriting scopes/namespace/rate_limit from `key_id`.
+    Marks the old key status='rotating' with rotation_deadline = now + grace_period_seconds.
+    Both keys authenticate successfully until the deadline. Returns the new plaintext key once.
+    """
+    _init_table()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_id = ?", (key_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"API key {key_id} not found")
+        
+        if row["revoked"] != 0 or row["status"] == "revoked":
+            raise ValueError(f"Cannot rotate revoked API key {key_id}")
+        if row["expires_at"] and row["expires_at"] < now:
+            raise ValueError(f"Cannot rotate expired API key {key_id}")
+
+        scopes = [s.strip() for s in row["scopes"].split(",") if s.strip()] if row["scopes"] else []
+        namespace_id = row["namespace_id"]
+        rate_limit_per_minute = row["rate_limit_per_minute"]
+        daily_quota = row["daily_quota"]
+        namespace_daily_quota = row["namespace_daily_quota"]
+        monthly_quota = row["monthly_quota"]
+        namespace_monthly_quota = row["namespace_monthly_quota"]
+
+        new_key_id = str(uuid.uuid4())
+        plaintext = f"ll_{secrets.token_urlsafe(32)}"
+        new_key_hash = _hash_key(plaintext)
+
+        deadline = (now_dt + timedelta(seconds=grace_period_seconds)).isoformat()
+
+        conn.execute(
+            "UPDATE api_keys SET status = 'rotating', rotation_deadline = ?, rotated_to = ? WHERE key_id = ?",
+            (deadline, new_key_id, key_id)
+        )
+
+        conn.execute(
+            "INSERT INTO api_keys (key_id, key_hash, namespace_id, scopes, rate_limit_per_minute, "
+            "daily_quota, namespace_daily_quota, monthly_quota, namespace_monthly_quota, "
+            "created_at, expires_at, status, rotated_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+            (new_key_id, new_key_hash, namespace_id, ",".join(scopes), rate_limit_per_minute,
+             daily_quota, namespace_daily_quota, monthly_quota, namespace_monthly_quota, now, row["expires_at"], key_id),
+        )
+        conn.commit()
+
+    try:
+        from api.metrics import ledgerlens_secret_rotation_total
+        if ledgerlens_secret_rotation_total is not None:
+            ledgerlens_secret_rotation_total.labels(secret_type="api_key", result="success").inc()
+    except Exception:
+        pass
+
+    return {
+        "key_id": new_key_id,
+        "plaintext_key": plaintext,
+        "scopes": sorted(scopes),
+        "namespace_id": namespace_id,
+        "rate_limit_per_minute": rate_limit_per_minute,
+        "daily_quota": daily_quota,
+        "namespace_daily_quota": namespace_daily_quota,
+        "monthly_quota": monthly_quota,
+        "namespace_monthly_quota": namespace_monthly_quota,
+        "created_at": now,
+        "expires_at": row["expires_at"],
+        "status": "active",
+        "rotated_from": key_id,
+    }
+
+
+def sweep_expired_api_keys() -> int:
+    """Revoke keys whose rotation deadline has passed. Returns count of revoked keys."""
+    _init_table()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE api_keys SET revoked = 1, status = 'revoked' WHERE status = 'rotating' AND rotation_deadline < ?",
+            (now,)
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def get_overdue_api_keys_count() -> int:
+    """Count active keys that exceed the maximum age without rotation."""
+    _init_table()
+    max_age_days = getattr(settings, "api_key_max_age_days", 90)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM api_keys WHERE revoked = 0 AND (status = 'active' OR status = 'rotating') AND created_at < ?",
+            (cutoff,)
+        ).fetchone()
+        return row[0] if row else 0
+
+
+def lookup_key(plaintext: str) -> dict | None:
     """Resolve a plaintext key to its metadata row, or None if invalid/revoked/expired."""
     _init_table()
     key_hash = _hash_key(plaintext)
@@ -186,11 +292,13 @@ def lookup_key(plaintext: str) -> Optional[dict]:
 
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM api_keys WHERE key_hash=? AND revoked=0", (key_hash,)
+            "SELECT * FROM api_keys WHERE key_hash=? AND revoked=0 AND (status IS NULL OR status != 'revoked')", (key_hash,)
         ).fetchone()
         if row is None:
             return None
         if row["expires_at"] and row["expires_at"] < now:
+            return None
+        if row["status"] == "rotating" and row["rotation_deadline"] and row["rotation_deadline"] < now:
             return None
         conn.execute(
             "UPDATE api_keys SET last_used_at=? WHERE key_id=?", (now, row["key_id"])
@@ -224,7 +332,7 @@ def list_api_keys() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_api_key_by_hash(key_hash: str) -> Optional[dict]:
+def get_api_key_by_hash(key_hash: str) -> dict | None:
     """Look up an API key by its BLAKE2b hash.
 
     Returns the full record dict (including key_id) or None if not found,
@@ -234,11 +342,13 @@ def get_api_key_by_hash(key_hash: str) -> Optional[dict]:
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM api_keys WHERE key_hash=? AND revoked=0", (key_hash,)
+            "SELECT * FROM api_keys WHERE key_hash=? AND revoked=0 AND (status IS NULL OR status != 'revoked')", (key_hash,)
         ).fetchone()
         if row is None:
             return None
         if row["expires_at"] and row["expires_at"] < now:
+            return None
+        if row["status"] == "rotating" and row["rotation_deadline"] and row["rotation_deadline"] < now:
             return None
         return dict(row)
 
@@ -270,7 +380,6 @@ def check_daily_quota(key_id: str, daily_limit: int) -> tuple[bool, str]:
             (key_id, today),
         ).fetchone()[0]
     if count >= daily_limit:
-        from datetime import timedelta
         next_reset = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         return False, next_reset.isoformat()
     return True, ""
@@ -291,7 +400,6 @@ def check_namespace_quota(namespace_id: str, daily_limit: int) -> tuple[bool, st
             (namespace_id, today),
         ).fetchone()[0]
     if count >= daily_limit:
-        from datetime import timedelta
         next_reset = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         return False, next_reset.isoformat()
     return True, ""
@@ -313,7 +421,6 @@ def check_monthly_quota(key_id: str, monthly_limit: int) -> tuple[bool, str]:
             (key_id, month),
         ).fetchone()[0]
     if count >= monthly_limit:
-        from datetime import timedelta
         now = datetime.now(timezone.utc)
         next_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) + timedelta(days=32)
         next_month = next_month.replace(day=1)
@@ -336,7 +443,6 @@ def check_namespace_monthly_quota(namespace_id: str, monthly_limit: int) -> tupl
             (namespace_id, month),
         ).fetchone()[0]
     if count >= monthly_limit:
-        from datetime import timedelta
         now = datetime.now(timezone.utc)
         next_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) + timedelta(days=32)
         next_month = next_month.replace(day=1)
@@ -399,11 +505,6 @@ def _ensure_gateway_log_table(conn: sqlite3.Connection) -> None:
 # Consolidation migration helpers
 # ---------------------------------------------------------------------------
 
-_LEGACY_API_KEYS_COLS = ["key_hash", "namespace_id", "scopes", "rate_limit_per_minute",
-                          "created_at", "expires_at", "last_used_at", "revoked"]
-_NAMESPACE_API_KEYS_COLS = ["api_key_hash", "namespace_id", "description", "is_active",
-                            "created_at", "last_used_at"]
-
 
 def migrate_legacy_api_keys(conn: sqlite3.Connection) -> dict:
     """Ensure the canonical api_keys table has all required columns and data.
@@ -442,7 +543,6 @@ def migrate_legacy_api_keys(conn: sqlite3.Connection) -> dict:
         logger.warning("Some columns could not be verified: %s", still_missing)
 
     # Populate key_id for rows that have NULL (legacy schema used id autoincrement)
-    import uuid
     rows_without_key_id = conn.execute(
         "SELECT rowid FROM api_keys WHERE key_id IS NULL"
     ).fetchall()

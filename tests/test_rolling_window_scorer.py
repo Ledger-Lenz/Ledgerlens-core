@@ -145,6 +145,89 @@ class TestRollingWindowStore:
             result = store.load_state("GNOBODY")
             assert result is None
 
+    def test_save_all_with_caller_managed_connection_is_not_committed_early(self):
+        """save_all(state, conn=...) must not commit -- the caller owns the
+        transaction boundary, so a caller-side rollback must undo it."""
+        from detection.rolling_window import RollingWindowState, RollingWindowStore
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            store = RollingWindowStore(db_path=f.name)
+            state = RollingWindowState()
+            state.add_trade("GABC", _trade("GABC", _NOW))
+
+            with store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                store.save_all(state, conn=conn)
+                conn.rollback()
+
+            reloaded = RollingWindowState()
+            store.load_all(reloaded)
+            assert reloaded.active_wallets == 0
+
+    def test_save_all_with_caller_managed_connection_commits_together(self):
+        """When the caller commits, writes made via conn= are durable --
+        this is the building block the unified stream checkpoint
+        (ingestion/stream_checkpoint.py) relies on to make the Horizon
+        cursor and rolling-window state atomic with each other."""
+        from detection.rolling_window import RollingWindowState, RollingWindowStore
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            store = RollingWindowStore(db_path=f.name)
+            state = RollingWindowState()
+            state.add_trade("GABC", _trade("GABC", _NOW))
+            state.add_trade("GDEF", _trade("GDEF", _NOW))
+
+            with store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                store.save_all(state, conn=conn)
+                conn.commit()
+
+            reloaded = RollingWindowState()
+            store.load_all(reloaded)
+            assert reloaded.active_wallets == 2
+
+    def test_save_all_without_conn_is_a_single_atomic_transaction(self, monkeypatch):
+        """A crash mid-save_all (no explicit conn) must not leave a partial
+        mix of updated and stale wallet rows -- prior behavior opened one
+        connection and committed per wallet, which was not atomic."""
+        from detection import rolling_window as rw_module
+        from detection.rolling_window import RollingWindowState, RollingWindowStore
+        with tempfile.NamedTemporaryFile(suffix=".db") as f:
+            store = RollingWindowStore(db_path=f.name)
+            state = RollingWindowState()
+            for i in range(3):
+                state.add_trade(f"GWALLET{i}", _trade(f"GWALLET{i}", _NOW))
+
+            commit_calls = []
+            real_connect = rw_module._connect
+
+            class _CountingConn:
+                def __init__(self, conn):
+                    self._conn = conn
+
+                def commit(self):
+                    commit_calls.append(1)
+                    self._conn.commit()
+
+                def __getattr__(self, name):
+                    return getattr(self._conn, name)
+
+            class _CountingCtx:
+                def __init__(self, db_path):
+                    self._ctx = real_connect(db_path)
+
+                def __enter__(self):
+                    return _CountingConn(self._ctx.__enter__())
+
+                def __exit__(self, *exc):
+                    return self._ctx.__exit__(*exc)
+
+            monkeypatch.setattr(rw_module, "_connect", _CountingCtx)
+            store.save_all(state)
+
+            assert commit_calls == [1], (
+                "save_all() without an explicit conn must commit exactly "
+                "once for the whole batch, not once per wallet"
+            )
+
 
 # ---------------------------------------------------------------------------
 # IncrementalScorer tests

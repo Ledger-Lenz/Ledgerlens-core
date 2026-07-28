@@ -123,7 +123,7 @@ def log_hyperparameters(params: dict) -> None:
         try:
             mlflow.log_param(key, value)
         except Exception as exc:
-            logger.debug("Failed to log param %s=%s: %s", key, value, exc)
+            logger.warning("Failed to log param %s=%s: %s", key, value, exc)
 
 
 def log_metrics(metrics: dict, step: int | None = None) -> None:
@@ -132,7 +132,7 @@ def log_metrics(metrics: dict, step: int | None = None) -> None:
         try:
             mlflow.log_metric(key, value, step=step)
         except Exception as exc:
-            logger.debug("Failed to log metric %s=%s: %s", key, value, exc)
+            logger.warning("Failed to log metric %s=%s: %s", key, value, exc)
 
 
 def log_training_dataset_metadata(df: pd.DataFrame) -> None:

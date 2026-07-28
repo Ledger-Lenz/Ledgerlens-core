@@ -326,10 +326,7 @@ def _init_psi_tables(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(_FEATURE_PSI_HISTORY_DDL)
-    try:
-        conn.execute("ALTER TABLE degradation_alerts ADD COLUMN alert_type TEXT DEFAULT 'model_degradation'")
-    except sqlite3.OperationalError:
-        pass
+    conn.executescript(_DEGRADATION_ALERTS_DDL)
     conn.commit()
     conn.close()
 
@@ -672,6 +669,7 @@ _DEGRADATION_ALERTS_DDL = """
 CREATE TABLE IF NOT EXISTS degradation_alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     alert_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    alert_type TEXT DEFAULT 'model_degradation',
     baseline_f1 REAL,
     current_f1 REAL,
     f1_drop REAL,
@@ -991,16 +989,16 @@ class DriftReport:
         }
 
 
-_FEATURE_PSI_HISTORY_DDL = """
-CREATE TABLE IF NOT EXISTS feature_psi_history (
+_FEATURE_PSI_TREND_DDL = """
+CREATE TABLE IF NOT EXISTS feature_psi_trend (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     feature TEXT NOT NULL,
     psi REAL NOT NULL,
     escalation_level TEXT NOT NULL,
     recorded_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_psi_history_feature_time
-    ON feature_psi_history(feature, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_psi_trend_feature_time
+    ON feature_psi_trend(feature, recorded_at);
 """
 
 
@@ -1037,7 +1035,7 @@ class DriftMonitor:
         self.psi_config = psi_config or PerFeaturePSIConfig()
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
-        conn.executescript(_FEATURE_PSI_HISTORY_DDL)
+        conn.executescript(_FEATURE_PSI_TREND_DDL)
         conn.commit()
         conn.close()
 
@@ -1058,7 +1056,7 @@ class DriftMonitor:
         now = datetime.now(timezone.utc).isoformat()
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT INTO feature_psi_history (feature, psi, escalation_level, recorded_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO feature_psi_trend (feature, psi, escalation_level, recorded_at) VALUES (?, ?, ?, ?)",
             (feature, psi, level.value, now),
         )
         conn.commit()
@@ -1069,12 +1067,12 @@ class DriftMonitor:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         conn = sqlite3.connect(self.db_path)
         rows = conn.execute(
-            "SELECT psi FROM feature_psi_history WHERE feature=? AND recorded_at >= ? ORDER BY recorded_at",
+            "SELECT psi FROM feature_psi_trend WHERE feature=? AND recorded_at >= ? ORDER BY recorded_at",
             (feature, cutoff),
         ).fetchall()
         # Also get the value just before the 24h window for delta computation
         prev_rows = conn.execute(
-            "SELECT psi FROM feature_psi_history WHERE feature=? AND recorded_at < ? ORDER BY recorded_at DESC LIMIT 1",
+            "SELECT psi FROM feature_psi_trend WHERE feature=? AND recorded_at < ? ORDER BY recorded_at DESC LIMIT 1",
             (feature, cutoff),
         ).fetchall()
         conn.close()
@@ -1143,9 +1141,9 @@ class DriftMonitor:
         rows = conn.execute(
             """
             SELECT feature, psi, escalation_level, recorded_at
-            FROM feature_psi_history
+            FROM feature_psi_trend
             WHERE id IN (
-                SELECT MAX(id) FROM feature_psi_history GROUP BY feature
+                SELECT MAX(id) FROM feature_psi_trend GROUP BY feature
             )
             ORDER BY feature
             """

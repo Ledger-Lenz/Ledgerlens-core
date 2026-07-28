@@ -67,6 +67,7 @@ from __future__ import annotations
 import itertools
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -78,6 +79,34 @@ from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger("ledgerlens.causal_engine")
+
+# ---------------------------------------------------------------------------
+# ATE estimation method labels
+# ---------------------------------------------------------------------------
+# Every ATE returned to a caller is tagged with one of these two labels so
+# that API consumers can distinguish a genuine DoWhy-identified causal
+# estimate from a plain OLS correlational fallback — the two are NOT
+# interchangeable and must never share an indistinguishable schema.
+ESTIMATION_CAUSAL = "causal"
+ESTIMATION_FALLBACK = "correlational_fallback"
+
+
+@dataclass
+class ATEEstimate:
+    """A single feature's ATE, tagged with how it was obtained.
+
+    ``method`` is ``ESTIMATION_CAUSAL`` only when DoWhy successfully
+    identified the effect (via ``identify_effect(proceed_when_unidentifiable=False)``)
+    and estimated it without error. Any other outcome — DoWhy not installed,
+    non-identifiability, or an estimation error — produces
+    ``ESTIMATION_FALLBACK`` with ``reason`` explaining why, and ``identified``
+    set to ``False``.
+    """
+
+    value: float
+    method: str
+    identified: bool
+    reason: str | None = None
 
 # ---------------------------------------------------------------------------
 # Causal DAG definition
@@ -230,6 +259,68 @@ def _save_ate_cache(
         VALUES (?, ?, ?, ?)
         """,
         [(model_version, feat, ate, now) for feat, ate in ate_table.items()],
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# ATE estimation-method cache (SQLite persistence)
+# ---------------------------------------------------------------------------
+# Stored separately from ``causal_ate_cache`` (which is value-only and whose
+# schema/functions are relied on by existing callers/tests) so that the
+# causal-vs-fallback provenance of each cached ATE can be reconstructed
+# without changing the existing cache's contract.
+
+_ATE_METHOD_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS causal_ate_method_cache (
+    model_version TEXT NOT NULL,
+    feature_name  TEXT NOT NULL,
+    method        TEXT NOT NULL,
+    reason        TEXT,
+    computed_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (model_version, feature_name)
+);
+"""
+
+
+def _init_ate_method_cache(conn: sqlite3.Connection) -> None:
+    """Create the ``causal_ate_method_cache`` table if it does not exist."""
+    conn.execute(_ATE_METHOD_CACHE_DDL)
+    conn.commit()
+
+
+def _load_ate_method_cache(
+    conn: sqlite3.Connection, model_version: str
+) -> dict[str, tuple[str, str | None]] | None:
+    """Load ``{feature_name: (method, reason)}`` for ``model_version``, or None if absent."""
+    _init_ate_method_cache(conn)
+    rows = conn.execute(
+        "SELECT feature_name, method, reason FROM causal_ate_method_cache WHERE model_version = ?",
+        (model_version,),
+    ).fetchall()
+    if not rows:
+        return None
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
+def _save_ate_method_cache(
+    conn: sqlite3.Connection,
+    model_version: str,
+    method_table: dict[str, tuple[str, str | None]],
+) -> None:
+    """Persist ``{feature_name: (method, reason)}`` for ``model_version`` to SQLite."""
+    _init_ate_method_cache(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO causal_ate_method_cache
+            (model_version, feature_name, method, reason, computed_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (model_version, feat, method, reason, now)
+            for feat, (method, reason) in method_table.items()
+        ],
     )
     conn.commit()
 
@@ -404,9 +495,40 @@ class CausalEngine:
     ) -> float:
         """Estimate E[risk_score|do(feature=treatment)] - E[risk_score|do(feature=control)].
 
+        Thin wrapper around :meth:`_estimate_ate_detailed` that returns just the
+        point estimate for backward compatibility. Callers that need to know
+        whether the value is a genuine causal estimate or a correlational
+        fallback should call :meth:`_estimate_ate_detailed` (or
+        :meth:`feature_ate_table_detailed`) directly.
+
+        Raises
+        ------
+        RuntimeError
+            If the engine has not been fitted yet.
+        ValueError
+            If ``treatment_feature`` is not an observable feature node.
+        """
+        return self._estimate_ate_detailed(
+            treatment_feature, control_value, treatment_value
+        ).value
+
+    def _estimate_ate_detailed(
+        self,
+        treatment_feature: str,
+        control_value: float = 0.0,
+        treatment_value: float = 1.0,
+    ) -> ATEEstimate:
+        """Estimate the ATE of ``treatment_feature``, tagged with its provenance.
+
         Uses DoWhy with the configured ``estimation_method`` (default:
         ``backdoor.linear_regression``) after identifying the effect via the
         backdoor criterion on the causal DAG.
+
+        Unlike the pre-fix implementation, identification is performed with
+        ``proceed_when_unidentifiable=False`` — DoWhy's own unidentifiability
+        signal is allowed to raise, and that raise is caught and surfaced as
+        an explicit ``ESTIMATION_FALLBACK`` result (via ``reason``) rather
+        than being silently suppressed and passed through to estimation.
 
         Parameters
         ----------
@@ -420,9 +542,7 @@ class CausalEngine:
 
         Returns
         -------
-        float
-            The estimated average treatment effect (ATE) in risk-score units.
-            Positive means the feature causally increases the risk score.
+        ATEEstimate
 
         Raises
         ------
@@ -438,16 +558,22 @@ class CausalEngine:
                 f"Valid features: {OBSERVABLE_FEATURE_NODES}"
             )
 
+        delta = treatment_value - control_value
+        fallback_value = self._linear_coefs.get(treatment_feature, 0.0) * delta
+
         try:
             from dowhy import CausalModel  # type: ignore[import]
         except ImportError:
-            # DoWhy not installed — fall back to linear coefficient
             logger.debug(
                 "dowhy not installed; using linear coefficient for ATE of '%s'.",
                 treatment_feature,
             )
-            delta = treatment_value - control_value
-            return self._linear_coefs.get(treatment_feature, 0.0) * delta
+            return ATEEstimate(
+                value=fallback_value,
+                method=ESTIMATION_FALLBACK,
+                identified=False,
+                reason="dowhy_not_installed",
+            )
 
         gml = _dag_to_gml_string(self._dag)
         model = CausalModel(
@@ -458,7 +584,22 @@ class CausalEngine:
         )
 
         try:
-            estimand = model.identify_effect(proceed_when_unidentifiable=True)
+            estimand = model.identify_effect(proceed_when_unidentifiable=False)
+        except Exception as exc:
+            logger.warning(
+                "Effect not identifiable for treatment='%s': %s. "
+                "Falling back to correlational (OLS) estimate.",
+                treatment_feature,
+                exc,
+            )
+            return ATEEstimate(
+                value=fallback_value,
+                method=ESTIMATION_FALLBACK,
+                identified=False,
+                reason=f"non_identifiable: {exc}",
+            )
+
+        try:
             estimate = model.estimate_effect(
                 estimand,
                 method_name=self.estimation_method,
@@ -466,17 +607,25 @@ class CausalEngine:
                 treatment_value=treatment_value,
                 test_significance=False,
             )
-            return float(estimate.value)
+            return ATEEstimate(
+                value=float(estimate.value),
+                method=ESTIMATION_CAUSAL,
+                identified=True,
+                reason=None,
+            )
         except Exception as exc:
             logger.warning(
-                "DoWhy estimate_ate failed for treatment='%s': %s. "
-                "Falling back to linear coefficient.",
+                "DoWhy estimate_effect failed for treatment='%s': %s. "
+                "Falling back to correlational (OLS) estimate.",
                 treatment_feature,
                 exc,
             )
-            # Fall back to linear coefficient * (treatment - control)
-            delta = treatment_value - control_value
-            return self._linear_coefs.get(treatment_feature, 0.0) * delta
+            return ATEEstimate(
+                value=fallback_value,
+                method=ESTIMATION_FALLBACK,
+                identified=False,
+                reason=f"estimation_error: {exc}",
+            )
 
     # ------------------------------------------------------------------
     # ATE table
@@ -549,6 +698,87 @@ class CausalEngine:
 
         return ate_table
 
+    def feature_ate_table_detailed(
+        self,
+        df: pd.DataFrame | None = None,
+        use_cache: bool = True,
+    ) -> dict[str, ATEEstimate]:
+        """Like :meth:`feature_ate_table`, but tagging each ATE with its provenance.
+
+        Each entry distinguishes a genuine DoWhy-identified causal estimate
+        (``ATEEstimate.method == ESTIMATION_CAUSAL``) from a correlational OLS
+        fallback (``ESTIMATION_FALLBACK``), with ``reason`` explaining why the
+        fallback occurred (DoWhy missing, non-identifiable, or an estimation
+        error). This is what callers needing an honest causal-vs-correlational
+        distinction (e.g. the public API) should use instead of
+        :meth:`feature_ate_table`.
+
+        The method/reason provenance is cached separately from the plain
+        ATE-value cache used by :meth:`feature_ate_table`, so both caches must
+        be present to serve a cache hit; otherwise the table is recomputed.
+        """
+        if use_cache and self._db_path:
+            try:
+                with sqlite3.connect(self._db_path) as conn:
+                    cached_values = _load_ate_cache(conn, self._model_version)
+                    cached_methods = _load_ate_method_cache(conn, self._model_version)
+                    if cached_values is not None and cached_methods is not None:
+                        logger.debug(
+                            "Detailed ATE table loaded from cache (model_version=%s).",
+                            self._model_version,
+                        )
+                        return {
+                            feat: ATEEstimate(
+                                value=value,
+                                method=cached_methods.get(feat, (ESTIMATION_CAUSAL, None))[0],
+                                identified=cached_methods.get(feat, (ESTIMATION_CAUSAL, None))[0]
+                                == ESTIMATION_CAUSAL,
+                                reason=cached_methods.get(feat, (None, None))[1],
+                            )
+                            for feat, value in cached_values.items()
+                        }
+            except Exception as exc:
+                logger.warning("Could not read detailed ATE cache: %s", exc)
+
+        if df is not None:
+            self.fit(df)
+        self._assert_fitted()
+
+        detailed: dict[str, ATEEstimate] = {}
+        for feature in OBSERVABLE_FEATURE_NODES:
+            try:
+                detailed[feature] = self._estimate_ate_detailed(
+                    feature, control_value=0.0, treatment_value=1.0
+                )
+            except Exception as exc:
+                logger.warning("ATE estimation failed for '%s': %s", feature, exc)
+                detailed[feature] = ATEEstimate(
+                    value=0.0,
+                    method=ESTIMATION_FALLBACK,
+                    identified=False,
+                    reason=f"unexpected_error: {exc}",
+                )
+
+        self._ate_table = {feat: est.value for feat, est in detailed.items()}
+
+        if self._db_path:
+            try:
+                with sqlite3.connect(self._db_path) as conn:
+                    _save_ate_cache(conn, self._model_version, self._ate_table)
+                    _save_ate_method_cache(
+                        conn,
+                        self._model_version,
+                        {feat: (est.method, est.reason) for feat, est in detailed.items()},
+                    )
+                    logger.debug(
+                        "Detailed ATE table persisted to cache (model_version=%s).",
+                        self._model_version,
+                    )
+            except Exception as exc:
+                logger.warning("Could not write detailed ATE cache: %s", exc)
+
+        return detailed
+
 
     # ------------------------------------------------------------------
     # Counterfactual score
@@ -594,8 +824,8 @@ class CausalEngine:
     # Refutation tests
     # ------------------------------------------------------------------
 
-    def refutation_tests(self) -> dict[str, float]:
-        """Run DoWhy refutation tests on the primary treatment (``wash_ring_membership``).
+    def refutation_tests(self, treatment_feature: str = "wash_ring_membership") -> dict[str, float]:
+        """Run DoWhy refutation tests on ``treatment_feature``.
 
         Tests performed:
         - ``random_common_cause``: adds a random confounder; the ATE should
@@ -605,20 +835,40 @@ class CausalEngine:
         - ``data_subset_refuter``: re-estimates on a 70% random subset; the
           ATE should remain stable.
 
+        Parameters
+        ----------
+        treatment_feature:
+            The feature to run refutation tests against. Defaults to
+            ``"wash_ring_membership"`` for backward compatibility with callers
+            that only care about the primary treatment. To validate refutation
+            coverage across every feature reported in ``feature_ate_table``,
+            use :meth:`all_feature_refutation_tests` instead.
+
         Returns
         -------
         dict[str, float]
             Mapping of ``{test_name: p_value}``.  P-values < 0.05 indicate
             the causal model may be misspecified for the tested assumption.
+            If the effect for ``treatment_feature`` is not identifiable (or
+            DoWhy is unavailable), there is no genuine causal estimate to
+            refute and default p-values of 1.0 are returned — the
+            non-identifiability itself is surfaced separately via
+            :meth:`_estimate_ate_detailed` / ``ATEEstimate.reason``, not
+            silently folded into a "passing" refutation result.
 
         Raises
         ------
         RuntimeError
             If the engine has not been fitted yet.
-        ImportError
-            If ``dowhy`` is not installed.
+        ValueError
+            If ``treatment_feature`` is not an observable feature node.
         """
         self._assert_fitted()
+        if treatment_feature not in OBSERVABLE_FEATURE_NODES:
+            raise ValueError(
+                f"'{treatment_feature}' is not a valid treatment feature. "
+                f"Valid features: {OBSERVABLE_FEATURE_NODES}"
+            )
 
         try:
             from dowhy import CausalModel  # type: ignore[import]
@@ -637,18 +887,32 @@ class CausalEngine:
         gml = _dag_to_gml_string(self._dag)
         model = CausalModel(
             data=self._df,
-            treatment="wash_ring_membership",
+            treatment=treatment_feature,
             outcome="risk_score",
             graph=gml,
         )
-        estimand = model.identify_effect(proceed_when_unidentifiable=True)
-        estimate = model.estimate_effect(
-            estimand,
-            method_name=self.estimation_method,
-            control_value=0.0,
-            treatment_value=1.0,
-            test_significance=False,
-        )
+        try:
+            estimand = model.identify_effect(proceed_when_unidentifiable=False)
+            estimate = model.estimate_effect(
+                estimand,
+                method_name=self.estimation_method,
+                control_value=0.0,
+                treatment_value=1.0,
+                test_significance=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Cannot run refutation tests for treatment='%s': effect not "
+                "identified or not estimable (%s). There is no genuine causal "
+                "claim to refute for this feature.",
+                treatment_feature,
+                exc,
+            )
+            return {
+                "random_common_cause": 1.0,
+                "placebo_treatment_refuter": 1.0,
+                "data_subset_refuter": 1.0,
+            }
 
         results: dict[str, float] = {}
 
@@ -677,6 +941,47 @@ class CausalEngine:
                 logger.warning("Refutation test '%s' failed: %s", key, exc)
                 results[key] = 1.0
 
+        return results
+
+    def all_feature_refutation_tests(
+        self, features: list[str] | None = None
+    ) -> dict[str, dict[str, float]]:
+        """Run the three refutation tests for every feature with a genuine ATE.
+
+        This closes the coverage gap in the original implementation, which
+        only ever refuted the single hardcoded ``wash_ring_membership``
+        treatment even though ``feature_ate_table`` reports ATEs for every
+        feature in ``OBSERVABLE_FEATURE_NODES``.
+
+        Features whose ATE estimate fell back to the correlational OLS path
+        (DoWhy not installed, non-identifiable, or an estimation error) are
+        skipped: there is no identified causal estimand for them, so DoWhy
+        refutation tests would be meaningless (there is nothing to refute).
+        That skip is not silent — it is what :meth:`feature_ate_table_detailed`
+        already flags via ``ATEEstimate.method``/``reason``, and callers can
+        recover the exact set of features actually covered here from this
+        method's return keys.
+
+        Parameters
+        ----------
+        features:
+            Features to test. Defaults to all of ``OBSERVABLE_FEATURE_NODES``.
+
+        Returns
+        -------
+        dict[str, dict[str, float]]
+            ``{feature_name: {test_name: p_value}}``, containing only features
+            that had a genuinely DoWhy-identified ATE estimate.
+        """
+        self._assert_fitted()
+        target_features = features if features is not None else OBSERVABLE_FEATURE_NODES
+
+        results: dict[str, dict[str, float]] = {}
+        for feature in target_features:
+            detail = self._estimate_ate_detailed(feature)
+            if detail.method != ESTIMATION_CAUSAL:
+                continue
+            results[feature] = self.refutation_tests(treatment_feature=feature)
         return results
 
     # ------------------------------------------------------------------

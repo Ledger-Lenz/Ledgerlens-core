@@ -6,12 +6,13 @@ Tracks per-wallet alert state in SQLite and emits events only on transitions:
 - alert.resolved  — score below threshold for 3 consecutive cycles (hysteresis)
 """
 
+from __future__ import annotations
+
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
 
-from config.settings import settings
+from config.settings import get_runtime_risk_score_threshold, settings
 
 logger = logging.getLogger("ledgerlens.alert_engine")
 
@@ -20,7 +21,7 @@ _RESOLUTION_CONSECUTIVE = 3
 
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS alert_states (
             wallet TEXT PRIMARY KEY,
@@ -29,8 +30,11 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             below_threshold_streak INTEGER NOT NULL DEFAULT 0,
             opened_at TEXT,
             updated_at TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS alert_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             wallet TEXT NOT NULL,
@@ -38,9 +42,11 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             score REAL NOT NULL,
             previous_score REAL,
             emitted_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_alert_events_wallet ON alert_events (wallet);
+        )
         """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alert_events_wallet ON alert_events (wallet)"
     )
 
 
@@ -49,8 +55,8 @@ def _emit_event(
     wallet: str,
     event_type: str,
     score: float,
-    previous_score: Optional[float],
-) -> dict:
+    previous_score: float | None,
+) -> dict[str, object]:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
@@ -59,7 +65,7 @@ def _emit_event(
         """,
         (wallet, event_type, score, previous_score, now),
     )
-    event = {
+    event: dict[str, object] = {
         "event_type": event_type,
         "wallet": wallet,
         "score": score,
@@ -73,16 +79,16 @@ def _emit_event(
 class AlertDeduplicator:
     """Deduplicate alerts by tracking per-wallet active state across scoring cycles."""
 
-    def __init__(self, db_path: Optional[str] = None, threshold: Optional[int] = None):
+    def __init__(self, db_path: str | None = None, threshold: int | None = None):
         self._db_path = db_path or settings.db_path
-        self._threshold = threshold if threshold is not None else settings.risk_score_threshold
+        self._threshold = threshold if threshold is not None else get_runtime_risk_score_threshold()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def process(self, wallet: str, score: float) -> list[dict]:
+    def process(self, wallet: str, score: float) -> list[dict[str, object]]:
         """Process a new score observation for wallet. Returns list of emitted events.
 
         Returns an empty list without updating alert state when an active
@@ -99,7 +105,7 @@ class AlertDeduplicator:
             )
             return []
 
-        events: list[dict] = []
+        events: list[dict[str, object]] = []
         now = datetime.now(timezone.utc).isoformat()
 
         with self._connect() as conn:
@@ -165,7 +171,7 @@ class AlertDeduplicator:
 
         return events
 
-    def get_state(self, wallet: str) -> Optional[dict]:
+    def get_state(self, wallet: str) -> dict[str, object] | None:
         with self._connect() as conn:
             _ensure_tables(conn)
             row = conn.execute(
@@ -173,7 +179,7 @@ class AlertDeduplicator:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_events(self, wallet: str, limit: int = 100) -> list[dict]:
+    def get_events(self, wallet: str, limit: int = 100) -> list[dict[str, object]]:
         with self._connect() as conn:
             _ensure_tables(conn)
             rows = conn.execute(

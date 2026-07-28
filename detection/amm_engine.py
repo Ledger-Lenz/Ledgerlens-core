@@ -13,14 +13,14 @@ AMMPoolAnomaly records scored anomalies.
 
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 
 from detection.sandwich_engine import detect_sandwich_candidates
-from ingestion.data_models import LiquidityPool, TradeType
+from ingestion.data_models import TradeType
 
 logger = logging.getLogger("ledgerlens.amm_engine")
 
@@ -124,8 +124,8 @@ def pool_sandwich_frequency(
     return float(min(3 * count / n, 1.0))
 
 
-def pool_share_concentration(pool: LiquidityPool, deposits: pd.DataFrame) -> float:
-    """Herfindahl-style concentration of `pool`'s deposit/withdraw activity
+def pool_share_concentration(deposits: pd.DataFrame) -> float:
+    """Herfindahl-style concentration of a pool's deposit/withdraw activity
     across accounts — flags a single actor inflating then draining a pool to
     move its price around their own trades.
 
@@ -186,7 +186,7 @@ class AMMPoolAnomaly:
     deposit_withdraw_symmetry: float
     counterparty_concentration: float
     anomaly_score: float
-    detected_at: datetime = field(default_factory=datetime.utcnow)
+    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class AMMEngine:
@@ -286,7 +286,6 @@ class AMMEngine:
 
                 counterparties = [t.get("counter_account") for t in session.trades_during_tenure if t.get("counter_account")]
                 if counterparties:
-                    from collections import Counter
                     cp_counts = Counter(counterparties)
                     cp_conc = max(cp_counts.values()) / len(counterparties)
                 else:

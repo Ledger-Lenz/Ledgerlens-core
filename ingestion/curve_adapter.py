@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import requests
 from web3 import Web3
 
 
@@ -57,8 +58,6 @@ class CurveAdapter:
 
     def _fetch_logs(self, pool_addresses: list[str], from_block: int, to_block: int) -> list[dict]:
         """Fetch TokenExchange event logs from the RPC endpoint."""
-        import requests
-
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -78,16 +77,20 @@ class CurveAdapter:
         return result.get("result", [])
 
     def _parse_exchange_event(self, log: dict) -> Trade | None:
-        """Parse a raw TokenExchange log entry into a Trade dataclass."""
+        """Parse a raw TokenExchange log entry into a Trade dataclass.
+
+        Note: block_timestamp is set to the time of parsing. Callers should
+        fetch the actual block timestamp via eth_getBlockByNumber if accuracy
+        is required for historical analysis.
+        """
         topics = log.get("topics", [])
         if len(topics) < 2:
             return None
 
         buyer = "0x" + topics[1][-40:]
 
-        if self._linked_wallets:
-            if buyer.lower() not in self._linked_wallets:
-                return None
+        if self._linked_wallets and buyer.lower() not in self._linked_wallets:
+            return None
 
         data = bytes.fromhex(log["data"][2:])
         sold_id = int.from_bytes(data[0:32], "big", signed=True)

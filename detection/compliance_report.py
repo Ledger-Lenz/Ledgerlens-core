@@ -14,9 +14,6 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
-
-import pandas as pd
 
 from config.settings import settings
 from detection.benford_engine import compute_benford_metrics
@@ -105,7 +102,7 @@ class ComplianceReportGenerator:
         wallet: str,
         date: str,
         output_path: str,
-        db_path: Optional[str] = None,
+        db_path: str | None = None,
     ) -> None:
         self.wallet = wallet
         self.date = date
@@ -129,7 +126,7 @@ class ComplianceReportGenerator:
             db_path=self.db_path,
         )
 
-    def _gather_feature_vector(self) -> Optional[dict]:
+    def _gather_feature_vector(self) -> dict | None:
         """Fetch the cached feature vector for the wallet on the report date."""
         scores = self._gather_risk_scores()
         asset_pairs = {s["asset_pair"] for s in scores}
@@ -179,7 +176,7 @@ class ComplianceReportGenerator:
         """Get model version and training date metadata."""
         model_dir = settings.model_dir
         metadata_path = os.path.join(model_dir, "training_metadata.json")
-        version_map: dict[str, Optional[str]] = {}
+        version_map: dict[str, str | None] = {}
         for name in ("random_forest", "xgboost", "lightgbm"):
             version_map[name] = get_current_version(name, model_dir)
         training_date = None
@@ -320,6 +317,7 @@ class ComplianceReportGenerator:
             f"<td>{s['shap_value']}</td><td>{s['description']}</td></tr>"
             for s in top_shap
         )
+        generated_at = datetime.now(timezone.utc).isoformat()
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Compliance Report - {self.wallet}</title>
@@ -335,7 +333,7 @@ th{{background:#f0f4f8}}.risk-HIGH{{color:#c00}}.risk-CRITICAL{{color:#900}}
 <div class="summary">
 <p><strong>Wallet:</strong> {self.wallet}</p>
 <p><strong>Date:</strong> {self.date}</p>
-<p><strong>Generated:</strong> {datetime.now(timezone.utc).isoformat()}</p>
+<p><strong>Generated:</strong> {generated_at}</p>
 </div>
 <h2>Executive Summary</h2>
 <p>Peak Risk Score: <strong class="risk-{risk_level}">{peak_score}/100 ({risk_level})</strong></p>
@@ -356,7 +354,7 @@ th{{background:#f0f4f8}}.risk-HIGH{{color:#c00}}.risk-CRITICAL{{color:#900}}
 <p>Last Cursor: {provenance.get("last_cursor", "N/A")}</p>
 </body></html>"""
 
-    def generate_pdf(self) -> Optional[str]:
+    def generate_pdf(self) -> str | None:
         """Generate a PDF version of the report using WeasyPrint, if available.
 
         Returns the path to the PDF file, or ``None`` if WeasyPrint is not

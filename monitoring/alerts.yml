@@ -48,3 +48,11 @@ groups:
           summary: "WAF detected potential abuse"
           description: "More than 10 requests have been blocked by the WAF in the last 5 minutes."
           runbook: "Review blocked requests via GET /admin/waf/blocked-requests. Check for SQLi/XSS patterns or oversized requests. Consider adjusting rate limits or blocking specific clients if needed."
+
+      - alert: SecretRotationOverdue
+        expr: ledgerlens_secret_rotation_overdue > 0
+        for: 0m
+        annotations:
+          summary: "Secret rotation is overdue"
+          description: "One or more active API keys have exceeded the maximum age without rotation."
+          runbook: "Identify the overdue key using the API key metadata or database. Rotate the key immediately via the POST /admin/api-keys/{key_id}/rotate endpoint or namespace rotation."

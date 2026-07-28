@@ -15,7 +15,8 @@ Coverage guarantee (marginal, finite-sample): P(Y ∈ C(X)) ≥ 1 − α.
 import hashlib
 import json
 import logging
-from typing import Any, List
+from datetime import datetime, timezone
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -27,11 +28,6 @@ logger = logging.getLogger("ledgerlens.conformal")
 # ---------------------------------------------------------------------------
 
 CLASS_LABELS = {0: "clean", 1: "suspicious", 2: "wash"}
-CLASS_BOUNDARIES = {
-    0: (0, 33),    # score 0–33  → clean
-    1: (34, 66),   # score 34–66 → suspicious
-    2: (67, 100),  # score 67–100 → wash
-}
 
 
 def score_to_class(score: int) -> int:
@@ -120,7 +116,7 @@ def predict_set_raps(
     q_hat: float,
     lambda_reg: float = 0.2,
     k_reg: int = 2,
-) -> List[int]:
+) -> list[int]:
     """Return the RAPS prediction set for one softmax probability vector.
 
     Includes class k when raps_score(softmax_probs, k) ≤ q_hat.
@@ -264,7 +260,7 @@ class RAPSConformal:
         self,
         test_softmax_probs: np.ndarray,
         alpha: float | None = None,
-    ) -> List[int]:
+    ) -> list[int]:
         """Return the RAPS prediction set for one softmax probability vector.
 
         Args:
@@ -397,6 +393,8 @@ class ConformalCalibrator:
         self.alpha = alpha
         self.n_cal: int = 0
         self._content_hash: str = ""
+        self.n_adaptations: int = 0
+        self.last_adapted_at: str | None = None
 
     # ------------------------------------------------------------------
     # Calibration
@@ -533,6 +531,58 @@ class ConformalCalibrator:
         return results
 
     # ------------------------------------------------------------------
+    # Drift-coupled online adaptation (Issue-385)
+    # ------------------------------------------------------------------
+
+    def adapt_online(self, covered: bool, gamma: float = 0.01) -> float:
+        """Nudge ``q_hat`` toward the target coverage using one labelled outcome.
+
+        This is the recalibration response to detected drift (see
+        ``detection.drift_detectors``): once exchangeability may have broken,
+        the static, training-time ``q_hat`` is no longer guaranteed valid.
+        Rather than requiring a full offline retrain, or requantizing against
+        a stored calibration-score history (which would need to be persisted
+        indefinitely), this tracks the alpha-quantile online via stochastic
+        approximation — the same update used in "Conformal PID Control"
+        (Angelopoulos et al., 2023) and closely related to the alpha-update
+        in Gibbs & Candès' Adaptive Conformal Inference (NeurIPS 2021):
+
+            q_hat_{t+1} = q_hat_t + gamma * (error_t - alpha)
+
+        where ``error_t = 0`` if the true label was covered by the
+        prediction set, else ``1``. A run of misses widens ``q_hat``
+        (larger, more conservative prediction sets); a run of hits narrows
+        it back toward the nominal calibration level. This provides an
+        approximately-valid marginal coverage guarantee even under ongoing
+        (even adversarial) distribution shift, without a full retrain cycle.
+
+        Callers should gate invocation on
+        ``DriftDetectorRegistry.is_active()`` so the threshold only adapts
+        while drift is recent — under stationary conditions the static,
+        training-time calibration is left untouched.
+
+        Args:
+            covered: Whether the true label fell inside the prediction set
+                that was actually returned for this observation.
+            gamma: Adaptation step size (default 0.01, per Gibbs & Candès'
+                recommended range for this style of update).
+
+        Returns:
+            The updated ``q_hat``.
+        """
+        if self.q_hat is None:
+            raise RuntimeError("Call calibrate() before adapt_online().")
+        error_t = 0.0 if covered else 1.0
+        self.q_hat = max(0.0, self.q_hat + gamma * (error_t - self.alpha))
+        self.n_adaptations += 1
+        self.last_adapted_at = datetime.now(timezone.utc).isoformat()
+        logger.info(
+            "Online conformal adaptation: covered=%s q_hat=%.4f n_adaptations=%d",
+            covered, self.q_hat, self.n_adaptations,
+        )
+        return self.q_hat
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -549,6 +599,8 @@ class ConformalCalibrator:
             "q_hat": self.q_hat,
             "alpha": self.alpha,
             "n_cal": self.n_cal,
+            "n_adaptations": self.n_adaptations,
+            "last_adapted_at": self.last_adapted_at,
             "version": 1,
         }
         content = json.dumps(data, sort_keys=True)
@@ -585,6 +637,8 @@ class ConformalCalibrator:
 
         calibrator = cls(q_hat=data["q_hat"], alpha=data["alpha"])
         calibrator.n_cal = data.get("n_cal", 0)
+        calibrator.n_adaptations = data.get("n_adaptations", 0)
+        calibrator.last_adapted_at = data.get("last_adapted_at")
         calibrator._content_hash = stored_digest
         logger.info(
             "Loaded calibration artifact from %s (sha256=%s)", path, stored_digest[:16]

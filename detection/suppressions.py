@@ -15,7 +15,6 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional
 
 from config.settings import settings
 
@@ -93,7 +92,7 @@ class SuppressionsStore:
             logger.info("Suppression rule deleted: id=%d", rule_id)
         return deleted
 
-    def is_suppressed(self, wallet: str) -> Optional[dict]:
+    def is_suppressed(self, wallet: str) -> dict | None:
         """Return the active suppression rule for *wallet*, or None if not suppressed.
 
         A rule is active when its ``expires_at`` is NULL or still in the future.
@@ -109,18 +108,22 @@ class SuppressionsStore:
         return dict(row) if row else None
 
 
-# Module-level singleton
-_store: SuppressionsStore | None = None
+# Module-level cache of SuppressionsStore instances by db_path
+_stores: dict[str | None, SuppressionsStore] = {}
 
 
 def get_store(db_path: str | None = None) -> SuppressionsStore:
-    global _store
-    if _store is None or db_path is not None:
-        _store = SuppressionsStore(db_path)
-    return _store
+    """Return a SuppressionsStore instance, cached by db_path.
+
+    Each unique db_path gets its own cached instance. Passing db_path=None
+    uses the default from settings.db_path.
+    """
+    if db_path not in _stores:
+        _stores[db_path] = SuppressionsStore(db_path)
+    return _stores[db_path]
 
 
-def is_suppressed(wallet: str, db_path: str | None = None) -> Optional[dict]:
+def is_suppressed(wallet: str, db_path: str | None = None) -> dict | None:
     """Convenience function: return active suppression rule for wallet, or None."""
     return get_store(db_path).is_suppressed(wallet)
 

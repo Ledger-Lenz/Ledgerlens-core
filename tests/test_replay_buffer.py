@@ -185,3 +185,88 @@ def test_size_tracks_buffer():
     assert buf.size == 1
     buf.drain()
     assert buf.size == 0
+
+
+# ---------------------------------------------------------------------------
+# _sort_key type and ordering
+# ---------------------------------------------------------------------------
+
+def test_sort_key_numeric_sorts_by_integer_not_lexicographic():
+    from ingestion.replay_buffer import _sort_key
+    # "9" vs "10": lexicographically "10" < "9", but numerically 9 < 10.
+    assert _sort_key("9") < _sort_key("10")
+
+
+def test_sort_key_non_numeric_regime_greater_than_numeric():
+    from ingestion.replay_buffer import _sort_key
+    # Non-numeric tokens must sort *after* all numeric tokens.
+    assert _sort_key("abc") > _sort_key("999999")
+
+
+def test_sort_key_return_type():
+    from ingestion.replay_buffer import _sort_key
+    key = _sort_key("42")
+    assert isinstance(key, tuple)
+    assert len(key) == 3
+    assert key == (0, 42, "")
+
+    key2 = _sort_key("hello")
+    assert key2 == (1, 0, "hello")
+
+
+# ---------------------------------------------------------------------------
+# __all__ exports
+# ---------------------------------------------------------------------------
+
+def test_module_all_defined():
+    import ingestion.replay_buffer as m
+    assert hasattr(m, "__all__")
+    for name in m.__all__:
+        assert hasattr(m, name), f"__all__ lists {name!r} but it is not defined"
+
+
+# ---------------------------------------------------------------------------
+# flush_all cleans up _ingested_at per-event
+# ---------------------------------------------------------------------------
+
+def test_flush_all_clears_ingested_at():
+    buf = OrderBookReplayBuffer()
+    for tok in ["1", "2", "3"]:
+        buf.ingest(_event(tok))
+    assert len(buf._ingested_at) == 3
+    result = buf.flush_all()
+    assert len(result) == 3
+    assert buf._ingested_at == {}
+    assert buf.size == 0
+
+
+def test_flush_all_updates_last_emitted_key():
+    buf = OrderBookReplayBuffer()
+    for tok in ["10", "11", "12"]:
+        buf.ingest(_event(tok))
+    buf.flush_all()
+    from ingestion.replay_buffer import _sort_key
+    assert buf._last_emitted_key == _sort_key("12")
+
+
+# ---------------------------------------------------------------------------
+# Non-numeric tokens are ordered lexicographically without gap-checking
+# ---------------------------------------------------------------------------
+
+def test_non_numeric_tokens_emit_without_gap_hold():
+    buf = OrderBookReplayBuffer()
+    buf.ingest(_event("beta"))
+    buf.ingest(_event("alpha"))
+    result = buf.drain()
+    # Both emit immediately in lexicographic order.
+    assert [e.id for e in result] == ["alpha", "beta"]
+
+
+def test_mixed_numeric_and_non_numeric_numeric_first():
+    """Numeric tokens always sort before non-numeric tokens."""
+    buf = OrderBookReplayBuffer()
+    buf.ingest(_event("zzz"))
+    buf.ingest(_event("1"))
+    result = buf.drain()
+    assert result[0].id == "1"
+    assert result[1].id == "zzz"

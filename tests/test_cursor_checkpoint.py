@@ -1,3 +1,16 @@
+"""Tests for ingestion/checkpoint.py — CursorCheckpoint, FlushPolicy, resolve_checkpoint_path.
+
+Stability notes
+---------------
+- All tests use ``tmp_path`` (pytest-provided isolated temporary directory) so
+  they never touch shared filesystem state.
+- ``test_save_is_atomic_when_replace_fails`` patches ``os.replace`` *scoped to
+  the ingestion.checkpoint module* (``monkeypatch.setattr("ingestion.checkpoint.os.replace", …)``)
+  rather than the global ``os`` module, preventing accidental interference with
+  pytest internals or other tests running concurrently.
+- No module-level global state is mutated anywhere in this file.
+"""
+
 import json
 import os
 
@@ -32,8 +45,10 @@ def test_load_missing_checkpoint(tmp_path):
 def test_load_corrupt_or_empty_checkpoint(tmp_path):
     path = tmp_path / "cursor.json"
     checkpoint = CursorCheckpoint(path)
+
     path.write_text("{not-json")
     assert checkpoint.load() is None
+
     path.write_text("")
     assert checkpoint.load() is None
 
@@ -45,6 +60,11 @@ def test_load_invalid_paging_token(tmp_path):
 
 
 def test_save_is_atomic_when_replace_fails(tmp_path, monkeypatch):
+    """If os.replace raises mid-write, the original checkpoint is preserved.
+
+    The patch targets the ``os`` reference *inside* ingestion.checkpoint so
+    that pytest's own file I/O is not affected.
+    """
     path = tmp_path / "cursor.json"
     original = '{"paging_token":"100-0"}\n'
     path.write_text(original)
@@ -53,7 +73,8 @@ def test_save_is_atomic_when_replace_fails(tmp_path, monkeypatch):
     def fail_replace(source, destination):
         raise OSError("simulated crash")
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    # Patch os.replace only within the ingestion.checkpoint module namespace
+    monkeypatch.setattr("ingestion.checkpoint.os.replace", fail_replace)
     checkpoint.save("200-0", ledger_sequence=2)
 
     assert path.read_text() == original

@@ -9,6 +9,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+__all__ = [
+    "CorrelationIDMiddleware",
+    "HEADER",
+    "get_correlation_id",
+    "mask_wallet",
+    "set_correlation_id",
+]
+
 _correlation_id: ContextVar[str] = ContextVar("correlation_id", default="unset")
 
 HEADER = "X-Correlation-ID"

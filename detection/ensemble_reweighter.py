@@ -23,6 +23,7 @@ Prior:  Beta(alpha=2, beta=2) — weakly informative and symmetric.
 import json
 import logging
 import os
+import time
 
 from detection.feedback_store import ScoringFeedback
 
@@ -78,7 +79,7 @@ def get_current_weights(
         if rw is not None:
             return rw.current_weights()
     except Exception:
-        pass
+        logger.debug("Adaptive reweighter unavailable; falling back to weights file", exc_info=True)
 
     if model_dir is not None:
         path = os.path.join(model_dir, _WEIGHTS_FILENAME)
@@ -101,8 +102,6 @@ def apply_weights(weights: dict[str, float], model_dir: str) -> None:
         weights: Output of :func:`compute_updated_weights`.
         model_dir: Directory where model artefacts are stored.
     """
-    import time
-
     payload = {
         "random_forest": weights["random_forest"],
         "xgboost": weights["xgboost"],

@@ -1,3 +1,21 @@
+"""Tests for detection/storage.py — Issue #516.
+
+Cleanup applied
+---------------
+- Extracted shared ``_FakeConnection`` / ``_fake_connect`` helpers (replacing
+  two identical inline class definitions that were copy-pasted between
+  ``test_get_latest_scores_filters_flags_in_sql`` and
+  ``test_get_latest_scores_sorts_by_requested_column_in_sql``).
+- Removed the redundant ``from contextlib import contextmanager`` import that
+  appeared inside ``test_get_latest_scores_filters_flags_in_sql``; the import
+  is declared once at module level alongside the other stdlib imports.
+- Eliminated the separate ``FakeContext`` class used by
+  ``test_get_latest_scores_applies_limit_offset_in_sql``; it duplicated the
+  same fake-connection logic and is now replaced by the shared helper.
+- All existing behaviour is preserved; no assertions or test logic changed.
+"""
+
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -34,8 +52,59 @@ def _score(wallet="GABC", asset_pair="XLM/USDC", score=80, timestamp=None) -> Ri
 
 
 # ---------------------------------------------------------------------------
-# Existing tests (unchanged)
+# Shared fake-connection helpers (replaces duplicated inline classes)
 # ---------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    """Minimal cursor that records the last execute() call and returns nothing."""
+
+    def __init__(self):
+        self._executed: list[tuple] = []
+
+    def fetchall(self):
+        return []
+
+
+class _FakeConnection:
+    """Connection stub that captures every execute() call for assertion."""
+
+    def __init__(self):
+        self.executed: list[tuple[str, tuple]] = []
+
+    def executescript(self, _script: str) -> None:
+        return None
+
+    def commit(self) -> None:
+        return None
+
+    def execute(self, query: str, params: tuple = ()) -> _FakeCursor:
+        self.executed.append((query, params))
+        return _FakeCursor()
+
+    def close(self) -> None:
+        return None
+
+
+def _fake_connect_factory():
+    """Return a (cm, conn) pair where cm is a context-manager-returning callable.
+
+    Pass ``cm`` to ``monkeypatch.setattr(storage_module, "_connect", cm)`` and
+    inspect ``conn.executed`` afterwards to assert on the SQL that was issued.
+    """
+    conn = _FakeConnection()
+
+    @contextmanager
+    def _cm(_db_path=None):
+        yield conn
+
+    return _cm, conn
+
+
+# ---------------------------------------------------------------------------
+# Existing tests (behaviour unchanged)
+# ---------------------------------------------------------------------------
+
 
 def test_init_db_creates_table(db_path):
     init_db(db_path)
@@ -69,34 +138,15 @@ def test_get_latest_scores_filters_by_wallet(db_path):
 
 
 def test_get_latest_scores_filters_flags_in_sql(monkeypatch):
-    executed = []
+    """Flag filters (benford_flag, ml_flag) are pushed to SQL, not Python."""
+    import detection.storage as storage_module
 
-    class FakeCursor:
-        def fetchall(self):
-            return []
-
-    class FakeConnection:
-        def executescript(self, _script):
-            return None
-
-        def commit(self):
-            return None
-
-        def execute(self, query, params):
-            executed.append((query, params))
-            return FakeCursor()
-
-    from contextlib import contextmanager
-
-    @contextmanager
-    def fake_connect(_db_path=None):
-        yield FakeConnection()
-
-    monkeypatch.setattr("detection.storage._connect", fake_connect)
+    cm, conn = _fake_connect_factory()
+    monkeypatch.setattr(storage_module, "_connect", cm)
 
     get_latest_scores(benford_flag=True, ml_flag=False, db_path="fake.db")
 
-    query, params = executed[-1]
+    query, params = conn.executed[-1]
     compact_query = " ".join(query.split())
     assert "rs.benford_flag = ?" in compact_query
     assert "rs.ml_flag = ?" in compact_query
@@ -104,34 +154,15 @@ def test_get_latest_scores_filters_flags_in_sql(monkeypatch):
 
 
 def test_get_latest_scores_sorts_by_requested_column_in_sql(monkeypatch):
-    executed = []
+    """ORDER BY clause uses the caller-requested column, not hard-coded 'score'."""
+    import detection.storage as storage_module
 
-    class FakeCursor:
-        def fetchall(self):
-            return []
-
-    class FakeConnection:
-        def executescript(self, _script):
-            return None
-
-        def commit(self):
-            return None
-
-        def execute(self, query, params):
-            executed.append((query, params))
-            return FakeCursor()
-
-    from contextlib import contextmanager
-
-    @contextmanager
-    def fake_connect(_db_path=None):
-        yield FakeConnection()
-
-    monkeypatch.setattr("detection.storage._connect", fake_connect)
+    cm, conn = _fake_connect_factory()
+    monkeypatch.setattr(storage_module, "_connect", cm)
 
     get_latest_scores(sort_by="confidence", db_path="fake.db")
 
-    query, _params = executed[-1]
+    query, _params = conn.executed[-1]
     assert "ORDER BY rs.confidence DESC" in " ".join(query.split())
 
 
@@ -146,59 +177,27 @@ def test_save_scores_noop_on_empty_list(db_path):
 
 
 def test_get_latest_scores_applies_limit_offset_in_sql(tmp_path, monkeypatch):
-    """Ensure paging is done in SQL, not by loading all rows in Python."""
+    """Paging (LIMIT / OFFSET) is performed in SQL, not by loading all rows in Python."""
     import detection.storage as storage_module
 
     db_path = str(tmp_path / "ledgerlens.db")
 
-    # Mock sqlite3 connection and cursor behavior
-    calls = {}
-
-    class FakeConn:
-        def __init__(self):
-            self._executed = []
-
-        def execute(self, query, params):
-            calls["query"] = query
-            calls["params"] = params
-
-            class FakeCursor:
-                def fetchall(self_inner):
-                    return []
-
-            return FakeCursor()
-
-        def executescript(self, _):
-            return None
-
-        def commit(self):
-            return None
-
-        def close(self):
-            return None
-
-    class FakeContext:
-        def __enter__(self_inner):
-            return FakeConn()
-
-        def __exit__(self_inner, exc_type, exc, tb):
-            return False
-
-    def fake_connect(_db_path=None):
-        return FakeContext()
-
-    monkeypatch.setattr(storage_module, "_connect", lambda db_path=None: fake_connect(db_path))
+    cm, conn = _fake_connect_factory()
+    monkeypatch.setattr(storage_module, "_connect", cm)
 
     storage_module.init_db(db_path)
     storage_module.get_latest_scores(wallet=None, limit=5, offset=10, db_path=db_path)
 
-    assert "LIMIT ? OFFSET ?" in calls["query"]
-    assert calls["params"] == (5, 10)
+    # The last execute() call must contain LIMIT and OFFSET placeholders.
+    last_query, last_params = conn.executed[-1]
+    assert "LIMIT ? OFFSET ?" in last_query
+    assert last_params == (5, 10)
 
 
 # ---------------------------------------------------------------------------
 # Migration tests
 # ---------------------------------------------------------------------------
+
 
 def test_fresh_db_reaches_latest_schema_version(db_path):
     """A brand-new database is migrated all the way to len(_MIGRATIONS)."""
@@ -281,3 +280,63 @@ def test_save_and_get_scores_on_migrated_db(db_path):
     assert len(results) == 1
     assert results[0].wallet == s.wallet
 
+
+# ---------------------------------------------------------------------------
+# Additional regression tests (new coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_save_multiple_wallets_returned_as_latest(db_path):
+    """save_scores with multiple distinct wallet/pair combos are all returned."""
+    scores = [
+        _score(wallet="GABC", asset_pair="XLM/USDC", score=80),
+        _score(wallet="GXYZ", asset_pair="XLM/USDC", score=60),
+        _score(wallet="GABC", asset_pair="XLM/BTC", score=40),
+    ]
+    save_scores(scores, db_path)
+
+    all_scores = get_latest_scores(db_path=db_path)
+    assert len(all_scores) == 3
+
+
+def test_get_latest_scores_sort_by_timestamp(db_path):
+    """sort_by='timestamp' returns scores ordered by recency descending."""
+    t_old = datetime.now(timezone.utc) - timedelta(hours=2)
+    t_new = datetime.now(timezone.utc)
+
+    save_scores(
+        [
+            _score(wallet="GABC", score=50, timestamp=t_old),
+            _score(wallet="GXYZ", score=50, timestamp=t_new),
+        ],
+        db_path,
+    )
+
+    results = get_latest_scores(sort_by="timestamp", db_path=db_path)
+    assert len(results) == 2
+    # Most recent first
+    assert results[0].wallet == "GXYZ"
+    assert results[1].wallet == "GABC"
+
+
+def test_get_latest_scores_limit_zero_returns_empty(db_path):
+    """LIMIT 0 returns an empty list (SQL semantics, not a Python slice)."""
+    save_scores([_score()], db_path)
+
+    results = get_latest_scores(limit=0, offset=0, db_path=db_path)
+    assert results == []
+
+
+def test_get_latest_scores_filter_by_asset_pair(db_path):
+    """asset_pair kwarg restricts results to the requested pair."""
+    save_scores(
+        [
+            _score(wallet="GABC", asset_pair="XLM/USDC"),
+            _score(wallet="GABC", asset_pair="XLM/BTC"),
+        ],
+        db_path,
+    )
+
+    results = get_latest_scores(asset_pair="XLM/USDC", db_path=db_path)
+    assert len(results) == 1
+    assert results[0].asset_pair == "XLM/USDC"

@@ -6,6 +6,7 @@ import json
 import logging
 import queue
 import threading
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -290,17 +291,17 @@ def get_lineage_graph(dataset_name: str, db_path: str | None = None) -> dict:
         adj[src].add(tgt)
         adj[tgt].add(src)
 
-    visited = set()
-    queue_list = list(start_keys)
-    for k in queue_list:
+    visited: set[str] = set()
+    bfs_queue: deque[str] = deque(start_keys)
+    for k in bfs_queue:
         visited.add(k)
 
-    while queue_list:
-        curr = queue_list.pop(0)
+    while bfs_queue:
+        curr = bfs_queue.popleft()
         for neighbor in adj.get(curr, []):
             if neighbor not in visited:
                 visited.add(neighbor)
-                queue_list.append(neighbor)
+                bfs_queue.append(neighbor)
 
     filtered_nodes = [nodes[k] for k in visited]
     filtered_edges = [

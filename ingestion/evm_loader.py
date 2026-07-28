@@ -853,7 +853,8 @@ class EVMTradeLoader:
             self._circuit_breaker.record_success()
             return result
 
-        assert last_exc is not None
+        if last_exc is None:
+            raise RuntimeError("RPC call exhausted all retries but no error was recorded")
         raise last_exc
 
     def _get_latest_block(self) -> int:

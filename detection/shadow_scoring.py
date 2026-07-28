@@ -10,8 +10,10 @@ committing to a hard model cutover.
 """
 
 import logging
+import math
 import os
 import sqlite3
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -109,6 +111,14 @@ def load_shadow_models(shadow_version: str, model_dir: str) -> dict:
     return _load_models_base(shadow_dir)
 
 
+def _nearest_rank_percentile(values: Sequence[float], percentile: float) -> float:
+    """Return a percentile from sorted values using nearest-rank semantics."""
+    if not values:
+        return 0.0
+    index = max(0, math.ceil(len(values) * percentile) - 1)
+    return values[min(index, len(values) - 1)]
+
+
 def get_shadow_report(db_path: str, divergence_threshold: float = 0.20) -> dict:
     """Return shadow scoring report: mean divergence, p95, high-divergence wallets."""
     _init_shadow_table(db_path)
@@ -126,8 +136,7 @@ def get_shadow_report(db_path: str, divergence_threshold: float = 0.20) -> dict:
         ).fetchall()
         if divergences:
             vals = [r["divergence"] for r in divergences]
-            p95_idx = int(len(vals) * 0.95)
-            p95_div = vals[min(p95_idx, len(vals) - 1)]
+            p95_div = _nearest_rank_percentile(vals, 0.95)
         else:
             p95_div = 0.0
 

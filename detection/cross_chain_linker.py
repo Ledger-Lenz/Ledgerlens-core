@@ -12,7 +12,7 @@ import math
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict
 
@@ -45,7 +45,7 @@ class WalletLinkHypothesis:
     confidence: float
     link_status: LinkStatus
     bridge_event_count: int
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 def _validate_evm_address(address: str) -> None:
@@ -304,6 +304,11 @@ class CrossChainLinker:
             ).fetchall()
             conn.close()
         except Exception:
+            logger.warning(
+                "Failed to retrieve accepted links for stellar_wallet=%s",
+                stellar_wallet,
+                exc_info=True,
+            )
             return []
 
         results = []

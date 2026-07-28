@@ -1,4 +1,20 @@
-"""Tests for api/streaming.py — Issue #296.
+"""Tests for api/streaming.py — Issue #517.
+
+Cleanup applied
+---------------
+- Removed stale ``TYPE_CHECKING`` guard and its import block: ``ScoreUpdateEvent``
+  was referenced inside ``if TYPE_CHECKING`` for a type comment but was never
+  used at runtime through that path — every test that needs ``ScoreUpdateEvent``
+  imports it directly inside the test or via ``_make_event``.  Keeping the block
+  created an invisible coupling between the test module's import section and the
+  typing machinery that added no runtime safety.
+- Fixed ``TestScorePublisher.test_publishes_to_wallet_and_wildcard_channels``:
+  the mock Redis pipeline was constructed as a plain ``AsyncMock`` whose
+  ``__aenter__`` returned another coroutine rather than ``mock_pipe``, causing
+  ``'coroutine' object does not support the asynchronous context manager
+  protocol`` at runtime.  The pipeline context manager is now a ``MagicMock``
+  with ``__aenter__`` / ``__aexit__`` set to proper ``AsyncMock`` instances so
+  ``async with redis.pipeline(...) as pipe:`` resolves correctly.
 
 Covers:
 - ScorePublisher.publish writes to wallet-specific and wildcard channels.
@@ -16,13 +32,9 @@ import dataclasses
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-if TYPE_CHECKING:
-    from api.streaming import ScoreUpdateEvent
 
 
 # ---------------------------------------------------------------------------
@@ -101,13 +113,28 @@ class TestScoreUpdateEvent:
 class TestScorePublisher:
     @pytest.mark.asyncio
     async def test_publishes_to_wallet_and_wildcard_channels(self):
+        """publish() calls PUBLISH on both the wallet-specific and wildcard channels.
+
+        The Redis pipeline is used as an async context manager
+        (``async with redis.pipeline(...) as pipe``).  To make this work with
+        unittest.mock the pipeline return value must be a ``MagicMock`` whose
+        ``__aenter__`` is an ``AsyncMock`` that resolves to ``mock_pipe`` and
+        whose ``__aexit__`` is an ``AsyncMock`` returning ``False``.  A plain
+        ``AsyncMock`` pipeline would have its ``__aenter__`` return a second
+        coroutine instead of the pipe object, breaking the protocol.
+        """
         from api.streaming import ScorePublisher
 
-        mock_redis = AsyncMock()
         mock_pipe = AsyncMock()
-        mock_redis.pipeline.return_value.__aenter__ = AsyncMock(return_value=mock_pipe)
-        mock_redis.pipeline.return_value.__aexit__ = AsyncMock(return_value=False)
         mock_pipe.execute = AsyncMock(return_value=[1, 1, 1, True])
+
+        # Build a MagicMock that behaves as an async context manager
+        mock_pipeline_cm = MagicMock()
+        mock_pipeline_cm.__aenter__ = AsyncMock(return_value=mock_pipe)
+        mock_pipeline_cm.__aexit__ = AsyncMock(return_value=False)
+
+        mock_redis = AsyncMock()
+        mock_redis.pipeline = MagicMock(return_value=mock_pipeline_cm)
 
         publisher = ScorePublisher(mock_redis)
         event = _make_event()
@@ -122,8 +149,14 @@ class TestScorePublisher:
             str(call).find("ledgerlens:score:*") != -1
             for call in mock_pipe.publish.call_args_list
         )
-        assert wallet_channel_call
-        assert wildcard_call
+        assert wallet_channel_call, (
+            "Expected a publish call for the wallet-specific channel; "
+            f"calls: {mock_pipe.publish.call_args_list}"
+        )
+        assert wildcard_call, (
+            "Expected a publish call for the wildcard channel; "
+            f"calls: {mock_pipe.publish.call_args_list}"
+        )
         assert mock_pipe.publish.call_count == 2
         assert mock_pipe.hset.called
         assert mock_pipe.expire.called
@@ -132,7 +165,7 @@ class TestScorePublisher:
     async def test_publish_does_not_raise_on_redis_error(self):
         from api.streaming import ScorePublisher
 
-        mock_redis = AsyncMock()
+        mock_redis = MagicMock()
         mock_redis.pipeline.side_effect = Exception("Redis unavailable")
 
         publisher = ScorePublisher(mock_redis)

@@ -122,6 +122,7 @@ def test_shap_explainer_cache_hit_single_explainer_call():
 
     assert result1.base_value == result2.base_value
     assert result1.summary_sentence == result2.summary_sentence
+    assert isinstance(result2.contributions[0], FeatureContribution)
     assert explainer._explainer_call_count == 1
 
 
@@ -147,6 +148,18 @@ def test_shap_explainer_different_wallets_independent():
     explainer.explain(model, fv, wallet="GXYZ", model_version="v1", model_name="Test")
 
     assert explainer._explainer_call_count == 2
+
+
+def test_shap_explainer_rejects_empty_feature_vector():
+    model = _trained_model()
+    explainer = ShapExplainer()
+
+    try:
+        explainer.explain(model, {}, wallet="GABCD", model_version="v1", model_name="Test")
+    except ValueError as exc:
+        assert "feature_vector" in str(exc)
+    else:
+        raise AssertionError("empty feature vectors should be rejected")
 
 
 def test_feature_contribution_dataclass():

@@ -11,8 +11,13 @@ See `detection.compliance_exporter` for the package assembly that consumes this.
 
 from __future__ import annotations
 
-SAR_TEMPLATE = """Between {start_date} and {end_date}, wallet {wallet} received a LedgerLens Risk Score \
-of {peak_score}/100 (peak), indicating {risk_level} risk of wash trading activity.
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+SAR_TEMPLATE = (
+    "Between {start_date} and {end_date}, wallet {wallet} received a LedgerLens Risk "
+    "Score of {peak_score}/100 (peak), indicating {risk_level} risk of wash trading activity.\n"
+    """
 
 The following anomalies were detected:
 {alert_bullets}
@@ -21,6 +26,7 @@ Trade volume during the period: {volume_xlm:,.0f} XLM across {n_pairs} asset pai
 Counterparty cluster size: {cluster_size} accounts.
 Benford chi-square statistic: {chi_sq:.2f} (p={chi_p:.4f}).
 """
+)
 
 
 def risk_level_from_score(score: float) -> str:
@@ -34,7 +40,15 @@ def risk_level_from_score(score: float) -> str:
     return "LOW"
 
 
-def _format_alert_bullets(alerts: list[dict]) -> str:
+def _format_xlm_amount(value: Any) -> str | None:
+    """Return a formatted XLM amount, or ``None`` when the value is not numeric."""
+    try:
+        return f"{float(value):,.2f} XLM"
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_alert_bullets(alerts: Sequence[Mapping[str, Any]] | None) -> str:
     """Render alerts as a bulleted list; never returns an empty/placeholder line."""
     if not alerts:
         return "  - No discrete manipulation alerts were recorded in this period."
@@ -45,10 +59,14 @@ def _format_alert_bullets(alerts: list[dict]) -> str:
         detail = alert.get("detail") or {}
         ts = alert.get("timestamp", "unknown time")
         descriptor = alert_type
-        if "profit_xlm" in detail:
-            descriptor += f" (attacker profit {float(detail['profit_xlm']):,.2f} XLM)"
-        elif "cycle_volume" in detail:
-            descriptor += f" (cycle volume {float(detail['cycle_volume']):,.2f} XLM)"
+        if isinstance(detail, Mapping) and "profit_xlm" in detail:
+            amount = _format_xlm_amount(detail["profit_xlm"])
+            if amount is not None:
+                descriptor += f" (attacker profit {amount})"
+        elif isinstance(detail, Mapping) and "cycle_volume" in detail:
+            amount = _format_xlm_amount(detail["cycle_volume"])
+            if amount is not None:
+                descriptor += f" (cycle volume {amount})"
         pair = alert.get("asset_pair")
         pair_suffix = f" on {pair}" if pair else ""
         bullets.append(f"  - {descriptor}{pair_suffix} observed at {ts}.")
@@ -61,7 +79,7 @@ def generate_sar_narrative(
     start_date: str,
     end_date: str,
     peak_score: float,
-    alerts: list[dict],
+    alerts: Sequence[Mapping[str, Any]] | None,
     volume_xlm: float,
     n_pairs: int,
     cluster_size: int,

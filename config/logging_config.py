@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import logging
-import logging.config
 
 import structlog
 
 from config.correlation import get_correlation_id
 
 
-def _add_correlation_id(logger, method_name, event_dict):  # noqa: ANN001
+def _add_correlation_id(
+    _logger: logging.Logger,
+    _method_name: str,
+    event_dict: dict[str, object],
+) -> dict[str, object]:
     event_dict["correlation_id"] = get_correlation_id()
     return event_dict
 
 
-def _add_otel_trace_id(logger, method_name, event_dict):  # noqa: ANN001
+def _add_otel_trace_id(
+    _logger: logging.Logger,
+    _method_name: str,
+    event_dict: dict[str, object],
+) -> dict[str, object]:
     try:
         from opentelemetry import trace
 
@@ -28,6 +35,18 @@ def _add_otel_trace_id(logger, method_name, event_dict):  # noqa: ANN001
     except Exception:  # pragma: no cover
         event_dict["trace_id"] = "0" * 32
     return event_dict
+
+
+class _ServiceFilter(logging.Filter):
+    """Inject the service name into every log record."""
+
+    def __init__(self, service_name: str) -> None:
+        super().__init__()
+        self._service_name = service_name
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        record.service = self._service_name  # type: ignore[attr-defined]
+        return True
 
 
 def configure_logging(service_name: str = "ledgerlens", log_level: str = "INFO") -> None:
@@ -67,15 +86,9 @@ def configure_logging(service_name: str = "ledgerlens", log_level: str = "INFO")
         pass_foreign_args=True,
     )
 
-    # Add service name via a filter
-    class _ServiceFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-            record.service = service_name  # type: ignore[attr-defined]
-            return True
-
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
-    handler.addFilter(_ServiceFilter())
+    handler.addFilter(_ServiceFilter(service_name))
 
     root = logging.getLogger()
     root.handlers.clear()

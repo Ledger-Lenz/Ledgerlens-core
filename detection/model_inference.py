@@ -370,7 +370,19 @@ def score_with_uncertainty(
     or empty), returns maximally conservative bounds
     ``(score_lower=0.0, score_upper=100.0, coverage_guarantee=1.0)``
     without crashing.
+
+    Also feeds ``feature_vector`` to the streaming drift detectors
+    (Issue-385: ADWIN + Page-Hinkley, see ``detection.drift_detectors``) so
+    that ``GET /health/drift`` and the conformal-recalibration gate stay
+    current. This is a cheap, bounded-memory, per-observation update and
+    never raises — a detector failure is logged and scoring proceeds.
     """
+    try:
+        from detection.drift_detectors import get_drift_registry
+        get_drift_registry().observe(feature_vector)
+    except Exception:
+        logger.exception("Drift detector update failed; continuing without it")
+
     probability, confidence = score_feature_vector(models, feature_vector)
     score_0_100 = probability * 100.0
 
@@ -403,6 +415,62 @@ def score_with_uncertainty(
         "prediction_set": prediction_set,
         "coverage_guarantee": 1.0 - alpha,
     }
+
+
+def record_feedback_and_adapt(
+    predicted_score_0_100: float,
+    true_label: int,
+    model_dir: str | None = None,
+) -> dict:
+    """Couple a labelled feedback outcome to conformal recalibration (Issue-385).
+
+    Intended to be called from the analyst-feedback path once a ground-truth
+    label arrives for a previously-scored observation. Adapts each loaded
+    calibrator's ``q_hat`` via :meth:`ConformalCalibrator.adapt_online` and
+    persists it back to its JSON artifact -- so the next scoring run (a
+    separate process, per ``run_pipeline.py``) picks up the adapted
+    threshold on its next ``load_calibration()`` call.
+
+    Only adapts while the streaming drift detectors consider drift
+    "recently active" (:meth:`detection.drift_detectors.DriftDetectorRegistry.is_active`)
+    -- under stationary conditions the static, training-time calibration is
+    left untouched, which is the deliberate design choice that avoids
+    needless alpha churn when exchangeability isn't suspected to be broken.
+
+    Returns a dict describing what happened, for logging/observability.
+    Never raises -- a failure here must not break feedback submission.
+    """
+    from detection.drift_detectors import get_drift_registry
+
+    result: dict = {"adapted": False, "drift_active": False, "models": []}
+    try:
+        if not get_drift_registry().is_active():
+            return result
+        result["drift_active"] = True
+
+        actual_model_dir = model_dir or settings_module.settings.model_dir
+        cal = load_calibration(model_dir=actual_model_dir)
+        if not cal:
+            return result
+
+        probability = float(predicted_score_0_100) / 100.0
+        true_class = int(true_label)
+        prob_true_class = probability if true_class == 1 else (1.0 - probability)
+        nonconformity = 1.0 - prob_true_class
+
+        for name, calibrator in cal.items():
+            if calibrator.q_hat is None:
+                continue
+            covered = nonconformity <= calibrator.q_hat
+            calibrator.adapt_online(covered=covered)
+            path = os.path.join(actual_model_dir, _CALIBRATION_FILENAMES[name])
+            calibrator.save(path)
+            result["models"].append({"model": name, "covered": covered, "q_hat": calibrator.q_hat})
+
+        result["adapted"] = bool(result["models"])
+    except Exception:
+        logger.exception("Drift-coupled conformal adaptation failed")
+    return result
 
 
 from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402

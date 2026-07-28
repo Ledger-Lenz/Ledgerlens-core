@@ -1,9 +1,12 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import sqlite3
 import logging
-import numpy as np
 from pathlib import Path
+import random
+import sqlite3
+from collections.abc import Callable
+
+import numpy as np
 
 from detection.drift_monitor import compute_psi
 
@@ -31,10 +34,8 @@ CREATE INDEX IF NOT EXISTS idx_shap_history_feature_version
 
 def _init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.executescript(_SHAP_HISTORY_DDL)
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(_SHAP_HISTORY_DDL)
 
 
 def record_shap_snapshot(
@@ -44,37 +45,44 @@ def record_shap_snapshot(
     model_version: str,
     shap_values: dict[str, float],
     db_path: str | None = None,
+    sample_random: Callable[[], float] | None = None,
 ) -> None:
     from config.settings import settings
     db_path = db_path or settings.db_path
-    _init_db(db_path)
 
-    import random
-    if random.random() > SHAP_SNAPSHOT_SAMPLE_RATE:
+    random_value = (sample_random or random.random)()
+    if random_value > SHAP_SNAPSHOT_SAMPLE_RATE:
         return
 
+    _init_db(db_path)
     now = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(db_path)
-    rows = [(wallet, asset_pair, model_name, model_version, fname, float(val), now) for fname, val in shap_values.items()]
-    conn.executemany(
-        "INSERT INTO shap_value_history (wallet, asset_pair, model_name, model_version, feature_name, shap_value, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        rows,
-    )
-    conn.commit()
-    conn.close()
+    rows = [
+        (wallet, asset_pair, model_name, model_version, fname, float(val), now)
+        for fname, val in shap_values.items()
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO shap_value_history "
+            "(wallet, asset_pair, model_name, model_version, feature_name, shap_value, "
+            "recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
 
 
 def _load_shap_distribution(feature_name: str, model_version: str, db_path: str) -> np.ndarray:
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute(
-        "SELECT shap_value FROM shap_value_history WHERE feature_name = ? AND model_version = ?",
-        (feature_name, model_version),
-    ).fetchall()
-    conn.close()
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT shap_value FROM shap_value_history "
+            "WHERE feature_name = ? AND model_version = ?",
+            (feature_name, model_version),
+        ).fetchall()
     return np.array([r[0] for r in rows], dtype=float)
 
 
-def compute_shap_psi(feature_name: str, reference_version: str, current_version: str, db_path: str) -> float:
+def compute_shap_psi(
+    feature_name: str, reference_version: str, current_version: str, db_path: str
+) -> float:
     ref = _load_shap_distribution(feature_name, reference_version, db_path)
     cur = _load_shap_distribution(feature_name, current_version, db_path)
     if len(ref) == 0 or len(cur) == 0:
@@ -89,7 +97,9 @@ class KSResult:
     significant: bool
 
 
-def compute_shap_ks_test(feature_name: str, reference_version: str, current_version: str, db_path: str) -> KSResult:
+def compute_shap_ks_test(
+    feature_name: str, reference_version: str, current_version: str, db_path: str
+) -> KSResult:
     from scipy.stats import ks_2samp
     ref = _load_shap_distribution(feature_name, reference_version, db_path)
     cur = _load_shap_distribution(feature_name, current_version, db_path)

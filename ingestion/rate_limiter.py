@@ -20,6 +20,15 @@ from typing import Optional
 
 logger = logging.getLogger("ledgerlens.rate_limiter")
 
+__all__ = [
+    "TokenBucket",
+    "BackpressureController",
+    "AdaptiveRateController",
+]
+
+# Minimum allowed refill rate — prevents the bucket from being silenced to zero.
+_MIN_RATE = 0.1  # tokens/second
+
 
 class TokenBucket:
     """Token-bucket rate limiter.
@@ -65,9 +74,13 @@ class TokenBucket:
         return self._capacity
 
     def set_rate(self, new_rate: float) -> None:
-        """Update the refill rate (clamped to a minimum of 0.1 req/s)."""
+        """Update the refill rate.
+
+        The new rate is clamped to a minimum of :data:`_MIN_RATE` (0.1 req/s)
+        so the bucket can never be silenced entirely.
+        """
         with self._lock:
-            self._rate = max(new_rate, 0.1)
+            self._rate = max(new_rate, _MIN_RATE)
 
     def _refill(self) -> None:
         now = time.monotonic()
@@ -88,19 +101,24 @@ class TokenBucket:
         """Blocking: wait until a token is available or *timeout* expires.
 
         Returns ``True`` if a token was acquired, ``False`` on timeout.
+
+        Parameters
+        ----------
+        timeout:
+            Maximum seconds to wait. ``None`` means wait indefinitely.
         """
-        deadline = time.monotonic() + timeout if timeout else None
+        deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             if self.try_acquire():
                 return True
-            if deadline and time.monotonic() > deadline:
+            if deadline is not None and time.monotonic() > deadline:
                 return False
-            time.sleep(min(1.0 / max(self._rate, 0.1), 0.1))
+            time.sleep(min(1.0 / max(self._rate, _MIN_RATE), 0.1))
 
     async def async_acquire(self) -> None:
         """Async blocking version for use in asyncio event loops."""
         while not self.try_acquire():
-            await asyncio.sleep(min(1.0 / max(self._rate, 0.1), 0.05))
+            await asyncio.sleep(min(1.0 / max(self._rate, _MIN_RATE), 0.05))
 
 
 class BackpressureController:
@@ -138,15 +156,19 @@ class BackpressureController:
     async def check_and_wait(self) -> None:
         """Called before each SSE event is enqueued.
 
-        If queue size >= *high_watermark*, wait until it drains below
-        *low_watermark* before returning.
+        If queue size >= *high_watermark* and backpressure is not already
+        active, set the paused flag and wait until the queue drains below
+        *low_watermark*.
+
+        The ``_paused`` flag is set *before* entering the drain loop so that
+        concurrent callers arriving while draining bypass the watermark check
+        and fall directly into the shared wait, preventing a double-log storm.
         """
-        current_size = self._queue.qsize()
-        if current_size >= self._high and not self._paused:
+        if not self._paused and self._queue.qsize() >= self._high:
             self._paused = True
             logger.warning(
                 "Backpressure: downstream queue at %d items, pausing SSE consumption",
-                current_size,
+                self._queue.qsize(),
             )
         if self._paused:
             while self._queue.qsize() > self._low:
@@ -192,8 +214,9 @@ class AdaptiveRateController:
         self._bucket.set_rate(new_rate)
         self._last_429_at = time.monotonic()
         logger.warning(
-            "Horizon HTTP 429: reducing rate to %.1f req/s",
+            "Horizon HTTP 429: reducing rate to %.1f req/s (clamped to minimum %.1f)",
             new_rate,
+            _MIN_RATE,
         )
 
     def tick(self) -> None:
@@ -201,6 +224,7 @@ class AdaptiveRateController:
 
         Restores toward *configured_rate* at a pace of
         ``(configured_rate - current_rate) / restore_seconds`` per tick.
+        No-op when no 429 has been received.
         """
         if self._last_429_at is None:
             return
@@ -213,7 +237,6 @@ class AdaptiveRateController:
             )
             self._last_429_at = None
         else:
-            remaining = self._restore_seconds - elapsed
             step = (self._configured_rate - self._bucket.current_rate) * (
                 1.0 / self._restore_seconds
             )

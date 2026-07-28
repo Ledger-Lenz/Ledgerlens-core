@@ -293,11 +293,10 @@ class BridgeTransfer(IngestionModel):
     _data: str = PrivateAttr(default="")
     _block_hash: str = PrivateAttr(default="")
 
-    def model_post_init(self, __context: Any) -> None:
-        # Private attributes are set via keyword after normal init via __init__ below.
-        pass
-
     def __init__(self, **data: Any) -> None:
+        # Extract private attributes before validation to prevent them from being
+        # treated as model fields. They are stored separately and excluded from
+        # serialization via PrivateAttr.
         log_index = data.pop("_log_index", 0)
         topics = data.pop("_topics", [])
         raw_data = data.pop("_data", "")

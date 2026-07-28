@@ -693,8 +693,7 @@ def amm_features(
 
     `pool_trade_ratio` and `pool_round_trip_ratio` are derived from `trades`
     alone (rows with `trade_type == LIQUIDITY_POOL`). `pool_share_concentration`
-    additionally needs `liquidity_pools` (id -> `LiquidityPool`) and
-    `pool_deposits` (id -> deposit/withdraw DataFrame); omitting either yields
+    needs `pool_deposits` (id -> deposit/withdraw DataFrame); omitting yields
     `0.0` for that feature. `amm_tenure_ratio` and `amm_volume_concentration`
     come from the AMMEngine session tracker when available.
     """
@@ -718,12 +717,11 @@ def amm_features(
     avg_round_trip = float(sum(round_trip_ratios) / len(round_trip_ratios)) if round_trip_ratios else 0.0
 
     concentrations = []
-    if liquidity_pools and pool_deposits:
+    if pool_deposits:
         for pid in pool_ids:
-            pool = liquidity_pools.get(pid)
             deposits = pool_deposits.get(pid)
-            if pool is not None and deposits is not None:
-                concentrations.append(pool_share_concentration(pool, deposits))
+            if deposits is not None:
+                concentrations.append(pool_share_concentration(deposits))
     avg_concentration = float(sum(concentrations) / len(concentrations)) if concentrations else 0.0
 
     amm_feats = {"amm_tenure_ratio": 0.0, "amm_volume_concentration": 0.0}

@@ -165,9 +165,85 @@ the causal model:
 | `placebo_treatment_refuter` | Replaces the treatment with random noise; estimated effect should collapse to ~0 | p-value > 0.05 |
 | `data_subset_refuter`       | Re-estimates on a 70% random subset; ATE should remain stable                    | p-value > 0.05 |
 
-If more than 3 refutation tests return p < 0.05, the endpoint returns HTTP 503 with a
-descriptive error. This is a safety gate: a causal model that fails refutation may be
-misspecified and should not be served to analysts.
+### Coverage: every causally-identified feature, not just one treatment
+
+`CausalEngine.all_feature_refutation_tests()` runs the three tests above **for every
+feature in `feature_ate_table` that has a genuine DoWhy-identified causal estimate** —
+not only `wash_ring_membership`. (`CausalEngine.refutation_tests(treatment_feature=...)`
+still exists as a lower-level, single-treatment primitive, defaulting to
+`wash_ring_membership` for backward compatibility; `all_feature_refutation_tests` is
+what the API actually calls.)
+
+Features whose ATE fell back to the correlational OLS estimator (see "Estimation
+Provenance" below) are skipped: there is no identified DoWhy estimand to refute for
+them, so running refutation tests against them would be meaningless. This skip is not
+silent — it is exactly what `estimation_method`/`estimation_notes` in the API response
+already flags.
+
+### The rejection gate
+
+The endpoint pools every p-value from every refutation test across every
+causally-identified feature and computes:
+
+```
+failing_fraction = (# p-values < 0.05) / (total # of refutation tests run)
+```
+
+If `failing_fraction > 1/3` (`_MAX_FAILING_REFUTATION_FRACTION` in `api/main.py`), the
+endpoint returns **HTTP 503** with a descriptive error instead of serving the ATE table.
+If zero refutation tests were run at all (every feature fell back to the correlational
+path — e.g. DoWhy is not installed), the gate does not fire: there is no causal claim
+being made in that case, so there is nothing to refute, and the honestly-labeled
+fallback table is served instead.
+
+> **Fixed defect**: the original implementation ran exactly 3 refutation tests, always
+> against the single hardcoded `wash_ring_membership` treatment, and compared the failing
+> *count* against a threshold of exactly 3 (`if all_failing > 3`). Since the count could
+> only ever range over `{0, 1, 2, 3}`, the condition `> 3` was mathematically unreachable
+> — the gate silently passed on every request regardless of how badly the model failed
+> refutation. The fraction-based design above remains meaningful at any coverage size
+> (it scales with however many features/tests are actually run) instead of being tied to
+> a fixed count that happened to equal its own ceiling.
+
+### Estimation Provenance: `causal` vs. `correlational_fallback`
+
+`CausalEngine.estimate_ate()` / `feature_ate_table()` retain their original float-only
+signatures for backward compatibility. The provenance-aware equivalents —
+`CausalEngine._estimate_ate_detailed()` and `feature_ate_table_detailed()` — return an
+`ATEEstimate(value, method, identified, reason)` per feature, and this is what the API
+now uses to populate three additive response fields:
+
+| Field                | Meaning                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------ |
+| `estimation_method`   | Per-feature `"causal"` (genuine DoWhy-identified estimate) or `"correlational_fallback"` (plain OLS coefficient substituted). |
+| `estimation_notes`    | Per-feature reason string, present only for `"correlational_fallback"` entries (e.g. `non_identifiable: ...`, `estimation_error: ...`, `dowhy_not_installed`). |
+| `refutation_coverage` | The features that actually underwent refutation testing this request — the `"causal"` subset of `estimation_method`. |
+
+A fallback occurs when any of the following happens for a given feature:
+
+1. **DoWhy is not installed** — `reason = "dowhy_not_installed"`.
+2. **The effect is non-identifiable** — DoWhy's `identify_effect()` is now called with
+   `proceed_when_unidentifiable=False` (previously `True`), so a genuine
+   non-identifiability raises instead of being silently masked and passed through to
+   estimation. The resulting exception is caught and surfaced as
+   `reason = "non_identifiable: <DoWhy's message>"`.
+3. **DoWhy's `estimate_effect()` itself fails** (e.g. a singular design matrix) —
+   `reason = "estimation_error: <exception message>"`.
+
+In all three cases the fallback ATE value is still the OLS coefficient (so the endpoint
+can serve *something*), but it is now impossible for a client to mistake it for a
+genuine causal estimate — the two are never presented under an indistinguishable shape.
+
+> **Fixed defect**: the original `estimate_ate()` wrapped DoWhy's
+> `identify_effect`/`estimate_effect` calls in a bare `except Exception`, silently
+> substituting the OLS coefficient on any failure — including non-identifiability, which
+> was itself suppressed via `identify_effect(proceed_when_unidentifiable=True)`. Only a
+> `logger.warning` (never surfaced to the API caller) marked the difference; an analyst
+> reading the API response had no way to distinguish a real causal estimate from a
+> correlational fallback presented as one.
+
+This is a safety gate: a causal model that fails refutation may be misspecified and
+should not be served to analysts as if its ATEs were reliable causal estimates.
 
 ## Configuration
 

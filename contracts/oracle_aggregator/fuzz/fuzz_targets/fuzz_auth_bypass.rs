@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
 use soroban_sdk::{Env, Address, BytesN, Vec, testutils::Address as _};
-use oracle_aggregator::{OracleAggregator, OracleAggregatorClient, SignaturePair};
+use oracle_aggregator::{OracleAggregator, OracleAggregatorClient};
 
 /// Authorization bypass fuzzing - ensure initialize cannot be called multiple times
 #[derive(Arbitrary, Debug)]
@@ -31,42 +31,23 @@ fuzz_target!(|input: FuzzInput| {
     }
     
     let score_contract = Address::generate(&env);
-    
-    // First initialization should succeed (or fail with arithmetic issues)
-    let first_init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.initialize(&input.threshold1, &oracle_keys, &score_contract);
-    }));
-    
-    // If first init failed, check it's not an auth bypass
-    if first_init.is_err() {
-        // Should only fail on intentional panics (not auth issues since we mock_all_auths)
+
+    // `initialize` legitimately panics on invalid `threshold1` (zero, or
+    // greater than key_count) -- an intentional rejection, not a bug.
+    // cargo-fuzz builds always use panic=abort, so catch_unwind can never
+    // catch that there either; use the non-panicking try_ variant.
+    if client
+        .try_initialize(&input.threshold1, &oracle_keys, &score_contract)
+        .is_err()
+    {
         return;
     }
-    
-    // Second initialization MUST fail with "already initialized"
-    let second_init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.initialize(&input.threshold2, &oracle_keys, &score_contract);
-    }));
-    
-    match second_init {
-        Ok(_) => {
-            panic!("Authorization bypass: initialize succeeded twice!");
-        }
-        Err(e) => {
-            let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown".to_string()
-            };
-            
-            // Must panic with "already initialized" message
-            assert!(
-                panic_msg.contains("already initialized"),
-                "Second initialize panicked with unexpected message: {}",
-                panic_msg
-            );
-        }
-    }
+
+    // Second initialization MUST fail (already initialized) -- this is the
+    // actual property under test.
+    let second_init = client.try_initialize(&input.threshold2, &oracle_keys, &score_contract);
+    assert!(
+        second_init.is_err(),
+        "Authorization bypass: initialize succeeded twice!"
+    );
 });

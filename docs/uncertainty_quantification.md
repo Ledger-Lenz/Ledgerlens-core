@@ -173,6 +173,81 @@ closer manual review before acting on a prediction.
 
 ---
 
+## Staying Valid Under Drift (Issue-385)
+
+The coverage guarantee `P(Y ∈ C(X)) ≥ 1-α` rests on an **exchangeability**
+assumption between the calibration set and the live test distribution. That
+assumption silently breaks under concept drift — and until now, nothing
+connected the conformal calibrator to any drift signal, fast or slow.
+
+### The gap this closes
+
+- `q_hat` was frozen at training time (a static JSON artifact loaded once
+  per process) and never revisited based on any runtime signal.
+- The only drift-awareness mechanism was PSI-histogram batch comparison
+  (`detection/drift_monitor.py`), triggered manually or via cron
+  (`cli.py retrain-check`) — detection latency bounded only by operator
+  discipline, potentially days or weeks.
+
+See [`docs/drift_monitor.md`](drift_monitor.md) for the new streaming
+ADWIN + Page-Hinkley detectors (`detection/drift_detectors.py`) that close
+the *detection* half of this gap with 100-200-observation latency. This
+section covers the other half: what happens to the conformal calibrator
+once drift is detected.
+
+### Response mechanism: online threshold adaptation
+
+Rather than a full offline retrain, or switching every request onto a
+continuously-adapting alpha (which would need the historical calibration
+score set retained and persisted indefinitely), LedgerLens uses a
+lightweight **online quantile-tracking** update — the practical form of
+Adaptive Conformal Inference (Gibbs & Candès, NeurIPS 2021), closely related
+to "Conformal PID Control" (Angelopoulos et al., 2023):
+
+```
+q_hat_{t+1} = q_hat_t + gamma * (error_t - alpha)
+```
+
+where `error_t = 0` if the true label was covered by the prediction set
+returned for that observation, else `1`. A run of misses widens `q_hat`
+(larger, more conservative intervals); a run of hits narrows it back toward
+the nominal calibration level. This is implemented as
+`ConformalCalibrator.adapt_online()` in `detection/conformal.py`.
+
+**Why this over full recalibration:** analyst feedback labels arrive on a
+delay (via `POST /feedback`), so a fresh, sufficiently-large labelled
+calibration window isn't available at the moment drift is detected. Online
+quantile-tracking needs only one labelled outcome at a time and provides an
+approximately-valid marginal coverage guarantee even under ongoing
+(including adversarial) distribution shift, per Gibbs & Candès' Theorem 1 —
+without blocking on a retrain cycle.
+
+### How detection and adaptation are coupled
+
+1. Every real-time scoring call feeds its feature vector to the streaming
+   drift detectors (cheap, no label needed) — see
+   `detection.model_inference.score_with_uncertainty`.
+2. When analyst feedback arrives with a ground-truth label
+   (`POST /feedback` → `detection.model_inference.record_feedback_and_adapt`),
+   adaptation **only** runs if the drift registry considers drift "recently
+   active" (`DriftDetectorRegistry.is_active()`, default: within the last
+   200 observations). Under stationary conditions the static, training-time
+   `q_hat` is left untouched — this avoids needless alpha churn when
+   exchangeability isn't suspected to be broken.
+3. The adapted `q_hat` is persisted back to the same JSON calibration
+   artifact (`ConformalCalibrator.save()`), so the next scoring pipeline run
+   — a separate process — picks it up automatically on its next
+   `load_calibration()` call. No new distributed state is introduced; this
+   reuses the existing load-from-disk artifact architecture.
+
+### Observability
+
+`GET /health/drift` exposes whether drift is currently considered active
+(the same flag gating adaptation) alongside per-feature detector state. The
+calibration artifact itself gains two new fields, `n_adaptations` and
+`last_adapted_at`, so operators can see how often and how recently a given
+model's threshold has been nudged away from its training-time value.
+
 ## References
 
 - Angelopoulos, A. N. & Bates, S. (2023). *Conformal Prediction: A
@@ -184,3 +259,12 @@ closer manual review before acting on a prediction.
 - Romano, Y., Sesia, M., & Candès, E. J. (2020). *Classification with
   Valid and Adaptive Prediction Sets.*
   https://arxiv.org/abs/2004.09150
+- Gibbs, I. & Candès, E. J. (2021). *Adaptive Conformal Inference Under
+  Distribution Shift.* NeurIPS 2021. https://arxiv.org/abs/2106.00170
+- Angelopoulos, A. N., Candès, E. J., & Tibshirani, R. J. (2023).
+  *Conformal PID Control for Time Series Prediction.*
+  https://arxiv.org/abs/2307.16895
+- Bifet, A. & Gavaldà, R. (2007). *Learning from Time-Changing Data with
+  Adaptive Windowing.* SDM 2007 (ADWIN).
+- Page, E. S. (1954). *Continuous Inspection Schemes.* Biometrika
+  (Page-Hinkley test).

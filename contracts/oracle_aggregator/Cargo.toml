@@ -5,28 +5,50 @@ edition = "2021"
 
 [dependencies]
 soroban-sdk = { workspace = true }
-# Pinned explicitly (not just via [dev-dependencies] below) so the fuzz
-# sub-crate (contracts/oracle_aggregator/fuzz), which depends on this crate
-# via `path = ".."` and therefore shares this dependency graph, resolves
-# the same 2.x-compatible ed25519-dalek/rand_core line that
-# soroban-env-host's own testutils code (SigningKey::generate) requires,
-# instead of drifting to ed25519-dalek 3.x (whose rand_core major version
-# bump breaks that call). See docs in fuzz/Cargo.toml.
-ed25519-dalek = "2.2"
-rand = "0.8"
-rand_core = "0.6"
 
 [dev-dependencies]
 # `testutils` gates soroban_sdk::testutils (Env mocking, Address::generate,
 # Ledger::set_timestamp). Without it the test module cannot compile.
 # `alloc` provides Bytes::to_alloc_vec, used to compare digests in tests.
 soroban-sdk = { version = "21.0", features = ["testutils", "alloc"] }
-# Used to produce real ED25519 signatures so tests exercise the contract's
-# on-chain ed25519_verify path rather than a stub.
-ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+# soroban-env-host 21.2.1 (pinned by soroban-sdk itself, every 21.x release)
+# depends on `ed25519-dalek = ">=2.0.0"` with no upper bound. Its own
+# testutils code (SigningKey::generate, reached via
+# env.register_contract/mock_all_auths under the testutils feature) only
+# compiles against the 2.x API; the newer ed25519-dalek 3.0 breaks it
+# (E0277: ChaCha20Rng does not implement the 3.x-era CryptoRng trait).
+# An exact version pin here (`=2.2.0`, vs. a caret range) is NOT sufficient
+# on its own to prevent Cargo's resolver from independently picking 3.0.0
+# for soroban-env-host's own unrelated edge -- verified: `cargo test` still
+# failed with only this pin in place. What actually fixes it is the
+# *committed* Cargo.lock at the repo root (after running
+# `cargo update -p ed25519-dalek@3.0.0 --precise 2.2.0`), which collapses
+# every edge in the graph onto the single 2.2.0 resolution. This pin is
+# kept as defense-in-depth (keeps this crate's own edge from drifting) but
+# is not the mechanism actually doing the work -- do not remove the
+# committed lockfile assuming this line alone covers it.
+#
+# IMPORTANT: these three MUST stay in [dev-dependencies], not
+# [dependencies] -- the actual contract logic never uses them, and putting
+# them in [dependencies] pulls `getrandom` into the real wasm32 release
+# build, which fails outright ("the wasm*-unknown-unknown targets are not
+# supported by default") since a Soroban contract has no JS/browser
+# environment to source entropy from. (This was a real regression in an
+# earlier revision of this fix -- verified via
+# `cargo build --target wasm32-unknown-unknown --release`.)
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
 rand = "0.8"
+rand_core = "0.6"
 # Mirrors the Python side's hashlib.sha256 for the cross-language parity vector.
 sha2 = "0.10"
+
+# Passthrough feature so the fuzz sub-crate (contracts/oracle_aggregator/fuzz),
+# which depends on soroban-sdk's `testutils` directly rather than via our own
+# [dev-dependencies], can also request it -- see the `extern crate std` cfg
+# at the top of src/lib.rs for why this is needed. Mirrors the identical
+# feature in contracts/zk_verifier/Cargo.toml.
+[features]
+testutils = ["soroban-sdk/testutils"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

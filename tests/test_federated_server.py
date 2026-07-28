@@ -18,12 +18,21 @@ from detection.federated.audit import get_audit_records, verify_record
 from detection.federated.server import FederatedAggregationServer
 
 
-def _make_participant(server: FederatedAggregationServer) -> tuple[str, Ed25519PrivateKey]:
-    """Register a new participant and return (participant_id, private_key)."""
+def _make_participant(
+    server: FederatedAggregationServer, max_n_samples: int = 10_000_000
+) -> tuple[str, Ed25519PrivateKey]:
+    """Admit and register a new participant, return (participant_id, private_key).
+
+    `max_n_samples` defaults generously high so it never interferes with the
+    small n_samples values these tests submit -- see
+    tests/test_federated_sybil.py for tests that specifically exercise the
+    admission ceiling.
+    """
     import uuid
     pid = str(uuid.uuid4())
     sk = Ed25519PrivateKey.generate()
     pub_der = sk.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    server.admit_participant(pid, max_n_samples)
     server.register_participant(pid, pub_der)
     return pid, sk
 
@@ -105,6 +114,12 @@ def test_fedavg_double_sample_weight(tmp_path):
         dp_delta=0.0,
         dp_max_epsilon=1000.0,
         db_path=db,
+        # This test isolates the raw FedAvg weighting formula (same as it
+        # already isolates it from norm-clip/cosine/DP-noise above) --
+        # the weight-share cap is a separate, deliberately-tested defense
+        # (see tests/test_federated_sybil.py), not part of what this test
+        # covers, so it's disabled here.
+        max_participant_weight_fraction=1.0,
     )
 
     n = 40

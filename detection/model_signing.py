@@ -9,13 +9,14 @@ under model_dir. No call site outside this module may call joblib.load directly
 on a model_dir path.
 """
 
+from __future__ import annotations
+
 import base64
 import hashlib
 import hmac
 import logging
 import os
 from pathlib import Path
-from typing import Optional
 
 import joblib
 
@@ -36,7 +37,7 @@ class ModelSigner:
 
     SIG_SUFFIX = ".sig"
 
-    def __init__(self, public_key_b64: str, private_key_b64: Optional[str] = None):
+    def __init__(self, public_key_b64: str, private_key_b64: str | None = None):
         """
         public_key_b64: base64-encoded 32-byte ED25519 public key (from settings.py).
         private_key_b64: base64-encoded 32-byte private key (from env); required for signing.
@@ -48,7 +49,7 @@ class ModelSigner:
 
         pub_bytes = base64.b64decode(public_key_b64)
         self._public_key = Ed25519PublicKey.from_public_bytes(pub_bytes)
-        self._private_key: Optional[Ed25519PrivateKey] = None
+        self._private_key: Ed25519PrivateKey | None = None
         if private_key_b64:
             priv_bytes = base64.b64decode(private_key_b64)
             self._private_key = Ed25519PrivateKey.from_private_bytes(priv_bytes)

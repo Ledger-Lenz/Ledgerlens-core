@@ -15,6 +15,7 @@ Archival (dual-tier storage):
 
 import hashlib
 import logging
+import math
 import os
 import sqlite3
 from collections import deque
@@ -29,7 +30,7 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from ingestion.data_models import Trade
-from utils.circuit_breaker import CircuitBreaker, CircuitState
+from utils.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,6 @@ def _get_first_significant_digit(amount: float) -> int:
     if amount == 0:
         return 0
     # Use logarithm approach for accuracy with small decimals
-    import math
     log_amount = math.log10(abs(amount))
     exponent = math.floor(log_amount)
     mantissa = abs(amount) / (10 ** exponent)
@@ -543,7 +543,7 @@ class FeatureStoreArchiver:
         any existing partition), then deletes them from SQLite only on success.
         Returns the number of rows archived.
         """
-        cutoff = datetime.utcnow() - timedelta(days=cutoff_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=cutoff_days)
         with sqlite3.connect(self.db_path) as conn:
             df = pd.read_sql(
                 "SELECT wallet, asset_pair, feature_name, feature_value, recorded_at "

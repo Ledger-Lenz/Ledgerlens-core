@@ -150,8 +150,12 @@ def list_model_versions(
         model_dir: Directory containing versioned models.
 
     Returns:
-        List of version strings, newest first. Empty list if no versions found.
+        List of version strings, newest first. Empty list if no versions found
+        or if the model directory does not exist.
     """
+    if not os.path.isdir(model_dir):
+        return []
+
     pattern = f"{name}_v"
     versions = []
 
@@ -310,11 +314,15 @@ def save_shap_importances(
     metadata_path = os.path.join(model_dir, "training_metadata.json")
     metadata: dict = {}
     if os.path.exists(metadata_path):
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read existing metadata at %s: %s", metadata_path, exc)
 
     metadata["shap_importances"] = shap_data
 
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
@@ -327,8 +335,12 @@ def load_shap_importances(model_dir: str, version: str | None = None) -> dict | 
     if not os.path.exists(metadata_path):
         return None
 
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
+    try:
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not read SHAP importances from %s: %s", metadata_path, exc)
+        return None
 
     if version and metadata.get("version") != version:
         return None

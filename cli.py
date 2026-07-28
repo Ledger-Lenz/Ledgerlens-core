@@ -992,7 +992,7 @@ def serve(
 def stream(
     batch_size: int = typer.Option(500, "--batch-size", help="Number of trades to accumulate before scoring"),
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
-    checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
+    checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist cursor + window state together every N trades (default from settings)"),
     score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
     queue_depth: int = typer.Option(
         None,
@@ -1017,8 +1017,11 @@ def stream(
 
     Maintains per-wallet rolling windows (1h/4h/24h), recomputes features on
     each trade, and emits a RiskScore when the score changes by >= score_delta
-    points. Window state is checkpointed to SQLite every checkpoint_interval
-    trades. Graceful shutdown (SIGTERM/SIGINT) persists all in-memory state.
+    points. The Horizon cursor and window state are checkpointed together in
+    one atomic SQLite transaction every checkpoint_interval trades or
+    cursor_flush_seconds elapsed, whichever comes first — see
+    docs/ingestion.md for why the two must never desync. Graceful shutdown
+    (SIGTERM/SIGINT) persists all in-memory state.
     """
     import signal
     import threading
@@ -1032,6 +1035,7 @@ def stream(
     from detection.webhook_registry import get_matching_subscribers
     from ingestion.checkpoint import CursorCheckpoint, FlushPolicy, resolve_checkpoint_path
     from ingestion.horizon_streamer import stream_trades_with_cursor
+    from ingestion.stream_checkpoint import StreamCheckpointCoordinator
     import api.main as api_main
 
     _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
@@ -1047,27 +1051,51 @@ def stream(
             "must be block, drop_newest, or drop_oldest",
             param_hint="--overflow-strategy",
         )
+    # `cursor_checkpoint` (the legacy JSON file) is kept for two purposes only:
+    # seeding the initial cursor when upgrading a deployment that predates the
+    # unified checkpoint (see StreamCheckpointCoordinator.load_cursor), and the
+    # existing "delete stale checkpoint on HTTP 404/410" fallback inside
+    # stream_trades_with_cursor. It is no longer written by this command —
+    # the SQLite-backed unified checkpoint below is authoritative for cursor
+    # durability. See docs/ingestion.md for the full migration path.
     cursor_checkpoint = CursorCheckpoint(
         resolve_checkpoint_path(cfg.cursor_checkpoint_path, cfg.data_dir)
-    )
-    if reset_cursor:
-        cursor_checkpoint.delete()
-        logger.info("Reset Horizon cursor checkpoint")
-    stored_cursor = cursor_checkpoint.load()
-    cursor = stored_cursor or cfg.horizon_default_cursor
-    if stored_cursor:
-        logger.info("Resuming from cursor %s", cursor)
-    else:
-        logger.info("Starting fresh from cursor %s", cursor)
-    cursor_flush_policy = FlushPolicy(
-        max_events=cfg.cursor_flush_events,
-        max_seconds=cfg.cursor_flush_seconds,
     )
 
     init_db()
     checkpoint_store = RollingWindowStore()
     window_state = RollingWindowState()
+
+    # Persists the Horizon cursor and the rolling-window state in a single
+    # atomic SQLite transaction, so the cursor can never be durably ahead of
+    # the window state it depends on — see ingestion/stream_checkpoint.py.
+    # The event-count bound reuses `checkpoint_interval` (previously the
+    # window-state-only batch size, preserving amortized-cost checkpointing
+    # under high load); the time bound reuses `cursor_flush_seconds`
+    # (previously the cursor-only durability latency bound), which now also
+    # bounds the combined checkpoint under sustained low/moderate throughput.
+    stream_checkpoint = StreamCheckpointCoordinator(
+        rolling_store=checkpoint_store,
+        flush_policy=FlushPolicy(
+            max_events=_chk_interval, max_seconds=cfg.cursor_flush_seconds
+        ),
+        legacy_cursor_checkpoint=cursor_checkpoint,
+    )
+
+    if reset_cursor:
+        cursor_checkpoint.delete()
+        stream_checkpoint.reset()
+        logger.info("Reset Horizon cursor checkpoint (legacy file and unified checkpoint)")
+
     checkpoint_store.load_all(window_state)
+    stored_cursor = stream_checkpoint.load_cursor(
+        actual_wallet_count=window_state.active_wallets
+    )
+    cursor = stored_cursor or cfg.horizon_default_cursor
+    if stored_cursor:
+        logger.info("Resuming from cursor %s", cursor)
+    else:
+        logger.info("Starting fresh from cursor %s", cursor)
 
     try:
         models = load_models(cfg.model_dir)
@@ -1084,19 +1112,19 @@ def stream(
     )
 
     stop_event = threading.Event()
+    last_cursor = cursor
 
+    # Defined and read by `_shutdown` via closure. State it depends on
+    # (`last_cursor`, `scorer`, `stream_checkpoint`) must be initialized
+    # before the signal handlers are registered below, so a signal arriving
+    # before the main loop starts can't observe an undefined value.
     def _shutdown(signum, frame):
-        logger.info("Shutdown signal received — checkpointing all window states…")
-        checkpoint_store.save_all(scorer.window_state)
+        logger.info("Shutdown signal received — checkpointing cursor and window state…")
+        stream_checkpoint.flush(last_cursor, scorer.window_state)
         stop_event.set()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-
-    trades_since_checkpoint = 0
-    cursor_events_since_flush = 0
-    last_cursor_flush = time.monotonic()
-    last_cursor = cursor
 
     logger.info(
         "Starting incremental stream (checkpoint_interval=%d, score_delta=%d, "
@@ -1129,25 +1157,15 @@ def stream(
                 logger.warning("Webhook dispatch error: %s", exc)
 
         last_cursor = event_cursor
-        cursor_events_since_flush += 1
-        now = time.monotonic()
-        if cursor_flush_policy.should_flush(
-            cursor_events_since_flush, last_cursor_flush, now
-        ):
-            cursor_checkpoint.save(last_cursor)
-            cursor_events_since_flush = 0
-            last_cursor_flush = now
-
-        trades_since_checkpoint += 1
-        if trades_since_checkpoint >= _chk_interval:
-            checkpoint_store.save_all(scorer.window_state)
-            trades_since_checkpoint = 0
-            logger.debug("Checkpointed %d wallet windows", scorer.window_state.active_wallets)
+        if stream_checkpoint.on_trade_processed(event_cursor, scorer.window_state):
+            logger.debug(
+                "Checkpointed cursor %s and %d wallet windows",
+                event_cursor,
+                scorer.window_state.active_wallets,
+            )
 
     # Final checkpoint on clean exit
-    checkpoint_store.save_all(scorer.window_state)
-    if cursor_events_since_flush:
-        cursor_checkpoint.save(last_cursor)
+    stream_checkpoint.flush(last_cursor, scorer.window_state)
     logger.info("Stream stopped. Final checkpoint written.")
 
 
@@ -1683,6 +1701,32 @@ def federated_server(
     uvicorn.run(fl_app, host=bind_host, port=bind_port)
 
 
+@federated_app.command("admit")
+def federated_admit(
+    participant_id: str = typer.Argument(..., help="Identifier the operator will register with"),
+    max_n_samples: int = typer.Option(..., "--max-n-samples", help="Ceiling on this participant's claimed dataset size, enforced server-side on every round"),
+    admitted_by: str = typer.Option("operator", "--admitted-by", help="Free-text note recording who approved this admission (for audit)"),
+    db_path: str = typer.Option(None, "--db-path", help="Federated server's SQLite path (defaults to LEDGERLENS_DB_PATH)"),
+) -> None:
+    """Authorize a participant_id to register with the federated server.
+
+    Must be run (by an operator, out-of-band, e.g. after verifying the
+    institution's identity and roughly how much data it holds) before that
+    identity can call `federated join` or POST /federated/register --
+    registration is closed by default (FEDERATED_ADMISSION_REQUIRED=true).
+    `--max-n-samples` bounds the aggregation weight this identity can ever
+    claim, regardless of what it reports in a signed update; see
+    docs/federated_learning.md's "Participant Admission & Weight Bounding".
+    """
+    from detection.federated.admission import admit_participant
+
+    record = admit_participant(participant_id, max_n_samples, admitted_by, db_path=db_path)
+    typer.echo(
+        f"Admitted {record.participant_id!r}: max_n_samples={record.max_n_samples}, "
+        f"admitted_by={record.admitted_by!r}, admitted_at={record.admitted_at}"
+    )
+
+
 @federated_app.command("join")
 def federated_join(
     rounds: int = typer.Option(1, "--rounds", "-r", help="Number of federated rounds to participate in"),
@@ -1734,6 +1778,14 @@ def federated_join(
             "participant_id": operator_id,
             "public_key_der_b64": pub_der_b64,
         })
+        if resp.status_code == 403:
+            typer.echo(
+                f"Registration rejected: {resp.json().get('detail', resp.text)}\n"
+                f"An operator must run `cli.py federated admit {operator_id} "
+                f"--max-n-samples <N>` (or POST /federated/admit) first.",
+                err=True,
+            )
+            raise typer.Exit(1)
         resp.raise_for_status()
         logger.info("Registered with federated server as %s", operator_id)
 
@@ -1784,6 +1836,70 @@ def federated_join(
                 logger.info("Round %d: distillation update applied", round_num + 1)
 
     logger.info("Federated participation complete (%d round(s))", rounds)
+
+
+@app.command("fuzz-check")
+def fuzz_check(
+    duration: int = typer.Option(30, help="Seconds to run each harness (default: 30)"),
+    corpus_dir: str = typer.Option("fuzz/corpus", help="Root directory for per-harness corpus sub-dirs"),
+    harness_dir: str = typer.Option("fuzz", help="Directory containing fuzz_*.py harnesses"),
+) -> None:
+    """Run each Atheris fuzz harness for a bounded duration and exit non-zero on any crash.
+
+    Requires ``atheris`` to be installed (``pip install atheris``).  Suitable for
+    pre-merge smoke testing without the full nightly budget.
+
+    Example::
+
+        python cli.py fuzz-check --duration 30
+    """
+    import glob
+    import subprocess
+
+    harness_pattern = Path(harness_dir) / "fuzz_*.py"
+    harnesses = sorted(glob.glob(str(harness_pattern)))
+    if not harnesses:
+        typer.echo(f"No harnesses found matching {harness_pattern}", err=True)
+        raise typer.Exit(1)
+
+    corpus_root = Path(corpus_dir)
+    corpus_root.mkdir(parents=True, exist_ok=True)
+
+    any_crash = False
+    for harness in harnesses:
+        name = Path(harness).stem
+        harness_corpus = corpus_root / name
+        harness_corpus.mkdir(parents=True, exist_ok=True)
+        typer.echo(f"  Fuzzing {name} for {duration}s ...")
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    harness,
+                    str(harness_corpus),
+                    f"-max_total_time={duration}",
+                    "-print_final_stats=1",
+                ],
+                timeout=duration + 15,
+            )
+        except subprocess.TimeoutExpired:
+            typer.echo(f"  WARNING: {name} timed out after {duration + 15}s", err=True)
+
+        crash_files = list(harness_corpus.glob("crash-*")) + list(harness_corpus.glob("timeout-*"))
+        if crash_files:
+            typer.echo(f"  CRASH detected in {name}: {[f.name for f in crash_files]}", err=True)
+            any_crash = True
+
+    if any_crash:
+        typer.echo(
+            "fuzz-check: crash(es) detected. Download fuzz-crashes artifact and reproduce with:\n"
+            "  python fuzz/fuzz_<harness>.py fuzz/corpus/crash-<hash>\n"
+            "See fuzz/README.md for minimisation instructions.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    typer.echo(f"fuzz-check: all {len(harnesses)} harnesses completed without crashes.")
 
 
 @app.command("red-team")
@@ -2102,6 +2218,39 @@ def grpc_serve(
     from api.grpc_scoring_service import serve
 
     serve(port=port)
+
+
+@app.command("rotate-sweep")
+def rotate_sweep() -> None:
+    """Revoke keys whose rotation grace period has elapsed."""
+    from detection.api_key_store import sweep_expired_api_keys
+    revoked_count = sweep_expired_api_keys()
+    typer.echo(f"Secret rotation sweep completed. Revoked {revoked_count} expired rotating keys.")
+
+
+@app.command("re-encrypt-webhook-secrets")
+def re_encrypt_webhook_secrets() -> None:
+    """Decrypt webhook secrets using either current or previous keys, and re-encrypt under the current key."""
+    from detection.webhook_registry import _decrypt_secret, _encrypt_secret, _connect, init_db
+    
+    init_db()
+    reencrypted_count = 0
+    with _connect() as conn:
+        rows = conn.execute("SELECT id, secret_encrypted FROM webhook_subscribers").fetchall()
+        for row_id, encrypted_secret in rows:
+            try:
+                # Decrypts trying current first, then previous
+                plaintext = _decrypt_secret(encrypted_secret)
+                # Encrypts strictly under current key
+                new_encrypted = _encrypt_secret(plaintext)
+                if new_encrypted != encrypted_secret:
+                    conn.execute("UPDATE webhook_subscribers SET secret_encrypted = ? WHERE id = ?", (new_encrypted, row_id))
+                    reencrypted_count += 1
+            except Exception as e:
+                typer.echo(f"Failed to re-encrypt subscriber row ID {row_id}: {e}")
+                
+        conn.commit()
+    typer.echo(f"Re-encryption complete. Successfully re-encrypted {reencrypted_count} webhook secrets under the current encryption key.")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 """Chaos scenario #4: Partial network partition — circuit breaker validation.
 
-Simulates a partial network partition by injecting a connection timeout toxic
-on the Horizon proxy and verifies that the SorobanPublisher circuit breaker
-opens within 5 consecutive failures and resets automatically after the
-configured window.
+Simulates a partial network partition by injecting a connection-timeout
+toxic on the Horizon proxy and verifies that the SorobanPublisher circuit
+breaker opens within the configured ``threshold`` consecutive failures and
+resets automatically after ``circuit_reset_seconds``.
 
-Run with:
+Run with::
+
     docker compose --profile chaos up -d
     pytest tests/chaos/test_circuit_breaker.py -m chaos -v
 """
@@ -13,6 +14,7 @@ Run with:
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -22,26 +24,34 @@ PROXY_NAME = "horizon_partition"
 HORIZON_LISTEN = "0.0.0.0:18001"
 HORIZON_UPSTREAM = "horizon.stellar.org:443"
 
+# Circuit-breaker tuning used across tests
 CB_THRESHOLD = 5
-CB_WINDOW = 60
-CB_RESET_SECONDS = 2  # short for tests
+CB_RESET_SECONDS = 2  # intentionally short so reset tests are fast
+
+# Port derived once to avoid repeated string-splits in tests
+_HORIZON_PORT = int(HORIZON_LISTEN.split(":")[1])
 
 
-def _make_publisher(threshold: int = CB_THRESHOLD, reset_seconds: int = CB_RESET_SECONDS):
-    """Return a SorobanPublisher with an isolated circuit breaker for testing."""
-    from unittest.mock import patch
+def _make_publisher(
+    threshold: int = CB_THRESHOLD,
+    reset_seconds: int = CB_RESET_SECONDS,
+):
+    """Return a ``SorobanPublisher`` with an isolated circuit breaker.
+
+    ``Keypair.from_secret`` is patched so no real Stellar secret is needed.
+    The patch is applied only during object construction; the returned
+    publisher instance remains valid after the ``with`` block exits.
+    """
     from detection.soroban_publisher import SorobanPublisher
 
-    # Patch Keypair so we don't need a real Stellar secret
     with patch("detection.soroban_publisher.Keypair") as mock_kp:
         mock_kp.from_secret.return_value = mock_kp
         pub = SorobanPublisher(
             contract_id="CTEST",
             secret_key="SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            soroban_rpc_url="http://localhost:18001",
+            soroban_rpc_url=f"http://localhost:{_HORIZON_PORT}",
             network_passphrase="Test SDF Network ; September 2015",
             circuit_breaker_threshold=threshold,
-            circuit_breaker_window=CB_WINDOW,
             circuit_reset_seconds=reset_seconds,
         )
     return pub
@@ -49,35 +59,45 @@ def _make_publisher(threshold: int = CB_THRESHOLD, reset_seconds: int = CB_RESET
 
 @pytest.fixture(scope="module")
 def partition_proxy(toxiproxy):
+    """Create the Horizon partition proxy for this module and clean up after."""
     toxiproxy.create_proxy(PROXY_NAME, HORIZON_LISTEN, HORIZON_UPSTREAM)
     yield PROXY_NAME
     toxiproxy.reset_proxy(PROXY_NAME)
     toxiproxy.delete_proxy(PROXY_NAME)
 
 
-def test_circuit_breaker_opens_within_5_failures():
-    """Circuit breaker transitions to OPEN after exactly `threshold` failures."""
+# ---------------------------------------------------------------------------
+# Unit-level circuit-breaker tests (no Toxiproxy required)
+# ---------------------------------------------------------------------------
+
+def test_circuit_breaker_opens_within_threshold_failures():
+    """Circuit transitions to OPEN after exactly ``threshold`` consecutive failures.
+
+    The circuit must remain CLOSED for the first ``threshold - 1`` failures
+    and open on the ``threshold``-th failure.
+    """
     from detection.soroban_publisher import SorobanCircuitOpenError
 
     pub = _make_publisher(threshold=CB_THRESHOLD)
 
-    # Record threshold - 1 failures: circuit must stay closed
+    # threshold - 1 failures: circuit must stay closed
     for i in range(CB_THRESHOLD - 1):
         pub._record_failure()
-        # Should not raise yet
         try:
             pub._check_circuit()
         except SorobanCircuitOpenError:
-            pytest.fail(f"Circuit opened too early at failure {i + 1}/{CB_THRESHOLD}")
+            pytest.fail(
+                f"Circuit opened too early at failure {i + 1}/{CB_THRESHOLD}"
+            )
 
-    # One more failure opens it
+    # Final failure trips the breaker
     pub._record_failure()
     with pytest.raises(SorobanCircuitOpenError):
         pub._check_circuit()
 
 
 def test_circuit_breaker_rejects_calls_when_open():
-    """When OPEN, _check_circuit raises SorobanCircuitOpenError."""
+    """When OPEN, ``_check_circuit`` raises ``SorobanCircuitOpenError``."""
     from detection.soroban_publisher import SorobanCircuitOpenError
 
     pub = _make_publisher(threshold=2)
@@ -89,7 +109,7 @@ def test_circuit_breaker_rejects_calls_when_open():
 
 
 def test_circuit_breaker_resets_after_window():
-    """Circuit breaker auto-resets after circuit_reset_seconds elapses."""
+    """Circuit auto-resets to CLOSED/half-open after ``reset_seconds`` elapses."""
     from detection.soroban_publisher import SorobanCircuitOpenError
 
     pub = _make_publisher(threshold=2, reset_seconds=1)
@@ -99,36 +119,57 @@ def test_circuit_breaker_resets_after_window():
     with pytest.raises(SorobanCircuitOpenError):
         pub._check_circuit()
 
-    # Wait past reset window
+    # Wait past the reset window
     time.sleep(1.2)
 
-    # Should no longer raise after reset
+    # Circuit must no longer block calls (transitions to half-open)
     try:
         pub._check_circuit()
     except SorobanCircuitOpenError:
         pytest.fail("Circuit breaker did not reset after reset_seconds")
 
 
-def test_circuit_breaker_failure_timestamps_expire_with_window():
-    """Failures older than circuit_breaker_window do not count toward threshold."""
+def test_circuit_breaker_consecutive_count_drives_open():
+    """Circuit state is driven by ``_consecutive_failures``, not legacy timestamps.
+
+    The ``_failure_timestamps`` list is kept for backward compatibility but
+    the circuit-open decision uses ``_consecutive_failures`` against the
+    threshold.  This test confirms the authoritative counter is respected.
+    """
     from detection.soroban_publisher import SorobanCircuitOpenError
 
     pub = _make_publisher(threshold=CB_THRESHOLD, reset_seconds=CB_RESET_SECONDS)
 
-    # Manually inject old timestamps (outside the 60s window)
-    old_time = time.time() - CB_WINDOW - 1
+    # Manually set consecutive_failures below threshold — circuit stays closed
     with pub._lock:
-        pub._failure_timestamps = [old_time] * (CB_THRESHOLD + 1)
+        pub._consecutive_failures = CB_THRESHOLD - 1
+        pub._circuit_state = "closed"
 
-    # Old failures should be pruned — circuit should be CLOSED
     try:
         pub._check_circuit()
     except SorobanCircuitOpenError:
-        pytest.fail("Expired failures should not keep the circuit open")
+        pytest.fail(
+            "_consecutive_failures below threshold should not open the circuit"
+        )
+
+    # Tip it to the threshold — circuit opens
+    with pub._lock:
+        pub._consecutive_failures = CB_THRESHOLD
+        pub._circuit_state = "open"
+        pub._circuit_opened_at = time.monotonic()
+
+    with pytest.raises(SorobanCircuitOpenError):
+        pub._check_circuit()
 
 
-def test_partial_partition_opens_circuit_within_5_failures(toxiproxy, partition_proxy):
-    """Under simulated partition (5000ms latency), circuit opens within 5 call attempts."""
+# ---------------------------------------------------------------------------
+# Integration tests (require Toxiproxy + partition_proxy fixture)
+# ---------------------------------------------------------------------------
+
+def test_partial_partition_opens_circuit_within_threshold_failures(
+    toxiproxy, partition_proxy
+):
+    """Under simulated partition (5 s latency), circuit opens within ``CB_THRESHOLD`` attempts."""
     import requests
     from detection.soroban_publisher import SorobanCircuitOpenError
 
@@ -140,7 +181,7 @@ def test_partial_partition_opens_circuit_within_5_failures(toxiproxy, partition_
         for _ in range(CB_THRESHOLD + 2):
             try:
                 requests.get(
-                    f"http://localhost:{HORIZON_LISTEN.split(':')[1]}/",
+                    f"http://localhost:{_HORIZON_PORT}/",
                     timeout=0.2,
                 )
             except Exception:
@@ -156,14 +197,15 @@ def test_partial_partition_opens_circuit_within_5_failures(toxiproxy, partition_
             pub._check_circuit()
 
         assert failures <= CB_THRESHOLD, (
-            f"Circuit took {failures} failures to open (threshold={CB_THRESHOLD})"
+            f"Circuit took {failures} failures to open "
+            f"(threshold={CB_THRESHOLD})"
         )
     finally:
         toxiproxy.remove_toxic(partition_proxy, "partition")
 
 
 def test_partition_recovery_circuit_closes(toxiproxy, partition_proxy):
-    """After partition removal, circuit breaker self-resets within 60 s."""
+    """After partition removal, circuit self-resets within 60 s."""
     from detection.soroban_publisher import SorobanCircuitOpenError
 
     pub = _make_publisher(threshold=2, reset_seconds=2)
@@ -174,7 +216,7 @@ def test_partition_recovery_circuit_closes(toxiproxy, partition_proxy):
     with pytest.raises(SorobanCircuitOpenError):
         pub._check_circuit()
 
-    def _is_closed():
+    def _is_closed() -> bool:
         try:
             pub._check_circuit()
             return True

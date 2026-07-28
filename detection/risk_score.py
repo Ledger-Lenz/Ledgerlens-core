@@ -10,6 +10,8 @@ Starting from v2, the schema includes optional uncertainty fields
 populated by ``ConformalCalibrator`` during inference.
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
@@ -68,32 +70,16 @@ class RiskScore(BaseModel):
         pdc_discount_weight: float = 0.0,
         benford_copula_pval: float = 1.0,
         benford_copula_weight: float = 0.0,
-    ) -> "RiskScore":
-        """Combine Benford metrics and an ML probability into a single score.
+    ) -> RiskScore:
+        """Combine Benford metrics and an ML probability into a 0-100 score.
 
-        `score` is a 0-100 blend weighted toward the ML probability, with
-        the Benford signal acting as a corroborating flag.
+        The blend is weighted 70/30 toward the ML probability, with Benford
+        acting as a corroborating flag. Optional sandwich, PDC, and copula
+        signals each contribute a configurable weight fraction when enabled.
 
         Optional uncertainty fields (``score_lower``, ``score_upper``,
         ``prediction_set``, ``coverage_guarantee``) are passed through to
         the returned ``RiskScore`` when provided.
-
-        `sandwich_signal` (0-1) is an optional price-manipulation signal from
-        `detection.sandwich_engine` (e.g. a normalised sandwich frequency or
-        profit). It contributes a `sandwich_weight` fraction of the composite
-        score; the Benford/ML blend supplies the remaining `1 - sandwich_weight`.
-        With the default `sandwich_weight = 0.0` the score is identical to the
-        legacy Benford/ML blend.
-
-        `pdc_score` is the wallet's price-discovery contribution from
-        `detection.causal_engine.estimate_pdc`. A positive PDC discounts the
-        correlational score: `causal_adjustment = max(0.0, pdc_score) * pdc_discount_weight`.
-        With the default `pdc_discount_weight = 0.0` the score is unchanged.
-
-        `benford_copula_pval` is the cross-pair multivariate Benford dependence
-        p-value. A small p-value adds a `benford_copula_weight` fraction of
-        `1 - pval` to the composite score. With the default
-        `benford_copula_weight = 0.0` the score is unchanged.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5

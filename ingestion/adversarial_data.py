@@ -22,12 +22,15 @@ evasion strategy targets a specific detection signal:
 import random
 import string
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
-from ingestion.data_models import Trade
+from ingestion.data_models import Asset, Trade
 from ingestion.synthetic_data import (
+    NATIVE,
+    USDC,
     _make_trade,
     _random_account,
     generate_synthetic_dataset,
@@ -176,11 +179,6 @@ def generate_adversarial_dataset(
 # ============================================================
 # Specialist adversarial generators (new evasion strategies)
 # ============================================================
-
-from typing import Literal  # noqa: E402
-
-from ingestion.data_models import Asset  # noqa: E402
-from ingestion.synthetic_data import NATIVE, USDC  # noqa: E402
 
 BENFORD_PROBS = np.array([np.log10(1 + 1 / d) for d in range(1, 10)])
 BENFORD_PROBS /= BENFORD_PROBS.sum()

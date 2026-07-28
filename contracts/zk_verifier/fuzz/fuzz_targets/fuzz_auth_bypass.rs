@@ -38,39 +38,34 @@ fuzz_target!(|input: FuzzInput| {
     let pedersen_x = BytesN::from_array(&env, &[1u8; 32]);
     let pedersen_y = BytesN::from_array(&env, &[2u8; 32]);
     
-    // Attempt to submit without authorization
-    // This should fail (panic or return error), never succeed
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.submit_score(
-            &admin,
-            &wallet,
-            &input.score,
-            &commitment_hash,
-            &pedersen_x,
-            &pedersen_y,
-        );
-    }));
-    
-    // If it succeeded without panicking, that's an authorization bypass bug
-    if result.is_ok() {
-        // Verify that the score was NOT actually stored (defense in depth)
+    // Attempt to submit without authorization. cargo-fuzz always builds with
+    // panic=abort (required for libFuzzer), so std::panic::catch_unwind can
+    // never actually catch a panic here -- any panic from require_auth()
+    // failing would abort the whole process and libFuzzer would misreport
+    // the *correct* rejection as a crash. Use the non-panicking `try_`
+    // client variant (every #[contractimpl] method gets one, returning
+    // Result instead of panicking) so a failed auth check surfaces as a
+    // plain Err instead of an abort.
+    let result = client.try_submit_score(
+        &admin,
+        &wallet,
+        &input.score,
+        &commitment_hash,
+        &pedersen_x,
+        &pedersen_y,
+    );
+
+    // Expected: Err, because require_auth() rejects the call (no
+    // mock_all_auths() and no real signature was provided). Ok would mean
+    // submit_score stored a score with no authorization at all -- an
+    // authorization bypass.
+    if let Ok(inner) = result {
         let stored_score = client.get_score(&wallet);
         assert_eq!(
             stored_score, 0,
-            "Authorization bypass detected: submit_score succeeded without auth and stored score={}",
-            stored_score
+            "Authorization bypass detected: submit_score succeeded without auth (inner={:?}, stored score={})",
+            inner, stored_score
         );
-        
-        // Even if not stored, succeeding without auth is still a bug
-        // In a real scenario with mock_all_auths, this would be caught
-        // Here we're testing the contract's auth checks are present
-        // The contract should call admin.require_auth() which would fail
-        // without proper authorization context
-        
-        // Since we're in a test environment, the behavior may differ
-        // The key is that require_auth() is present in the code
+        panic!("Authorization bypass detected: submit_score returned Ok without any auth");
     }
-    
-    // Expected: result is Err (panic from require_auth failing)
-    // This test mainly documents the expected auth behavior
 });

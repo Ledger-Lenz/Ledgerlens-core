@@ -17,7 +17,7 @@ from api.auth import require_admin_key
 from api.webhook_sender import list_dlq, get_dlq_entry
 from api.webhook_sender import WebhookRetryQueue
 from detection.webhook_registry import get_subscriber
-from config.settings import settings, _runtime_cache
+from config.settings import settings, bump_config_version, invalidate_runtime_config_cache
 from detection.model_registry import get_current_version, list_model_versions
 from detection.storage import get_krum_aggregation_log
 
@@ -114,7 +114,16 @@ class RuntimeConfigPatch(BaseModel):
 
 @router.patch("/config", include_in_schema=False)
 def patch_config(body: RuntimeConfigPatch) -> dict:
-    """Persist config key/value updates to SQLite and invalidate the in-process cache."""
+    """Persist config key/value updates to SQLite and propagate to every process.
+
+    Shares the exact propagation mechanism used by governance proposal
+    execution (`detection.governance.SettingsReloader.apply`): this
+    process's own cache is invalidated immediately, and every other
+    process is signalled (via the shared Redis version counter, when
+    configured) to re-poll `runtime_config` right away rather than waiting
+    out its local TTL. See `config/settings.py`'s consistency-model
+    docstring for the full latency guarantee.
+    """
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(settings.db_path) as conn:
         conn.execute(
@@ -131,9 +140,9 @@ def patch_config(body: RuntimeConfigPatch) -> dict:
                 (key, value, now),
             )
 
-    # Invalidate the in-process cache so next load_runtime_config() re-reads from DB
-    _runtime_cache["ts"] = 0
-    _runtime_cache["config"] = {}
+    # Invalidate this process's own cache, then signal every other process.
+    invalidate_runtime_config_cache()
+    bump_config_version()
 
     return {"updated": list(body.updates.keys())}
 
@@ -446,3 +455,21 @@ def get_model_card_pdf(model_name: str, version: str):
         media_type="application/pdf",
         headers={"Content-Disposition": f"inline; filename={model_name}_{version}.pdf"}
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/graph-shards  (Issue #348)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/graph-shards", include_in_schema=False)
+def get_graph_shards() -> dict:
+    """Return shard topology and per-shard timing/ring counts.
+
+    Reads the latest shard assignment from the global ShardedTradeGraph
+    instance if one was created during the current process lifetime.
+    """
+    from detection.graph_engine import _SHARDED_GRAPH_INSTANCE
+    if _SHARDED_GRAPH_INSTANCE is None:
+        return {"shard_count": 0, "modularity": 0.0, "shards": [], "message": "No sharded graph active"}
+    return _SHARDED_GRAPH_INSTANCE.shard_topology

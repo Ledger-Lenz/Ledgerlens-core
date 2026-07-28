@@ -21,39 +21,29 @@ import re
 import sqlite3
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
-from concurrent.futures import TimeoutError as FutureTimeoutError
-from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from api.auth import require_admin_key, require_compliance_key
 from api.api_key_router import router as api_key_router, require_scope
 from api.admin_router import router as admin_router
 from api.analyst import router as analyst_router
-from api.api_key_router import require_scope, router as api_key_router
 from api.api_keys_router import router as api_keys_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
-from api.api_key_router import router as api_key_router
-from api.api_keys_router import router as api_keys_router, require_scope
 from api.namespace import list_namespaces
-from api.api_key_router import router as api_key_router, require_scope
-from api.api_keys_router import router as api_keys_router
 from api.gateway import GatewayMiddleware
-from config.settings import settings
+from config.settings import get_runtime_risk_score_threshold, settings
 from detection.tracing import (
     configure_tracing,
-    extract_context_from_headers,
-    get_tracer,
     start_span,
 )
 from detection.amm_engine import pool_risk_from_trade_rows
@@ -63,7 +53,6 @@ from detection.counterfactual_engine import generate_counterfactuals
 from detection.counterfactual_translator import translate_counterfactual
 from detection.storage import (
     get_alerts,
-    get_bridge_transfer_history,
     get_bridge_transfers,
     get_circular_routes,
     get_drift_reports,
@@ -73,11 +62,16 @@ from detection.storage import (
     get_pair_correlations,
     get_retrain_runs,
     get_rings,
-    get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
 from detection.feedback_store import AnalystFeedbackStore
-from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
+from detection.governance import (
+    GovernanceEngine,
+    GovernanceError,
+    create_proposal,
+    list_open_proposals,
+    cast_proposal_vote,
+)
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
@@ -86,57 +80,70 @@ logger = logging.getLogger("ledgerlens.api")
 _STELLAR_ADDRESS_PATTERN = re.compile(r"^G[A-Z2-7]{55}$")
 
 # ---------------------------------------------------------------------------
-# Simple in-process IP rate limiter for the causal-explanation endpoint.
-# Limit: 10 requests per minute per IP (token-bucket style).
+# Shared in-process sliding-window rate limiter helper
 # ---------------------------------------------------------------------------
-_CAUSAL_RATE_LIMIT = 10         # max requests per window
-_CAUSAL_RATE_WINDOW = 60.0      # window size in seconds
+
+_RATE_WINDOW = 60.0
+
+
+def _check_sliding_window_rate_limit(
+    buckets: dict[str, list[float]],
+    client_ip: str,
+    max_requests: int,
+    window: float = _RATE_WINDOW,
+    detail: str = "Rate limit exceeded",
+) -> None:
+    """Raise HTTP 429 if ``client_ip`` has exceeded the sliding-window rate limit.
+
+    Uses a sliding window: only timestamps within the last ``window`` seconds
+    are counted. Mutates ``buckets`` in-place to evict stale entries.
+    """
+    now = time.monotonic()
+    bucket = buckets[client_ip]
+    buckets[client_ip] = [t for t in bucket if now - t < window]
+    if len(buckets[client_ip]) >= max_requests:
+        raise HTTPException(
+            status_code=429,
+            detail=detail,
+        )
+    buckets[client_ip].append(now)
+
+
+# ---------------------------------------------------------------------------
+# Causal-explanation rate limiter (10 req/min per IP)
+# ---------------------------------------------------------------------------
+_CAUSAL_RATE_LIMIT = 10
 _causal_rate_buckets: dict[str, list[float]] = defaultdict(list)
 
 
 def _check_causal_rate_limit(client_ip: str) -> None:
-    """Raise HTTP 429 if ``client_ip`` has exceeded the causal-explanation rate limit.
-
-    Uses a sliding window: only timestamps within the last 60 seconds are counted.
-    """
-    now = time.monotonic()
-    bucket = _causal_rate_buckets[client_ip]
-    # Evict timestamps outside the window
-    _causal_rate_buckets[client_ip] = [t for t in bucket if now - t < _CAUSAL_RATE_WINDOW]
-    if len(_causal_rate_buckets[client_ip]) >= _CAUSAL_RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Rate limit exceeded: causal-explanation endpoint allows "
-                f"{_CAUSAL_RATE_LIMIT} requests per minute per IP."
-            ),
-        )
-    _causal_rate_buckets[client_ip].append(now)
+    _check_sliding_window_rate_limit(
+        _causal_rate_buckets,
+        client_ip,
+        _CAUSAL_RATE_LIMIT,
+        detail=(
+            f"Rate limit exceeded: causal-explanation endpoint allows "
+            f"{_CAUSAL_RATE_LIMIT} requests per minute per IP."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Simple in-process IP rate limiter for the similar-wallets endpoint.
+# GNN similarity rate limiter (configurable rate/min per IP)
 # ---------------------------------------------------------------------------
-_GNN_SIMILARITY_RATE_WINDOW = 60.0  # window size in seconds
 _gnn_similarity_rate_buckets: dict[str, list[float]] = defaultdict(list)
 
 
 def _check_gnn_similarity_rate_limit(client_ip: str) -> None:
-    """Raise HTTP 429 if ``client_ip`` has exceeded the similar-wallets rate limit."""
-    from config.settings import settings
-    now = time.monotonic()
-    bucket = _gnn_similarity_rate_buckets[client_ip]
-    # Evict timestamps outside the window
-    _gnn_similarity_rate_buckets[client_ip] = [t for t in bucket if now - t < _GNN_SIMILARITY_RATE_WINDOW]
-    if len(_gnn_similarity_rate_buckets[client_ip]) >= settings.gnn_similarity_rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Rate limit exceeded: similar-wallets endpoint allows "
-                f"{settings.gnn_similarity_rate_limit_per_minute} requests per minute per IP."
-            ),
-        )
-    _gnn_similarity_rate_buckets[client_ip].append(now)
+    _check_sliding_window_rate_limit(
+        _gnn_similarity_rate_buckets,
+        client_ip,
+        settings.gnn_similarity_rate_limit_per_minute,
+        detail=(
+            f"Rate limit exceeded: similar-wallets endpoint allows "
+            f"{settings.gnn_similarity_rate_limit_per_minute} requests per minute per IP."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -292,20 +299,6 @@ async def _lifespan(application: FastAPI):
 
     logger.info("[shutdown] Shutdown sequence complete")
 
-
-_OPENAPI_TAGS = [
-    {"name": "Scores", "description": "Wallet risk score retrieval and explanation endpoints."},
-    {"name": "Alerts", "description": "Manipulation alert listing and deduplication state."},
-    {"name": "Webhooks", "description": "Webhook subscriber management."},
-    {"name": "Feedback", "description": "Ground-truth feedback ingestion for model improvement."},
-    {"name": "AMM", "description": "Automated Market Maker pool risk metrics."},
-    {"name": "Disputes", "description": "Score dispute submission and committee voting."},
-    {"name": "Governance", "description": "On-chain parameter governance proposals."},
-    {"name": "Admin", "description": "Admin-only model lifecycle, config, and observability endpoints."},
-    {"name": "Allowlist / Denylist", "description": "Wallet allowlist and denylist management with audit trail."},
-    {"name": "export", "description": "CSV / Parquet bulk export of risk score data."},
-    {"name": "batch", "description": "Async batch wallet scoring jobs."},
-]
 
 app = FastAPI(
     title="LedgerLens API",
@@ -479,7 +472,7 @@ def _get_health_feature_store():
     "/health",
     tags=["System"],
     summary="Health check",
-    description="Returns 200 (ok/degraded) or 503. Checks DB, model files, and circuit breakers.",
+    description="Returns 200 (ok/degraded) or 503. Checks DB, model files, circuit breakers, and governed config version.",
 )
 def health() -> JSONResponse:
     """Returns 200 when healthy, 503 when any hard-failure component check fails.
@@ -492,6 +485,12 @@ def health() -> JSONResponse:
       circuit marks the response "degraded" but keeps returning 200 (the
       service is still serving traffic in a reduced-functionality state,
       not failed) — only DB/model failures return 503.
+    - Governed config: `status["config"]` reports this process's currently
+      active `risk_score_threshold` and the `runtime_config` row's
+      `updated_at` as its version, so operators can confirm a governance
+      proposal (or `PATCH /admin/config`) has actually propagated to this
+      process rather than assuming it did. See
+      `docs/governance_protocol.md` for the propagation consistency model.
 
     Returns 503 when any check fails or when soroban_circuit_status=="open",
     drift_status=="drifted", or webhook_dead_letter_count > 0.
@@ -552,6 +551,10 @@ def health() -> JSONResponse:
             if bus_health.get("status") != "ok":
                 degraded = True
 
+    # --- Governed config (governance / PATCH /admin/config propagation) ---
+    from config.settings import get_governed_config_status
+    status["config"] = get_governed_config_status()
+
     if healthy:
         status["status"] = "degraded" if degraded else "ok"
         http_status = 200
@@ -567,6 +570,31 @@ def _model_file_ok(path: str) -> bool:
         return os.path.isfile(path) and os.path.getsize(path) > 0
     except OSError:
         return False
+
+
+@v1_router.get(
+    "/health/drift",
+    tags=["System"],
+    summary="Streaming drift-detector health",
+    description=(
+        "Returns per-feature ADWIN / Page-Hinkley detector state (Issue-385): "
+        "whether drift was recently detected, per-feature detector internals, "
+        "and whether conformal recalibration is currently gated active. "
+        "Complements the slower, batch PSI mechanism (see `detection/drift_monitor.py` "
+        "and `cli.py retrain-check`), which is not real-time."
+    ),
+)
+def health_drift() -> JSONResponse:
+    """Always returns 200; this endpoint reports observability state, not liveness."""
+    from detection.drift_detectors import get_drift_registry
+
+    return JSONResponse(content=get_drift_registry().state(), status_code=200)
+
+
+@app.get("/health/drift", include_in_schema=False)
+def health_drift_unversioned() -> JSONResponse:
+    """Unversioned alias, matching the `/health` and `/health/ready` convention."""
+    return health_drift()
 
 
 @app.get("/health/ready")
@@ -612,16 +640,15 @@ class PaginatedFeedback(BaseModel):
 
 _feedback_rate_buckets: dict[str, list[float]] = defaultdict(list)
 _FEEDBACK_RATE_LIMIT = 100
-_FEEDBACK_RATE_WINDOW = 3600.0
 
 
 def _check_feedback_rate_limit(client_ip: str) -> None:
-    now = time.monotonic()
-    bucket = _feedback_rate_buckets[client_ip]
-    _feedback_rate_buckets[client_ip] = [t for t in bucket if now - t < _FEEDBACK_RATE_WINDOW]
-    if len(_feedback_rate_buckets[client_ip]) >= _FEEDBACK_RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded: 100 corrections per hour.")
-    _feedback_rate_buckets[client_ip].append(now)
+    _check_sliding_window_rate_limit(
+        _feedback_rate_buckets,
+        client_ip,
+        _FEEDBACK_RATE_LIMIT,
+        detail=f"Rate limit exceeded: {_FEEDBACK_RATE_LIMIT} corrections per hour.",
+    )
 
 
 @v1_router.post("/feedback", status_code=201, response_model=FeedbackRecordOut,
@@ -641,6 +668,16 @@ def submit_analyst_feedback(payload: FeedbackSubmission, request: Request):
 
     scores = get_latest_scores(wallet=payload.wallet, limit=1)
     original_score = scores[0].score if scores else 0
+
+    if scores:
+        try:
+            from detection.model_inference import record_feedback_and_adapt
+            record_feedback_and_adapt(
+                predicted_score_0_100=float(original_score),
+                true_label=payload.analyst_label,
+            )
+        except Exception:
+            logger.exception("Drift-coupled conformal adaptation failed for feedback submission")
 
     record = store.add_correction(
         wallet=payload.wallet,
@@ -952,8 +989,7 @@ async def prometheus_metrics(
     from fastapi.responses import Response as _Response  # noqa: PLC0415
 
     try:
-        from config.settings import settings as _s  # noqa: PLC0415
-        if not getattr(_s, "metrics_enabled", True):
+        if not getattr(settings, "metrics_enabled", True):
             return _Response(
                 content="# Metrics collection is disabled (METRICS_ENABLED=False)\n",
                 status_code=503,
@@ -1016,7 +1052,7 @@ def wallet_counterfactual(
 
     from detection.model_inference import score_feature_vector
 
-    resolved_target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
+    resolved_target_score = target_score if target_score is not None else get_runtime_risk_score_threshold() - 1
     with start_span("model.inference", attributes={"wallet": wallet}):
         current_probability, _confidence = score_feature_vector(_models, feature_vector)
     current_score = round(current_probability * 100)
@@ -1279,7 +1315,7 @@ def alerts(
         return get_alerts(alert_type=alert_type, limit=limit, offset=offset)
 
     scores = get_latest_scores(limit=limit, offset=offset)
-    return [s for s in scores if s.score >= settings.risk_score_threshold]
+    return [s for s in scores if s.score >= get_runtime_risk_score_threshold()]
 
 
 
@@ -1411,10 +1447,10 @@ class FeedbackRequest(BaseModel):
 
 
 @v1_router.post(
-    "/feedback",
+    "/feedback/ground-truth",
     dependencies=[Depends(require_admin_key)],
     tags=["Admin"],
-    summary="Submit scoring feedback",
+    summary="Submit ground-truth scoring feedback",
     description="Record ground-truth feedback (confirmed wash / confirmed clean) for a previously scored wallet.",
 )
 def submit_feedback(body: FeedbackRequest) -> dict:
@@ -1481,7 +1517,8 @@ def get_slo_status_from_registry() -> dict:
     try:
         from prometheus_client import REGISTRY
     except ImportError:
-        return {}
+        logger.warning("prometheus_client not installed — SLO status unavailable")
+        return {"error": "prometheus_client not installed"}
 
     # Initialise counters
     # 1. Score Availability
@@ -1662,6 +1699,21 @@ def admin_namespaces() -> list[dict]:
     required to see cross-namespace data.
     """
     return list_namespaces()
+
+
+@app.post("/admin/namespaces/{namespace_id}/rotate-key", dependencies=[Depends(require_admin_key)])
+def admin_rotate_namespace_key(
+    namespace_id: str,
+    grace_period_seconds: int = 604800,
+) -> dict:
+    """Rotate the namespace key. Marks the old one rotating, creates a new one.
+
+    Admin-only (requires the ``LEDGERLENS_ADMIN_API_KEY`` header).
+    """
+    from api.namespace import rotate_namespace_key
+    if grace_period_seconds <= 0:
+        raise HTTPException(status_code=422, detail="Grace period must be positive")
+    return rotate_namespace_key(namespace_id, grace_period_seconds=grace_period_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -1921,6 +1973,42 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
     return p.model_dump()
 
 
+@v1_router.post(
+    "/governance/proposals/{proposal_id}/execute",
+    dependencies=[Depends(require_admin_key)],
+    tags=["Governance"],
+    summary="Execute proposal",
+    description=(
+        "Execute a passed governance proposal (admin only): applies the "
+        "change and propagates it to every process. See "
+        "docs/governance_protocol.md for the consistency model and "
+        "propagation latency."
+    ),
+)
+def execute_proposal_endpoint(proposal_id: str):
+    """Delegates to `GovernanceEngine.execute_proposal` (the canonical
+    engine, not the legacy create/list/vote shim above -- there is no
+    legacy execute equivalent). Documented as existing since this
+    module's inception but never actually wired up; this closes that gap.
+    """
+    try:
+        pid = int(proposal_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="proposal_id must be an integer")
+
+    try:
+        p = GovernanceEngine().execute_proposal(pid)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "proposal_id": p.id,
+        "status": p.status,
+        "executed_at": p.executed_at.isoformat() if p.executed_at else None,
+        "execution_error": p.execution_error,
+    }
+
+
 # ------------------------------------------------------------------
 # Regulatory compliance export layer
 #
@@ -2032,9 +2120,18 @@ _CAUSAL_FEATURE_NAMES_SET: frozenset[str] = frozenset([
 _FEATURE_OVERRIDE_MIN = -1000.0
 _FEATURE_OVERRIDE_MAX = 1000.0
 
-# Refutation gate: if more than this many features have placebo p-value < 0.05,
-# refuse to serve the ATE table and return 503.
-_MAX_FAILING_REFUTATIONS = 3
+# Refutation gate: refuse to serve the ATE table and return 503 if more than
+# this FRACTION of all conducted refutation tests (across every feature that
+# has a genuine DoWhy-identified causal estimate) return p < 0.05.
+#
+# This is fraction-based, not a fixed count, because refutation coverage now
+# scales with the number of causally-identified features (see
+# CausalEngine.all_feature_refutation_tests) — a fixed count threshold would
+# either be trivially unreachable (if set >= max possible failures, as the
+# original _MAX_FAILING_REFUTATIONS = 3 bug did when exactly 3 tests were
+# ever run) or arbitrary (if raised without regard to coverage). A fraction
+# remains meaningful regardless of how many features/tests are in scope.
+_MAX_FAILING_REFUTATION_FRACTION = 1.0 / 3.0
 
 
 class CausalExplanationResponse(BaseModel):
@@ -2046,6 +2143,17 @@ class CausalExplanationResponse(BaseModel):
     top_causal_features: list[tuple[str, float]]
     counterfactual_score: Optional[float]
     coverage_note: str
+    # --- Fields below are additive (default to empty) for backward compatibility. ---
+    # Per-feature provenance: "causal" (genuine DoWhy-identified estimate) or
+    # "correlational_fallback" (OLS coefficient substituted after DoWhy could
+    # not identify/estimate the effect). See detection.causal_engine.ATEEstimate.
+    estimation_method: dict[str, str] = Field(default_factory=dict)
+    # Human-readable reason for each feature present in estimation_method with
+    # value "correlational_fallback" (e.g. non-identifiable, dowhy missing).
+    estimation_notes: dict[str, str] = Field(default_factory=dict)
+    # Features that actually underwent DoWhy refutation testing this request
+    # (i.e. the subset of feature_ate_table with estimation_method == "causal").
+    refutation_coverage: list[str] = Field(default_factory=list)
 
 
 def _parse_feature_override(raw: str | None) -> tuple[str, float] | None:
@@ -2206,6 +2314,16 @@ def causal_explanation(
     - ``counterfactual_score``: predicted score if ``feature_override`` were
       applied (only present when ``feature_override`` is supplied).
     - ``coverage_note``: advisory note about sample size and estimate quality.
+    - ``estimation_method``: per-feature ``"causal"`` (genuine DoWhy-identified
+      estimate) or ``"correlational_fallback"`` (OLS coefficient substituted
+      because DoWhy could not identify or estimate the effect). Consumers
+      must not treat these two as interchangeable.
+    - ``estimation_notes``: reason for each fallback entry in
+      ``estimation_method`` (e.g. non-identifiable, DoWhy not installed).
+    - ``refutation_coverage``: features that actually underwent DoWhy
+      refutation testing this request — i.e. the ``"causal"`` subset of
+      ``estimation_method``. See docs/causal_inference.md for the refutation
+      gate's coverage scope and rejection threshold.
 
     Security
     --------
@@ -2252,31 +2370,57 @@ def causal_explanation(
             ),
         )
 
-    # Fetch the ATE table (uses cache when available)
-    ate_table = engine.feature_ate_table(use_cache=True)
+    # Fetch the ATE table (uses cache when available), tagged with provenance
+    # so genuine causal estimates can never be confused with correlational
+    # fallbacks under the same schema.
+    from detection.causal_engine import ESTIMATION_CAUSAL
 
-    # Refutation gate: if the model appears misspecified, refuse to serve ATEs
+    detailed_ate = engine.feature_ate_table_detailed(use_cache=True)
+    ate_table = {feat: est.value for feat, est in detailed_ate.items()}
+    estimation_method = {feat: est.method for feat, est in detailed_ate.items()}
+    estimation_notes = {
+        feat: est.reason for feat, est in detailed_ate.items() if est.reason
+    }
+    causally_identified_features = [
+        feat for feat, est in detailed_ate.items() if est.method == ESTIMATION_CAUSAL
+    ]
+
+    # Refutation gate: if the model appears misspecified, refuse to serve ATEs.
+    # Coverage now spans every causally-identified feature (not just a single
+    # hardcoded treatment), and the threshold is a fraction of tests actually
+    # run — so rejection is mathematically reachable at any coverage size.
     try:
-        refutation_results = engine.refutation_tests()
-        failing = sum(
-            1 for k, pval in refutation_results.items()
-            if k == "placebo_treatment_refuter" and pval < 0.05
+        refutation_results = (
+            engine.all_feature_refutation_tests(features=causally_identified_features)
+            if causally_identified_features
+            else {}
         )
-        # A stricter check: if any refutation test fails for more than
-        # _MAX_FAILING_REFUTATIONS features, refuse
-        all_failing = sum(1 for pval in refutation_results.values() if pval < 0.05)
-        if all_failing > _MAX_FAILING_REFUTATIONS:
+        total_tests = sum(len(tests) for tests in refutation_results.values())
+        failing = sum(
+            1
+            for tests in refutation_results.values()
+            for pval in tests.values()
+            if pval < 0.05
+        )
+        if total_tests > 0 and (failing / total_tests) > _MAX_FAILING_REFUTATION_FRACTION:
+            failing_fraction = failing / total_tests
             logger.error(
-                "Causal model refutation gate triggered: %d tests have p < 0.05 "
-                "(threshold: %d). Refusing to serve ATE table.",
-                all_failing,
-                _MAX_FAILING_REFUTATIONS,
+                "Causal model refutation gate triggered: %d/%d refutation tests "
+                "(%.1f%%) have p < 0.05 across %d features (threshold: %.1f%%). "
+                "Refusing to serve ATE table.",
+                failing,
+                total_tests,
+                failing_fraction * 100,
+                len(refutation_results),
+                _MAX_FAILING_REFUTATION_FRACTION * 100,
             )
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    f"Causal model appears misspecified: {all_failing} refutation tests "
-                    f"returned p < 0.05 (threshold: {_MAX_FAILING_REFUTATIONS}). "
+                    f"Causal model appears misspecified: {failing}/{total_tests} "
+                    f"refutation tests ({failing_fraction:.0%}) returned p < 0.05 "
+                    f"across {len(refutation_results)} feature(s) "
+                    f"(threshold: {_MAX_FAILING_REFUTATION_FRACTION:.0%}). "
                     "The causal graph may not fit the current data distribution. "
                     "Please retrain or investigate model specification."
                 ),
@@ -2295,7 +2439,7 @@ def causal_explanation(
     counterfactual_score_value: Optional[float] = None
     if override_parsed is not None:
         feature_name, feature_value = override_parsed
-        wallet_features = get_feature_vector_for_wallet(wallet, scores[0].asset_pair)
+        wallet_features = get_feature_vector(wallet, scores[0].asset_pair)
         if wallet_features is not None:
             counterfactual_score_value = engine.counterfactual_score(
                 wallet_features=wallet_features,
@@ -2329,6 +2473,9 @@ def causal_explanation(
         top_causal_features=top_causal_features,
         counterfactual_score=counterfactual_score_value,
         coverage_note=coverage_note,
+        estimation_method=estimation_method,
+        estimation_notes=estimation_notes,
+        refutation_coverage=causally_identified_features,
     )
 # Mount versioned router and register legacy 302 redirect aliases
 # ---------------------------------------------------------------------------

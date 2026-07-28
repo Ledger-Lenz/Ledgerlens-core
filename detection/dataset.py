@@ -133,7 +133,6 @@ def walk_forward_cv(
     timestamps: np.ndarray,
     n_splits: int = 5,
     gap_days: float = 7.0,
-    min_train_days: float = 60.0,
 ) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
     """Walk-forward (rolling-origin) cross-validation respecting chronological order.
 

@@ -17,6 +17,11 @@ Changelog = "https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/CHANGELOG.
 [project.scripts]
 ledgerlens = "cli:app"
 
+[project.optional-dependencies]
+dev = [
+    "atheris>=2.3.0",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
@@ -46,6 +51,9 @@ target-version = "py310"
 ignore = ["E402"]
 
 [tool.ruff.lint.per-file-ignores]
+# Fuzz harnesses use atheris.instrument_imports() as a context manager around
+# imports (required by Atheris) — this intentionally violates E402.
+"fuzz/*.py"                        = ["E402"]
 # Pre-existing issues in files not modified by #197-#200
 "detection/feature_engineering.py" = ["F811", "F821"]
 "detection/model_inference.py"     = ["F811", "F821"]
@@ -84,3 +92,8 @@ ignore = ["E402"]
 "ingestion/rate_limiter.py"        = ["F841"]
 "tests/test_feature_store.py"      = ["F401"]
 "tests/test_wash_trade_sequence_model.py" = ["F401"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

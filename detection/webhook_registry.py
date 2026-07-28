@@ -54,8 +54,10 @@ class Subscriber:
     def masked_secret(self) -> str:
         s = self.secret
         if len(s) <= 8:
-            return s[:2] + "****"
-        return s[:4] + "****"
+            visible = min(2, len(s))
+        else:
+            visible = 4
+        return s[:visible] + "****"
 
 
 # ---------------------------------------------------------------------------
@@ -81,12 +83,23 @@ def _encrypt_secret(plaintext: str) -> str:
     return base64.b64encode(nonce + ct).decode()
 
 
-def _decrypt_secret(encrypted: str) -> str:
-    key = _get_encryption_key()
+def _decrypt_with_key(encrypted: str, key: bytes) -> str:
     data = base64.b64decode(encrypted)
     nonce, ct = data[:12], data[12:]
     aesgcm = AESGCM(key)
     return aesgcm.decrypt(nonce, ct, None).decode()
+
+
+def _decrypt_secret(encrypted: str) -> str:
+    for key_env in ("LEDGERLENS_WEBHOOK_ENCRYPTION_KEY", "LEDGERLENS_WEBHOOK_ENCRYPTION_KEY_PREVIOUS"):
+        key_b64 = os.environ.get(key_env)
+        if not key_b64:
+            continue
+        try:
+            return _decrypt_with_key(encrypted, base64.b64decode(key_b64))
+        except Exception:
+            continue
+    raise RuntimeError("Unable to decrypt secret with current or previous encryption key")
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +161,10 @@ def init_db(db_path: str | None = None):
         conn.commit()
 
 
+# Initialize database at module import time (idempotent)
+init_db()
+
+
 def _row_to_subscriber(row) -> Subscriber:
     return Subscriber(
         subscriber_id=row[0],
@@ -173,7 +190,6 @@ def register_subscriber(
     asset_pair_filter: str | None = None,
     db_path: str | None = None,
 ) -> str:
-    init_db(db_path)
     validate_webhook_url(url)
     subscriber_id = str(uuid.uuid4())
     secret_encrypted = _encrypt_secret(secret)
@@ -188,7 +204,6 @@ def register_subscriber(
 
 
 def get_subscriber(subscriber_id: str, db_path: str | None = None) -> Subscriber | None:
-    init_db(db_path)
     with _connect(db_path) as conn:
         row = conn.execute(
             "SELECT subscriber_id, url, secret_encrypted, min_score, wallet_filter, asset_pair_filter, active, created_at FROM webhook_subscribers WHERE subscriber_id = ?",
@@ -198,7 +213,6 @@ def get_subscriber(subscriber_id: str, db_path: str | None = None) -> Subscriber
 
 
 def list_subscribers(active_only: bool = True, db_path: str | None = None) -> list[Subscriber]:
-    init_db(db_path)
     with _connect(db_path) as conn:
         if active_only:
             rows = conn.execute(
@@ -212,7 +226,6 @@ def list_subscribers(active_only: bool = True, db_path: str | None = None) -> li
 
 
 def deactivate_subscriber(subscriber_id: str, db_path: str | None = None) -> bool:
-    init_db(db_path)
     with _connect(db_path) as conn:
         cur = conn.execute(
             "UPDATE webhook_subscribers SET active = 0 WHERE subscriber_id = ? AND active = 1",

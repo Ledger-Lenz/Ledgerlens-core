@@ -48,24 +48,17 @@ fuzz_target!(|input: FuzzInput| {
     ];
     
     for (score, timestamp) in test_cases {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.canonical_message(&wallet, &asset_pair, &score, &timestamp)
-        }));
-        
-        if let Err(e) = result {
-            let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            
-            // canonical_message should never panic - it's pure byte packing
-            panic!(
-                "Unexpected panic in canonical_message with score={}, timestamp={}: {}",
-                score, timestamp, panic_msg
-            );
-        }
+        // canonical_message is pure byte packing and should never reject any
+        // of these bounded inputs. Uses try_canonical_message, not
+        // catch_unwind(canonical_message) -- cargo-fuzz builds always use
+        // panic=abort, so catch_unwind could never catch a real regression
+        // here either; it would just abort silently with a less useful
+        // libFuzzer-reported crash instead of this assertion.
+        let result = client.try_canonical_message(&wallet, &asset_pair, &score, &timestamp);
+        assert!(
+            result.is_ok(),
+            "Unexpected rejection in canonical_message with score={}, timestamp={}",
+            score, timestamp
+        );
     }
 });

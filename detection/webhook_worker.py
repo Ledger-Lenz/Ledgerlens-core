@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 import httpx
 
 from detection.webhook_queue import (
-    get_dead_letters as _get_dead_letters,
     get_due_deliveries,
     mark_delivered,
     mark_failed,
@@ -26,8 +25,6 @@ logger = logging.getLogger("ledgerlens.webhook.worker")
 
 MAX_CONCURRENT = 10
 REQUEST_TIMEOUT = 10.0
-
-get_dead_letters = _get_dead_letters
 
 
 def build_webhook_payload(score_data: dict) -> dict:
@@ -83,15 +80,20 @@ async def _deliver(
         except httpx.HTTPStatusError as exc:
             error = f"HTTP {exc.response.status_code}"
             mark_failed(delivery.id, error, db_path=db_path)
-            # Check if now dead-lettered
-            _result = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
-            webhook_deliveries_total.labels(result=_result).inc()
+            result_metric = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            webhook_deliveries_total.labels(result=result_metric).inc()
+            return False
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = f"{type(exc).__name__}"
+            mark_failed(delivery.id, error, db_path=db_path)
+            result_metric = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            webhook_deliveries_total.labels(result=result_metric).inc()
             return False
         except Exception as exc:
             error = str(exc)[:200]
             mark_failed(delivery.id, error, db_path=db_path)
-            _result = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
-            webhook_deliveries_total.labels(result=_result).inc()
+            result_metric = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            webhook_deliveries_total.labels(result=result_metric).inc()
             return False
 
 
@@ -121,7 +123,10 @@ async def run_delivery_worker(
                                 await _deliver(client, d, sub, db_path=db_path)
 
                     await asyncio.gather(*[_deliver_one(d) for d in deliveries])
-            except Exception:
-                logger.exception("Unhandled error in delivery worker loop")
+            except asyncio.CancelledError:
+                logger.info("Webhook worker cancelled")
+                raise
+            except Exception as exc:
+                logger.exception("Unhandled error in delivery worker loop: %s", type(exc).__name__)
 
             await asyncio.sleep(interval_seconds)

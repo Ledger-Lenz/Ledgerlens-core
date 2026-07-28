@@ -5,6 +5,8 @@ Stellar to EVM and back within a configurable time window, computing a
 correlation score that feeds into the risk model as an additional feature.
 """
 
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -19,12 +21,18 @@ DEFAULT_WINDOW_HOURS = 24
 AMOUNT_MATCH_TOLERANCE = 0.05
 
 
-def _parse_timestamp(ts) -> datetime:
-    """Parse a timestamp from datetime or ISO-format string."""
+def _parse_timestamp(ts: datetime | str) -> datetime:
+    """Parse a timestamp from datetime or ISO-format string.
+
+    Returns a timezone-aware UTC datetime.  Raises :exc:`ValueError` for
+    unparseable strings so callers can propagate or fall back gracefully.
+    """
     if isinstance(ts, datetime):
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         return ts
+    if not isinstance(ts, str):
+        raise TypeError(f"timestamp must be datetime or str, got {type(ts).__name__}")
     dt = datetime.fromisoformat(ts)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -74,7 +82,8 @@ class CrossChainCorrelator:
         Parameters
         ----------
         wallet:
-            Stellar wallet address.
+            Stellar wallet address (retained for logging / caller
+            compatibility; not used in the scoring algorithm itself).
         transfers:
             List of bridge transfers involving this wallet.
 
@@ -85,6 +94,7 @@ class CrossChainCorrelator:
             exist or no matching pairs are found.
         """
         if len(transfers) < 2:
+            logger.debug("Wallet %s has <2 transfers; round-trip score = 0.0", wallet)
             return 0.0
 
         # Separate outbound (Stellar→EVM) and inbound (EVM→Stellar)
@@ -96,6 +106,7 @@ class CrossChainCorrelator:
         ]
 
         if not outbound or not inbound:
+            logger.debug("Wallet %s missing outbound or inbound transfers; score = 0.0", wallet)
             return 0.0
 
         # Find matching pairs: for each outbound, look for an inbound
@@ -127,9 +138,10 @@ class CrossChainCorrelator:
                 # Amount score: closer amounts = higher score (0..1)
                 amount_score = ratio
 
-                # Hop score: fewer hops is more suspicious (direct round-trip)
-                # but we don't have hop count in BridgeTransfer yet,
-                # so we default to a neutral value
+                # Hop score: fewer hops is more suspicious (direct round-trip).
+                # BridgeTransfer does not carry an evm_hop_count field (tracked
+                # as issue #634), so we default to 1 (neutral) to avoid silently
+                # inflating or deflating the hop contribution.
                 hop_count = getattr(inp, "evm_hop_count", 1)
                 hop_score = 1.0 / max(hop_count, 1)
 

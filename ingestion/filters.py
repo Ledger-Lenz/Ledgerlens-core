@@ -392,10 +392,10 @@ class TradeFilterPipeline:
 
     Thread safety
     -------------
-    ``apply()`` acquires the internal ``_lock`` for reading (non-exclusive).
-    ``reload_filters()`` acquires the same lock exclusively, ensuring
-    in-flight ``apply()`` calls complete before the filter list is swapped.
-    The pipeline is **never** left without filters during a swap.
+    ``apply()`` acquires the internal ``_lock`` to snapshot the filter list.
+    ``reload_filters()`` acquires the same exclusive lock, ensuring in-flight
+    ``apply()`` calls complete before the filter list is swapped. The pipeline
+    is **never** left without filters during a swap.
 
     Parameters
     ----------
@@ -632,11 +632,11 @@ class FilterConfigLoader:
         self._config_path = config_path
         if reload_interval_seconds is None:
             try:
-                from config.settings import settings  # local import to avoid circular deps
+                from config.settings import settings
                 reload_interval_seconds = float(
                     settings.filter_config_reload_interval_seconds
                 )
-            except Exception:
+            except (ImportError, AttributeError, TypeError, ValueError):
                 reload_interval_seconds = 60.0
         self._reload_interval = reload_interval_seconds
         self._last_mtime: float = 0.0

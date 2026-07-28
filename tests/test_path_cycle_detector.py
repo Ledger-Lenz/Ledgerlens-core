@@ -18,6 +18,55 @@ from detection.path_cycle_detector import (
 from detection.storage import AlertType, get_alerts, save_alerts
 from ingestion.data_models import Asset, PathPayment
 
+
+class TestCleanupLockIn:
+    """Lock in the cleanup changes so future edits don't regress."""
+
+    def test_heapq_is_module_level_not_local_import(self):
+        """`heapq` must be at module top level, not inside a function."""
+        import ast
+        import detection.path_cycle_detector as m
+        src = ast.parse(m.__loader__.get_source(m.__name__))
+        module_imports: set[str] = set()
+        for node in ast.iter_child_nodes(src):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_imports.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    module_imports.add(alias.asname or alias.name)
+        assert "heapq" in module_imports, (
+            "heapq must be imported at module level, not inside _select_timed_cycle_edges"
+        )
+
+    def test_alerttype_is_module_level_not_local_import(self):
+        """`AlertType` must be at module top level, not inside a function."""
+        import ast
+        import detection.path_cycle_detector as m
+        src = ast.parse(m.__loader__.get_source(m.__name__))
+        for node in ast.iter_child_nodes(src):
+            if isinstance(node, ast.ImportFrom):
+                imported = {a.name for a in node.names}
+                if "AlertType" in imported:
+                    return  # found at top level
+        pytest.fail("AlertType must be imported at module level, not inside path_payment_cycles_to_alerts")
+
+    def test_module_uses_future_annotations(self):
+        """Lock in the `from __future__ import annotations` cleanup."""
+        import ast
+        import detection.path_cycle_detector as m
+        src = ast.parse(m.__loader__.get_source(m.__name__))
+        future_imports = [
+            node.names[0].name
+            for node in ast.iter_child_nodes(src)
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            for alias in node.names
+        ]
+        assert "annotations" in future_imports, (
+            "path_cycle_detector.py must have `from __future__ import annotations`"
+        )
+
+
 BASE = pd.Timestamp("2026-06-12T00:00:00Z")
 
 

@@ -1,5 +1,6 @@
 """Tests for HMAC-SHA256 model artifact signing and integrity verification."""
 
+import ast
 import os
 
 import joblib
@@ -13,6 +14,36 @@ from detection.model_signing import (
     sign_model_file,
     verify_model_file,
 )
+
+
+class TestCleanupLockIn:
+    """Lock in the cleanup changes so future edits don't regress."""
+
+    def test_no_typing_optional_import(self):
+        """`from typing import Optional` must not be present — use `X | None`."""
+        import detection.model_signing as m
+        src = ast.parse(m.__loader__.get_source(m.__name__))
+        for node in ast.iter_child_nodes(src):
+            if isinstance(node, ast.ImportFrom) and node.module == "typing":
+                imported = {a.name for a in node.names}
+                assert "Optional" not in imported, (
+                    "model_signing.py must not import Optional from typing; use X | None"
+                )
+
+    def test_module_uses_future_annotations(self):
+        """Lock in the `from __future__ import annotations` cleanup."""
+        import detection.model_signing as m
+        src = ast.parse(m.__loader__.get_source(m.__name__))
+        future_imports = [
+            node.names[0].name
+            for node in ast.iter_child_nodes(src)
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            for alias in node.names
+        ]
+        assert "annotations" in future_imports, (
+            "model_signing.py must have `from __future__ import annotations`"
+        )
+
 
 TEST_KEY = b"test-signing-key-for-unit-tests-only"
 
@@ -144,6 +175,7 @@ class TestNoDirectJobLibLoadInCodebase:
                 if rel in (
                     os.path.join("detection", "model_signing.py"),
                     os.path.join("tests", "test_model_signing.py"),
+                    os.path.join("tests", "test_ed25519_model_signing.py"),
                 ):
                     continue
                 with open(full, "r", encoding="utf-8", errors="ignore") as f:

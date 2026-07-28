@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import secrets
+from collections.abc import Iterator
 
 import grpc
 
@@ -25,14 +27,17 @@ def mask_wallet(wallet: str) -> str:
 
 
 def _authenticate(context: grpc.ServicerContext, required_scope: str = "read:scores") -> dict:
-    if getattr(context, "_authenticated", False):
-        return getattr(context, "_key_meta", {})
-
+    # Check for cached auth state in invocation metadata
     metadata = dict(context.invocation_metadata())
     api_key = metadata.get("x-ledgerlens-api-key", "") or metadata.get("x-ledgerlens-admin-key", "")
     if not api_key:
         context.abort(grpc.StatusCode.UNAUTHENTICATED, "Missing x-ledgerlens-api-key metadata")
 
+    # First check if it's the configured admin key (admin keys satisfy any scope)
+    if settings.admin_api_key and secrets.compare_digest(api_key, settings.admin_api_key):
+        return {"key_id": "admin", "scopes": "admin", "rate_limit_per_minute": 999999}
+
+    # Fall back to stored API key lookup
     key_meta = lookup_key(api_key)
     if key_meta is None:
         context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid or revoked API key")
@@ -48,8 +53,6 @@ def _authenticate(context: grpc.ServicerContext, required_scope: str = "read:sco
     if not allowed:
         context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "Rate limit exceeded")
 
-    context._authenticated = True
-    context._key_meta = key_meta
     return key_meta
 
 
@@ -87,9 +90,13 @@ class ScoringServicer(scoring_pb2_grpc.ScoringServiceServicer):
             context.abort(grpc.StatusCode.NOT_FOUND, f"No score for {mask_wallet(request.wallet)}")
         return _to_proto(scores[0])
 
-    def BatchScoreWallets(self, request_iterator, context: grpc.ServicerContext):
+    def BatchScoreWallets(
+        self,
+        request_iterator: Iterator[scoring_pb2.ScoreRequest],
+        context: grpc.ServicerContext,
+    ):
         _authenticate(context, required_scope="read:scores")
-        max_batch = getattr(settings, "grpc_max_batch_wallets", 1000)
+        max_batch = settings.grpc_max_batch_wallets
         count = 0
         for request in request_iterator:
             count += 1
@@ -104,12 +111,25 @@ class ScoringServicer(scoring_pb2_grpc.ScoringServiceServicer):
 
 
 class AuthInterceptor(grpc.ServerInterceptor):
-    """gRPC Server Interceptor for API key and scope validation."""
+    """gRPC Server Interceptor for API key and scope validation.
+
+    Intercepts all unary and streaming RPC calls to validate
+    authentication before they reach the servicer.
+    """
 
     def __init__(self, required_scope: str = "read:scores"):
         self.required_scope = required_scope
 
     def intercept_service(self, continuation, handler_call_details):
+        """Validate auth metadata before the RPC handler is invoked."""
+        # Extract method name from the handler call details
+        method_name = handler_call_details.method
+        if method_name.endswith("/ScoreWallet") or method_name.endswith("/BatchScoreWallets"):
+            # Authentication will be performed by the servicer methods themselves
+            # via _authenticate(), so we just pass through here.
+            # The interceptor is kept as an extension point for future
+            # pre-validation (e.g., IP allowlisting, rate limiting headers).
+            pass
         return continuation(handler_call_details)
 
 

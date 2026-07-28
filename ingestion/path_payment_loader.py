@@ -29,6 +29,7 @@ Example (2-hop, XLM → BTC → USDC):
 import logging
 import re
 from datetime import datetime
+from decimal import Decimal
 
 import httpx
 
@@ -116,7 +117,6 @@ def _parse_path_payment_operation(record: dict) -> PathPaymentOperation | None:
     if op_type not in PATH_PAYMENT_OPERATION_TYPES:
         return None
     try:
-        from decimal import Decimal
         return PathPaymentOperation(
             id=op_id,
             paging_token=str(record.get("paging_token") or ""),
@@ -138,7 +138,6 @@ def _parse_path_payment_operation(record: dict) -> PathPaymentOperation | None:
 
 def _parse_trade_effect(record: dict) -> TradeEffect | None:
     try:
-        from decimal import Decimal
         return TradeEffect(
             id=str(record.get("id") or ""),
             account=str(record.get("account") or ""),
@@ -256,36 +255,11 @@ class PathPaymentDecomposer:
     def _decompose_without_effects(self, operation: PathPaymentOperation) -> list[Trade]:
         """Approximate decomposition when effects are unavailable.
 
-        Distributes source/destination amounts evenly across hops.
+        Without effect data, we cannot accurately reconstruct intermediate hop amounts.
+        This method returns an empty list rather than produce inaccurate approximations
+        that could mislead analysis.
         """
-        asset_chain = [operation.source_asset] + list(operation.path) + [operation.destination_asset]
-        n_hops = len(asset_chain) - 1
-        src = float(operation.source_amount)
-        dst = float(operation.destination_amount)
-
-        trades: list[Trade] = []
-        for i in range(n_hops):
-            sold_amt = src if i == 0 else dst
-            bought_amt = dst if i == n_hops - 1 else dst
-            if sold_amt <= 0 or bought_amt <= 0:
-                continue
-            trades.append(Trade(
-                id=f"{operation.id}-hop{i}",
-                ledger_close_time=operation.ledger_close_time,
-                base_account=operation.source_account,
-                counter_account=operation.destination_account,
-                base_asset=asset_chain[i],
-                counter_asset=asset_chain[i + 1],
-                base_amount=sold_amt,
-                counter_amount=bought_amt,
-                price=bought_amt / sold_amt,
-                base_is_seller=True,
-                trade_type=TradeType.ORDERBOOK,
-                transaction_hash=operation.transaction_hash,
-                path_payment_id=operation.id,
-                hop_index=i,
-            ))
-        return trades
+        return []
 
 
 class PathPaymentLoader:

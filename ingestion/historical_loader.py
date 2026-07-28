@@ -18,6 +18,7 @@ import pandas as pd
 
 from config.settings import settings
 from detection.storage import RiskScoreStore
+from ingestion.dedup import DedupResult, IdempotencyKeyStore
 from ingestion.horizon_streamer import _parse_trade
 from ingestion.http_client import (
     AsyncHorizonClient,
@@ -190,8 +191,9 @@ class ParallelHistoricalLoader:
         self.chunk_hours = chunk_hours
         self.progress_path = _resolve_progress_path(progress_path)
         self.tracker = ProgressTracker(self.progress_path)
-        from ingestion.dedup import IdempotencyKeyStore
         db_path = getattr(storage, "db_path", None) or settings.db_path
+        # Historical loads use 0.0 replay window since this is a one-time backfill,
+        # not a live stream with replay concerns (unlike horizon_streamer).
         self.dedup_store = IdempotencyKeyStore(
             db_path=db_path,
             replay_window_seconds=0.0
@@ -278,10 +280,10 @@ class ParallelHistoricalLoader:
         start, end = chunk
         from detection.lineage import lineage, Dataset
         from config.correlation import get_correlation_id
-        
+
         cid = get_correlation_id()
         parent_run_id = None if cid == "unset" else cid
-        
+
         inputs = [
             Dataset(
                 namespace="horizon",
@@ -304,7 +306,6 @@ class ParallelHistoricalLoader:
         path: str | None = "/trades"
         request_params: dict | None = params
         records_fetched = 0
-        from ingestion.dedup import DedupResult
         
         with lineage.run("ingestion.historical_loader.fetch_chunk", inputs=inputs, parent_run_id=parent_run_id) as r:
             async with sem:
@@ -494,7 +495,8 @@ async def async_load_historical_trades(
     client: AsyncHorizonClient | None = None,
 ) -> pd.DataFrame:
     """Fetch historical trades sequentially using the shared async client."""
-    assert client is not None, "client is required for async_load_historical_trades"
+    if client is None:
+        raise ValueError("client is required for async_load_historical_trades")
     lookback_days = lookback_days or settings.trade_history_lookback_days
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     params: dict[str, str | int] = {"limit": PAGE_LIMIT, "order": "desc"}

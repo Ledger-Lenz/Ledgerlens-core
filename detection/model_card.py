@@ -2,6 +2,10 @@
 
 Implements the Model Cards for Model Reporting pattern, with a Datasheet for
 Datasets section covering the training data.
+
+When rendering to PDF, the ``markdown`` library is used to convert
+Markdown to HTML before passing to WeasyPrint.  Falls back gracefully when
+the optional dependency is unavailable.
 """
 
 from __future__ import annotations
@@ -121,6 +125,7 @@ def generate_model_card(
         metrics=model_metrics,
         top_shap_features=top_shap,
         stability_vs_previous=metadata.get("stability_vs_previous"),
+        fairness_summary=metadata.get("fairness_summary"),
         datasheet=datasheet,
         known_limitations=[
             "Model performance may degrade under heavy adversarial evasion",
@@ -236,6 +241,36 @@ def render_markdown(card: ModelCard) -> str:
     return "\n".join(lines)
 
 
+def _render_markdown_to_html(md_text: str) -> str:
+    """Convert Markdown to HTML using the ``markdown`` library when available.
+
+    Falls back to a simple line-by-line converter that replaces headings with
+    ``<h1>``-``<h3>`` tags and wraps non-heading lines in ``<p>`` blocks.
+    """
+    try:
+        import markdown
+        return markdown.markdown(md_text, extensions=["extra", "codehilite"])
+    except ImportError:
+        pass
+
+    # Minimal fallback converter – avoids naive string replacements that could
+    # corrupt code blocks or inline Markdown tokens.
+    lines_out: list[str] = []
+    for line in md_text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("### "):
+            lines_out.append(f"<h3>{stripped[4:]}</h3>")
+        elif stripped.startswith("## "):
+            lines_out.append(f"<h2>{stripped[3:]}</h2>")
+        elif stripped.startswith("# "):
+            lines_out.append(f"<h1>{stripped[2:]}</h1>")
+        elif stripped:
+            lines_out.append(f"<p>{line}</p>")
+        else:
+            lines_out.append("")
+    return "\n".join(lines_out)
+
+
 def render_pdf(card: ModelCard, output_path: str | None = None) -> bytes | None:
     """Render a ModelCard as PDF (optional, requires weasyprint).
 
@@ -256,6 +291,7 @@ def render_pdf(card: ModelCard, output_path: str | None = None) -> bytes | None:
         return None
 
     md = render_markdown(card)
+    html_body = _render_markdown_to_html(md)
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -273,7 +309,7 @@ def render_pdf(card: ModelCard, output_path: str | None = None) -> bytes | None:
         </style>
     </head>
     <body>
-        {md.replace('# ', '<h1>').replace('## ', '<h2>').replace('### ', '<h3>')}
+        {html_body}
     </body>
     </html>
     """

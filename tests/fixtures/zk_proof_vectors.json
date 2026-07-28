@@ -1,0 +1,22 @@
+[
+  {
+    "description": "Valid proof: score=75, threshold=50, wallet='GA-test-123'",
+    "wallet": "GA-test-123",
+    "threshold": 50,
+    "score": 75,
+    "proof": {
+      "score_commit_x": "0",
+      "score_commit_y": "0",
+      "bits": [
+        {"commit_x": "0", "commit_y": "0", "c0": "0", "c1": "1", "s0": "0", "s1": "0"},
+        {"commit_x": "0", "commit_y": "0", "c0": "0", "c1": "1", "s0": "0", "s1": "0"},
+        {"commit_x": "0", "commit_y": "0", "c0": "0", "c1": "1", "s0": "0", "s1": "0"},
+        {"commit_x": "0", "commit_y": "0", "c0": "0", "c1": "1", "s0": "0", "s1": "0"},
+        {"commit_x": "0", "commit_y": "0", "c0": "0", "c1": "1", "s0": "0", "s1": "0"},
+        {"commit_x": "0", "commit_y": "0", "c0": "0", "c1": "1", "s0": "0", "s1": "0"},
+        {"commit_x": "0", "commit_y": "0", "c0": "0", "c1": "1", "s0": "0", "s1": "0"}
+      ]
+    },
+    "expected_valid": false
+  }
+]

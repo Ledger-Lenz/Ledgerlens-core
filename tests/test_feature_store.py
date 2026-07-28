@@ -1,4 +1,24 @@
-"""Tests for the streaming feature store (incremental updates, ring buffers, equivalence)."""
+"""Tests for the streaming feature store (incremental updates, ring buffers, equivalence).
+
+Cleanup applied — Issue #518
+-----------------------------
+- Removed ``time.sleep(0.01)`` from ``test_update_feature_state_adds_trade``.
+  The sleep was a defensive hack added to force a measurable timestamp
+  difference between fixture construction and ``update_feature_state()``, but
+  ``update_feature_state`` always sets ``last_updated = datetime.now()`` at the
+  end of its execution, which is guaranteed to be >= the fixture's timestamp
+  without any artificial delay.  Replacing the sleep with an explicit
+  ``FIXED_PAST`` sentinel for ``initial_state.last_updated`` removes the
+  timing dependency entirely: the assertion is now structural, not temporal.
+- Fixed hidden state coupling in ``initial_state`` fixture: the previous
+  fixture created the state with ``last_updated=datetime.now(timezone.utc)``
+  which bound test outcomes to wall-clock ordering.  It now uses a fixed past
+  timestamp so tests are deterministic on any machine regardless of execution
+  speed.
+- Added ``_fresh_state()`` helper to create isolated ``WalletFeatureState``
+  instances in tests that mutate state incrementally, preventing ring-buffer
+  state from leaking across test calls inside the same session.
+"""
 
 import pytest
 from datetime import datetime, timezone, timedelta
@@ -14,6 +34,26 @@ from detection.feature_store import (
 from ingestion.data_models import Asset, TradeType
 from tests.factories import TradeFactory
 
+# ---------------------------------------------------------------------------
+# Sentinel timestamp: a fixed point well in the past so that any
+# ``datetime.now()`` call inside ``update_feature_state`` is >= it.
+# ---------------------------------------------------------------------------
+_FIXED_PAST = datetime(2020, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+_WALLET = "GA123"
+_ASSET_PAIR = "USDC:GBUQWP3BOUZX34LOCALHOSTED/XLM"
+_BASE_ASSET = Asset(code="USDC", issuer="GBUQWP3BOUZX34LOCALHOSTED")
+_COUNTER_ASSET = Asset(code="XLM", issuer=None)
+
+
+def _fresh_state() -> WalletFeatureState:
+    """Return a new, isolated WalletFeatureState with a deterministic past timestamp."""
+    return WalletFeatureState(
+        wallet=_WALLET,
+        asset_pair=_ASSET_PAIR,
+        last_updated=_FIXED_PAST,
+    )
+
 
 @pytest.fixture
 def sample_trade():
@@ -21,10 +61,10 @@ def sample_trade():
     return TradeFactory.trade(
         id="trade_123",
         ledger_close_time=datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc),
-        base_account="GA123",
+        base_account=_WALLET,
         counter_account="GA456",
-        base_asset=Asset(code="USDC", issuer="GBUQWP3BOUZX34LOCALHOSTED"),
-        counter_asset=Asset(code="XLM", issuer=None),
+        base_asset=_BASE_ASSET,
+        counter_asset=_COUNTER_ASSET,
         base_amount=100.5,
         counter_amount=500.0,
         price=5.0,
@@ -35,12 +75,13 @@ def sample_trade():
 
 @pytest.fixture
 def initial_state():
-    """Create an initial feature state."""
-    return WalletFeatureState(
-        wallet="GA123",
-        asset_pair="USDC:GBUQWP3BOUZX34LOCALHOSTED/XLM",
-        last_updated=datetime.now(timezone.utc),
-    )
+    """Create an initial feature state with a fixed deterministic timestamp.
+
+    Using a fixed past timestamp (not ``datetime.now()``) ensures the assertion
+    ``updated.last_updated >= initial_state.last_updated`` is structural rather
+    than timing-dependent.
+    """
+    return _fresh_state()
 
 
 def test_benford_digit_extraction():
@@ -56,31 +97,34 @@ def test_hash_counterparty():
     """Test counterparty hashing."""
     hash1 = _hash_counterparty("GA123")
     hash2 = _hash_counterparty("GA456")
-    
+
     # Should be deterministic
     assert hash1 == _hash_counterparty("GA123")
-    
+
     # Different inputs should produce different hashes (with high probability)
     assert hash1 != hash2
-    
+
     # Should be a 32-bit integer
     assert 0 <= hash1 <= 0xFFFFFFFF
     assert 0 <= hash2 <= 0xFFFFFFFF
 
 
 def test_update_feature_state_adds_trade(sample_trade, initial_state):
-    """Test that update_feature_state adds trade to ring buffers."""
-    import time
-    time.sleep(0.01)  # Ensure timestamp difference
+    """Test that update_feature_state adds trade to ring buffers.
+
+    No time.sleep needed: initial_state.last_updated is a fixed past timestamp
+    (_FIXED_PAST), so updated.last_updated (set to datetime.now() inside
+    update_feature_state) is guaranteed to be >= it without any artificial delay.
+    """
     updated = update_feature_state(initial_state, sample_trade)
-    
+
     # Trade should be in all rings
     assert len(updated.trade_ring_1h) == 1
     assert len(updated.trade_ring_4h) == 1
     assert len(updated.trade_ring_24h) == 1
     assert len(updated.trade_ring_7d) == 1
     assert len(updated.trade_ring_30d) == 1
-    
+
     # Metadata should be updated
     assert updated.trade_count == 1
     assert updated.last_updated >= initial_state.last_updated
@@ -89,7 +133,7 @@ def test_update_feature_state_adds_trade(sample_trade, initial_state):
 def test_update_feature_state_benford_update(sample_trade, initial_state):
     """Test that Benford digit counts are updated correctly."""
     updated = update_feature_state(initial_state, sample_trade)
-    
+
     # base_amount = 100.5, first digit = 1
     assert updated.benford_digit_counts_30d[0] == 1  # digit 1 is at index 0
     assert sum(updated.benford_digit_counts_30d) == 1
@@ -98,10 +142,10 @@ def test_update_feature_state_benford_update(sample_trade, initial_state):
 def test_update_feature_state_counterparty_update(sample_trade, initial_state):
     """Test that counterparty hashes are updated correctly."""
     updated = update_feature_state(initial_state, sample_trade)
-    
+
     # Should have one counterparty
     assert len(updated.counterparty_hashes_30d) == 1
-    
+
     # Second trade with same counterparty should not add duplicate
     sample_trade2 = sample_trade.model_copy(
         update={"id": "trade_456", "ledger_close_time": sample_trade.ledger_close_time + timedelta(seconds=1)}
@@ -115,23 +159,23 @@ def test_ring_buffer_overflow(initial_state):
     # Test with small number of trades to verify FIFO eviction works
     state = initial_state
     base_time = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    
+
     # Add trades (200 trades spanning 20 seconds, all within 1h window)
     for i in range(200):
         trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(milliseconds=i * 100),
-            base_account="GA123",
+            base_account=_WALLET,
             counter_account=f"GA{i % 5}",  # Reuse counterparties
-            base_asset=Asset(code="USDC", issuer="GBUQWP3BOUZX34LOCALHOSTED"),
-            counter_asset=Asset(code="XLM", issuer=None),
+            base_asset=_BASE_ASSET,
+            counter_asset=_COUNTER_ASSET,
             base_amount=100.0 + i,
             counter_amount=500.0,
             price=5.0,
             base_is_seller=True,
         )
         state = update_feature_state(state, trade)
-    
+
     # Ring should respect the cap
     assert len(state.trade_ring_1h) <= RING_BUFFER_CAPS["1h"]
     # Since all trades are within 1h, should have all 200
@@ -141,15 +185,15 @@ def test_ring_buffer_overflow(initial_state):
 def test_prune_expired_entries(initial_state):
     """Test that entries older than window are pruned from ring buffers."""
     base_time = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    
+
     # Add a trade at the beginning
     trade1 = TradeFactory.trade(
         id="trade_1",
         ledger_close_time=base_time,
-        base_account="GA123",
+        base_account=_WALLET,
         counter_account="GA456",
-        base_asset=Asset(code="USDC", issuer="GBUQWP3BOUZX34LOCALHOSTED"),
-        counter_asset=Asset(code="XLM", issuer=None),
+        base_asset=_BASE_ASSET,
+        counter_asset=_COUNTER_ASSET,
         base_amount=100.0,
         counter_amount=500.0,
         price=5.0,
@@ -157,26 +201,26 @@ def test_prune_expired_entries(initial_state):
     )
     state = update_feature_state(initial_state, trade1)
     assert len(state.trade_ring_1h) == 1
-    
+
     # Add a trade 2 hours later
     trade2 = TradeFactory.trade(
         id="trade_2",
         ledger_close_time=base_time + timedelta(hours=2),
-        base_account="GA123",
+        base_account=_WALLET,
         counter_account="GA456",
-        base_asset=Asset(code="USDC", issuer="GBUQWP3BOUZX34LOCALHOSTED"),
-        counter_asset=Asset(code="XLM", issuer=None),
+        base_asset=_BASE_ASSET,
+        counter_asset=_COUNTER_ASSET,
         base_amount=100.0,
         counter_amount=500.0,
         price=5.0,
         base_is_seller=True,
     )
     state = update_feature_state(state, trade2)
-    
+
     # The first trade should have been pruned from 1h ring (> 1h old)
     assert len(state.trade_ring_1h) == 1
     assert state.trade_ring_1h[0][1] == 100.0  # Only trade2 remains
-    
+
     # But the 4h ring should have both
     assert len(state.trade_ring_4h) == 2
 
@@ -184,38 +228,38 @@ def test_prune_expired_entries(initial_state):
 def test_derive_feature_vector_benford(initial_state):
     """Test that derive_feature_vector computes Benford features correctly."""
     base_time = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    
+
     # Create states with known Benford distributions
     # Benford's Law: digit 1 should appear ~30%, digit 2 ~17%, etc.
     state = initial_state
-    
+
     # Add 100 trades with amounts starting with 1-9 (cycling)
     for i in range(100):
         digit = (i % 9) + 1  # digits 1-9
         amount = float(f"{digit}00.0")  # 100, 200, ..., 900
-        
+
         trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(seconds=i),
-            base_account="GA123",
+            base_account=_WALLET,
             counter_account=f"GA{i % 10}",
-            base_asset=Asset(code="USDC", issuer="GBUQWP3BOUZX34LOCALHOSTED"),
-            counter_asset=Asset(code="XLM", issuer=None),
+            base_asset=_BASE_ASSET,
+            counter_asset=_COUNTER_ASSET,
             base_amount=amount,
             counter_amount=500.0,
             price=5.0,
             base_is_seller=True,
         )
         state = update_feature_state(state, trade)
-    
+
     features = derive_feature_vector(state)
-    
+
     # Should have Benford features for all windows
     assert "benford_chi_square_1h" in features
     assert "benford_mad_1h" in features
     assert "benford_max_zscore_1h" in features
     assert "benford_chi_square_30d" in features
-    
+
     # Features should be numeric
     for key in ["benford_chi_square_1h", "benford_mad_1h", "benford_max_zscore_1h"]:
         assert isinstance(features[key], float)
@@ -225,27 +269,27 @@ def test_derive_feature_vector_benford(initial_state):
 def test_derive_feature_vector_volume_ratio(initial_state):
     """Test volume_to_unique_counterparty_ratio calculation."""
     base_time = datetime(2026, 6, 22, 12, 0, 0, tzinfo=timezone.utc)
-    
+
     state = initial_state
-    
+
     # Add 10 trades with 5 unique counterparties
     for i in range(10):
         trade = TradeFactory.trade(
             id=f"trade_{i}",
             ledger_close_time=base_time + timedelta(seconds=i),
-            base_account="GA123",
+            base_account=_WALLET,
             counter_account=f"GA{i % 5}",
-            base_asset=Asset(code="USDC", issuer="GBUQWP3BOUZX34LOCALHOSTED"),
-            counter_asset=Asset(code="XLM", issuer=None),
+            base_asset=_BASE_ASSET,
+            counter_asset=_COUNTER_ASSET,
             base_amount=100.0,
             counter_amount=500.0,
             price=5.0,
             base_is_seller=True,
         )
         state = update_feature_state(state, trade)
-    
+
     features = derive_feature_vector(state)
-    
+
     # volume_to_unique_counterparty_ratio = 1000 / 5 = 200
     assert features["volume_to_unique_counterparty_ratio"] == 200.0
 
@@ -254,7 +298,7 @@ def test_serialize_deserialize_state(initial_state):
     """Test JSON serialization/deserialization of WalletFeatureState."""
     json_str = initial_state.model_dump_json()
     deserialized = WalletFeatureState.model_validate_json(json_str)
-    
+
     assert deserialized.wallet == initial_state.wallet
     assert deserialized.asset_pair == initial_state.asset_pair
     assert deserialized.trade_count == initial_state.trade_count
@@ -264,7 +308,7 @@ def test_serialize_deserialize_state(initial_state):
 def test_get_state_unknown_wallet(initial_state):
     """Test that FeatureStore.get_state returns None for unknown wallet."""
     from detection.feature_store import FeatureStore
-    
+
     fs = FeatureStore()
     result = fs.get_state("UNKNOWN", "USDC/XLM")
     assert result is None
@@ -273,10 +317,10 @@ def test_get_state_unknown_wallet(initial_state):
 def test_set_get_state_roundtrip(initial_state):
     """Test set_state / get_state roundtrip."""
     from detection.feature_store import FeatureStore
-    
+
     fs = FeatureStore()
     fs.set_state(initial_state)
-    
+
     retrieved = fs.get_state(initial_state.wallet, initial_state.asset_pair)
     assert retrieved is not None
     assert retrieved.wallet == initial_state.wallet
@@ -286,26 +330,26 @@ def test_set_get_state_roundtrip(initial_state):
 def test_fallback_dict_lru_eviction():
     """Test that fallback dict evicts LRU entries when at capacity."""
     from detection.feature_store import FeatureStore
-    
+
     max_entries = 10
     fs = FeatureStore(redis_url=None, max_fallback_entries=max_entries)
-    
+
     # Add more than max entries
     for i in range(max_entries + 5):
         state = WalletFeatureState(
             wallet=f"GA{i}",
             asset_pair="USDC/XLM",
-            last_updated=datetime.now(timezone.utc),
+            last_updated=_FIXED_PAST,
         )
         fs.set_state(state)
-    
+
     # Should only have max_entries in fallback dict
     assert len(fs._fallback_dict) == max_entries
 
 
 class _FailingRedisClient:
-    """Stands in for a real `redis.Redis` whose calls always raise --
-    simulates a Redis outage without needing the `redis` package installed.
+    """Stands in for a real ``redis.Redis`` whose calls always raise --
+    simulates a Redis outage without needing the ``redis`` package installed.
     """
 
     def get(self, key):
@@ -324,7 +368,7 @@ class _FailingRedisClient:
 
 def _feature_store_with_failing_redis():
     """A FeatureStore wired to a Redis client that always raises, without
-    ever importing the real `redis` package."""
+    ever importing the real ``redis`` package."""
     from detection.feature_store import FeatureStore
 
     fs = FeatureStore(redis_url=None)
@@ -337,7 +381,7 @@ def test_redis_failure_falls_back_to_in_process_dict():
     from utils.circuit_breaker import CircuitState
 
     fs = _feature_store_with_failing_redis()
-    state = WalletFeatureState(wallet="GA1", asset_pair="USDC/XLM", last_updated=datetime.now(timezone.utc))
+    state = WalletFeatureState(wallet="GA1", asset_pair="USDC/XLM", last_updated=_FIXED_PAST)
 
     fs.set_state(state)
     retrieved = fs.get_state("GA1", "USDC/XLM")
@@ -394,6 +438,6 @@ def test_redis_circuit_recovers_after_timeout():
             self.store[key] = value.encode() if isinstance(value, str) else value
 
     fs.redis_client = _WorkingClient()
-    state = WalletFeatureState(wallet="GA1", asset_pair="USDC/XLM", last_updated=datetime.now(timezone.utc))
+    state = WalletFeatureState(wallet="GA1", asset_pair="USDC/XLM", last_updated=_FIXED_PAST)
     fs.set_state(state)
     assert fs.circuit_state == "closed"

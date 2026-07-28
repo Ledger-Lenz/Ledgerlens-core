@@ -15,7 +15,7 @@ try:
     _HAS_PYG = True
 except ImportError:
     torch = None
-    HeteroData = object
+    HeteroData = type(None)
     _HAS_PYG = False
 
 from ingestion.data_models import Trade
@@ -60,9 +60,13 @@ class TemporalGraphBuilder:
         self.bucket_hours = bucket_hours
         self.max_node_degree = max_node_degree
 
-    def build_snapshots(self, trades: Iterable[Trade], lookback_days: int,
-                         node_feature_lookup: dict = None,
-                         end_time: datetime = None) -> list:
+    def build_snapshots(
+        self,
+        trades: Iterable[Trade],
+        lookback_days: int,
+        node_feature_lookup: dict | None = None,
+        end_time: datetime | None = None,
+    ) -> list[GraphSnapshot]:
         """Builds non-overlapping temporal graph snapshots covering the window."""
         node_feature_lookup = node_feature_lookup or {}
         end_time = end_time or datetime.now(timezone.utc)
@@ -88,13 +92,15 @@ class TemporalGraphBuilder:
                     continue
                 if t.base_account == t.counter_account:
                     continue
+                price = t.price if t.price is not None else 0.0
+                is_pool = t.trade_type == "liquidity_pool" if t.trade_type else False
                 edges.append((
                     t.base_account,
                     t.counter_account,
                     [
                         float(t.base_amount),
-                        float(getattr(t, "price", 0.0) or 0.0),
-                        1.0 if getattr(t, "trade_type", "orderbook") == "liquidity_pool" else 0.0,
+                        float(price),
+                        1.0 if is_pool else 0.0,
                     ],
                 ))
 

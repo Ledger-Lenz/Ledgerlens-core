@@ -1,12 +1,14 @@
 """SQLite-backed store for wallet allowlist/denylist overrides with full audit trail."""
 
+import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional
 
 from config.settings import settings
+
+logger = logging.getLogger("ledgerlens.wallet_overrides")
 
 
 _CREATE_TABLE = """
@@ -42,8 +44,11 @@ def init_override_table() -> None:
         conn.executescript(_CREATE_TABLE)
 
 
+# Initialize table at module import time
+init_override_table()
+
+
 def add_override(wallet: str, list_type: str, reason: str, added_by: str) -> dict:
-    init_override_table()
     entry_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
@@ -59,12 +64,15 @@ def add_override(wallet: str, list_type: str, reason: str, added_by: str) -> dic
             (entry_id, wallet, list_type, reason, added_by, now),
         )
         conn.commit()
+    logger.info(
+        "Wallet override added: wallet=%s list_type=%s entry_id=%s added_by=%s reason=%s",
+        wallet, list_type, entry_id, added_by, reason,
+    )
     return {"entry_id": entry_id, "wallet": wallet, "list_type": list_type,
             "reason": reason, "added_by": added_by, "added_at": now}
 
 
-def remove_override(wallet: str, list_type: str, removed_by: str) -> Optional[dict]:
-    init_override_table()
+def remove_override(wallet: str, list_type: str, removed_by: str) -> dict | None:
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         row = conn.execute(
@@ -72,17 +80,21 @@ def remove_override(wallet: str, list_type: str, removed_by: str) -> Optional[di
             (wallet, list_type),
         ).fetchone()
         if not row:
+            logger.debug("Override not found for removal: wallet=%s list_type=%s", wallet, list_type)
             return None
         conn.execute(
             "UPDATE wallet_overrides SET removed_by=?, removed_at=? WHERE entry_id=?",
             (removed_by, now, row["entry_id"]),
         )
         conn.commit()
-        return {"entry_id": row["entry_id"], "wallet": wallet, "removed_by": removed_by, "removed_at": now}
+    logger.info(
+        "Wallet override removed: wallet=%s list_type=%s entry_id=%s removed_by=%s",
+        wallet, list_type, row["entry_id"], removed_by,
+    )
+    return {"entry_id": row["entry_id"], "wallet": wallet, "removed_by": removed_by, "removed_at": now}
 
 
-def get_active_override(wallet: str) -> Optional[dict]:
-    init_override_table()
+def get_active_override(wallet: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             "SELECT * FROM wallet_overrides WHERE wallet=? AND removed_at IS NULL LIMIT 1",
@@ -92,7 +104,6 @@ def get_active_override(wallet: str) -> Optional[dict]:
 
 
 def list_overrides(list_type: str, limit: int = 50, offset: int = 0) -> list[dict]:
-    init_override_table()
     with _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM wallet_overrides WHERE list_type=? ORDER BY added_at DESC LIMIT ? OFFSET ?",

@@ -15,18 +15,18 @@ fully supported for the one feature where the opposite holds
 (`cross_chain_time_lag_median_h`).
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
 
-from detection.feature_engineering import FEATURE_NAMES
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class FeatureConstraint:
     """Describes how a single feature may legally be perturbed.
 
-    `direction` is only meaningful when `mutable` is True: "decrease" means
+    `direction` is only meaningful when `mutable` is True: ``"decrease"`` means
     the counterfactual may only lower the feature relative to its observed
-    value, "increase" the reverse, and "any" permits movement in either
+    value, ``"increase"`` the reverse, and ``"any"`` permits movement in either
     direction (subject to `min_val`/`max_val`). `min_val`/`max_val` bound
     the *absolute* value the feature may take after perturbation, not the
     size of the perturbation itself.
@@ -132,7 +132,7 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _decreasable("pool_round_trip_ratio"),
     _decreasable("pool_share_concentration"),
 
-    # --- Path-payment features (3) ------------------------------------------
+    # --- Path-payment features (4) ------------------------------------------
     # atomic_self_payment_ratio and path_cycle_volume_ratio directly measure
     # circular/self-dealing path payments. avg_path_hop_count is included as
     # a decreasable obfuscation signal (fewer hops = less layering); a floor
@@ -174,10 +174,10 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _decreasable("jitter_fingerprint"),
     _decreasable("evasion_composite_score"),
 
-    # --- Cross-chain features (6) -------------------------------------------
+    # --- Cross-chain features (7) -------------------------------------------
     # has_evm_link records the historical fact that a wallet was once linked
     # to an EVM address via a bridge transfer -- that fact cannot be undone,
-    # so it is immutable, exactly like account_age_days. The remaining five
+    # so it is immutable, exactly like account_age_days. The remaining six
     # are forward-looking behavioural ratios/medians the wallet can still
     # change going forward.
     _immutable("has_evm_link"),
@@ -191,6 +191,7 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # feature. Capped at 720h (30 days, the longest rolling window elsewhere
     # in this codebase) as a practical upper bound on a "wait longer" ask.
     _increasable("cross_chain_time_lag_median_h", max_val=720.0),
+    _decreasable("cross_chain_round_trip_score"),
 
     # --- Multivariate Benford features (3) ----------------------------------
     # benford_copula_pval is a p-value: 1.0 = no coordination evidence, so it
@@ -210,7 +211,7 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     _increasable("pdc_5m", max_val=1.0),
     _increasable("pdc_1h", max_val=1.0),
 
-    # --- T-GNN features (5) -------------------------------------------------
+    # --- T-GNN features (2) -------------------------------------------------
     # gnn_wash_ring_probability is the GNN's own [0, 1] suspicion estimate --
     # decreasable like any other suspicion score, with the same independent-
     # feature simplification noted for evasion_composite_score above.
@@ -218,18 +219,6 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # neighbours; a wallet lowers it by trading with lower-risk counterparties.
     _decreasable("gnn_wash_ring_probability"),
     _decreasable("gnn_neighbor_avg_score"),
-    # gnn_asset_mediated_ring_score, gnn_order_cancel_coordination_score, and
-    # gnn_funding_proximity_score are additional [0, 1] GNN suspicion scores
-    # (asset-mediated ring participation, coordinated order-cancellation
-    # timing, and shared-funding-source proximity respectively) -- each
-    # follows the same "higher = more suspicious" convention as the other GNN
-    # scores above, so all three are decreasable.
-    _decreasable("gnn_asset_mediated_ring_score"),
-    _decreasable("gnn_order_cancel_coordination_score"),
-    _decreasable("gnn_funding_proximity_score"),
-    # cross_chain_round_trip_score: lowering this reduces cross-chain
-    # round-trip detection signal.
-    _decreasable("cross_chain_round_trip_score"),
 
     # --- Benford stratification features (25) --------------------------------
     # max_stratum_chi2/MAD are the worst-case per-stratum goodness-of-fit
@@ -271,26 +260,49 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # scorer -- decreasable for the same reason.
     _decreasable("gnn_wash_ring_prob"),
 
-    # --- Heterogeneous GNN graph scores (3) -----------------------------------
+    # --- Heterogeneous GNN graph scores (3) ----------------------------------
     # asset-mediated ring / order-cancellation-coordination / funding-proximity
-    # probabilities from the heterogeneous GraphSAGE/HGT model
-    # (detection/feature_engineering.py). Same [0, 1] "higher = more
-    # suspicious" semantics as gnn_wash_ring_prob -- decreasable.
+    # probabilities from the heterogeneous GraphSAGE/HGT model. Same [0, 1]
+    # "higher = more suspicious" semantics as gnn_wash_ring_prob -- decreasable.
+    # NOTE: These were formerly duplicated in the "T-GNN features" section
+    # above; removed in the v2.7.0 cleanup (commit dedup counterfactual_constraints).
     _decreasable("gnn_asset_mediated_ring_score"),
     _decreasable("gnn_order_cancel_coordination_score"),
     _decreasable("gnn_funding_proximity_score"),
 
-    # --- Adversarial composite (1) --------------------------------------------
+    # --- Adversarial composite (1) -------------------------------------------
     # adversarial_feature_score is a direct copy of evasion_composite_score
     # (see detection/feature_engineering.py); same constraint applies.
     _decreasable("adversarial_feature_score"),
 ]
 
-_missing = set(FEATURE_NAMES) - {c.feature_name for c in FEATURE_CONSTRAINTS}
-if _missing:
-    raise RuntimeError(f"FEATURE_CONSTRAINTS is missing entries for: {sorted(_missing)}")
+
+def _validate_constraints() -> None:
+    """Validate completeness of FEATURE_CONSTRAINTS against FEATURE_NAMES.
+
+    Raises :exc:`RuntimeError` when any feature name is missing from the
+    constraints list.  Called lazily on first use so importing this module
+    does not trigger a full feature-engineering reconciliation at import time.
+    """
+    from detection.feature_engineering import FEATURE_NAMES
+
+    missing = set(FEATURE_NAMES) - {c.feature_name for c in FEATURE_CONSTRAINTS}
+    if missing:
+        raise RuntimeError(
+            f"FEATURE_CONSTRAINTS is missing entries for: {sorted(missing)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cached mutable-feature list -- built once on first call.
+# ---------------------------------------------------------------------------
+_MUTABLE_FEATURES: list[str] | None = None
 
 
 def get_mutable_features() -> list[str]:
     """Return the names of all features the counterfactual engine may perturb."""
-    return [c.feature_name for c in FEATURE_CONSTRAINTS if c.mutable]
+    global _MUTABLE_FEATURES
+    if _MUTABLE_FEATURES is None:
+        _validate_constraints()
+        _MUTABLE_FEATURES = [c.feature_name for c in FEATURE_CONSTRAINTS if c.mutable]
+    return _MUTABLE_FEATURES

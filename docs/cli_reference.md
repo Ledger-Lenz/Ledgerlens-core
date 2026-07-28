@@ -52,8 +52,10 @@ ledgerlens completion --shell fish | source
 - `--shell` enum values (`bash`, `zsh`, `fish`)
 
 `stream --reset-cursor` deletes the durable Horizon paging-token checkpoint
-before connecting. The checkpoint location is configured with
-`CURSOR_CHECKPOINT_PATH` and must be inside `DATA_DIR`.
+before connecting — both the legacy JSON file at `CURSOR_CHECKPOINT_PATH`
+(must be inside `DATA_DIR`) and the unified SQLite checkpoint that also
+covers rolling-window state (see
+[Ingestion](ingestion.md#horizon-cursor-checkpointing)).
 
 The stream command also accepts:
 

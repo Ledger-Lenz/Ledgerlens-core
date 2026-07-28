@@ -292,6 +292,10 @@ class BridgeTransferLoader:
         - topics[0]: event signature hash
         - topics[1]: sender address (indexed)
         - data: ABI-encoded (recipient_bytes32, amount_uint256, ...)
+
+        Note: Fields prefixed with underscore (_log_index, _topics, _data, _block_hash)
+        are stored internally for later receipt verification and are not part of the
+        canonical transfer data.
         """
         try:
             topics = log["topics"]
@@ -309,7 +313,6 @@ class BridgeTransferLoader:
                     f"TokensSent data too short ({len(data_hex)} chars): {data_hex!r}"
                 )
             recipient_bytes = bytes.fromhex(data_hex[0:64])
-            amount_raw = int.from_bytes(bytes.fromhex(data_hex[64:128]), "big")  # noqa: F841
         except (KeyError, IndexError) as exc:
             raise ValueError(
                 f"Failed to parse TokensSent event — missing field {exc}: {log!r}"
@@ -345,7 +348,6 @@ class BridgeTransferLoader:
             canonical_hash=canonical_hash,
             verification_status=VerificationResult.DISABLED,
             verified_at=None,
-            # Store raw log fields needed for receipt verification
             _log_index=log_index,
             _topics=log["topics"],
             _data=log["data"],
@@ -387,11 +389,11 @@ class BridgeTransferLoader:
             if sample_rate > 0.0 and random.random() < sample_rate:
                 result = self._verifier.verify_event_via_receipt(
                     tx_hash=transfer.tx_hash_evm,
-                    log_index=transfer._log_index,  # type: ignore[attr-defined]
+                    log_index=transfer._log_index,
                     contract_address=self.contract_address,
-                    topics=transfer._topics,  # type: ignore[attr-defined]
-                    data=transfer._data,  # type: ignore[attr-defined]
-                    block_hash=transfer._block_hash,  # type: ignore[attr-defined]
+                    topics=transfer._topics,
+                    data=transfer._data,
+                    block_hash=transfer._block_hash,
                 )
                 transfer.verification_status = result
                 transfer.verified_at = datetime.now(timezone.utc)
@@ -400,7 +402,7 @@ class BridgeTransferLoader:
                     logger.error(
                         "TAMPERED bridge event detected: tx=%s log_index=%d chain=%d",
                         transfer.tx_hash_evm,
-                        transfer._log_index,  # type: ignore[attr-defined]
+                        transfer._log_index,
                         self.chain_id,
                     )
                     self._send_to_dlq(transfer)

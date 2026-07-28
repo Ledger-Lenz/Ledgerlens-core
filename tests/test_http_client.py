@@ -78,12 +78,36 @@ def _make_mock_response(status_code: int, body: dict | None = None) -> MagicMock
         resp.raise_for_status.side_effect = httpx.HTTPStatusError(
             f"HTTP {status_code}", request=resp.request, response=resp
         )
+    else:
+        resp.raise_for_status.return_value = None
     return resp
 
 
 def _patch_client_get(client: AsyncHorizonClient, handler):
-    """Replace the inner httpx.AsyncClient.get with an async callable."""
-    client._client.get = handler
+    """Replace the inner httpx.AsyncClient.request with an async callable.
+
+    ``_make_request`` routes all HTTP calls through ``client._client.request``.
+    This helper wraps a legacy ``async def mock_get(url, params=None)`` handler
+    so that existing tests written against the ``get``-based interface continue
+    to work without modification.
+    """
+
+    async def mock_request(method, url, **kwargs):
+        inner = await handler(url, params=kwargs.get("params"))
+        resp = MagicMock()
+        resp.status_code = inner.status_code
+        resp.headers = {}  # no version header → guard no-op
+        resp.json.return_value = inner.json.return_value if inner.json.return_value else {}
+        resp.request = inner.request
+        if inner.status_code >= 400:
+            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+                f"HTTP {inner.status_code}", request=resp.request, response=resp
+            )
+        else:
+            resp.raise_for_status.return_value = None
+        return resp
+
+    client._client.request = mock_request
     return client
 
 

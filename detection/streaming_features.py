@@ -34,7 +34,6 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -44,12 +43,15 @@ from ingestion.data_models import Trade
 # Window configuration
 # ---------------------------------------------------------------------------
 
+_SECONDS_PER_HOUR = 3600
+_RECENT_LEGS_WINDOW = 20  # Number of recent legs to track for round-trip detection
+
 _WINDOW_SECONDS: dict[str, int] = {
-    "1h": 3600,
-    "4h": 4 * 3600,
-    "24h": 24 * 3600,
-    "7d": 7 * 24 * 3600,
-    "30d": 30 * 24 * 3600,
+    "1h": _SECONDS_PER_HOUR,
+    "4h": 4 * _SECONDS_PER_HOUR,
+    "24h": 24 * _SECONDS_PER_HOUR,
+    "7d": 7 * 24 * _SECONDS_PER_HOUR,
+    "30d": 30 * 24 * _SECONDS_PER_HOUR,
 }
 
 _DIGITS = list(range(1, 10))
@@ -63,7 +65,7 @@ _OFF_HOURS = frozenset(range(0, 6))
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _first_digit(value: float) -> Optional[int]:
+def _first_digit(value: float) -> int | None:
     """Return the leading decimal digit of *value*, or ``None`` for invalid values."""
     if value is None or not math.isfinite(value) or value <= 0:
         return None
@@ -130,7 +132,7 @@ class WindowState:
     amount_sum: float = 0.0
     trade_count: int = 0
     cp_volume: dict = field(default_factory=dict)
-    digit_histogram: List[int] = field(default_factory=lambda: [0] * 9)
+    digit_histogram: list[int] = field(default_factory=lambda: [0] * 9)
     digit_count: int = 0
     self_match_count: int = 0
     off_hours_count: int = 0
@@ -138,7 +140,7 @@ class WindowState:
     hourly_volume: dict = field(default_factory=dict)
 
     # Lightweight round-trip tracker: recent (gave, got) pairs.
-    recent_legs: deque = field(default_factory=lambda: deque(maxlen=20))
+    recent_legs: deque = field(default_factory=lambda: deque(maxlen=_RECENT_LEGS_WINDOW))
 
     def _add(
         self,
@@ -149,7 +151,7 @@ class WindowState:
         gave: str,
         got: str,
         self_match: bool,
-        digit: Optional[int],
+        digit: int | None,
         minute_key: int,
         hour_bucket: int,
     ) -> None:
@@ -198,7 +200,7 @@ class WindowState:
         gave: str,
         got: str,
         self_match: bool,
-        digit: Optional[int],
+        digit: int | None,
         minute_key: int,
         hour_bucket: int,
     ) -> None:
@@ -210,7 +212,7 @@ class WindowState:
 
     # ---- Feature extraction ------------------------------------------------
 
-    def benford_metrics(self) -> Tuple[float, float, float]:
+    def benford_metrics(self) -> tuple[float, float, float]:
         """Return ``(chi_square, mad, max_zscore)`` from the current digit histogram."""
         n = self.digit_count
         if n == 0:
@@ -298,11 +300,11 @@ class WalletState:
     """Per-wallet state across all rolling windows."""
 
     wallet: str
-    windows: Dict[str, WindowState] = field(default_factory=dict)
+    windows: dict[str, WindowState] = field(default_factory=dict)
     # Global (all-time) accumulators for features that need full history.
     all_time_trade_count: int = 0
     all_time_counterparties: set = field(default_factory=set)
-    first_seen_sec: Optional[int] = None
+    first_seen_sec: int | None = None
 
     def __post_init__(self) -> None:
         self.windows = {label: WindowState(window_sec=secs) for label, secs in _WINDOW_SECONDS.items()}
@@ -312,7 +314,7 @@ class WalletState:
 # Streaming feature vector type
 # ---------------------------------------------------------------------------
 
-FeatureVector = Dict[str, float]
+FeatureVector = dict[str, float]
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +338,7 @@ class StreamingFeatureEngine:
     """
 
     def __init__(self) -> None:
-        self._wallets: Dict[str, WalletState] = {}
+        self._wallets: dict[str, WalletState] = {}
 
     def _get_or_create(self, wallet: str) -> WalletState:
         if wallet not in self._wallets:
@@ -345,7 +347,7 @@ class StreamingFeatureEngine:
 
     def _extract_trade_fields(
         self, trade: Trade, wallet: str
-    ) -> Tuple[int, float, str, int, str, str, bool, Optional[int], int, int]:
+    ) -> tuple[int, float, str, int, str, str, bool, int | None, int, int]:
         """Extract the fields needed by `WindowState.update`."""
         ts = trade.ledger_close_time
         if hasattr(ts, "timestamp"):
@@ -374,7 +376,7 @@ class StreamingFeatureEngine:
         self_match = (trade.base_account == trade.counter_account)
         digit = _first_digit(amount)
         minute_key = ts_sec // 60
-        hour_bucket = ts_sec // 3600
+        hour_bucket = ts_sec // _SECONDS_PER_HOUR
 
         return ts_sec, amount, cp, hour, gave, got, self_match, digit, minute_key, hour_bucket
 

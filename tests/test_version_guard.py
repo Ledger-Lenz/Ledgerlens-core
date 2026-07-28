@@ -594,56 +594,11 @@ def test_version_guard_performance_10k_calls():
 # ---------------------------------------------------------------------------
 
 
-def _patch_client_get(client: AsyncHorizonClient, handler):
-    """Replace the inner httpx.AsyncClient.get with an async callable.
-
-    The existing test helpers called `client._client.get` directly; now
-    _make_request uses `client._client.request`.  We wrap `get` calls
-    via `request` so legacy test helpers keep working when they call
-    `client.get(path)` (which internally calls `_make_request("GET", ...)`).
-    """
-
-    async def mock_request(method, url, **kwargs):
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.headers = {}  # no version header → no-op guard
-        resp.raise_for_status.return_value = None
-        inner = await handler(url, params=kwargs.get("params"))
-        resp.status_code = inner.status_code
-        resp.json.return_value = inner.json.return_value if inner.json.return_value else {}
-        resp.request = inner.request
-        if inner.status_code >= 400:
-            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-                f"HTTP {inner.status_code}", request=resp.request, response=resp
-            )
-        return resp
-
-    client._client.request = mock_request
-    return client
-
-
-def _make_legacy_mock_response(status_code: int, body: dict | None = None) -> MagicMock:
-    resp = MagicMock()
-    resp.status_code = status_code
-    resp.json.return_value = body or {}
-    resp.request = MagicMock()
-    resp.headers = {}
-    if status_code >= 400:
-        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-            f"HTTP {status_code}", request=resp.request, response=resp
-        )
-    else:
-        resp.raise_for_status.return_value = None
-    return resp
-
-
 @pytest.mark.asyncio
 async def test_regression_async_client_returns_json_on_success():
-    async def mock_get(url, params=None):
-        return _make_legacy_mock_response(200, {"ok": True})
-
     client = AsyncHorizonClient("https://horizon.stellar.org", version_guard=None)
-    _patch_client_get(client, mock_get)
+    resp = _make_mock_response(200, {"ok": True})
+    _patch_make_request(client, resp)
 
     result = await client.get("/trades")
     assert result == {"ok": True}
@@ -653,17 +608,20 @@ async def test_regression_async_client_returns_json_on_success():
 @pytest.mark.asyncio
 async def test_regression_async_client_retries_on_retryable_status():
     calls = {"count": 0}
+    responses = [
+        _make_mock_response(503),
+        _make_mock_response(503),
+        _make_mock_response(200, {"ok": True}),
+    ]
 
-    async def mock_get(url, params=None):
+    async def mock_request(method, url, **kwargs):
         calls["count"] += 1
-        if calls["count"] < 3:
-            return _make_legacy_mock_response(503)
-        return _make_legacy_mock_response(200, {"ok": True})
+        return responses[min(calls["count"] - 1, len(responses) - 1)]
 
     client = AsyncHorizonClient(
         "https://horizon.stellar.org", max_retries=3, version_guard=None
     )
-    _patch_client_get(client, mock_get)
+    client._client.request = mock_request
 
     with patch("ingestion.http_client.asyncio.sleep"):
         result = await client.get("/trades")
@@ -675,13 +633,11 @@ async def test_regression_async_client_retries_on_retryable_status():
 
 @pytest.mark.asyncio
 async def test_regression_async_client_raises_after_exhausting_retries():
-    async def mock_get(url, params=None):
-        return _make_legacy_mock_response(429)
-
+    resp = _make_mock_response(429)
     client = AsyncHorizonClient(
         "https://horizon.stellar.org", max_retries=2, version_guard=None
     )
-    _patch_client_get(client, mock_get)
+    _patch_make_request(client, resp)
 
     with patch("ingestion.http_client.asyncio.sleep"):
         with pytest.raises(httpx.HTTPStatusError):
@@ -694,14 +650,14 @@ async def test_regression_async_client_raises_after_exhausting_retries():
 async def test_regression_async_client_does_not_retry_non_retryable_error():
     calls = {"count": 0}
 
-    async def mock_get(url, params=None):
+    async def mock_request(method, url, **kwargs):
         calls["count"] += 1
-        return _make_legacy_mock_response(404)
+        return _make_mock_response(404)
 
     client = AsyncHorizonClient(
         "https://horizon.stellar.org", max_retries=3, version_guard=None
     )
-    _patch_client_get(client, mock_get)
+    client._client.request = mock_request
 
     with pytest.raises(httpx.HTTPStatusError):
         await client.get("/trades")

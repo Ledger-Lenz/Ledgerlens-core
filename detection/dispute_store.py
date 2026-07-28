@@ -42,8 +42,36 @@ def _validate_evidence_url(evidence_url: str) -> None:
         raise ValueError("evidence_url must use https scheme")
     # Reject private IPs by hostname starting with common private ranges
     host = parsed.hostname or ""
-    if host.startswith("10.") or host.startswith("127.") or host.startswith("192.168.") or host.startswith("172."):
+    if host.startswith("10.") or host.startswith("127.") or host.startswith("192.168."):
         raise ValueError("evidence_url must not point to private IP ranges")
+    if host.startswith("172."):
+        parts = host.split(".")
+        if len(parts) >= 2:
+            try:
+                second = int(parts[1])
+                if 16 <= second <= 31:
+                    raise ValueError("evidence_url must not point to private IP ranges")
+            except ValueError:
+                pass
+
+
+def _update_override_status(override_id: int, status: str, tx_hash: str | None = None) -> None:
+    """Atomically update a single score_override row status and optional tx_hash."""
+    conn = sqlite3.connect(settings.db_path)
+    try:
+        if tx_hash:
+            conn.execute(
+                "UPDATE score_overrides SET tx_hash = ?, status = ? WHERE id = ?",
+                (tx_hash, status, override_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE score_overrides SET status = ? WHERE id = ?",
+                (status, override_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # Public API
@@ -157,7 +185,6 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
         conn.commit()
 
         # Check quorum
-        member_count = conn.execute("SELECT COUNT(*) FROM committee_members").fetchone()[0]  # noqa: F841
         quorum = getattr(settings, "COMMITTEE_QUORUM", 3)
         if len(votes) >= quorum:
             approves = sum(1 for v in votes if v.get("vote") == "approve")
@@ -188,6 +215,7 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
                 # Publish zero score in background
                 def _publish_override():
                     try:
+                        _update_override_status(override_id, "failed")
                         publisher = SorobanPublisher(
                             contract_id=settings.score_contract_id,
                             secret_key=settings.service_secret_key,
@@ -208,30 +236,7 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
                         try:
                             tx_hash = publisher.submit_score(zero_score)
                             if tx_hash:
-                                conn2 = sqlite3.connect(settings.db_path)
-                                conn2.execute(
-                                    "UPDATE score_overrides SET tx_hash = ?, status = ? WHERE id = ?",
-                                    (tx_hash, "submitted", override_id),
-                                )
-                                conn2.commit()
-                                conn2.close()
-                        except SorobanCircuitOpenError:
-                            # circuit open: mark failed and leave for retry
-                            conn2 = sqlite3.connect(settings.db_path)
-                            conn2.execute(
-                                "UPDATE score_overrides SET status = ? WHERE id = ?",
-                                ("failed", override_id),
-                            )
-                            conn2.commit()
-                            conn2.close()
-                        except Exception:
-                            conn2 = sqlite3.connect(settings.db_path)
-                            conn2.execute(
-                                "UPDATE score_overrides SET status = ? WHERE id = ?",
-                                ("failed", override_id),
-                            )
-                            conn2.commit()
-                            conn2.close()
+                                _update_override_status(override_id, "submitted", tx_hash)
                     except Exception:
                         pass
 

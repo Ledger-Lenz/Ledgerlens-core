@@ -1,16 +1,16 @@
-"""WebSocket push channel for real-time risk score alerts (#162).
+"""WebSocket push channel for real-time risk score alerts (#162, #428).
 
 Endpoint: GET /ws/alerts?api_key=<key>[&wallet_filter=G...]
 
 Authentication: api_key query param compared against settings.admin_api_key.
 Heartbeat: ping every 30s; connection dropped if no pong within 60s.
-Max connections: WS_MAX_CONNECTIONS env var (default 100).
+Max connections: settings.ws_max_connections (env var LEDGERLENS_WS_MAX_CONNECTIONS, default 100).
 """
 
 import asyncio
 import logging
-import os
 import secrets
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
@@ -21,7 +21,6 @@ from detection.risk_score import RiskScore
 
 logger = logging.getLogger("ledgerlens.ws")
 
-_MAX_CONNECTIONS = int(os.getenv("WS_MAX_CONNECTIONS", "100"))
 _HEARTBEAT_INTERVAL = 30  # seconds
 _PONG_TIMEOUT = 60         # seconds without pong → drop
 
@@ -30,7 +29,7 @@ _PONG_TIMEOUT = 60         # seconds without pong → drop
 class _Conn:
     ws: WebSocket
     wallet_filter: str | None
-    last_pong: float = field(default_factory=lambda: asyncio.get_event_loop().time())
+    last_pong: float = field(default_factory=time.monotonic)
     heartbeat_task: asyncio.Task | None = None
 
 
@@ -47,7 +46,7 @@ class ConnectionManager:
 
         Returns False (and closes with 1008) if the connection limit is reached.
         """
-        if len(self._connections) >= _MAX_CONNECTIONS:
+        if len(self._connections) >= settings.ws_max_connections:
             await ws.close(code=status.WS_1008_POLICY_VIOLATION)
             return False
 
@@ -80,7 +79,6 @@ class ConnectionManager:
     # ------------------------------------------------------------------
 
     async def _heartbeat(self, ws_id: int, conn: _Conn) -> None:
-        loop = asyncio.get_event_loop()
         try:
             while True:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL)
@@ -88,7 +86,7 @@ class ConnectionManager:
                 if conn_now is None:
                     return
                 # Drop stale connection
-                if loop.time() - conn.last_pong > _PONG_TIMEOUT:
+                if time.monotonic() - conn.last_pong > _PONG_TIMEOUT:
                     logger.warning("WS pong timeout id=%d, dropping", ws_id)
                     await conn.ws.close(code=status.WS_1001_GOING_AWAY)
                     self.disconnect(conn.ws)
@@ -104,7 +102,7 @@ class ConnectionManager:
     def record_pong(self, ws: WebSocket) -> None:
         conn = self._connections.get(id(ws))
         if conn:
-            conn.last_pong = asyncio.get_event_loop().time()
+            conn.last_pong = time.monotonic()
 
     # ------------------------------------------------------------------
     # Broadcasting

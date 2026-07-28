@@ -14,11 +14,13 @@ integration point is wired up (see README's "Open Integration Points"),
    `schema_migrations` log table.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -26,12 +28,18 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from detection.feature_store import WalletFeatureState
+    from detection.sandwich_engine import SandwichCandidate
 
 from config.settings import settings
 from detection.risk_score import RiskScore
 from ingestion.data_models import BridgeTransfer, PathPayment, Trade
 
 logger = logging.getLogger("ledgerlens.storage")
+
+# Database configuration constants
+_DB_TIMEOUT_SECONDS = 30.0
+_DB_BUSY_TIMEOUT_MS = 30000
+_PRUNE_TARGET_RATIO = 0.9  # Keep 90% of max rows when pruning
 
 
 class AlertType(str, Enum):
@@ -502,6 +510,64 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON compliance_exports (timestamp);
         """,
     ),
+    (
+        18,
+        "add proof_system column to on_chain_submissions",
+        "ALTER TABLE on_chain_submissions ADD COLUMN proof_system TEXT DEFAULT 'sigma';",
+    ),
+    (
+        19,
+        "fix governance_proposals schema for GovernanceEngine (Issue #150) and "
+        "add the governance_votes/governance_committee tables it requires",
+        """
+        -- Migration 7's `governance_proposals` (proposal_id, proposed_value,
+        -- proposed_by_key_hash, votes_for_json, votes_against_json, created_at,
+        -- expires_at) predates `detection.governance.GovernanceEngine` and was
+        -- never actually compatible with it: every real column
+        -- `GovernanceEngine` reads/writes (payload, proposer, submitted_at,
+        -- voting_ends_at, executed_at, execution_error) is missing, so
+        -- `submit_proposal()` raised `OperationalError: table
+        -- governance_proposals has no column named payload` on any database
+        -- that had run migration 7 -- i.e. every real deployment, since
+        -- `init_db()` runs unconditionally at startup. No governance proposal
+        -- could ever have been successfully submitted against the old schema
+        -- (the very first write would have crashed), so there is no data to
+        -- preserve; dropping and recreating is safe. `governance_votes` and
+        -- `governance_committee` were never created by any migration at all --
+        -- `cast_vote`/`_is_committee_member` would fail with "no such table"
+        -- on a fresh database. This does not touch `committee_members`, which
+        -- is a distinct, still-used table for the score-dispute committee
+        -- (see detection/dispute_store.py), not the governance committee.
+        DROP TABLE IF EXISTS governance_proposals;
+
+        CREATE TABLE governance_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            proposer TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            submitted_at TIMESTAMP NOT NULL,
+            voting_ends_at TIMESTAMP NOT NULL,
+            executed_at TIMESTAMP,
+            execution_error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS governance_votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id INTEGER NOT NULL,
+            voter TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK(decision IN ('for','against','abstain')),
+            cast_at TIMESTAMP NOT NULL,
+            UNIQUE(proposal_id, voter)
+        );
+
+        CREATE TABLE IF NOT EXISTS governance_committee (
+            member TEXT PRIMARY KEY,
+            added_at TIMESTAMP NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        """,
+    ),
 ]
 
 
@@ -642,9 +708,9 @@ class RiskScoreStore:
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = db_path or settings.db_path
         init_db(self.db_path)
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+        with sqlite3.connect(self.db_path, timeout=_DB_TIMEOUT_SECONDS) as conn:
             conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute(f"PRAGMA busy_timeout = {_DB_BUSY_TIMEOUT_MS}")
 
     def upsert_trades(self, trades: list[Trade]) -> int:
         """Insert validated trades, ignoring existing paging tokens."""
@@ -760,7 +826,7 @@ def prune_filtered_trades(
     """
     if max_rows is None:
         max_rows = settings.filter_rejected_trades_max_rows
-    target_rows = int(max_rows * 0.9)
+    target_rows = int(max_rows * _PRUNE_TARGET_RATIO)
     with _connect(db_path) as conn:
         (count,) = conn.execute(
             "SELECT COUNT(*) FROM filtered_trades"
@@ -824,6 +890,7 @@ def save_submission(
     tx_hash: str | None = None,
     error_message: str | None = None,
     db_path: str | None = None,
+    proof_system: str = "sigma",
 ) -> None:
     """Insert a row into the ``on_chain_submissions`` audit table."""
     init_db(db_path)
@@ -831,8 +898,8 @@ def save_submission(
         conn.execute(
             """
             INSERT INTO on_chain_submissions
-                (wallet, asset_pair, score, tx_hash, status, error_message, submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (wallet, asset_pair, score, tx_hash, status, error_message, proof_system, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 wallet,
@@ -841,10 +908,12 @@ def save_submission(
                 tx_hash,
                 status,
                 error_message,
+                proof_system,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
         conn.commit()
+
 
 
 def _row_to_score(row: tuple) -> RiskScore:
@@ -1646,13 +1715,13 @@ def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | Non
 
     count = 0
     from detection.feature_store import WalletFeatureState
-    for row in rows:
+    for i, row in enumerate(rows):
         try:
             state = WalletFeatureState.model_validate_json(row[0])
             feature_store.set_state(state)
             count += 1
         except Exception as e:
-            logger.error(f"Error promoting feature state: {e}")
+            logger.warning("Failed to promote feature state at row %d: %s", i, e)
 
     return count
 
@@ -1730,8 +1799,6 @@ def get_bridge_transfers(
 ) -> list[BridgeTransfer]:
     """Return bridge transfers filtered by wallet and recency."""
     init_db(db_path)
-    from datetime import timedelta
-
     cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
     conditions = ["timestamp >= ?"]
     params: list = [cutoff]
@@ -1809,7 +1876,7 @@ def get_bridge_transfer_history(
     ]
 
 
-def sandwich_candidates_to_alerts(candidates, asset_pair: str) -> list[dict]:
+def sandwich_candidates_to_alerts(candidates: list[SandwichCandidate], asset_pair: str) -> list[dict]:
     """Convert `SandwichCandidate` objects into storable alert dicts.
 
     Each alert is attributed to the attacker account (`wallet`) and carries the
@@ -2030,11 +2097,10 @@ def get_scores_since(since: str, db_path: str | None = None) -> list[RiskScore]:
 
 
 def save_hop_payment_cycles(
-    cycles: list,
+    cycles: list[PathPaymentCycle],
     db_path: str | None = None,
 ) -> None:
     """Persist PathPaymentCycle records to the hop_payment_cycles table."""
-    import dataclasses
     init_db(db_path)
     if not cycles:
         return

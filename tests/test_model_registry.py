@@ -1,5 +1,6 @@
 """Tests for model versioning and rollback functionality."""
 
+import json
 import os
 
 import pytest
@@ -10,7 +11,9 @@ from detection.model_registry import (
     get_current_version,
     list_model_versions,
     load_latest_model,
+    load_shap_importances,
     rollback_model,
+    save_shap_importances,
     save_versioned_model,
 )
 from detection.model_signing import ModelIntegrityError
@@ -232,6 +235,11 @@ class TestListModelVersions:
         listed = list_model_versions("nonexistent_model", model_dir)
         assert listed == []
 
+    def test_list_model_versions_empty_when_dir_missing(self):
+        """list_model_versions should return empty list when model_dir doesn't exist."""
+        listed = list_model_versions("test_model", "/nonexistent/path/12345")
+        assert listed == []
+
 
 class TestGetCurrentVersion:
     """Tests for getting the current version."""
@@ -316,3 +324,80 @@ class TestSigningIntegration:
                 "model_signing_key",
                 "test-signing-key-for-unit-tests-only",
             )
+
+
+# ---------------------------------------------------------------------------
+# SHAP importances save / load
+# ---------------------------------------------------------------------------
+
+
+class TestShapImportances:
+    def test_save_and_load_round_trip(self, tmp_path):
+        model_dir = str(tmp_path)
+        shap_data = {
+            "random_forest": [
+                {"feature": "f1", "mean_abs_shap": 0.5, "rank": 1},
+                {"feature": "f2", "mean_abs_shap": 0.3, "rank": 2},
+            ]
+        }
+        save_shap_importances(shap_data, model_dir)
+        loaded = load_shap_importances(model_dir)
+        assert loaded == shap_data
+
+    def test_save_creates_metadata_file(self, tmp_path):
+        model_dir = str(tmp_path)
+        shap_data = {"rf": [{"feature": "f1", "mean_abs_shap": 0.1, "rank": 1}]}
+        save_shap_importances(shap_data, model_dir)
+
+        metadata_path = os.path.join(model_dir, "training_metadata.json")
+        assert os.path.exists(metadata_path)
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        assert "shap_importances" in metadata
+
+    def test_load_returns_none_when_no_metadata(self, tmp_path):
+        model_dir = str(tmp_path)
+        result = load_shap_importances(model_dir)
+        assert result is None
+
+    def test_load_returns_none_for_corrupt_json(self, tmp_path):
+        model_dir = str(tmp_path)
+        os.makedirs(model_dir, exist_ok=True)
+        metadata_path = os.path.join(model_dir, "training_metadata.json")
+        with open(metadata_path, "w") as f:
+            f.write("{invalid json!!!")
+
+        result = load_shap_importances(model_dir)
+        assert result is None
+
+    def test_load_returns_none_when_version_mismatch(self, tmp_path):
+        model_dir = str(tmp_path)
+        metadata = {"version": "v1", "shap_importances": {"rf": []}}
+        metadata_path = os.path.join(model_dir, "training_metadata.json")
+        os.makedirs(model_dir, exist_ok=True)
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+
+        result = load_shap_importances(model_dir, version="v2")
+        assert result is None
+
+    def test_save_handles_corrupt_existing_metadata(self, tmp_path):
+        model_dir = str(tmp_path)
+        os.makedirs(model_dir, exist_ok=True)
+        metadata_path = os.path.join(model_dir, "training_metadata.json")
+        with open(metadata_path, "w") as f:
+            f.write("not valid json")
+
+        shap_data = {"rf": [{"feature": "f1", "mean_abs_shap": 0.1, "rank": 1}]}
+        # Should not crash; should overwrite with valid JSON
+        save_shap_importances(shap_data, model_dir)
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        assert metadata["shap_importances"] == shap_data
+
+    def test_save_creates_directory_if_missing(self, tmp_path):
+        model_dir = str(tmp_path / "deeply" / "nested" / "models")
+        shap_data = {"rf": []}
+        save_shap_importances(shap_data, model_dir)
+        assert os.path.isdir(model_dir)

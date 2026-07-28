@@ -1,9 +1,10 @@
-"""OpenTelemetry SDK initialisation with graceful degradation."""
+"""OpenTelemetry SDK initialization with graceful degradation."""
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -16,7 +17,7 @@ _tracer_provider: TracerProvider | None = None
 
 
 def init_telemetry(service_name: str = "ledgerlens") -> None:
-    """Initialise the OTel SDK.
+    """Initialize the OTel SDK.
 
     Uses the OTLP gRPC exporter when OTEL_EXPORTER_OTLP_ENDPOINT is set,
     falling back to ConsoleSpanExporter otherwise. If the OTLP endpoint is
@@ -32,18 +33,29 @@ def init_telemetry(service_name: str = "ledgerlens") -> None:
         try:
             from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
-            kwargs: dict = {"endpoint": endpoint}
+            kwargs: dict[str, Any] = {"endpoint": endpoint}
 
             cert = os.getenv("OTEL_EXPORTER_OTLP_CERTIFICATE")
             client_key = os.getenv("OTEL_EXPORTER_OTLP_CLIENT_KEY")
             client_cert = os.getenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE")
             if cert and client_key and client_cert:
-                with open(cert, "rb") as f:
-                    root_cert = f.read()
-                with open(client_key, "rb") as f:
-                    private_key = f.read()
-                with open(client_cert, "rb") as f:
-                    certificate_chain = f.read()
+                kwargs["insecure"] = False
+                try:
+                    with open(cert, "rb") as f:
+                        root_cert = f.read()
+                    with open(client_key, "rb") as f:
+                        private_key = f.read()
+                    with open(client_cert, "rb") as f:
+                        certificate_chain = f.read()
+                except OSError as exc:
+                    logger.warning(
+                        "OTel TLS credential file unreadable (%s); falling back to console", exc
+                    )
+                    provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+                    trace.set_tracer_provider(provider)
+                    _tracer_provider = provider
+                    return
+
                 import grpc
 
                 credentials = grpc.ssl_channel_credentials(
@@ -52,7 +64,6 @@ def init_telemetry(service_name: str = "ledgerlens") -> None:
                     certificate_chain=certificate_chain,
                 )
                 kwargs["credentials"] = credentials
-                kwargs["insecure"] = False
             else:
                 kwargs["insecure"] = True
 
@@ -68,6 +79,22 @@ def init_telemetry(service_name: str = "ledgerlens") -> None:
 
     trace.set_tracer_provider(provider)
     _tracer_provider = provider
+
+
+def shutdown_telemetry() -> None:
+    """Shut down the configured tracer provider, flushing pending spans.
+
+    Safe to call even when telemetry was never initialized (no-op).
+    Should be called during graceful shutdown.
+    """
+    global _tracer_provider
+    if _tracer_provider is not None:
+        try:
+            _tracer_provider.shutdown()
+        except Exception as exc:
+            logger.warning("Error shutting down tracer provider: %s", exc)
+        finally:
+            _tracer_provider = None
 
 
 def get_tracer(name: str = "ledgerlens") -> trace.Tracer:

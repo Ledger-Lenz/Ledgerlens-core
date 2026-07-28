@@ -65,6 +65,10 @@ def init_db(db_path: str | None = None):
         conn.commit()
 
 
+# Initialize database at module import time (idempotent)
+init_db()
+
+
 def _row_to_delivery(row) -> Delivery:
     return Delivery(
         id=row[0],
@@ -80,7 +84,6 @@ def _row_to_delivery(row) -> Delivery:
 
 
 def enqueue(subscriber_id: str, payload: dict, db_path: str | None = None):
-    init_db(db_path)
     now = datetime.now(timezone.utc).isoformat()
     payload_json = json.dumps(payload)
     with _connect(db_path) as conn:
@@ -92,7 +95,6 @@ def enqueue(subscriber_id: str, payload: dict, db_path: str | None = None):
 
 
 def get_due_deliveries(limit: int = 50, db_path: str | None = None) -> list[Delivery]:
-    init_db(db_path)
     now = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
         rows = conn.execute(
@@ -103,7 +105,6 @@ def get_due_deliveries(limit: int = 50, db_path: str | None = None) -> list[Deli
 
 
 def mark_delivered(delivery_id: int, response_status: int, db_path: str | None = None):
-    init_db(db_path)
     now = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
         conn.execute(
@@ -114,7 +115,6 @@ def mark_delivered(delivery_id: int, response_status: int, db_path: str | None =
 
 
 def mark_failed(delivery_id: int, error: str, max_attempts: int = MAX_ATTEMPTS, db_path: str | None = None):
-    init_db(db_path)
     with _connect(db_path) as conn:
         row = conn.execute(
             "SELECT attempt_count FROM webhook_delivery_queue WHERE id = ?",
@@ -142,7 +142,6 @@ def mark_failed(delivery_id: int, error: str, max_attempts: int = MAX_ATTEMPTS, 
 
 
 def get_dead_letters(db_path: str | None = None) -> list[Delivery]:
-    init_db(db_path)
     with _connect(db_path) as conn:
         rows = conn.execute(
             "SELECT id, subscriber_id, payload_json, attempt_count, next_attempt_at, last_error, status, created_at, delivered_at FROM webhook_delivery_queue WHERE status = 'dead' ORDER BY created_at"

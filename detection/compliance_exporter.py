@@ -184,9 +184,14 @@ def _gather_trade_context(
 
 
 def _benford_chi(amounts: list[float]) -> tuple[float, float]:
-    """Return the Benford first-digit chi-square statistic and its p-value.
+    """Return the Benford first-digit chi-square statistic and its asymptotic p-value.
 
     Falls back to ``(0.0, 1.0)`` when there are too few observations to test.
+
+    Uses the asymptotic chi-square survival function with 8 degrees of freedom
+    (not the bootstrap p-value from ``compute_benford_metrics``) so that the
+    SAR narrative always reports the same asymptotic statistic regulators
+    expect, regardless of sample size.
     """
     metrics = compute_benford_metrics(amounts)
     chi_sq = float(metrics["chi_square"])

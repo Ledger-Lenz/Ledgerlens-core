@@ -37,6 +37,45 @@ from detection.rate_limiter import (  # noqa: E402
 )
 
 
+class TestCleanupLockIn:
+    """Lock in the cleanup changes so future edits don't regress."""
+
+    def test_no_typing_optional_import(self):
+        """`from typing import Optional` must not be present — use `X | None`."""
+        import ast
+        import detection.rate_limiter as m
+        src = ast.parse(m.__loader__.get_source(m.__name__))
+        for node in ast.iter_child_nodes(src):
+            if isinstance(node, ast.ImportFrom) and node.module == "typing":
+                imported = {a.name for a in node.names}
+                assert "Optional" not in imported, (
+                    "rate_limiter.py must not import Optional from typing; use X | None"
+                )
+
+    def test_module_uses_future_annotations(self):
+        """Lock in the `from __future__ import annotations` cleanup."""
+        import ast
+        import detection.rate_limiter as m
+        src = ast.parse(m.__loader__.get_source(m.__name__))
+        future_imports = [
+            node.names[0].name
+            for node in ast.iter_child_nodes(src)
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            for alias in node.names
+        ]
+        assert "annotations" in future_imports, (
+            "rate_limiter.py must have `from __future__ import annotations`"
+        )
+
+    def test_check_rate_limit_importable_from_api_key_store(self):
+        """`detection.api_key_store.check_rate_limit` binds to this module's
+        `check_rate_limit` — verify the import chain isn't broken."""
+        import detection.api_key_store as store
+        assert callable(store.check_rate_limit), (
+            "api_key_store.check_rate_limit must be callable after cleanup"
+        )
+
+
 @pytest.fixture(autouse=True)
 def _reset_singleton():
     """Every test gets a fresh module-level limiter singleton."""

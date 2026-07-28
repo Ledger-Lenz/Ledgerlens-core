@@ -63,8 +63,9 @@ def compute_event_hash(
     log_index: int,
 ) -> str:
     """Stable, backward-compatible SHA-256 digest for an EVM event."""
-    store = IdempotencyKeyStore()
-    return store.compute_key("evm", chain_id=chain_id, tx_hash=tx_hash, log_index=log_index)
+    return IdempotencyKeyStore.compute_key_static(
+        "evm", chain_id=chain_id, tx_hash=tx_hash, log_index=log_index
+    )
 
 
 class IdempotencyKeyStore:
@@ -143,7 +144,8 @@ class IdempotencyKeyStore:
                 """
             )
 
-    def compute_key(self, source: str, **identity_fields: Any) -> str:
+    @staticmethod
+    def compute_key_static(source: str, **identity_fields: Any) -> str:
         """SHA-256 of `source` + sorted, normalised identity_fields."""
         normalized = {}
         for k, v in identity_fields.items():
@@ -167,6 +169,10 @@ class IdempotencyKeyStore:
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode()).hexdigest()
+
+    def compute_key(self, source: str, **identity_fields: Any) -> str:
+        """SHA-256 of `source` + sorted, normalised identity_fields."""
+        return self.compute_key_static(source, **identity_fields)
 
     def is_duplicate(
         self,

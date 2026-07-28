@@ -247,6 +247,13 @@ def get_tracer(name: str = "ledgerlens") -> Any:
     return trace.get_tracer(name)
 
 
+def _set_span_attributes(span, attributes: dict | None = None) -> None:
+    """Helper to set attributes on a span if OTel is available."""
+    if attributes and _OTEL_AVAILABLE:
+        for k, v in attributes.items():
+            span.set_attribute(k, str(v))
+
+
 @contextmanager
 def start_span(
     name: str,
@@ -262,9 +269,7 @@ def start_span(
     """
     tracer = get_tracer(tracer_name)
     with tracer.start_as_current_span(name) as span:
-        if attributes and _OTEL_AVAILABLE:
-            for k, v in attributes.items():
-                span.set_attribute(k, str(v))
+        _set_span_attributes(span, attributes)
         yield span
 
 
@@ -283,9 +288,7 @@ async def async_span(
     """
     tracer = get_tracer(tracer_name)
     with tracer.start_as_current_span(name) as span:
-        if attributes and _OTEL_AVAILABLE:
-            for k, v in attributes.items():
-                span.set_attribute(k, str(v))
+        _set_span_attributes(span, attributes)
         yield span
 
 
@@ -385,7 +388,4 @@ class _NoOpSpan:
 
 class _NoOpTracer:
     def start_as_current_span(self, name, **kwargs):
-        return _NoOpSpan()
-
-    def start_span(self, name, **kwargs):
         return _NoOpSpan()

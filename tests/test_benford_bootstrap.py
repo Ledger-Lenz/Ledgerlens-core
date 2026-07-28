@@ -148,6 +148,25 @@ def test_empty_counts_returns_one():
     assert method == "bootstrap"
 
 
+def test_compute_benford_metrics_empty_amounts():
+    """compute_benford_metrics with no valid amounts returns all required keys."""
+    metrics = compute_benford_metrics([])
+    assert metrics["sample_size"] == 0
+    assert metrics["chi_square"] == 0.0
+    assert metrics["chi_square_pvalue"] == 1.0
+    assert metrics["pvalue_method"] == "bootstrap"
+    assert metrics["mad"] == 0.0
+    assert metrics["z_scores"] == {d: 0.0 for d in range(1, 10)}
+
+
+def test_compute_benford_metrics_zero_or_negative_only():
+    """compute_benford_metrics with only non-positive values returns valid defaults."""
+    metrics = compute_benford_metrics([0.0, -5.0, -100.0])
+    assert metrics["sample_size"] == 0
+    assert metrics["chi_square_pvalue"] == 1.0
+    assert metrics["pvalue_method"] == "bootstrap"
+
+
 # --------------------------------------------------------------------------- #
 # BenfordWindowFeatures dataclass — field population for both methods
 # --------------------------------------------------------------------------- #

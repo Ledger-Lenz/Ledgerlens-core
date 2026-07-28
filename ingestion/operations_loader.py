@@ -171,14 +171,7 @@ def load_order_book_events_for_pair(
         response = get_with_retry(client, url, params=params)
         records = response.json().get("_embedded", {}).get("records", [])
 
-    events: list[OrderBookEvent] = []
-    for record in records:
-        if not _is_offer_operation(record):
-            continue
-        event = _parse_event(record)
-        if event.timestamp >= cutoff and _matches_asset_pair(event, base_asset, counter_asset):
-            events.append(event)
-    return events
+    return _filter_order_book_records(records, base_asset, counter_asset, cutoff)
 
 
 def _filter_order_book_records(

@@ -20,8 +20,6 @@ from pydantic import BaseModel
 
 from config.settings import settings
 
-_MODEL_NAMES = frozenset({"random_forest", "xgboost", "lightgbm"})
-
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS scoring_feedback (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,7 +355,8 @@ class AnalystFeedbackStore:
         """Check if a feature vector exists for this wallet."""
         try:
             from detection.storage import get_feature_vector
+
             fv = get_feature_vector(wallet, db_path=self._db_path)
             return fv is not None and len(fv) > 0
-        except Exception:
+        except (ValueError, LookupError, OSError, sqlite3.Error):
             return False

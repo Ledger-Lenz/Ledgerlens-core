@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from config.settings import settings
 
@@ -23,7 +23,7 @@ class DLQErrorClass(str, Enum):
 
 @dataclass
 class DLQEntry:
-    id: Optional[int]
+    id: int | None
     source: str
     error_class: DLQErrorClass
     error_message: str
@@ -31,7 +31,7 @@ class DLQEntry:
     created_at: datetime
     retry_count: int
     status: str           # "pending", "replayed", "dead"
-    replayed_at: Optional[datetime] = None
+    replayed_at: datetime | None = None
 
 
 def _parse_entry(row: tuple) -> DLQEntry:

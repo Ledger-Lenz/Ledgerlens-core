@@ -48,7 +48,7 @@ Configure via `STREAM_SCORE_DELTA_THRESHOLD` in `.env`.
 
 ## Checkpoint Strategy
 
-Window state is serialised to `rolling_window_checkpoints` (SQLite) every `STREAM_CHECKPOINT_INTERVAL` trades (default: 100). Each wallet row stores:
+Window state is serialised to `rolling_window_checkpoints` (SQLite). Each wallet row stores:
 
 | Column | Content |
 |---|---|
@@ -61,6 +61,8 @@ Serialisation uses Pydantic's `model_dump` (not `pickle`) to prevent code execut
 
 On startup, `RollingWindowStore.load_all()` repopulates in-memory windows from all persisted rows, so the streamer resumes from where it stopped.
 
+Window-state checkpointing is no longer triggered independently of the Horizon cursor checkpoint. `ingestion/stream_checkpoint.py`'s `StreamCheckpointCoordinator` writes both in one atomic SQLite transaction every `STREAM_CHECKPOINT_INTERVAL` trades (default: 100) or `CURSOR_FLUSH_SECONDS` elapsed seconds (default: 10), whichever comes first — see [Ingestion](ingestion.md#horizon-cursor-checkpointing) for why the two checkpoints must never desync and how the atomic write guarantees it.
+
 ## Graceful Shutdown
 
 The `stream` CLI command installs handlers for `SIGTERM` and `SIGINT`:
@@ -72,7 +74,7 @@ signal.signal(signal.SIGINT, _shutdown)
 
 The handler:
 1. Logs the shutdown signal.
-2. Calls `checkpoint_store.save_all(scorer.window_state)` — persists all in-memory windows.
+2. Calls `stream_checkpoint.flush(last_cursor, scorer.window_state)` — atomically persists the cursor and all in-memory windows together.
 3. Sets a `threading.Event` that causes the stream loop to exit after the current trade.
 
 A final checkpoint is also written after the loop exits cleanly (e.g. the SSE stream closes).

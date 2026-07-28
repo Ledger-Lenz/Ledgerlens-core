@@ -7,6 +7,7 @@ both positive cases and attack / tamper scenarios.
 from __future__ import annotations
 
 import copy
+from unittest import mock
 
 import pytest
 
@@ -360,3 +361,49 @@ class TestMalformedProofs:
         p2 = copy.deepcopy(proof_85)
         p2["bits"] = p2["bits"] * 2
         assert not verify_threshold_proof(70, p2, WALLET)
+
+
+def test_pedersen_commit_accepted_by_both():
+    """The same pedersen_commit output coordinates are used by both proof systems."""
+    # Generate Pedersen commitment coordinates
+    score = 85
+    blinding = 12345
+    pt = pedersen_commit(score, blinding)
+    px, py = serialize_point(pt)
+
+    # 1. Sigma proof commitment
+    _, sigma_commit, sigma_proof = generate_threshold_proof(WALLET, score, FEATURES, SALT, 70)
+    assert sigma_commit == (px, py)
+    assert sigma_proof["score_commit_x"] == px
+    assert sigma_proof["score_commit_y"] == py
+
+    # 2. SNARK proof commitment matches
+    with mock.patch("os.path.exists", return_value=True), \
+         mock.patch("subprocess.run") as mock_run, \
+         mock.patch("builtins.open") as mock_file:
+
+        # Mock json load
+        import json
+        mock_proof_json = {
+            "pi_a": ["1111", "2222", "1"],
+            "pi_b": [["3333", "4444", "1"], ["5555", "6666", "1"], ["1", "0", "0"]],
+            "pi_c": ["7777", "8888", "1"]
+        }
+        mock_public_json = [str(px), str(py), "70"]
+
+        from unittest.mock import MagicMock
+        mock_run.return_value = MagicMock(returncode=0)
+
+        # Mock open read
+        mock_file.return_value.__enter__.return_value.read.side_effect = [
+            json.dumps(mock_proof_json),
+            json.dumps(mock_public_json)
+        ]
+
+        from detection.zk_snark_prover import generate_snark_range_proof
+        snark_proof = generate_snark_range_proof(score, blinding, (px, py), 70)
+
+        # Assert that the SNARK public inputs match the Pedersen commitment coordinates
+        assert snark_proof.public_signals[0] == px
+        assert snark_proof.public_signals[1] == py
+

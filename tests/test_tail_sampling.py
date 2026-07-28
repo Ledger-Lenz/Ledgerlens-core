@@ -1,6 +1,8 @@
 import time
 import unittest
 
+from opentelemetry.trace import StatusCode
+
 from detection.tracing import TailSamplingSpanProcessor
 
 

@@ -3,7 +3,9 @@ members = [
     "contracts/oracle_aggregator",
     "contracts/zk_verifier",
     "contracts/ledgerlens-score",
+    "crates/ledgerlens-sdk",
 ]
+
 resolver = "2"
 
 [workspace.dependencies]

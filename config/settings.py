@@ -5,6 +5,7 @@ field or type/range violation aborts startup immediately with a human-readable
 error listing every problem at once.
 """
 
+import logging
 import time
 from pathlib import Path
 
@@ -142,6 +143,14 @@ class Settings(BaseSettings):
     committee_quorum: int = 3
     committee_vote_deadline_days: int = 14
 
+    # ── Graph sharding ─────────────────────────────────────────────────────────
+    # When MAX_GRAPH_NODES would be exceeded, automatically shard the trade graph
+    # across multiple workers using community-detection-based partitioning.
+    graph_shard_enabled: bool = True
+    graph_shard_count: int = 8
+    graph_shard_overlap_hops: int = 1
+    graph_shard_max_workers: int = 8
+
     # ── Ensemble weights ──────────────────────────────────────────────────────
     ensemble_weight_rf: float = 0.25
     ensemble_weight_xgb: float = 0.50
@@ -166,6 +175,18 @@ class Settings(BaseSettings):
     openlineage_url: str = ""
     openlineage_namespace: str = "ledgerlens-core"
     lineage_queue_maxsize: int = 1000
+
+    # ── Cost coefficients (used by Prometheus cost gauges) ────────────────────
+    # Operator-configurable cost coefficients for capacity planning.
+    # All values must be non-negative; validated by `non_negative_cost`.
+    cost_per_vcpu_hour_usd: float = 0.048
+    cost_per_gb_memory_hour_usd: float = 0.006
+    cost_per_gb_storage_month_usd: float = 0.023
+
+    # ── Capacity projection (used by capacity planning CLI) ───────────────────
+    # Both values must be >= 1 day; validated by `positive_capacity_days`.
+    capacity_projection_window_days: int = 30
+    capacity_projection_lead_time_days: int = 7
 
     # ── Event Bus (RiskScore Handoff) ─────────────────────────────────────────
     event_bus_backend: str = "none"  # none | kafka | nats
@@ -202,6 +223,10 @@ class Settings(BaseSettings):
     ledgerlens_compliance_api_key: str = ""
     ledgerlens_model_signing_key: str = ""
     ledgerlens_webhook_encryption_key: str = ""
+    ledgerlens_webhook_encryption_key_previous: str = ""
+    api_key_rotation_grace_seconds: int = 604800
+    ws_max_connections: int = 100
+    api_key_max_age_days: int = 90
     # Minimum LedgerLens risk score (0-100) required to export a SAR package.
     compliance_sar_min_score: int = 70
     # Hourly cap on regulatory exports (SAR + Travel Rule) per `detection.compliance_exporter`.
@@ -222,6 +247,31 @@ class Settings(BaseSettings):
     federated_noise_multiplier: float = 0.0
     federated_server_host: str = "127.0.0.1"
     federated_server_port: int = 8001
+    # Require operator admission (detection.federated.admission) before a
+    # participant_id may register a key at all. Secure by default; disabling
+    # this restores the old fully-open self-service registration behaviour
+    # and is strongly discouraged outside of local/offline testing.
+    federated_admission_required: bool = True
+    # No single participant's aggregation weight may exceed this fraction of
+    # a round's total weight, regardless of its (admission-capped) claimed
+    # n_samples -- an interim, defense-in-depth bound on top of admission
+    # control; see docs/federated_learning.md. 1.0 disables it.
+    federated_max_participant_weight_fraction: float = 0.5
+    # A participant's newly claimed n_samples may not exceed this multiple of
+    # its own historical accepted maximum without being flagged/excluded for
+    # that round (cross-round consistency check). Only applies from a
+    # participant's second accepted round onward.
+    federated_max_n_samples_growth_factor: float = 3.0
+    # Default-on: use Krum/Multi-Krum peer-distance selection (see
+    # detection/federated/krum.py, docs/byzantine_resilience.md) at
+    # aggregation time to exclude the most outlying updates *within the same
+    # round*, on top of (not instead of) the existing historical-cosine
+    # heuristic. `f` (Byzantine tolerance) is derived each round from the
+    # live count of valid updates, never a static config value -- see
+    # `FederatedAggregationServer._select_krum_survivors`. Disabling this
+    # falls back to plain weighted FedAvg with no per-round peer-distance
+    # defense (the cosine heuristic still applies if enabled).
+    federated_use_krum: bool = True
 
     # ── Cross-chain Bayesian linking ─────────────────────────────────────────
     cross_chain_timing_sigma_seconds: float = 300.0
@@ -287,6 +337,14 @@ class Settings(BaseSettings):
     #   the pre-existing setting.
     gateway_quota_store: str = "redis"
     gateway_log_body: bool = False
+
+    # ── Cost & capacity monitoring ────────────────────────────────────────────
+    # See COST_CAPACITY_IMPLEMENTATION.md and config/cost_exporter.py for usage.
+    cost_per_vcpu_hour_usd: float = 0.0416
+    cost_per_gb_memory_hour_usd: float = 0.0056
+    cost_per_gb_storage_month_usd: float = 0.10
+    capacity_projection_window_days: int = 7
+    capacity_projection_lead_time_days: int = 14
 
     # ── Performance monitoring ────────────────────────────────────────────────
     performance_min_feedback_samples: int = 20
@@ -395,6 +453,25 @@ class Settings(BaseSettings):
     grpc_max_message_size_bytes: int = 4194304
     grpc_max_batch_wallets: int = 1000
 
+    # ── ZK-SNARK Configuration ────────────────────────────────────────────────
+    zk_proof_system: str = "sigma"                      # "sigma" | "snark"
+    zk_snark_circuit_path: str = "circuits/score_range_proof.circom"
+    zk_snark_proving_key_path: str = "circuits/keys/score_range_proof.zkey"
+    zk_snark_verification_key_path: str = "circuits/keys/verification_key.json"
+    zk_snark_prover_timeout_seconds: float = 10.0
+
+    # ── Cost & Capacity ─────────────────────────────────────
+    cost_per_vcpu_hour_usd: float = 0.0416
+    """Cost per vCPU-hour in USD (operator-configurable coefficient)."""
+    cost_per_gb_memory_hour_usd: float = 0.0056
+    """Cost per GB memory-hour in USD (operator-configurable coefficient)."""
+    cost_per_gb_storage_month_usd: float = 0.10
+    """Cost per GB storage per month in USD (operator-configurable coefficient)."""
+    capacity_projection_window_days: int = 7
+    """Number of days to look back for capacity trend projection (must be >= 1)."""
+    capacity_projection_lead_time_days: int = 14
+    """Number of days ahead to alert for capacity shortfall (must be >= 1)."""
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("poll_interval_seconds", "trade_history_lookback_days",
@@ -448,6 +525,22 @@ class Settings(BaseSettings):
             raise ValueError(f"RISK_SCORE_THRESHOLD {val} must be 0-100")
         return v
 
+    @field_validator("graph_shard_count", "graph_shard_max_workers", mode="before")
+    @classmethod
+    def valid_shard_count(cls, v: object) -> object:
+        val = int(v)
+        if val < 1:
+            raise ValueError("must be >= 1")
+        return val
+
+    @field_validator("graph_shard_overlap_hops", mode="before")
+    @classmethod
+    def valid_overlap_hops(cls, v: object) -> object:
+        val = int(v)
+        if not (0 <= val <= 3):
+            raise ValueError("GRAPH_SHARD_OVERLAP_HOPS must be 0-3")
+        return val
+
     @field_validator("soroban_circuit_breaker_threshold", mode="before")
     @classmethod
     def valid_circuit_threshold(cls, v: object) -> object:
@@ -468,6 +561,23 @@ class Settings(BaseSettings):
     def valid_export_rate_limit(cls, v: object) -> object:
         if int(v) < 1:
             raise ValueError("COMPLIANCE_EXPORT_RATE_LIMIT_PER_HOUR must be >= 1")
+        return v
+
+    @field_validator("federated_max_participant_weight_fraction", mode="before")
+    @classmethod
+    def valid_max_participant_weight_fraction(cls, v: object) -> object:
+        val = float(v)
+        if not (0.0 < val <= 1.0):
+            raise ValueError(
+                f"FEDERATED_MAX_PARTICIPANT_WEIGHT_FRACTION {val} must be in (0.0, 1.0]"
+            )
+        return v
+
+    @field_validator("federated_max_n_samples_growth_factor", mode="before")
+    @classmethod
+    def valid_max_n_samples_growth_factor(cls, v: object) -> object:
+        if float(v) <= 1.0:
+            raise ValueError("FEDERATED_MAX_N_SAMPLES_GROWTH_FACTOR must be > 1.0")
         return v
 
     @field_validator("gateway_default_daily_quota", "gateway_default_namespace_daily_quota", mode="before")
@@ -496,9 +606,9 @@ class Settings(BaseSettings):
 
     @field_validator("cursor_flush_seconds", "historical_chunk_hours", mode="before")
     @classmethod
-    def positive_cursor_flush_seconds(cls, v: object) -> object:
+    def positive_float_gt_zero(cls, v: object) -> object:
         if float(v) <= 0:
-            raise ValueError("CURSOR_FLUSH_SECONDS must be positive")
+            raise ValueError("must be positive")
         return v
 
     @field_validator("streamer_overflow_strategy", mode="before")
@@ -550,6 +660,15 @@ class Settings(BaseSettings):
                 or s.startswith("redis://") or s.startswith("rediss://")):
             raise ValueError(f"{s!r} is not a valid URL (expected http/https/redis scheme)")
         return s
+
+    @field_validator("zk_proof_system", mode="before")
+    @classmethod
+    def valid_zk_proof_system(cls, v: object) -> object:
+        s = str(v).strip().lower()
+        if s not in {"sigma", "snark"}:
+            raise ValueError("zk_proof_system must be 'sigma' or 'snark'")
+        return s
+
 
     @field_validator("network", mode="before")
     @classmethod
@@ -627,7 +746,7 @@ class Settings(BaseSettings):
         return val
 
     @field_validator("cost_per_vcpu_hour_usd", "cost_per_gb_memory_hour_usd",
-                     "cost_per_gb_storage_month_usd", mode="before", check_fields=False)
+                     "cost_per_gb_storage_month_usd", mode="before")
     @classmethod
     def non_negative_cost(cls, v: object) -> object:
         val = float(v)
@@ -636,7 +755,7 @@ class Settings(BaseSettings):
         return val
 
     @field_validator("capacity_projection_window_days",
-                     "capacity_projection_lead_time_days", mode="before", check_fields=False)
+                     "capacity_projection_lead_time_days", mode="before")
     @classmethod
     def positive_capacity_days(cls, v: object) -> object:
         val = int(v)
@@ -842,6 +961,10 @@ class Settings(BaseSettings):
     def _default_risk_score_threshold(self) -> int:
         return self.risk_score_threshold
 
+    @_default_risk_score_threshold.setter
+    def _default_risk_score_threshold(self, value: int) -> None:
+        object.__setattr__(self, "risk_score_threshold", value)
+
     @property
     def _runtime_cache_ttl_seconds(self) -> int:
         return self.runtime_config_ttl_seconds
@@ -849,33 +972,203 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+logger = logging.getLogger("ledgerlens.config")
+
 
 # ── Runtime config cache ──────────────────────────────────────────────────────
-_runtime_cache: dict = {"ts": 0, "config": {}}
+#
+# Consistency model: EVENTUALLY CONSISTENT.
+#
+# `runtime_config` (SQLite, same database as everything else) is the durable
+# source of truth, written by governance proposal execution
+# (`detection.governance.SettingsReloader.apply`) and by `PATCH
+# /admin/config`. Every process independently polls it through a local TTL
+# cache (`RUNTIME_CONFIG_TTL_SECONDS`, default 60s) so a governance-approved
+# change is guaranteed visible to every process within that many seconds --
+# a hard, documented worst-case bound -- even with no other infrastructure
+# configured.
+#
+# When `REDIS_URL` is configured and reachable, propagation is bounded far
+# tighter than the TTL: every write bumps a shared Redis counter
+# (`bump_config_version`), and each process's next config read compares its
+# last-seen counter value against the shared one -- a single cheap Redis GET,
+# not a new poll cycle -- and re-reads `runtime_config` immediately if the
+# counter moved, regardless of how much local TTL remains. In practice this
+# means propagation completes on the very next scoring call / API request /
+# ingestion batch in any process that reads governed settings, typically
+# well under a second.
+#
+# This is a versioned-config-epoch pattern (not literal pub/sub): no
+# background subscriber thread is needed, which matters because several
+# consumers (`run_pipeline.py`, CLI batch jobs) are not long-running daemons
+# and could never host a subscriber loop anyway. It degrades gracefully --
+# falling back to TTL-only polling, identical to this module's pre-existing
+# behavior -- when Redis is unconfigured or unreachable (e.g. local
+# docker-compose's default profile, which does not run Redis at all).
+
+_CONFIG_VERSION_REDIS_KEY = "ledgerlens:config:version"
+_CONFIG_VERSION_FAILURE_THRESHOLD = 3
+_CONFIG_VERSION_RECOVERY_TIMEOUT_SECONDS = 30.0
+
+_config_redis_client = None
+_config_redis_attempted = False
+_config_redis_circuit = None
+
+
+def _get_config_redis_client():
+    """Lazily connect to Redis for the config-version counter.
+
+    Returns ``None`` (and keeps returning ``None`` for the rest of the
+    process's life -- connection is attempted at most once, matching this
+    codebase's existing Redis-client conventions in
+    ``detection.feature_store`` / ``detection.rate_limiter``) when
+    ``redis_url`` isn't configured or the connection fails. Callers must
+    treat ``None`` as "no fast-path available, use the TTL fallback," not as
+    an error.
+    """
+    global _config_redis_client, _config_redis_attempted, _config_redis_circuit
+
+    if _config_redis_attempted:
+        return _config_redis_client
+    _config_redis_attempted = True
+
+    redis_url = getattr(settings, "redis_url", None)
+    if not redis_url:
+        return None
+
+    from utils.circuit_breaker import CircuitBreaker
+
+    _config_redis_circuit = CircuitBreaker(
+        name="config_propagation_redis",
+        failure_threshold=_CONFIG_VERSION_FAILURE_THRESHOLD,
+        recovery_timeout=_CONFIG_VERSION_RECOVERY_TIMEOUT_SECONDS,
+    )
+    try:
+        import redis
+
+        client = redis.from_url(redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
+        client.ping()
+        _config_redis_client = client
+        logger.info("Config propagation: connected to Redis at %s", redis_url)
+    except Exception as exc:
+        logger.warning(
+            "Config propagation: Redis connection failed (%s); falling back to "
+            "%ds TTL-only polling for runtime_config",
+            exc,
+            settings.runtime_config_ttl_seconds,
+        )
+        _config_redis_client = None
+    return _config_redis_client
+
+
+def _get_remote_config_version() -> int | None:
+    """Return the shared config-version counter, or ``None`` if unavailable."""
+    client = _get_config_redis_client()
+    if client is None or _config_redis_circuit is None or not _config_redis_circuit.allow_request():
+        return None
+    try:
+        raw = client.get(_CONFIG_VERSION_REDIS_KEY)
+        _config_redis_circuit.record_success()
+        return int(raw) if raw is not None else 0
+    except Exception as exc:
+        _config_redis_circuit.record_failure()
+        logger.warning("Config propagation: Redis version check failed (%s)", exc)
+        return None
+
+
+def bump_config_version() -> None:
+    """Signal every process to bypass its local TTL and re-poll ``runtime_config``.
+
+    Call this after any write to the ``runtime_config`` table (governance
+    proposal execution, ``PATCH /admin/config``). No-ops silently when Redis
+    isn't configured/reachable -- those processes still converge, just
+    bounded by ``runtime_config_ttl_seconds`` instead of near-instantly.
+    """
+    client = _get_config_redis_client()
+    if client is None:
+        return
+    try:
+        client.incr(_CONFIG_VERSION_REDIS_KEY)
+        if _config_redis_circuit is not None:
+            _config_redis_circuit.record_success()
+    except Exception as exc:
+        if _config_redis_circuit is not None:
+            _config_redis_circuit.record_failure()
+        logger.warning("Config propagation: failed to bump version (%s)", exc)
+
+
+class _RuntimeConfigCache:
+    """TTL-cached view of the ``runtime_config`` table.
+
+    Invalidated early by the shared Redis version counter when available
+    (see the module-level consistency-model docstring above). Each instance
+    holds independent local state (``_ts``/``_config``/``_seen_version``),
+    so multiple instances constructed against the same backing SQLite
+    database and Redis behave like independent OS processes sharing only
+    that backing store -- this is what lets tests simulate the real
+    multi-replica topology without spawning real processes.
+    """
+
+    def __init__(self) -> None:
+        self._ts = 0.0
+        self._config: dict[str, str] = {}
+        self._seen_version: int | None = None
+
+    def get(self) -> dict[str, str]:
+        now = time.time()
+        ttl = settings._runtime_cache_ttl_seconds
+
+        remote_version = _get_remote_config_version()
+        stale = remote_version is not None and remote_version != self._seen_version
+
+        if not stale and self._ts + ttl > now and self._config:
+            return self._config
+
+        import sqlite3
+
+        config: dict[str, str] = {}
+        try:
+            conn = sqlite3.connect(settings.db_path)
+            cur = conn.execute("SELECT key, value FROM runtime_config")
+            for k, v in cur.fetchall():
+                config[k] = v
+            conn.close()
+        except Exception:
+            config = {}
+
+        self._ts = now
+        self._config = config
+        if remote_version is not None:
+            self._seen_version = remote_version
+        return config
+
+    def invalidate(self) -> None:
+        """Force the next `get()` call to re-read from the DB immediately."""
+        self._ts = 0.0
+        self._config = {}
+
+
+_default_runtime_cache = _RuntimeConfigCache()
 
 
 def load_runtime_config() -> dict:
-    """Load runtime overrides from the `runtime_config` table with a TTL cache."""
-    now = time.time()
-    ttl = settings._runtime_cache_ttl_seconds
-    if _runtime_cache.get("ts", 0) + ttl > now and _runtime_cache.get("config"):
-        return _runtime_cache["config"]
+    """Load runtime overrides from the `runtime_config` table with a TTL cache.
 
-    import sqlite3
+    See the consistency-model docstring above `_CONFIG_VERSION_REDIS_KEY` for
+    the full propagation-latency guarantee.
+    """
+    return _default_runtime_cache.get()
 
-    config: dict = {}
-    try:
-        conn = sqlite3.connect(settings.db_path)
-        cur = conn.execute("SELECT key, value FROM runtime_config")
-        for k, v in cur.fetchall():
-            config[k] = v
-        conn.close()
-    except Exception:
-        config = {}
 
-    _runtime_cache["ts"] = now
-    _runtime_cache["config"] = config
-    return config
+def invalidate_runtime_config_cache() -> None:
+    """Force this process's next `load_runtime_config()` call to re-read the DB.
+
+    Call this immediately after writing to `runtime_config` directly (e.g.
+    `PATCH /admin/config`) so the writing process itself doesn't have to wait
+    out its own local TTL. Pair with `bump_config_version()` to also notify
+    other processes.
+    """
+    _default_runtime_cache.invalidate()
 
 
 def get_runtime_risk_score_threshold() -> int:
@@ -884,3 +1177,34 @@ def get_runtime_risk_score_threshold() -> int:
         return int(cfg["risk_score_threshold"])
     except (KeyError, ValueError):
         return settings._default_risk_score_threshold
+
+
+def get_governed_config_status() -> dict:
+    """Return this process's currently-active governed config state.
+
+    Exposed via ``GET /health`` so operators can confirm a governance-
+    approved change (or a ``PATCH /admin/config`` change) has actually
+    propagated to *this* process, rather than assuming it did.
+    ``risk_score_threshold_version`` is the ``runtime_config`` row's
+    ``updated_at`` timestamp -- ``None`` means no override has ever been
+    written and this process is still running the env-configured default.
+    """
+    import sqlite3
+
+    threshold = get_runtime_risk_score_threshold()
+    version: str | None = None
+    try:
+        conn = sqlite3.connect(settings.db_path)
+        row = conn.execute(
+            "SELECT updated_at FROM runtime_config WHERE key = 'risk_score_threshold'"
+        ).fetchone()
+        conn.close()
+        if row:
+            version = row[0]
+    except Exception:
+        pass
+
+    return {
+        "risk_score_threshold": threshold,
+        "risk_score_threshold_version": version,
+    }

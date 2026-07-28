@@ -10,6 +10,7 @@ TTL-based caching keyed on (wallet, model_version) in the feature store.
 import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -210,23 +211,34 @@ class ShapExplainer:
         if time.monotonic() - stored_at > self._cache_ttl:
             del self._cache[key]
             return None
-        return ShapExplanation(**json.loads(serialised))
+        payload = json.loads(serialised)
+        payload["contributions"] = [
+            FeatureContribution(**contribution)
+            for contribution in payload.get("contributions", [])
+        ]
+        return ShapExplanation(**payload)
 
     def _write_cache(self, explanation: ShapExplanation) -> None:
         """Store an explanation in the cache."""
         key = self._cache_key(explanation.wallet, explanation.model_version)
-        serialised = json.dumps({
-            "wallet": explanation.wallet,
-            "model_version": explanation.model_version,
-            "base_value": explanation.base_value,
-            "contributions": [
-                {"feature": c.feature, "shap_value": c.shap_value, "rank": c.rank}
-                for c in explanation.contributions
-            ],
-            "summary_sentence": explanation.summary_sentence,
-            "model_name": explanation.model_name,
-        })
+        serialised = json.dumps(
+            {
+                "wallet": explanation.wallet,
+                "model_version": explanation.model_version,
+                "base_value": explanation.base_value,
+                "contributions": [
+                    {"feature": c.feature, "shap_value": c.shap_value, "rank": c.rank}
+                    for c in explanation.contributions
+                ],
+                "summary_sentence": explanation.summary_sentence,
+                "model_name": explanation.model_name,
+            }
+        )
         self._cache[key] = (time.monotonic(), serialised)
+
+    def clear_cache(self) -> None:
+        """Remove all cached explanations."""
+        self._cache.clear()
 
     def explain(
         self,
@@ -269,6 +281,11 @@ class ShapExplainer:
         cached = self._read_cache(wallet, model_version)
         if cached is not None:
             return cached
+
+        if not isinstance(feature_vector, Mapping) or not feature_vector:
+            raise ValueError(
+                "feature_vector must be a non-empty mapping of feature names to values"
+            )
 
         feature_names = sorted(feature_vector.keys())
         X = np.array([[feature_vector[name] for name in feature_names]])

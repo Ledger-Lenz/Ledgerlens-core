@@ -90,6 +90,11 @@ def load_liquidity_pools(limit: int = PAGE_LIMIT) -> list[LiquidityPool]:
     return [_parse_pool(r) for r in records]
 
 
+def _filter_trades_by_cutoff(trades: list[Trade], cutoff: datetime) -> list[Trade]:
+    """Filter trades to those on or after cutoff datetime."""
+    return [t for t in trades if t.ledger_close_time >= cutoff]
+
+
 def load_liquidity_pool_trades(pool_id: str, since: datetime, limit: int = PAGE_LIMIT) -> list[Trade]:
     """GET /liquidity_pools/{pool_id}/trades, mapped to `Trade` records.
 
@@ -102,7 +107,7 @@ def load_liquidity_pool_trades(pool_id: str, since: datetime, limit: int = PAGE_
         response = get_with_retry(client, url, params={"limit": limit, "order": "desc"})
         records = response.json().get("_embedded", {}).get("records", [])
     trades = [_parse_pool_trade(r, pool_id) for r in records]
-    return [t for t in trades if t.ledger_close_time >= cutoff]
+    return _filter_trades_by_cutoff(trades, cutoff)
 
 
 async def async_load_liquidity_pool_trades(
@@ -116,7 +121,7 @@ async def async_load_liquidity_pool_trades(
     data = await client.get(f"/liquidity_pools/{pool_id}/trades", params={"limit": limit, "order": "desc"})
     records = data.get("_embedded", {}).get("records", [])
     trades = [_parse_pool_trade(r, pool_id) for r in records]
-    return [t for t in trades if t.ledger_close_time >= cutoff]
+    return _filter_trades_by_cutoff(trades, cutoff)
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +253,10 @@ class AMMPoolRegistry:
                     self._pools = self._fetch_pools()
                     self._last_refresh = time.monotonic()
                     logger.info("AMMPoolRegistry refreshed: %d pools above TVL threshold", len(self._pools))
-                except Exception:
-                    logger.exception("AMMPoolRegistry refresh failed; using cached data")
+                except httpx.HTTPError as exc:
+                    logger.warning("AMMPoolRegistry HTTP error; using cached data: %s", exc)
+                except Exception as exc:
+                    logger.exception("AMMPoolRegistry refresh failed: %s", type(exc).__name__)
             return list(self._pools)
 
     def get_pool_ids(self, force_refresh: bool = False) -> list[str]:

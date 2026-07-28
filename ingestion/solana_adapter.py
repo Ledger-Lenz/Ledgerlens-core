@@ -19,20 +19,21 @@ SOLANA_REQUEST_TIMEOUT : float, default 30.0
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
+import math
 import os
 import struct
 from datetime import datetime, timezone
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 import httpx
 
 from ingestion.data_models import Asset, Trade, TradeType
 
-if TYPE_CHECKING:
-    from ingestion.dedup import IdempotencyKeyStore
-
 logger = logging.getLogger("ledgerlens.solana_adapter")
+
+__all__ = ["SolanaAdapter"]
 
 _DEFAULT_RPC = "https://api.mainnet-beta.solana.com"
 
@@ -47,6 +48,9 @@ _SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
 SOURCE_LABEL = "solana"
 
+# Balance deltas at or below this magnitude are treated as noise/rounding.
+_AMOUNT_EPSILON = 1e-9
+
 
 def _rpc_url() -> str:
     return os.environ.get("SOLANA_RPC_URL", _DEFAULT_RPC)
@@ -56,12 +60,17 @@ def _timeout() -> float:
     return float(os.environ.get("SOLANA_REQUEST_TIMEOUT", "30.0"))
 
 
-def _post(method: str, params: list[Any], client: httpx.Client) -> Any:
+def _post(
+    method: str,
+    params: list[Any],
+    client: httpx.Client,
+    rpc_url: str | None = None,
+) -> Any:
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    resp = client.post(_rpc_url(), json=payload, timeout=_timeout())
+    resp = client.post(rpc_url or _rpc_url(), json=payload, timeout=_timeout())
     resp.raise_for_status()
     data = resp.json()
-    if "error" in data:
+    if data.get("error") is not None:
         raise RuntimeError(f"Solana RPC error: {data['error']}")
     return data.get("result")
 
@@ -71,21 +80,26 @@ def _get_signatures(
     client: httpx.Client,
     limit: int = 100,
     before: str | None = None,
+    rpc_url: str | None = None,
 ) -> list[dict]:
-    params: list[Any] = [address, {"limit": limit, "commitment": "finalized"}]
+    options: dict[str, Any] = {"limit": limit, "commitment": "finalized"}
     if before:
-        params[1]["before"] = before
-    result = _post("getSignaturesForAddress", params, client)
+        options["before"] = before
+    result = _post("getSignaturesForAddress", [address, options], client, rpc_url)
     return result or []
 
 
-def _get_transaction(sig: str, client: httpx.Client) -> dict | None:
-    result = _post(
+def _get_transaction(
+    sig: str,
+    client: httpx.Client,
+    rpc_url: str | None = None,
+) -> dict | None:
+    return _post(
         "getTransaction",
         [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0, "commitment": "finalized"}],
         client,
+        rpc_url,
     )
-    return result
 
 
 def _is_dex_transaction(tx: dict) -> bool:
@@ -98,13 +112,7 @@ def _is_dex_transaction(tx: dict) -> bool:
 def _extract_spl_token_changes(
     tx: dict,
 ) -> list[tuple[str, str, float]]:
-    """Return (owner_pubkey, mint, amount_change) for each SPL token balance change."""
-    pre: list[dict] = tx.get("meta", {}).get("preTokenBalances", []) or []
-    post: list[dict] = tx.get("meta", {}).get("postTokenBalances", []) or []
-
-    (
-        tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
-    )
+    """Return ``(owner_pubkey, mint, amount_change)`` for each SPL balance change.
 
     pre_map: dict[tuple[int, str], float] = {}
     for b in pre:
@@ -114,27 +122,37 @@ def _extract_spl_token_changes(
         pre_map[(idx, mint)] = amt
 
     changes: list[tuple[str, str, float]] = []
-    for b in post:
-        idx = b.get("accountIndex", -1)
-        mint = b.get("mint", "")
-        owner = b.get("owner", "")
-        amt = float(b.get("uiTokenAmount", {}).get("uiAmount") or 0)
-        pre_amt = pre_map.get((idx, mint), 0.0)
-        delta = amt - pre_amt
-        if abs(delta) > 1e-9 and owner:
-            changes.append((owner, mint, delta))
+    for key in sorted(pre_map.keys() | post_map.keys()):
+        pre_entry = pre_map.get(key)
+        post_entry = post_map.get(key)
+        delta = _amount(post_entry or {}) - _amount(pre_entry or {})
+        if not math.isfinite(delta) or abs(delta) <= _AMOUNT_EPSILON:
+            continue
+        # ``owner`` may be absent from one side; prefer the post-state owner.
+        owner = (post_entry or {}).get("owner") or (pre_entry or {}).get("owner") or ""
+        if not owner:
+            continue
+        changes.append((owner, key[1], delta))
 
     return changes
 
 
 def _tx_to_trade(tx: dict, sig: str) -> Trade | None:
+    """Map a Solana DEX transaction to a canonical :class:`Trade`, or ``None``.
+
+    Returns ``None`` (never raises) whenever the transaction cannot be expressed
+    as a well-formed trade: missing/invalid ``blockTime``, fewer than two SPL
+    balance changes, or a one-sided (buy-only / sell-only) transfer.
+    """
     block_time = tx.get("blockTime")
-    if block_time is None:
+    if block_time is None or isinstance(block_time, bool):
+        return None
+    try:
+        ts = datetime.fromtimestamp(int(block_time), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
         return None
 
-    ts = datetime.fromtimestamp(block_time, tz=timezone.utc)
     changes = _extract_spl_token_changes(tx)
-
     if len(changes) < 2:
         return None
 
@@ -143,10 +161,35 @@ def _tx_to_trade(tx: dict, sig: str) -> Trade | None:
     if not sells or not buys:
         return None
 
+    # Base leg: the first (deterministically ordered) outgoing transfer.
     base_owner, base_mint, base_amount = sells[0]
-    counter_owner, counter_mint, counter_amount = buys[0]
 
-    price = counter_amount / base_amount if base_amount else 0.0
+    # Counter leg: what the base owner received in exchange.  Prefer the base
+    # owner's own incoming leg — pairing against an arbitrary ``buys[0]`` used
+    # to pick the *counterparty's* receipt of the base asset, producing a
+    # nonsensical A/A "trade" whose price depended on RPC response ordering.
+    counter_candidates = [b for b in buys if b[1] != base_mint]
+    if not counter_candidates:
+        return None
+    counter_leg = next(
+        (b for b in counter_candidates if b[0] == base_owner), counter_candidates[0]
+    )
+    _, counter_mint, counter_amount = counter_leg
+
+    # The counterparty is whoever gave up the counter asset; fall back to the
+    # receiving owner when no distinct seller of that mint is visible.
+    counter_owner = next(
+        (owner for owner, mint, _ in sells if mint == counter_mint and owner != base_owner),
+        counter_leg[0],
+    )
+
+    # Trade enforces strictly-positive amounts/price; bail out instead of
+    # letting a pydantic ValidationError escape into the ingest loop.
+    if base_amount <= 0 or counter_amount <= 0:
+        return None
+    price = counter_amount / base_amount
+    if price <= 0 or not math.isfinite(price):
+        return None
 
     return Trade(
         id=sig,
@@ -182,72 +225,89 @@ class SolanaAdapter:
         rpc_url: str | None = None,
         dedup_store: IdempotencyKeyStore | None = None,
     ) -> None:
-        if rpc_url:
-            os.environ.setdefault("SOLANA_RPC_URL", rpc_url)
         from config.settings import settings
+        # Imported at runtime inside __init__ to avoid a circular import at
+        # module load time between ingestion.solana_adapter and ingestion.dedup.
         from ingestion.dedup import IdempotencyKeyStore
-        
+
         self.dedup_store = dedup_store or (
             IdempotencyKeyStore(
                 db_path=settings.db_path,
-                replay_window_seconds=settings.idempotency_replay_window_seconds
-            ) if settings.ingestion_dedup_enabled else None
+                replay_window_seconds=settings.idempotency_replay_window_seconds,
+            )
+            if settings.ingestion_dedup_enabled
+            else None
         )
+
+    def _effective_rpc_url(self) -> str:
+        """Explicit constructor argument wins; otherwise fall back to the env."""
+        return self.rpc_url or _rpc_url()
+
+    def _accept_trade(self, trade: Trade, sig: str, address: str) -> bool:
+        """Return True when ``trade`` is new; records it in the dedup store."""
+        if self.dedup_store is None:
+            return True
+
+        from ingestion.dedup import DedupResult
+
+        key = self.dedup_store.compute_key(
+            SOURCE_LABEL, signature=sig, instruction_index=0
+        )
+        metadata = {"signature": sig, "instruction_index": 0, "wallet": address}
+        result = self.dedup_store.is_duplicate(
+            key,
+            timestamp=trade.ledger_close_time,
+            source=SOURCE_LABEL,
+            metadata=metadata,
+        )
+        if result is DedupResult.DUPLICATE:
+            logger.debug("Skipping duplicate Solana trade %s", key[:16])
+            return False
+        if result is DedupResult.REPLAY_REJECTED:
+            logger.warning("Rejecting replay Solana trade %s", key[:16])
+            return False
+
+        self.dedup_store.mark_seen(key, source=SOURCE_LABEL, metadata=metadata)
+        return True
 
     def ingest(
         self,
         address: str,
         limit: int = 100,
         before_signature: str | None = None,
+        client: httpx.Client | None = None,
     ) -> list[Trade]:
-        """Fetch SPL swap events for ``address`` and return canonical Trade records."""
+        """Fetch SPL swap events for ``address`` and return canonical Trade records.
+
+        ``client`` may be supplied to reuse an existing (or mock-transport)
+        httpx.Client; when omitted a short-lived client is created and closed.
+        """
         trades: list[Trade] = []
-        from ingestion.dedup import DedupResult
-        with httpx.Client() as client:
-            sigs = _get_signatures(address, client, limit=limit, before=before_signature)
+        rpc_url = self._effective_rpc_url()
+        own_client = client is None
+        client = client or httpx.Client()
+        try:
+            sigs = _get_signatures(
+                address, client, limit=limit, before=before_signature, rpc_url=rpc_url
+            )
             for sig_info in sigs:
                 sig = sig_info.get("signature", "")
                 if not sig:
                     continue
                 try:
-                    tx = _get_transaction(sig, client)
+                    tx = _get_transaction(sig, client, rpc_url=rpc_url)
                     if not tx or not _is_dex_transaction(tx):
                         continue
                     trade = _tx_to_trade(tx, sig)
-                    if trade:
-                        if self.dedup_store is not None:
-                            key = self.dedup_store.compute_key(
-                                "solana",
-                                signature=sig,
-                                instruction_index=0,
-                            )
-                            metadata = {
-                                "signature": sig,
-                                "instruction_index": 0,
-                                "wallet": address,
-                            }
-                            result = self.dedup_store.is_duplicate(
-                                key,
-                                timestamp=trade.ledger_close_time,
-                                source="solana",
-                                metadata=metadata,
-                            )
-                            if result is DedupResult.DUPLICATE:
-                                logger.debug("Skipping duplicate Solana trade %s", key[:16])
-                                continue
-                            elif result is DedupResult.REPLAY_REJECTED:
-                                logger.warning("Rejecting replay Solana trade %s", key[:16])
-                                continue
-                            
-                            trades.append(trade)
-                            self.dedup_store.mark_seen(key, source="solana", metadata=metadata)
-                        else:
-                            trades.append(trade)
+                    if trade is not None and self._accept_trade(trade, sig, address):
+                        trades.append(trade)
                 except Exception:
                     logger.warning("Failed to process Solana tx %s", sig, exc_info=True)
-        logger.info(
-            "solana.ingest address=%s trades=%d", address, len(trades)
-        )
+        finally:
+            if own_client:
+                client.close()
+
+        logger.info("solana.ingest address=%s trades=%d", address, len(trades))
         return trades
 
     def resolve_stellar_link(
@@ -270,13 +330,14 @@ class SolanaAdapter:
         solana_address: str,
         client: httpx.Client,
     ) -> str | None:
-        sigs = _get_signatures(solana_address, client, limit=50)
+        rpc_url = self._effective_rpc_url()
+        sigs = _get_signatures(solana_address, client, limit=50, rpc_url=rpc_url)
         for sig_info in sigs:
             sig = sig_info.get("signature", "")
             if not sig:
                 continue
             try:
-                tx = _get_transaction(sig, client)
+                tx = _get_transaction(sig, client, rpc_url=rpc_url)
                 if not tx:
                     continue
                 stellar_addr = _extract_stellar_address_from_vaa(tx)
@@ -321,7 +382,8 @@ def _extract_stellar_address_from_vaa(tx: dict) -> str | None:
             continue
         try:
             raw = base64.b64decode(data_b64)
-        except Exception:
+        except (binascii.Error, ValueError, TypeError):
+            logger.debug("Skipping instruction with undecodable base64 data")
             continue
 
         # The VAA starts after a 1-byte discriminator (Wormhole instruction enum)
@@ -332,9 +394,12 @@ def _extract_stellar_address_from_vaa(tx: dict) -> str | None:
         # Locate the guardian signatures block to find the VAA body.
         # VAA header: version(1) guardian_set_index(4) num_signatures(1) signatures(66*n)
         offset = 1  # skip instruction discriminator
-        if len(raw) < offset + 5:
+        if len(raw) < offset + 6:
             continue
-        raw[offset]
+        vaa_version = raw[offset]
+        if vaa_version != 1:
+            # Only VAA version 1 is currently defined by Wormhole; skip unknown formats.
+            continue
         num_sigs = raw[offset + 5]
         body_start = offset + 6 + 66 * num_sigs
 

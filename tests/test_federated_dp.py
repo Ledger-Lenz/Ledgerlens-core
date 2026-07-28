@@ -18,6 +18,7 @@ def _register(server: FederatedAggregationServer) -> tuple[str, Ed25519PrivateKe
     pid = str(uuid.uuid4())
     sk = Ed25519PrivateKey.generate()
     pub_der = sk.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    server.admit_participant(pid, max_n_samples=10_000_000)
     server.register_participant(pid, pub_der)
     return pid, sk
 

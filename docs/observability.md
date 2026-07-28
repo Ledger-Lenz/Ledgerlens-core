@@ -145,6 +145,8 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 | `ledgerlens_pipeline_run_duration_seconds` | Histogram | — | Full pipeline pass duration |
 | `ledgerlens_api_request_duration_seconds` | Histogram | `method`, `endpoint`, `status_code` | FastAPI request duration |
 | `ledgerlens_model_auc_roc` | Gauge | `model_name` | Latest AUC-ROC per model |
+| `ledgerlens_secret_rotation_total` | Counter | `secret_type`, `result` | Total secret rotation attempts |
+| `ledgerlens_secret_rotation_overdue` | Gauge | — | Count of active keys exceeding maximum age without rotation |
 
 **Security**: metric labels never contain wallet addresses, asset pair names beyond their label definition, or any PII.
 
@@ -189,6 +191,14 @@ Exposed at `GET /metrics` (no auth — standard Prometheus scrape convention).
 **Condition**: `(time() - ledgerlens_pipeline_run_duration_seconds_created) > 300`
 
 **Runbook**: The detection pipeline has not completed a run in over 5 minutes. Check that `python run_pipeline.py` (or `cli.py score`) is still running and not blocked. Review logs for exceptions in Horizon ingestion or model loading. Verify `LEDGERLENS_DB_PATH` is writable.
+
+---
+
+### SecretRotationOverdue
+
+**Condition**: `ledgerlens_secret_rotation_overdue > 0`
+
+**Runbook**: One or more active API keys have exceeded `API_KEY_MAX_AGE_DAYS` without rotation. Identify the overdue keys in the database and coordinate rotation via `POST /admin/api-keys/{key_id}/rotate` or the namespace key rotation endpoint.
 
 ### CapacityLimitApproaching
 

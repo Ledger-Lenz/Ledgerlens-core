@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Iterator, Tuple
+from collections.abc import Iterator
 
 import numpy as np
 
@@ -20,7 +20,7 @@ from config.settings import settings
 
 
 class EmbeddingStore:
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: str | None = None):
         self.db_path = db_path or settings.embedding_store_path
         self._ensure_db_exists()
 
@@ -44,18 +44,33 @@ class EmbeddingStore:
                 ON wallet_embeddings (model_version)
             """)
 
-    def upsert_embedding(self, wallet: str, model_version: str, embedding: np.ndarray) -> None:
-        """Insert or update a wallet's embedding."""
+    def upsert_embedding(
+        self,
+        wallet: str,
+        model_version: str,
+        embedding: np.ndarray,
+        computed_at: datetime | None = None,
+    ) -> None:
+        """Insert or update a wallet's embedding.
+
+        Args:
+            wallet: Wallet address.
+            model_version: Model version string.
+            embedding: Float32 numpy array.
+            computed_at: Optional explicit timestamp; defaults to now.
+        """
         embedding_bytes = embedding.astype(np.float32).tobytes()
-        computed_at = datetime.now().isoformat()
+        if computed_at is None:
+            computed_at = datetime.now()
+        computed_at_str = computed_at.isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO wallet_embeddings (wallet, model_version, embedding, computed_at)
                 VALUES (?, ?, ?, ?)
-            """, (wallet, model_version, embedding_bytes, computed_at))
+            """, (wallet, model_version, embedding_bytes, computed_at_str))
 
-    def get_embedding(self, wallet: str, model_version: str) -> Optional[Tuple[np.ndarray, datetime]]:
+    def get_embedding(self, wallet: str, model_version: str) -> tuple[np.ndarray, datetime] | None:
         """Retrieve a wallet's embedding and its computed timestamp, or None if not found."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("""
@@ -71,7 +86,7 @@ class EmbeddingStore:
                 return embedding, computed_at
             return None
 
-    def get_all_embeddings(self, model_version: str) -> Iterator[Tuple[str, np.ndarray]]:
+    def get_all_embeddings(self, model_version: str) -> Iterator[tuple[str, np.ndarray]]:
         """Iterate over all embeddings for a given model version."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("""
@@ -102,7 +117,7 @@ class EmbeddingStore:
                 (wallet, model_version),
             )
 
-    def get_latest_model_version(self) -> Optional[str]:
+    def get_latest_model_version(self) -> str | None:
         """Get the latest model version (most recent computed_at timestamp)."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(

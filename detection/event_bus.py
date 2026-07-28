@@ -1,6 +1,8 @@
 import asyncio
+import importlib.util
 import json
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -157,10 +159,8 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         self._js = None
         self._last_publish = None
         self._failures = 0
-        
-        try:
-            import nats  # noqa: F401 -- availability probe; re-imported properly in _connect()
-        except ImportError:
+
+        if importlib.util.find_spec("nats") is None:
             logger.warning("nats-py not installed. Degrading NATSRiskScoreBus to NullEventBus behavior.")
             return
             
@@ -214,7 +214,7 @@ class NATSRiskScoreBus(RiskScoreEventBus):
                             errors.append(str(e))
                             logger.error("Failed to publish to NATS after %d retries: %s", settings.event_bus_max_retries, str(e))
                         else:
-                            await __import__('asyncio').sleep(settings.event_bus_retry_backoff_seconds)
+                            await asyncio.sleep(settings.event_bus_retry_backoff_seconds)
                             
         self._loop.run_until_complete(_publish_all())
         if published > 0:
@@ -235,26 +235,32 @@ class NATSRiskScoreBus(RiskScoreEventBus):
 
 
 _bus_instance: RiskScoreEventBus | None = None
+_bus_lock: threading.Lock = threading.Lock()
+
 
 def get_event_bus() -> RiskScoreEventBus:
     global _bus_instance
     if _bus_instance is not None:
         return _bus_instance
-        
-    backend = settings.event_bus_backend.lower()
-    if backend == "kafka":
-        _bus_instance = KafkaRiskScoreBus(
-            bootstrap_servers=settings.event_bus_kafka_bootstrap_servers,
-            topic=settings.event_bus_kafka_topic,
-            sasl_password=settings.event_bus_kafka_sasl_password,
-        )
-    elif backend == "nats":
-        _bus_instance = NATSRiskScoreBus(
-            servers=settings.event_bus_nats_servers,
-            subject=settings.event_bus_nats_subject,
-            token=settings.event_bus_nats_token,
-        )
-    else:
-        _bus_instance = NullEventBus()
-        
-    return _bus_instance
+
+    with _bus_lock:
+        if _bus_instance is not None:
+            return _bus_instance
+
+        backend = settings.event_bus_backend.lower()
+        if backend == "kafka":
+            _bus_instance = KafkaRiskScoreBus(
+                bootstrap_servers=settings.event_bus_kafka_bootstrap_servers,
+                topic=settings.event_bus_kafka_topic,
+                sasl_password=settings.event_bus_kafka_sasl_password,
+            )
+        elif backend == "nats":
+            _bus_instance = NATSRiskScoreBus(
+                servers=settings.event_bus_nats_servers,
+                subject=settings.event_bus_nats_subject,
+                token=settings.event_bus_nats_token,
+            )
+        else:
+            _bus_instance = NullEventBus()
+
+        return _bus_instance

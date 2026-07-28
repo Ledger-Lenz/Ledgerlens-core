@@ -12,9 +12,9 @@ import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from config.settings import settings
+from detection.benford_engine import first_digit
 
 
 @dataclass
@@ -24,13 +24,6 @@ class BenfordBaseline:
     trade_count: int
     computed_at: datetime
     window_days: int
-
-
-def _first_digit(value: float) -> int | None:
-    """Return the leading decimal digit using the log10 method."""
-    if value is None or not math.isfinite(value) or value <= 0:
-        return None
-    return int(10 ** (math.log10(value) % 1)) or 1
 
 
 class BenfordBaselineCalibrator:
@@ -88,7 +81,7 @@ class BenfordBaselineCalibrator:
         counts = [0] * 9
         n = 0
         for amount in amounts:
-            d = _first_digit(amount)
+            d = first_digit(amount)
             if d is not None:
                 counts[d - 1] += 1
                 n += 1
@@ -131,7 +124,7 @@ class BenfordBaselineCalibrator:
             window_days=window_days,
         )
 
-    def load(self, asset_pair: str) -> Optional[BenfordBaseline]:
+    def load(self, asset_pair: str) -> BenfordBaseline | None:
         """Load a persisted baseline for ``asset_pair`` from ``benford_baselines``."""
         try:
             with sqlite3.connect(self._db_path) as conn:

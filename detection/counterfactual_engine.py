@@ -1,12 +1,13 @@
-"""Counterfactual explanation generation: "what would need to change?"
+"""
+Counterfactual explanation generation: "what would need to change?"
 
 Given a wallet's current feature vector, finds the smallest feasible
 perturbation that would drop the ensemble's predicted score below a target
 threshold. See `docs/counterfactual_explanations.md` for the full algorithm
 write-up and its limitations.
 
-## Algorithm
-
+Algorithm
+---------
 The models in the ensemble (Random Forest, XGBoost, LightGBM) are all
 tree-based, so their decision surface is piecewise-constant -- gradient-based
 search (and therefore DiCE's default gradient mode) has no useful gradient to
@@ -35,14 +36,20 @@ ensembles in principle; when it does, the binary search still returns a
 but not necessarily the minimum-distance one. See the docs for more detail.
 """
 
+from __future__ import annotations
+
 from detection.counterfactual_constraints import FEATURE_CONSTRAINTS, get_mutable_features
 from detection.model_inference import score_feature_vector
 
-_CONSTRAINTS_BY_NAME = {c.feature_name: c for c in FEATURE_CONSTRAINTS}
-
+# ---------------------------------------------------------------------------
+# Algorithm constants
+# ---------------------------------------------------------------------------
 _BISECTION_ITERATIONS = 15
 _MAX_SINGLE_FEATURE_PROBES = 5
 _MAX_EXTRA_CUMULATIVE_SUBSETS = 2
+_FEASIBILITY_TOLERANCE = 1e-9
+
+_CONSTRAINTS_BY_NAME = {c.feature_name: c for c in FEATURE_CONSTRAINTS}
 
 
 def _predicted_score(models: dict, feature_vector: dict) -> int:
@@ -75,22 +82,21 @@ def _candidate_for_subset(feature_vector: dict, subset: list[str], t: float) -> 
 
 def _violates_constraints(candidate: dict, original: dict) -> bool:
     """Return True if `candidate` is infeasible under `FEATURE_CONSTRAINTS`."""
-    tolerance = 1e-9
     for name, value in candidate.items():
         constraint = _CONSTRAINTS_BY_NAME.get(name)
         if constraint is None:
             continue
         if not constraint.mutable:
-            if abs(value - original[name]) > tolerance:
+            if abs(value - original[name]) > _FEASIBILITY_TOLERANCE:
                 return True
             continue
-        if constraint.direction == "decrease" and value > original[name] + tolerance:
+        if constraint.direction == "decrease" and value > original[name] + _FEASIBILITY_TOLERANCE:
             return True
-        if constraint.direction == "increase" and value < original[name] - tolerance:
+        if constraint.direction == "increase" and value < original[name] - _FEASIBILITY_TOLERANCE:
             return True
-        if constraint.min_val is not None and value < constraint.min_val - tolerance:
+        if constraint.min_val is not None and value < constraint.min_val - _FEASIBILITY_TOLERANCE:
             return True
-        if constraint.max_val is not None and value > constraint.max_val + tolerance:
+        if constraint.max_val is not None and value > constraint.max_val + _FEASIBILITY_TOLERANCE:
             return True
     return False
 
@@ -176,14 +182,17 @@ def generate_counterfactuals(
     that would drop the ensemble's predicted score below `target_score`.
 
     `target_score` defaults to `settings.risk_score_threshold - 1`. `norm` selects
-    the distance metric used to rank candidates ("l1" or "l2", default "l2").
+    the distance metric used to rank candidates (``"l1"`` or ``"l2"``, default ``"l2"``).
 
     Returns an empty list if `feature_vector` already scores below `target_score`,
     or if no feasible counterfactual exists within `FEATURE_CONSTRAINTS`.
     """
-    from config.settings import settings
+    # Lazy import to avoid circular dependency:
+    #   counterfactual_engine → counterfactual_constraints → feature_engineering
+    #   config.settings may import from detection.*, creating a cycle.
+    from config.settings import get_runtime_risk_score_threshold
 
-    target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
+    target_score = target_score if target_score is not None else get_runtime_risk_score_threshold() - 1
 
     current_score = _predicted_score(models, feature_vector)
     if current_score < target_score:

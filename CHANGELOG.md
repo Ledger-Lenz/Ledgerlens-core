@@ -13,6 +13,19 @@ reinstated (tracked in [ROADMAP.md](ROADMAP.md)).
 ## [Unreleased]
 
 ### Fixed
+- **Krum/Multi-Krum wired into production federated aggregation** (`detection/federated/server.py`,
+  new `_select_krum_survivors`): `FederatedAggregationServer._aggregate_locked()` previously ran plain
+  weighted FedAvg plus a historical-cosine heuristic that compares only against a rolling baseline and
+  skips entirely on round 1 — `KrumStrategy` (`detection/federated/krum.py`) was defined and tested but
+  never invoked from the live aggregation path. Krum/Multi-Krum peer-distance selection is now default-on
+  (`settings.federated_use_krum`) and supplements the cosine heuristic, closing the round-1 / "boiling
+  frog" gap. `f`/`m` are derived each round from the live valid-update count, not a static config value,
+  with a documented, logged fallback to plain FedAvg when a round has too few participants for any
+  tolerance. Also fixes `KrumStrategy`'s default constructor, which previously raised `ValueError` on
+  `KrumStrategy()` with no arguments (`min_clients=3` gave `f=1`, and `2(1)+2=4 < 3` is false); default
+  `min_clients` corrected to 5, the smallest value for which the default `f = floor(min_clients / 3)`
+  derivation is self-consistent. See `docs/byzantine_resilience.md` for the full ordering rationale
+  against DP noise and gradient clipping.
 - **Distributed per-API-key rate limiting** (`detection/rate_limiter.py`, new): replaces
   three independent, non-communicating in-process sliding-window dicts
   (`api/gateway.py`, `detection/api_key_store.py`, each replicated per REST pod and

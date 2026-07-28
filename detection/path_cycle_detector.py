@@ -17,12 +17,14 @@ trading via path payments past ~6 hops is negligible).
 
 from __future__ import annotations
 
+import heapq
 import logging
 
 import networkx as nx
 import pandas as pd
 
 from detection.graph_engine import add_path_payment_edges
+from detection.storage import AlertType
 from ingestion.data_models import PathPayment
 
 logger = logging.getLogger(__name__)
@@ -106,9 +108,7 @@ def _select_timed_cycle_edges(
             untimed_picks.append(hops[0])
 
     if not timed:
-        return untimed_picks  # nothing to time-bound
-
-    import heapq
+        return untimed_picks
 
     pointers = [0] * len(timed)
     heap = [(timed[i][0][0], i) for i in range(len(timed))]
@@ -304,8 +304,6 @@ def path_payment_cycles_to_alerts(cycles: list[dict]) -> list[dict]:
     full account ring, asset path, cyclic value and completion time travel in
     the alert `detail`. The asset pair is the first->last leg of the ring.
     """
-    from detection.storage import AlertType
-
     alerts: list[dict] = []
     for cycle in cycles:
         accounts = cycle.get("accounts", [])

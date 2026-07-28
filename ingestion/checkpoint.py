@@ -95,26 +95,31 @@ class CursorCheckpoint:
                 if fcntl is not None:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-    def _warn_if_permissions_wide(self) -> None:
-        mode = stat.S_IMODE(self.path.stat().st_mode)
-        if mode & 0o077:
-            logger.warning(
-                "Cursor checkpoint %s has permissions %03o; expected 600",
-                self.path,
-                mode,
-            )
+    def _fix_permissions(self) -> None:
+        """Ensure checkpoint file has restricted permissions (0o600)."""
+        try:
+            mode = stat.S_IMODE(self.path.stat().st_mode)
+            if mode & 0o077:
+                os.chmod(self.path, 0o600)
+                logger.info(
+                    "Fixed cursor checkpoint permissions: %s (%03o → 0600)",
+                    self.path, mode,
+                )
+        except OSError as exc:
+            logger.warning("Failed to fix checkpoint permissions %s: %s", self.path, exc)
 
     def load(self) -> str | None:
         """Return the stored token, or ``None`` when absent, unreadable, or corrupt.
 
         Reading is protected by an advisory lock. Malformed JSON and invalid
         paging-token values are logged and treated as a missing checkpoint.
+        File permissions are automatically corrected if overly permissive.
         """
         try:
             with self._locked():
                 if not self.path.exists():
                     return None
-                self._warn_if_permissions_wide()
+                self._fix_permissions()
                 payload = json.loads(self.path.read_text(encoding="utf-8"))
                 token = payload["paging_token"]
                 if not isinstance(token, str):
