@@ -1,0 +1,25 @@
+[package]
+name = "ledgerlens-score"
+version = "0.1.0"
+edition = "2021"
+description = "LedgerLens risk-score storage and privileged parameter governance with structured authorization-failure telemetry"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+# testutils gates soroban_sdk::testutils (Env mocking, Address::generate,
+# Ledger::set_timestamp, mock_all_auths, mock_auths).
+# alloc provides to_alloc_vec helpers used in test assertions.
+soroban-sdk = { version = "21.0", features = ["testutils", "alloc"] }
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+lto = true
