@@ -54,7 +54,12 @@ fuzz_target!(|input: FuzzInput| {
     // would misreport it as a crash. Use the non-panicking `try_initialize`
     // client variant instead, which surfaces a rejection as a plain `Err`.
     if client
-        .try_initialize(&threshold, &oracle_keys, &score_contract)
+        .try_initialize(
+            &Address::generate(&env),
+            &threshold,
+            &oracle_keys,
+            &score_contract,
+        )
         .is_err()
     {
         return; // Any rejection here is an intentional, expected outcome.

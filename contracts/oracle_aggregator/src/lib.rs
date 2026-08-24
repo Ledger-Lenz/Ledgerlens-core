@@ -39,10 +39,27 @@ pub struct OracleAggregator;
 impl OracleAggregator {
     /// Initialise with threshold k, list of n authorised oracle public keys, and the ledgerlens-score contract address.
     ///
-    /// Panics if called twice, or if `threshold` is zero or exceeds the number
-    /// of authorised keys — a quorum that cannot be met (or that any single
-    /// caller can meet with no signatures) is always a configuration error.
-    pub fn initialize(env: Env, threshold: u32, oracle_keys: Vec<BytesN<32>>, score_contract: Address) {
+    /// The `deployer` identity must authorise this call. Because (re)initialisation
+    /// is permanently blocked after the first success, whoever presents a valid
+    /// authorisation for `deployer` on the very first `initialize` call fixes the
+    /// trusted oracle key set and quorum threshold for the lifetime of the
+    /// contract. Front-running is mitigated by submitting deployment and this
+    /// authorised call as tightly coupled as operationally possible (see
+    /// `docs/oracle_quorum.md`).
+    ///
+    /// Panics if called twice, if `threshold` is zero or exceeds the number of
+    /// authorised keys, or if `deployer` does not authorise the call — a quorum
+    /// that cannot be met (or that any single caller can meet with no
+    /// signatures) is always a configuration error.
+    pub fn initialize(
+        env: Env,
+        deployer: Address,
+        threshold: u32,
+        oracle_keys: Vec<BytesN<32>>,
+        score_contract: Address,
+    ) {
+        deployer.require_auth();
+
         if env.storage().instance().has(&Symbol::new(&env, "THRESHOLD")) {
             panic!("already initialized");
         }
@@ -52,9 +69,21 @@ impl OracleAggregator {
         if threshold > oracle_keys.len() {
             panic!("threshold exceeds number of oracle keys");
         }
+        env.storage().instance().set(&Symbol::new(&env, "DEPLOYER"), &deployer);
         env.storage().instance().set(&Symbol::new(&env, "THRESHOLD"), &threshold);
         env.storage().instance().set(&Symbol::new(&env, "ORACLE_KEYS"), &oracle_keys);
         env.storage().instance().set(&Symbol::new(&env, "SCORE_CONTRACT"), &score_contract);
+    }
+
+    /// Return the `deployer` identity that authorised `initialize`.
+    ///
+    /// Lets operators verify, after deployment, which key controls the
+    /// one-time configuration authority for this contract instance.
+    pub fn get_deployer(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "DEPLOYER"))
+            .unwrap_or_else(|| panic!("not initialized"))
     }
 
     /// Verify k-of-n signatures and forward to ledgerlens-score contract.
