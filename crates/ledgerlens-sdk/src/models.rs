@@ -1,11 +1,11 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A single wallet/asset-pair risk score, as returned by the scoring pipeline.
 ///
 /// Field names and types match the Python SDK (`packages/ledgerlens-sdk/src/ledgerlens/models.py`)
 /// and the TypeScript SDK (`sdk/`) exactly.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct RiskScore {
     /// Stellar wallet address (G...).

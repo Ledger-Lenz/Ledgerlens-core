@@ -1,0 +1,14 @@
+{
+  "wallet": "GBXGQJWVN5C3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3",
+  "asset_pair": "XLM/USDC",
+  "score": 85,
+  "benford_flag": true,
+  "ml_flag": true,
+  "confidence": 95,
+  "disputed": false,
+  "timestamp": "2023-10-27T10:00:00Z",
+  "score_lower": 80.5,
+  "score_upper": 90.0,
+  "prediction_set": [1, 2],
+  "coverage_guarantee": 0.9
+}
