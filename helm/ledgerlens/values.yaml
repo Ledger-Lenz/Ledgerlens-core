@@ -127,13 +127,27 @@ secrets:
   LEDGERLENS_COMPLIANCE_API_KEY: ""
   LEDGERLENS_WEBHOOK_ENCRYPTION_KEY: ""
 
-# ── Persistent Volume ────────────────────────────────────────────────────────
+# ── Persistent Volume (Deprecated for DB) ────────────────────────────────────
+# The local SQLite persistent volume is disabled by default in favour of PostgreSQL.
 persistence:
-  enabled: true
+  enabled: false
   storageClass: ""
   accessMode: ReadWriteOnce
   size: 10Gi
   annotations: {}
+
+# ── PostgreSQL ───────────────────────────────────────────────────────────────
+postgresql:
+  enabled: true
+  auth:
+    username: ledgerlens
+    database: ledgerlens
+    # password should be set via --set postgresql.auth.password
+    password: ""
+  primary:
+    persistence:
+      enabled: true
+      size: 20Gi
 
 # ── ServiceAccount ───────────────────────────────────────────────────────────
 serviceAccount:

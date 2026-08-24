@@ -14,9 +14,10 @@ target_metadata = None
 
 
 def _db_url() -> str:
-    """Resolve the SQLite DB path from env (same logic as config/settings.py)."""
-    db_path = os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db")
-    return f"sqlite:///{db_path}"
+    """Resolve the DB URL from env (supports both Postgres and SQLite)."""
+    # Import locally to avoid circular imports if config imports something else
+    from config.settings import settings
+    return settings.db_url
 
 
 def run_migrations_offline() -> None:
