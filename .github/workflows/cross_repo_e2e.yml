@@ -1,4 +1,3 @@
-
 name: Cross-Repo E2E Tests
 
 # Run on schedule (weekly) or manual dispatch only
@@ -8,6 +7,14 @@ on:
   schedule:
     - cron: '0 0 * * 0'  # Every Sunday at 00:00 UTC
   workflow_dispatch:  # Allow manual trigger
+    inputs:
+      pinned_ref:
+        description: 'Branch, tag or SHA to checkout for sibling repos'
+        required: false
+        default: 'main'
+
+env:
+  CROSS_REPO_E2E_PINNED_REF: ${{ github.event.inputs.pinned_ref || 'main' }}
 
 jobs:
   cross_repo_e2e:
@@ -21,14 +28,14 @@ jobs:
         with:
           repository: Ledger-Lenz/ledgerlens-api
           path: ledgerlens-api
-          ref: main  # Replace with a specific SHA in production
+          ref: ${{ env.CROSS_REPO_E2E_PINNED_REF }}
 
       - name: Checkout ledgerlens-contracts
         uses: actions/checkout@v4
         with:
           repository: Ledger-Lenz/ledgerlens-contracts
           path: ledgerlens-contracts
-          ref: main  # Replace with a specific SHA in production
+          ref: ${{ env.CROSS_REPO_E2E_PINNED_REF }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,7 +53,5 @@ jobs:
         env:
           LEDGERLENS_API_REPO_PATH: ./ledgerlens-api
           LEDGERLENS_CONTRACTS_REPO_PATH: ./ledgerlens-contracts
-          CROSS_REPO_E2E_PINNED_REF: main
         run: |
           pytest -m cross_repo_e2e tests/e2e_cross_repo/
-

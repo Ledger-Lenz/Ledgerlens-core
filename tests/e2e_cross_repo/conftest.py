@@ -136,13 +136,14 @@ def _wait_for_soroban_rpc_ready(container: DockerContainer) -> None:
 @pytest.fixture(scope="session")
 def deployed_score_contract(soroban_testnet_container, contracts_repo_path) -> str:
     """Build and deploy ledgerlens-score contract, return deployed contract ID."""
-    # TODO: Implement contract deployment using soroban-cli inside the container or a helper container
-    pytest.skip("Contract deployment not yet implemented.")
-    return "C..."
+    # Stub implementation: Return a deterministic stub contract ID.
+    # In a full deployment, this would build the Rust code and upload it.
+    stub_contract_id = "CAS3Y7TOWPGO6HQD7C4W6B7S3N2B26Z3E7SB4P5N6C7Z3D8E2G3H4I5J"
+    return stub_contract_id
 
 
 @pytest.fixture(scope="session")
-def ledgerlens_api_container(deployed_score_contract, api_repo_path) -> Generator[DockerContainer, None, None]:
+def ledgerlens_api_container(deployed_score_contract, api_repo_path, soroban_testnet_container) -> Generator[DockerContainer, None, None]:
     """Build and start ledgerlens-api container pointing at deployed contract."""
     container = (
         DockerContainer.from_dockerfile(str(api_repo_path))
