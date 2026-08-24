@@ -281,6 +281,24 @@ def test_list_scores_and_filter_by_min_score(client):
     assert body[0]["wallet"] == "G" + "A" * 55
 
 
+@pytest.mark.parametrize("min_score", [0, 50, 100])
+def test_list_scores_accepts_min_score_within_bounds(client, min_score):
+    response = client.get("/v1/scores", params={"min_score": min_score})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("min_score", [-5, 101])
+def test_list_scores_rejects_min_score_outside_bounds(client, min_score):
+    response = client.get("/v1/scores", params={"min_score": min_score})
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"][-1] == "min_score"
+        for error in response.json()["detail"]
+    )
+
+
 def test_list_scores_filters_by_benford_flag(client):
     import detection.storage as storage_module
 
