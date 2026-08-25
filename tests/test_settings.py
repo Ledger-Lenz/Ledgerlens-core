@@ -243,3 +243,36 @@ def test_streamer_high_water_ratio_above_one_raises(monkeypatch):
 
     with pytest.raises(ValueError, match="STREAMER_HIGH_WATER_RATIO"):
         settings_module.Settings()
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests
+# ---------------------------------------------------------------------------
+
+def test_no_duplicate_field_declarations():
+    """Regression test for Issue #683: ensure fields are declared exactly once."""
+    import ast
+    from pathlib import Path
+    import config.settings
+
+    settings_path = Path(config.settings.__file__)
+    tree = ast.parse(settings_path.read_text(encoding="utf-8"))
+
+    # find the Settings class
+    settings_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Settings")
+
+    # count assignments
+    field_counts = {}
+    for node in settings_class.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            field_name = node.target.id
+            field_counts[field_name] = field_counts.get(field_name, 0) + 1
+
+    for field in [
+        "cost_per_vcpu_hour_usd",
+        "cost_per_gb_memory_hour_usd",
+        "cost_per_gb_storage_month_usd",
+        "capacity_projection_window_days",
+        "capacity_projection_lead_time_days",
+    ]:
+        assert field_counts.get(field, 0) == 1, f"Field {field} is declared {field_counts.get(field, 0)} times."
