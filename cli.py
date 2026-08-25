@@ -1684,6 +1684,10 @@ def federated_server(
     min_participants: int = typer.Option(None, help="Minimum quorum size before aggregation"),
 ) -> None:
     """Start the federated aggregation server as a standalone process."""
+    logger.warning(
+        "[DEPRECATED] `cli.py federated server` is deprecated and will be removed in a future release. "
+        "Please use the standalone package `ledgerlens-fl-server` instead."
+    )
     import uvicorn
 
     from config.settings import settings as cfg
