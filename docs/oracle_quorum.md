@@ -16,6 +16,41 @@ The `oracle_aggregator` contract:
 4. Checks timestamps for replay protection.
 5. Forwards the approved score to the main `ledgerlens-score` contract.
 
+## `ledgerlens-score` ABI Integration
+
+The aggregator targets the current ten-argument `submit_score` ABI:
+
+```text
+submit_score(
+  signers, wallet, asset_pair, score, benford_flag, ml_flag,
+  timestamp, confidence, model_version, attestation_input
+)
+```
+
+Oracle nodes sign every caller-controlled score field in the
+`LedgerLens-Oracle-v2` canonical message. `asset_pair` is encoded as a Soroban
+`Symbol` XDR value, matching the destination ABI; callers must provide a
+non-empty ASCII alphanumeric/underscore identifier of at most 32 bytes.
+
+The aggregator derives the remaining arguments rather than accepting
+caller-controlled authorization data:
+
+- `signers = [oracle_aggregator contract address]`
+- `attestation_input = None`
+
+Deployment must configure the aggregator contract address as the
+`ledgerlens-score` service address. Before invoking `submit_score`, the
+aggregator authorizes that exact nested call with
+`authorize_as_current_contract`, so the destination's `require_auth` check is
+preserved. The destination's optional secp256k1 service-pubkey attestation must
+not be enabled for this service path because the Ed25519 oracle quorum provides
+the cryptographic attestation.
+
+A destination contract error or trap propagates and rolls back the aggregator
+invocation. It is deliberately not converted to `false`: `false` means quorum
+or replay rejection, while a target trap means quorum succeeded but persistence
+failed.
+
 ## Key Management
 - Each node's ED25519 private key is injected via environment variables (`ORACLE_NODE_{1..5}_KEY`).
 - Keys are never logged or stored on disk unencrypted.

@@ -33,14 +33,40 @@ class OracleCoordinator:
         self.threshold = threshold
 
     def collect_signatures(
-        self, wallet: str, asset_pair: str, score: int, timestamp: int
+        self,
+        wallet: str,
+        asset_pair: str,
+        score: int,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: int,
+        confidence: int,
+        model_version: int,
     ) -> QuorumSignature:
         """Collect signatures from all nodes; stop after threshold is reached."""
-        message = OracleNode._canonical_message(wallet, asset_pair, score, timestamp)
+        message = OracleNode._canonical_message(
+            wallet,
+            asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        )
         signatures = []
         for node in self.nodes:
             try:
-                sig = node.sign_score_submission(wallet, asset_pair, score, timestamp)
+                sig = node.sign_score_submission(
+                    wallet,
+                    asset_pair,
+                    score,
+                    benford_flag,
+                    ml_flag,
+                    timestamp,
+                    confidence,
+                    model_version,
+                )
                 signatures.append((node.public_key_hex, sig.hex()))
                 if len(signatures) >= self.threshold:
                     break      # Short-circuit: quorum reached
@@ -55,13 +81,44 @@ class OracleCoordinator:
         )
 
     def submit_with_quorum(
-        self, wallet: str, asset_pair: str, score: int, timestamp: int,
-        publisher: "SorobanPublisher"
+        self,
+        wallet: str,
+        asset_pair: str,
+        score: int,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: int,
+        confidence: int,
+        model_version: int,
+        publisher: "SorobanPublisher",
     ) -> bool:
         """Collects quorum signatures and forwards to the publisher."""
-        quorum = self.collect_signatures(wallet, asset_pair, score, timestamp)
+        quorum = self.collect_signatures(
+            wallet,
+            asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        )
         if not quorum.is_valid_quorum:
-            logger.error("Quorum not reached: %d/%d signatures", quorum.signers_count, self.threshold)
+            logger.error(
+                "Quorum not reached: %d/%d signatures",
+                quorum.signers_count,
+                self.threshold,
+            )
             return False
         # Call oracle_aggregator Soroban contract
-        return publisher.submit_with_quorum(wallet, asset_pair, score, timestamp, quorum)
+        return publisher.submit_with_quorum(
+            wallet,
+            asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+            quorum,
+        )

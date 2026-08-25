@@ -256,7 +256,7 @@ LedgerLens supports two ZK backends for proving that a score meets a threshold:
 
 ### Contract Functions
 
-- `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)` - Registers a computed risk score on-chain (authorised LedgerLens service account only)
+- `submit_score(signers: Vec<Address>, wallet: Address, asset_pair: Symbol, score: u32, benford_flag: bool, ml_flag: bool, timestamp: u64, confidence: u32, model_version: u32, attestation_input: Option<ScoreAttestationInput>)` - Registers a computed risk score on-chain (authorised LedgerLens service path only)
 
 ### Dispute & Governance
 
@@ -1090,7 +1090,7 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 **4. Soroban contract interface** — `ledgerlens-contracts` exposes:
 
-- `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)`
+- `submit_score(signers: Vec<Address>, wallet: Address, asset_pair: Symbol, score: u32, benford_flag: bool, ml_flag: bool, timestamp: u64, confidence: u32, model_version: u32, attestation_input: Option<ScoreAttestationInput>)`
 - `get_score(wallet: Address, asset_pair: Symbol) -> RiskScore`
 
 `core` and `api` must call `submit_score` with `score` already clamped to 0-100 (see `RiskScore.combine` in `detection/risk_score.py`).

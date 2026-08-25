@@ -8,6 +8,10 @@ import time
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+ORACLE_DOMAIN_SEPARATOR = b"LedgerLens-Oracle-v2"
+SOROBAN_SYMBOL_SCVAL_TYPE = 15
+MAX_SYMBOL_LENGTH = 32
+
 
 class OracleNode:
     """
@@ -40,27 +44,84 @@ class OracleNode:
         return pub.public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
 
     def sign_score_submission(
-        self, wallet: str, asset_pair: str, score: int, timestamp: int
+        self,
+        wallet: str,
+        asset_pair: str,
+        score: int,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: int,
+        confidence: int,
+        model_version: int,
     ) -> bytes:
         """
-        Sign canonical message: SHA-256("LedgerLens-Oracle-v1" || wallet || asset_pair || score_u32_be || timestamp_u64_be)
+        Sign every caller-controlled field forwarded to ledgerlens-score.
+
         Returns 64-byte ED25519 signature.
         """
-        message = self._canonical_message(wallet, asset_pair, score, timestamp)
+        message = self._canonical_message(
+            wallet,
+            asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        )
         sig = self._private_key.sign(message)
         self.last_seen = time.time()
         return sig
 
     @staticmethod
-    def _canonical_message(wallet: str, asset_pair: str, score: int, timestamp: int) -> bytes:
-        prefix = b"LedgerLens-Oracle-v1"
+    def _canonical_message(
+        wallet: str,
+        asset_pair: str,
+        score: int,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: int,
+        confidence: int,
+        model_version: int,
+    ) -> bytes:
+        OracleNode._validate_payload(score, confidence, timestamp, model_version)
         body = (
-            prefix
+            ORACLE_DOMAIN_SEPARATOR
             + wallet.encode("utf-8")
             + b"|"
-            + asset_pair.encode("utf-8")
+            + OracleNode._symbol_xdr(asset_pair)
             + b"|"
             + struct.pack(">I", score)
+            + struct.pack(">?", benford_flag)
+            + struct.pack(">?", ml_flag)
             + struct.pack(">Q", timestamp)
+            + struct.pack(">I", confidence)
+            + struct.pack(">I", model_version)
         )
         return hashlib.sha256(body).digest()
+
+    @staticmethod
+    def _symbol_xdr(value: str) -> bytes:
+        encoded = value.encode("ascii")
+        if (
+            len(encoded) > MAX_SYMBOL_LENGTH
+            or not encoded
+            or any(not (chr(byte).isalnum() or byte == ord("_")) for byte in encoded)
+        ):
+            raise ValueError(
+                "asset_pair must be a non-empty Soroban Symbol "
+                "(ASCII alphanumeric/underscore, at most 32 bytes)"
+            )
+        padding = b"\x00" * ((-len(encoded)) % 4)
+        return struct.pack(">iI", SOROBAN_SYMBOL_SCVAL_TYPE, len(encoded)) + encoded + padding
+
+    @staticmethod
+    def _validate_payload(score: int, confidence: int, timestamp: int, model_version: int) -> None:
+        if not 0 <= score <= 100:
+            raise ValueError("score must be between 0 and 100")
+        if not 0 <= confidence <= 100:
+            raise ValueError("confidence must be between 0 and 100")
+        if not 0 <= timestamp <= 2**64 - 1:
+            raise ValueError("timestamp must fit u64")
+        if not 0 <= model_version <= 2**32 - 1:
+            raise ValueError("model_version must fit u32")
