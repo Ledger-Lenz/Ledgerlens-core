@@ -1,11 +1,15 @@
 name: CD
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
     branches: [main]
   workflow_dispatch:
 jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     env:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
@@ -33,13 +37,28 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
-      - name: Build and push Docker image
+      - name: Build Docker image
         if: steps.deploy-config.outputs.enabled == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          load: true
           tags: ${{ env.DOCKER_USERNAME }}/ledgerlens:${{ github.sha }}
+
+      - name: Run Trivy vulnerability scanner
+        if: steps.deploy-config.outputs.enabled == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.DOCKER_USERNAME }}/ledgerlens:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push Docker image
+        if: steps.deploy-config.outputs.enabled == 'true'
+        run: docker push ${{ env.DOCKER_USERNAME }}/ledgerlens:${{ github.sha }}
 
       - name: Set up Kubeconfig
         if: steps.deploy-config.outputs.enabled == 'true'
