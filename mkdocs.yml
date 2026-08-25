@@ -70,6 +70,7 @@ nav:
     - Uncertainty Quantification: uncertainty_quantification.md
     - Governance Protocol: governance_protocol.md
     - Oracle Network: oracle_network.md
+    - Client-Binding Strategy: client_binding_strategy.md
   - API Reference:
     - REST API: api_reference.md
     - Detection Engine: api/detection.md
