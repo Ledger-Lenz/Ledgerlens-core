@@ -7,6 +7,31 @@
 
 Hybrid on-chain fraud detection for the Stellar DEX — detecting wash trading and artificial volume using Benford's Law combined with ensemble machine learning, with risk scores anchored on Soroban.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Benford's Law on the Blockchain](#benfords-law-on-the-blockchain)
+- [Machine Learning Layer](#machine-learning-layer)
+- [Graph-Based Ring Detection](#graph-based-ring-detection)
+- [Soroban Smart Contract Layer](#soroban-smart-contract-layer)
+- [Repository Structure](#repository-structure)
+- [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
+- [Continuous Retraining](#continuous-retraining)
+- [Webhook Alerts](#webhook-alerts)
+- [Observability](#observability)
+- [Testing](#testing)
+- [Roadmap](#roadmap)
+- [Why This Matters for the Stellar Ecosystem](#why-this-matters-for-the-stellar-ecosystem)
+- [Dependencies](#dependencies)
+- [License](#license)
+- [Contributing](#contributing)
+- [LedgerLens Organization](#ledgerlens-organization)
+- [Support](#support)
+- [References](#references)
+
 ## Overview
 
 LedgerLens is a fraud detection system for the Stellar Decentralised Exchange (SDEX). It ingests trade data from the Stellar Horizon API, scores wallets and asset pairs for wash-trading risk using a combination of Benford's Law digit-distribution analysis and ensemble ML classifiers, and publishes those scores both via a public REST API and an on-chain Soroban contract so other protocols can consume them natively.
