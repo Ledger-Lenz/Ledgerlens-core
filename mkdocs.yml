@@ -61,6 +61,7 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Glossary: glossary.md
   - Architecture:
     - Ingestion: ingestion.md
     - Feature Store: feature_store.md

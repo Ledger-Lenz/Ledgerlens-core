@@ -11,13 +11,15 @@ feature changes.
 1. [Prerequisites](#prerequisites)
 2. [First-time setup](#first-time-setup)
 3. [Ecosystem layout](#ecosystem-layout)
-4. [Development workflow](#development-workflow)
-5. [How dependencies are managed](#how-dependencies-are-managed)
-6. [Adding or updating a dependency](#adding-or-updating-a-dependency)
-7. [Optional features and import guards](#optional-features-and-import-guards)
-8. [License and vulnerability policy](#license-and-vulnerability-policy)
-9. [Before opening a PR](#before-opening-a-pr)
-10. [Cross-repo changes](#cross-repo-changes)
+4. [Choosing which package manager and lockfile to update](#choosing-which-package-manager-and-lockfile-to-update)
+5. [Development workflow](#development-workflow)
+6. [How dependencies are managed](#how-dependencies-are-managed)
+7. [Adding or updating a dependency](#adding-or-updating-a-dependency)
+8. [Optional features and import guards](#optional-features-and-import-guards)
+9. [License and vulnerability policy](#license-and-vulnerability-policy)
+10. [Before opening a PR](#before-opening-a-pr)
+11. [Definition of Done checklist](#definition-of-done-checklist)
+12. [Cross-repo changes](#cross-repo-changes)
 
 ---
 
@@ -88,6 +90,31 @@ manifest, lockfile, and update procedure:
 | **Rust** | `Cargo.toml` + workspace members | `Cargo.lock` | `cargo update` + commit |
 | **Go** | `go/go.mod` | `go/go.sum` | `cd go && go get -u ./... && go mod tidy` |
 | **TypeScript SDK** | `sdk/package.json` | `sdk/package-lock.json` | `cd sdk && npm update` + commit |
+
+---
+
+## Choosing which package manager and lockfile to update
+
+> **Full policy details** — including allowed and blocked license families, vulnerability SLAs, and the exception-granting process — live in [`docs/dependency_policy.md`](docs/dependency_policy.md). Read that document before adding any new dependency. This section is a quick-start orientation.
+
+This repository contains **four independent dependency ecosystems**. When you add or upgrade a dependency, touch only the files that belong to the ecosystem you are working in:
+
+| If you changed… | Ecosystem | Manifest to edit | Lockfile to regenerate | Command |
+|---|---|---|---|---|
+| Python source (`api/`, `detection/`, `ingestion/`, …) | **Python** | `pyproject.toml` | `requirements/*.txt` | `make lock` |
+| Rust crates (`crates/`, `contracts/`) | **Rust** | `Cargo.toml` | `Cargo.lock` | `cargo add <crate>` then `cargo update` |
+| Go SDK (`go/`) | **Go** | `go/go.mod` | `go/go.sum` | `cd go && go get <module> && go mod tidy` |
+| TypeScript SDK (`sdk/`) | **TypeScript** | `sdk/package.json` | `sdk/package-lock.json` | `cd sdk && npm install <pkg>` |
+
+### Key rules
+
+- **Python** — never edit `requirements/*.txt` by hand. They are compiled from `pyproject.toml` by `pip-compile --generate-hashes`. Run `make lock` and commit the resulting files.
+- **Rust** — `Cargo.lock` is committed and must stay consistent. After `cargo add` or `cargo update`, commit `Cargo.lock` in the same PR as the `Cargo.toml` change.
+- **Go** — commit both `go/go.mod` and `go/go.sum` together. Run `go mod tidy` after `go get` to prune unused indirect dependencies.
+- **TypeScript** — use exact or tightly-bounded constraints in `sdk/package.json`. Commit `sdk/package-lock.json` after `npm install`. Run `npm ci` to verify the lockfile is consistent before pushing.
+- **Do not cross-pollinate** — a Python feature PR must not touch `Cargo.lock`; a Rust PR must not regenerate `requirements/*.txt`. Keep ecosystem changes isolated.
+
+For license compliance requirements that apply to all four ecosystems, see [`docs/dependency_policy.md`](docs/dependency_policy.md).
 
 ---
 
@@ -313,13 +340,56 @@ make audit       # all of the above
 
 ## Before opening a PR
 
-1. `pytest -q` passes
-2. `make lint` passes (`ruff check .`)
-3. `make lock-check` passes (lockfiles are not stale)
-4. New features include tests
-5. Documentation (`README.md`, `docs/`) is updated for any user-facing change
-6. If adding or bumping a dependency: `pyproject.toml` **and** the affected
-   `requirements/*.txt` files are committed in the same PR
+Run through the [Definition of Done checklist](#definition-of-done-checklist) below before
+opening a PR. It lists the exact commands for every part of the codebase, scoped to only the
+language(s) you actually touched.
+
+---
+
+## Definition of Done checklist
+
+Run only the checks that apply to the parts of the codebase you changed. Tick each item before
+opening a PR.
+
+### Python (`api/`, `detection/`, `ingestion/`, `audit/`, `backtesting/`, …)
+
+- [ ] **Tests pass** — `pytest -q`
+- [ ] **Lint passes** — `make lint` (runs `ruff check .`)
+- [ ] **Type-check passes** — `make typecheck` (runs `mypy` if configured, otherwise skip)
+- [ ] **Lockfiles are fresh** — `make lock-check` (runs `pip-compile --check`; fails if stale)
+- [ ] **New public behaviour has tests** — unit or integration test added/updated
+- [ ] **User-facing docs updated** — `README.md` and/or `docs/` updated if the change affects
+  API surface, CLI flags, config keys, or deployment behaviour
+
+### Rust (`crates/`, `contracts/`)
+
+- [ ] **Tests pass** — `cargo test --workspace`
+- [ ] **Lint passes** — `cargo clippy --workspace -- -D warnings`
+- [ ] **Format is clean** — `cargo fmt --check`
+- [ ] **Lockfile committed** — `Cargo.lock` committed in the same PR as `Cargo.toml` changes
+
+### Go (`go/`)
+
+- [ ] **Tests pass (with race detector)** — `cd go && go test ./... -race`
+- [ ] **Vet passes** — `cd go && go vet ./...`
+- [ ] **Module files committed** — `go/go.mod` and `go/go.sum` committed together
+
+### TypeScript SDK (`sdk/`)
+
+- [ ] **Tests pass** — `cd sdk && npm test`
+- [ ] **Lint passes** — `cd sdk && npm run lint`
+- [ ] **Lockfile consistent** — `cd sdk && npm ci` completes without error; commit `sdk/package-lock.json`
+
+### All changes
+
+- [ ] **No debug or temporary code** — no `print`, `console.log`, `TODO: remove`, or commented-out
+  blocks left behind
+- [ ] **No secrets** — no API keys, secret keys, or credentials in any committed file
+- [ ] **Branch is up to date** — `git fetch origin && git rebase origin/main` completes cleanly
+- [ ] **PR description includes** `Closes #<issue>` for every resolved issue
+
+> **Shortcut**: if your change only touches Python source, you only need the Python block and
+> the "All changes" block. A Rust-only change needs only the Rust + All blocks, and so on.
 
 ---
 
