@@ -8,16 +8,47 @@ feature changes.
 
 ## Table of Contents
 
-1. [Prerequisites](#prerequisites)
-2. [First-time setup](#first-time-setup)
-3. [Ecosystem layout](#ecosystem-layout)
-4. [Development workflow](#development-workflow)
-5. [How dependencies are managed](#how-dependencies-are-managed)
-6. [Adding or updating a dependency](#adding-or-updating-a-dependency)
-7. [Optional features and import guards](#optional-features-and-import-guards)
-8. [License and vulnerability policy](#license-and-vulnerability-policy)
-9. [Before opening a PR](#before-opening-a-pr)
-10. [Cross-repo changes](#cross-repo-changes)
+1. [Picking your first issue](#picking-your-first-issue)
+2. [Prerequisites](#prerequisites)
+3. [First-time setup](#first-time-setup)
+4. [Ecosystem layout](#ecosystem-layout)
+5. [Development workflow](#development-workflow)
+6. [How dependencies are managed](#how-dependencies-are-managed)
+7. [Adding or updating a dependency](#adding-or-updating-a-dependency)
+8. [Optional features and import guards](#optional-features-and-import-guards)
+9. [License and vulnerability policy](#license-and-vulnerability-policy)
+10. [Before opening a PR](#before-opening-a-pr)
+11. [Cross-repo changes](#cross-repo-changes)
+
+---
+
+## Picking your first issue
+
+New to the project? Start with an issue labeled `good first issue` or one
+that has a clear, self-contained description. A well-scoped issue usually
+includes:
+
+- A **Description** explaining the problem or gap.
+- **Acceptance Criteria** as a checklist — the concrete conditions your PR
+  needs to satisfy.
+- **File/Folder Hints** pointing at the files most likely involved.
+
+If any of these are missing or unclear, ask on the issue before starting —
+it's much cheaper to clarify scope up front than to rework a PR later.
+
+This repository spans several ecosystems; here's roughly where to look
+depending on what you're interested in:
+
+- **Python core** (detection pipeline, API, ML models) — repo root, `api/`,
+  `detection/`, `ingestion/`.
+- **Rust** (Soroban SDK crate) — `crates/`.
+- **Soroban smart contracts** — `contracts/`.
+- **Go SDK** — `go/`.
+- **TypeScript SDK** — `sdk/`.
+
+See [Ecosystem layout](#ecosystem-layout) below for how each ecosystem's
+dependencies are managed, and [First-time setup](#first-time-setup) for how
+to get a working local environment.
 
 ---
 

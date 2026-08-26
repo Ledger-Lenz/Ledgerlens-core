@@ -1107,6 +1107,19 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 - When a change in this repo affects a shared contract above, call it out explicitly so the corresponding change can be made in the other repo(s).
 - Keep `RiskScore` and `Trade`/`Asset` field names identical (same casing, same units) across Python (`core`, `api`), Rust (`contracts`), and TypeScript (`dashboard`) — translation layers are a common source of bugs.
 
+## Getting Help
+
+Before filing a new issue, please:
+
+1. Check the [`docs/`](docs/) directory — many subsystems (threat model,
+   event bus, uncertainty quantification, etc.) have dedicated write-ups.
+2. Search [existing GitHub Issues](https://github.com/Ledger-Lenz/Ledgerlens-core/issues)
+   to see if it's already been reported or answered.
+
+If you still need help, open a new issue. GitHub Discussions is not
+currently enabled for this repository, so issues are the primary channel
+for questions and bug reports — see [Support](#support) below for details.
+
 ## Support
 
 For issues and questions:
