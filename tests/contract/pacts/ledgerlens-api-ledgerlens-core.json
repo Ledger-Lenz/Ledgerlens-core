@@ -1,0 +1,61 @@
+{
+  "consumer": { "name": "ledgerlens-api" },
+  "provider": { "name": "ledgerlens-core" },
+  "interactions": [
+    {
+      "description": "get risk score with conformal fields",
+      "providerStates": [
+        { "name": "a risk score exists for wallet with conformal fields" }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/risk_scores/GABCDEF123"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "wallet": "GABCDEF123",
+          "asset_pair": "XLM/USDC",
+          "score": 75,
+          "benford_flag": true,
+          "ml_flag": false,
+          "confidence": 0.93,
+          "disputed": false,
+          "timestamp": "2024-05-01T12:00:00Z",
+          "score_lower": 70.0,
+          "score_upper": 80.0,
+          "prediction_set": ["XLM", "USDC"],
+          "coverage_guarantee": 0.95
+        }
+      }
+    },
+    {
+      "description": "get risk score without conformal fields",
+      "providerStates": [
+        { "name": "a risk score exists for wallet without conformal fields" }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/risk_scores/GABCDEF456"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "wallet": "GABCDEF456",
+          "asset_pair": "BTC/USDT",
+          "score": 20,
+          "benford_flag": false,
+          "ml_flag": true,
+          "confidence": 0.5,
+          "disputed": false,
+          "timestamp": "2024-05-01T12:00:00Z"
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "pactSpecification": { "version": "3.0.0" }
+  }
+}
