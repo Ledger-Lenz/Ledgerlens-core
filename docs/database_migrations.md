@@ -2,6 +2,9 @@
 
 LedgerLens uses [Alembic](https://alembic.sqlalchemy.org/) for versioned, rollback-capable database migrations.
 
+For the contributor workflow, including creating manual revisions and safely
+selecting a development database, see [`alembic/README.md`](../alembic/README.md).
+
 ## Quick reference
 
 | Command | Effect |
