@@ -76,6 +76,9 @@ nav:
     - Ingestion: api/ingestion.md
     - API Module: api/api.md
   - OpenAPI: openapi.md
+  - Migrations & Schema:
+    - Database Migrations: database_migrations.md
+    - Pydantic v2 Migration: pydantic_v2_migration.md
 
 extra:
   social:
