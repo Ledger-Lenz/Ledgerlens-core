@@ -25,9 +25,12 @@ func newTestClient(t *testing.T, mux *http.ServeMux) (*ledgerlens.Client, *httpt
 	return client, srv
 }
 
-func writeJSON(w http.ResponseWriter, v interface{}) {
+func writeJSON(t *testing.T, w http.ResponseWriter, v interface{}) {
+	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Errorf("writeJSON: encode response: %v", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +41,7 @@ func TestHealth_OK(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
-		writeJSON(w, map[string]string{"status": "ok", "db": "ok", "models": "ok"})
+		writeJSON(t, w, map[string]string{"status": "ok", "db": "ok", "models": "ok"})
 	})
 	client, _ := newTestClient(t, mux)
 
@@ -59,7 +62,7 @@ func TestGetScore_OK(t *testing.T) {
 	mux.HandleFunc("/scores/"+wallet, func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
 		assert.Equal(t, "test-key", r.Header.Get("X-LedgerLens-Admin-Key"))
-		writeJSON(w, map[string]interface{}{
+		writeJSON(t, w, map[string]interface{}{
 			"scores": []map[string]interface{}{
 				{
 					"wallet":       wallet,
@@ -98,7 +101,7 @@ func TestGetScores_OK(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/scores", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "XLM/USDC", r.URL.Query().Get("asset_pair"))
-		writeJSON(w, []map[string]interface{}{
+		writeJSON(t, w, []map[string]interface{}{
 			{
 				"wallet":       "GABC",
 				"asset_pair":   "XLM/USDC",
@@ -123,7 +126,7 @@ func TestGetScores_NoFilter(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/scores", func(w http.ResponseWriter, r *http.Request) {
 		assert.Empty(t, r.URL.Query().Get("asset_pair"))
-		writeJSON(w, []interface{}{})
+		writeJSON(t, w, []interface{}{})
 	})
 	client, _ := newTestClient(t, mux)
 
@@ -139,7 +142,7 @@ func TestGetScores_NoFilter(t *testing.T) {
 func TestGetRings_OK(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/rings", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, []map[string]interface{}{
+		writeJSON(t, w, []map[string]interface{}{
 			{
 				"id":               1,
 				"accounts":         []string{"GAAA", "GBBB", "GCCC"},
@@ -174,7 +177,7 @@ func TestRegisterWebhook_OK(t *testing.T) {
 		assert.Equal(t, "https://example.com/webhook", body.URL)
 		assert.Equal(t, 75, body.MinScore)
 		w.WriteHeader(http.StatusCreated)
-		writeJSON(w, map[string]string{"subscriber_id": "sub-uuid-1234"})
+		writeJSON(t, w, map[string]string{"subscriber_id": "sub-uuid-1234"})
 	})
 	client, _ := newTestClient(t, mux)
 
@@ -195,7 +198,9 @@ func TestGetScore_401(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"detail":"Invalid API key"}`))
+		if _, err := w.Write([]byte(`{"detail":"Invalid API key"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	})
 	client, _ := newTestClient(t, mux)
 
@@ -215,7 +220,9 @@ func TestGetScore_404(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/scores/GNOT_FOUND", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"detail":"Wallet not found"}`))
+		if _, err := w.Write([]byte(`{"detail":"Wallet not found"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	})
 	client, _ := newTestClient(t, mux)
 
@@ -236,7 +243,9 @@ func TestGetScore_429WithRetryAfter(t *testing.T) {
 	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "30")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"detail":"rate limit exceeded"}`))
+		if _, err := w.Write([]byte(`{"detail":"rate limit exceeded"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	})
 	client, _ := newTestClient(t, mux)
 
@@ -255,9 +264,14 @@ func TestGetScore_429WithRetryAfter(t *testing.T) {
 func TestGetScore_ContextCancellation(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
-		// Simulate a slow server — the context should be cancelled first.
-		time.Sleep(500 * time.Millisecond)
-		writeJSON(w, map[string]interface{}{"scores": []interface{}{}})
+		// Simulate a slow server — the client's context should be cancelled
+		// first. Honour request cancellation so we never write to a
+		// disconnected client (which would fail the writeJSON error check).
+		select {
+		case <-time.After(500 * time.Millisecond):
+			writeJSON(t, w, map[string]interface{}{"scores": []interface{}{}})
+		case <-r.Context().Done():
+		}
 	})
 	client, _ := newTestClient(t, mux)
 
@@ -292,7 +306,7 @@ func TestGetScore_ConformalFields(t *testing.T) {
 	coverage := 0.90
 	mux := http.NewServeMux()
 	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]interface{}{
+		writeJSON(t, w, map[string]interface{}{
 			"scores": []map[string]interface{}{
 				{
 					"wallet":             "GABC",
