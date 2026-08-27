@@ -556,6 +556,9 @@ errors are logged server-side at `ERROR` level via `logger.exception`.
 docker compose up --build
 ```
 
+For evidence-based fixes to Python, Rust, Go, TypeScript, database, Redis, and
+first-run test problems, see the detailed [troubleshooting guide](docs/troubleshooting.md).
+
 ## CLI Reference
 
 ```bash
