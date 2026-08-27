@@ -102,6 +102,27 @@ the Python prover and consumed by both the Python and Rust test suites. A change
 to one verifier that silently diverges from the other will fail CI in both
 places.
 
+## Minimum Supported Rust Version (MSRV)
+
+**No MSRV is currently pinned.** The CI `rust-sdk` job installs the latest
+`stable` toolchain (via `actions-rs/toolchain@v1` with `toolchain: stable`)
+without locking to a specific version, and `Cargo.toml` has no
+`rust-version` field.
+
+In practice the crate has an _implicit_ floor imposed by its dependencies:
+
+| Constraint | Minimum Rust |
+|------------|--------------|
+| `edition = "2021"` | 1.56 |
+| `reqwest 0.12` | 1.63 |
+
+The effective floor is therefore **Rust ≥ 1.63**, but this is not tested or
+enforced in CI. Older toolchains may fail to compile.
+
+If you need a stable MSRV guarantee, open an issue to request that a
+`rust-version` field be added to `Cargo.toml` and that CI be updated to
+test against it.
+
 ## License
 
 MIT
