@@ -75,6 +75,8 @@ nav:
     - Detection Engine: api/detection.md
     - Ingestion: api/ingestion.md
     - API Module: api/api.md
+  - Testing:
+    - Toxiproxy & Chaos Testing: toxiproxy.md
   - OpenAPI: openapi.md
 
 extra:
