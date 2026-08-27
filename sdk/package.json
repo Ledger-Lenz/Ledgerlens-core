@@ -37,7 +37,8 @@
     "build:types": "tsc --project tsconfig.types.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "//lint": "TODO(#774): add a real `lint` script invoking ESLint once the eslint/prettier config lands (https://github.com/Ledger-Lenz/Ledgerlens-core/issues/774). Until then use `npm run typecheck` for type-only checks.",
     "prepublishOnly": "npm run build && npm run test"
   },
   "dependencies": {
