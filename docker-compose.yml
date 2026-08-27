@@ -5,8 +5,14 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    depends_on:
+      - redis
     volumes:
       - ./models:/app/models
+      # Bind mount of a single SQLite file. This file is NOT created automatically —
+      # run `python cli.py db-migrate` (or `python cli.py train`) on the host before
+      # the first `docker compose up`, or the container will fail to start because
+      # the mount source doesn't exist.
       - ./ledgerlens.db:/app/ledgerlens.db
 
   # ── Observability (dev profile) ──────────────────────────────────────────

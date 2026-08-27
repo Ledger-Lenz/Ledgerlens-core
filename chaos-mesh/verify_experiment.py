@@ -2,7 +2,6 @@ import time
 import requests
 
 HEALTH_URL = "http://localhost:8000/health"
-METRICS_URL = "http://localhost:8000/metrics"
 
 
 def assert_recovery(health_url: str, timeout_s: int = 60) -> None:
