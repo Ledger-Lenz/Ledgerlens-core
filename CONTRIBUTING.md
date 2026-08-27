@@ -12,12 +12,13 @@ feature changes.
 2. [First-time setup](#first-time-setup)
 3. [Ecosystem layout](#ecosystem-layout)
 4. [Development workflow](#development-workflow)
-5. [How dependencies are managed](#how-dependencies-are-managed)
-6. [Adding or updating a dependency](#adding-or-updating-a-dependency)
-7. [Optional features and import guards](#optional-features-and-import-guards)
-8. [License and vulnerability policy](#license-and-vulnerability-policy)
-9. [Before opening a PR](#before-opening-a-pr)
-10. [Cross-repo changes](#cross-repo-changes)
+5. [Mutation testing](#mutation-testing)
+6. [How dependencies are managed](#how-dependencies-are-managed)
+7. [Adding or updating a dependency](#adding-or-updating-a-dependency)
+8. [Optional features and import guards](#optional-features-and-import-guards)
+9. [License and vulnerability policy](#license-and-vulnerability-policy)
+10. [Before opening a PR](#before-opening-a-pr)
+11. [Cross-repo changes](#cross-repo-changes)
 
 ---
 
@@ -101,6 +102,68 @@ pytest -q                     # run the full test suite
 make lint                     # ruff linting
 make lock-check               # verify all lockfiles are up to date
 ```
+
+---
+
+## Mutation testing
+
+Line/branch coverage tells you a line *ran* during the test suite; it does not
+tell you a test would *fail* if that line were wrong. Mutation testing closes
+that gap: it makes small semantic edits to the source ("mutants" — flip a `<` to
+`<=`, swap `and` for `or`, replace a return value with `None`) and re-runs the
+tests against each one. A mutant that still passes the suite ("survived") is a
+blind spot — the tests don't actually pin down that behaviour.
+
+We run [`mutmut`](https://github.com/boxed/mutmut) (`mutmut>=3.0.0,<4.0`, in the
+`test` / `dev` extras) against the three core detection modules. The configuration
+lives in `pyproject.toml` under `[tool.mutmut]`:
+
+```toml
+[tool.mutmut]
+paths = ["detection/benford_engine.py", "detection/graph_engine.py", "detection/model_inference.py"]
+tests_dir = "tests"
+```
+
+Run it with:
+
+```bash
+make mutation-test
+```
+
+which is equivalent to:
+
+```bash
+mutmut run --paths-to-mutate detection/benford_engine.py,detection/graph_engine.py,detection/model_inference.py
+mutmut results --all
+```
+
+**Runtime expectations.** Each surviving/tested mutant runs the full test suite
+once, so this is *much* slower than a normal `pytest` run — plan for **20–40+
+minutes** on a typical laptop for a cold run over all three modules (longer on
+first run, faster on re-runs thanks to `mutmut`'s cache in `.mutmut-cache`). To
+iterate on a single file while working on it:
+
+```bash
+mutmut run --paths-to-mutate detection/benford_engine.py
+mutmut results          # summary
+mutmut show <id>        # view a specific surviving mutant as a diff
+```
+
+**When to run it.** Mutation testing is **not part of CI** — no workflow in
+`.github/workflows/` invokes `mutmut`, and the mutation-score badge in
+`README.md` is updated manually. It is **not** expected before every PR. Run it
+locally when:
+
+- you change detection logic in `detection/benford_engine.py`,
+  `detection/graph_engine.py`, or `detection/model_inference.py`, or the tests
+  covering them;
+- you want to verify that new tests for those modules are actually assertion-
+  sensitive and not just coverage-padding.
+
+Kill surviving mutants by adding or tightening assertions until the score is back
+to **≥ 80%** across the three modules (`mutmut results --all`). See
+[docs/testing_guide.md](docs/testing_guide.md) for how this fits alongside the
+Hypothesis and Atheris suites.
 
 ---
 
