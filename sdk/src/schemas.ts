@@ -66,7 +66,6 @@ export const AlertSchema = z.object({
 
 export type Alert = z.infer<typeof AlertSchema>;
 
-
 // ---------------------------------------------------------------------------
 // Asset / pool types
 // ---------------------------------------------------------------------------
@@ -123,7 +122,6 @@ export const PairCorrelationSchema = z.object({
 
 export type PairCorrelation = z.infer<typeof PairCorrelationSchema>;
 
-
 // ---------------------------------------------------------------------------
 // Counterfactual explanation
 // ---------------------------------------------------------------------------
@@ -134,7 +132,6 @@ export const CounterfactualSchema = z.object({
   changed_features: z.record(z.string(), z.unknown()),
   explanation: z.string(),
 });
-
 
 // ---------------------------------------------------------------------------
 // Webhook subscriber

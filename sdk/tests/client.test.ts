@@ -28,7 +28,9 @@ describe("LedgerLensClient", () => {
       expect(fetch).toHaveBeenCalledWith(
         "http://localhost:8000/health",
         expect.objectContaining({
-          headers: expect.objectContaining({ "Content-Type": "application/json" }),
+          headers: expect.objectContaining({
+            "Content-Type": "application/json",
+          }),
         }),
       );
     });
@@ -107,9 +109,7 @@ describe("LedgerLensClient", () => {
 
     it("throws on invalid wallet format response", async () => {
       mockFetch(400, { detail: "Invalid wallet address" });
-      await expect(
-        client.getScore("invalid"),
-      ).rejects.toThrow(LedgerLensError);
+      await expect(client.getScore("invalid")).rejects.toThrow(LedgerLensError);
     });
   });
 
@@ -204,7 +204,6 @@ describe("LedgerLensClient", () => {
     });
   });
 
-
   describe("getRings", () => {
     it("returns wash-trading rings", async () => {
       const rings = [
@@ -241,7 +240,9 @@ describe("LedgerLensClient", () => {
       mockFetch(200, { invalid: "data" });
 
       await expect(
-        client.getScore("GABCDEF1234567890123456789012345678901234567890123456"),
+        client.getScore(
+          "GABCDEF1234567890123456789012345678901234567890123456",
+        ),
       ).rejects.toThrow(LedgerLensError);
     });
 
