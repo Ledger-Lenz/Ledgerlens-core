@@ -43,6 +43,10 @@ print(f"Round {result.round_id}: accepted={result.accepted}")
 
 See `docs/federation_integration.md` in the main repository for detailed integration guide.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a full history of releases and notable changes.
+
 ## License
 
 MIT
