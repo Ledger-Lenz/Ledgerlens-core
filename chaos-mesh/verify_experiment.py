@@ -1,3 +1,31 @@
+"""Post-experiment recovery check for chaos-mesh experiments.
+
+Usage
+-----
+    python chaos-mesh/verify_experiment.py --health-url https://ledgerlens.staging.example/health
+
+    # Local default (http://localhost:8000/health), e.g. against a port-forward
+    python chaos-mesh/verify_experiment.py
+
+    # Environment variable instead of the flag
+    HEALTH_URL=https://ledgerlens.staging.example/health python chaos-mesh/verify_experiment.py
+
+Workflow
+    This script is the "verify" step of the chaos-testing loop:
+    apply an experiment YAML in this directory (deploy) -> watch the system
+    while the fault is injected (observe) -> run this script once the
+    experiment's ``duration`` has elapsed (verify).  It polls ``GET /health``
+    every 2s until the endpoint returns HTTP 200 with ``{"status": "ok"}`` or
+    ``--timeout`` seconds (default 60, ``HEALTH_TIMEOUT_S``) pass.
+
+    Connection errors during polling are expected while the fault is active and
+    are logged at DEBUG (use ``-v`` to see them); only a failure to recover
+    before the timeout is treated as an error.
+
+Exit codes
+    0  the health endpoint recovered within the timeout
+    1  the health endpoint did not recover in time
+"""
 import argparse
 import logging
 import os
