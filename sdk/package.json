@@ -37,6 +37,7 @@
     "build:types": "tsc --project tsconfig.types.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "example": "tsx examples/basic-usage.ts",
     "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm run test"
   },
@@ -45,6 +46,7 @@
   },
   "devDependencies": {
     "typescript": "^5.4.0",
+    "tsx": "^4.7.0",
     "vitest": "^1.6.0",
     "@types/node": "^20.12.0"
   },
