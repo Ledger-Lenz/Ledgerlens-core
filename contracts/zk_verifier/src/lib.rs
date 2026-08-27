@@ -49,7 +49,10 @@ extern crate std;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Map, Symbol};
 
 mod curve;
+mod pairing;
 use curve::{Fq, Fr, Point};
+use pairing::{pairing as bn128_pairing, Fq2, G2Point};
+mod snark_test_vectors;
 
 #[cfg(test)]
 mod test;
@@ -426,6 +429,3 @@ impl ZkVerifier {
         Some(ProofData { score_commit, bits })
     }
 }
-
-#[cfg(test)]
-mod test;
