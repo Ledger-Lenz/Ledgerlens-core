@@ -48,3 +48,6 @@ somzilla.md
 *.nbc
 
 .tools/
+.venv312/
+node_modules/
+.DS_Store

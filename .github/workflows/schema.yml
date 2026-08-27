@@ -1,4 +1,4 @@
-name: OpenAPI Schema Drift Check
+name: Schema Drift & Contract Vector Checks
 
 on:
   push:
@@ -6,7 +6,10 @@ on:
   pull_request:
 
 jobs:
-  schema-diff:
+  # ---------------------------------------------------------------------------
+  # Job 1: OpenAPI schema drift check (existing)
+  # ---------------------------------------------------------------------------
+  openapi-drift:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,3 +35,121 @@ jobs:
             exit 1
           fi
           echo "✅ OpenAPI schema is up to date"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Cross-language schema contract vector check (new — ADR-005)
+  #
+  # This job verifies that tests/fixtures/contract_vectors.json matches the
+  # canonical Python models (detection/risk_score.py, ingestion/data_models.py).
+  # It is the primary CI gate against schema drift between language implementations.
+  #
+  # Failure message identifies which fields are out of sync and which language
+  # implementations need to be updated.
+  # ---------------------------------------------------------------------------
+  contract-vectors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check contract vectors match canonical Python models
+        run: |
+          python scripts/check_contract_vectors.py
+          if [ $? -ne 0 ]; then
+            echo ""
+            echo "❌ CONTRACT VECTOR DRIFT DETECTED"
+            echo ""
+            echo "The fixture file tests/fixtures/contract_vectors.json is out of sync"
+            echo "with the canonical Python models."
+            echo ""
+            echo "To fix:"
+            echo "  1. Run: python scripts/generate_contract_vectors.py"
+            echo "  2. Review the diff: git diff tests/fixtures/contract_vectors.json"
+            echo "  3. Update the affected language implementations:"
+            echo "     - sdk/src/schemas.ts (TypeScript/Zod)"
+            echo "     - crates/ledgerlens-sdk/src/models.rs (Rust)"
+            echo "     - packages/ledgerlens-sdk/src/ledgerlens/models.py (Python SDK)"
+            echo "     - proto/ledgerlens/v1/scoring.proto (Proto)"
+            echo "  4. Confirm per-language tests pass:"
+            echo "     pytest tests/test_contract_vectors.py"
+            echo "     cargo test -p ledgerlens-sdk contract_vectors"
+            echo "     npx vitest run sdk/tests/contract_vectors.test.ts"
+            exit 1
+          fi
+
+      - name: Run Python contract vector tests
+        run: |
+          pytest tests/test_contract_vectors.py -v \
+            --tb=short \
+            --no-header \
+            -q
+        # These tests exercise round-trip deserialization and adversarial vector
+        # rejection. If they pass in Python but fail in Rust/TS, the fixture is
+        # correct and the other language implementation needs updating.
+
+      - name: Verify fixture declares v2+ uncertainty fields (acceptance criterion)
+        run: |
+          python -c "
+          import json
+          with open('tests/fixtures/contract_vectors.json') as f:
+              v = json.load(f)
+          required = set(v['required_risk_score_fields'])
+          v2_fields = {'score_lower', 'score_upper', 'prediction_set', 'coverage_guarantee', 'latency_ms'}
+          missing = v2_fields - required
+          if missing:
+              print(f'❌ v2+ fields missing from fixture: {missing}')
+              exit(1)
+          print(f'✅ All v2+ uncertainty fields present: {sorted(v2_fields)}')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Job 3: TypeScript contract vector tests (new — ADR-005)
+  # ---------------------------------------------------------------------------
+  contract-vectors-typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: sdk/package.json
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run TypeScript contract vector tests
+        run: npx vitest run tests/contract_vectors.test.ts --reporter=verbose
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Rust contract vector tests (new — ADR-005)
+  # ---------------------------------------------------------------------------
+  contract-vectors-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust contract vector tests
+        run: cargo test -p ledgerlens-sdk contract_vectors --verbose
+        # This runs only the contract vector tests in the ledgerlens-sdk crate.
+        # The fixture is loaded from tests/fixtures/contract_vectors.json relative
+        # to the workspace root.

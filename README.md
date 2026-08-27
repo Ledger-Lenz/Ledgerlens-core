@@ -1055,7 +1055,47 @@ ledgerlens-data  ──(labelled datasets)──▶  ledgerlens-core
 4. **`ledgerlens-contracts`** persists the score on-chain via the `ledgerlens-score` Soroban contract, making it queryable by any other Soroban contract via `get_score`.
 5. **`ledgerlens-dashboard`** calls `ledgerlens-api` to render scores, alerts, and SHAP-based explanations.
 
-### Shared Contracts (must stay in sync across repos)
+### Shared Contracts (enforced by CI — see ADR-005)
+
+Schema contract enforcement is **automated**, not documentation-only. A field rename or type change in any of the four shared contracts below will fail CI before it reaches production. See [ADR-005](docs/adr/ADR-005-schema-contract-enforcement.md) for the design and [`.github/workflows/schema.yml`](.github/workflows/schema.yml) for the CI jobs.
+
+#### How enforcement works
+
+The canonical fixture file `tests/fixtures/contract_vectors.json` (generated from `detection/risk_score.py` via `python scripts/generate_contract_vectors.py`) is loaded and round-tripped by **all three language test suites** in CI:
+
+| Language | Test file | CI job |
+|---|---|---|
+| Python (core model) | `tests/test_contract_vectors.py` | `contract-vectors` |
+| Rust (`crates/ledgerlens-sdk`) | `crates/ledgerlens-sdk/tests/contract_vectors_test.rs` | `contract-vectors-rust` |
+| TypeScript (`sdk/`) | `sdk/tests/contract_vectors.test.ts` | `contract-vectors-typescript` |
+
+Each test suite:
+1. Deserializes every valid vector from the fixture using its own model.
+2. Re-serializes and verifies every required field is present with the correct type.
+3. Confirms that adversarial vectors (wrong field name, out-of-range value) are **rejected** — proving divergence detection, not just parsing.
+
+**When you change a shared field:**
+
+```bash
+# 1. Update detection/risk_score.py or ingestion/data_models.py
+# 2. Regenerate the fixture (Python core is authoritative):
+python scripts/generate_contract_vectors.py
+
+# 3. Update the other language implementations:
+#    sdk/src/schemas.ts           (TypeScript/Zod)
+#    crates/ledgerlens-sdk/src/models.rs  (Rust)
+#    packages/ledgerlens-sdk/src/ledgerlens/models.py  (Python SDK)
+#    proto/ledgerlens/v1/scoring.proto    (Proto)
+
+# 4. Confirm all language tests pass:
+pytest tests/test_contract_vectors.py
+cargo test -p ledgerlens-sdk contract_vectors
+npx vitest run sdk/tests/contract_vectors.test.ts
+```
+
+CI will fail with a message identifying which fields are out of sync and which language implementations need updating.
+
+---
 
 **1. `RiskScore` schema** — defined here at `detection/risk_score.py`, mirrored by `ledgerlens-api`'s response models and `ledgerlens-contracts`'s on-chain `RiskScore` struct (`contracts/ledgerlens-score/src/lib.rs`):
 
@@ -1066,8 +1106,10 @@ class RiskScore:
     score: int            # 0-100
     benford_flag: bool
     ml_flag: bool
-    confidence: int        # 0-100
+    confidence: int       # 0-100
+    disputed: bool        # default False
     timestamp: datetime
+    latency_ms: float | None        # End-to-end latency ms (streaming path)
     # Uncertainty fields (optional, v2+)
     score_lower: float | None       # Lower bound of 90 % conformal prediction interval
     score_upper: float | None       # Upper bound of 90 % conformal prediction interval
@@ -1077,9 +1119,9 @@ class RiskScore:
 
 The uncertainty fields are populated by `ConformalCalibrator` when conformal prediction calibration artifacts are available. See `docs/uncertainty_quantification.md` for a plain-language explanation.
 
-If you change a field name, type, or range here, update the Rust struct in `ledgerlens-contracts` and the Pydantic response models in `ledgerlens-api` in the same change set (or open a tracked follow-up in each repo).
+**Canonical fixture:** `tests/fixtures/contract_vectors.json` — regenerate with `python scripts/generate_contract_vectors.py` whenever this schema changes.
 
-**2. Trade / Asset schema** — defined here at `ingestion/data_models.py` (`Trade`, `Asset`, `OrderBookEvent`). `ledgerlens-data` persists records in this shape; changing field names here requires a migration note for `ledgerlens-data`.
+**2. Trade / Asset schema** — defined here at `ingestion/data_models.py` (`Trade`, `Asset`, `OrderBookEvent`). `ledgerlens-data` persists records in this shape; changing field names here requires a migration note for `ledgerlens-data`. Contract vectors for `Trade` and `Asset` are also in `tests/fixtures/contract_vectors.json`.
 
 **3. Environment variables / config keys** — `.env.example` defines the cross-repo keys:
 
@@ -1095,6 +1137,8 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 `core` and `api` must call `submit_score` with `score` already clamped to 0-100 (see `RiskScore.combine` in `detection/risk_score.py`).
 
+The weekly cross-repo E2E suite ([`.github/workflows/cross_repo_e2e.yml`](.github/workflows/cross_repo_e2e.yml)) tests the full `submit_score` / `get_score` flow against a documented stub server (see `tests/e2e_cross_repo/stub_contract_server.py`) or a real Soroban quickstart deployment. The suite fails the job if zero real assertions are executed, preventing false-green runs.
+
 ### Open Integration Points
 
 - **[RESOLVED]** How `core` hands `RiskScore` records to `api`: Handled via an Event Bus (Kafka or NATS) configured in `.env`. See [docs/event_bus.md](docs/event_bus.md) for consumer contract details.
@@ -1105,7 +1149,7 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 - Treat this section as the source of truth for **cross-repo** contracts. Each repo's own README covers repo-local conventions.
 - When a change in this repo affects a shared contract above, call it out explicitly so the corresponding change can be made in the other repo(s).
-- Keep `RiskScore` and `Trade`/`Asset` field names identical (same casing, same units) across Python (`core`, `api`), Rust (`contracts`), and TypeScript (`dashboard`) — translation layers are a common source of bugs.
+- `RiskScore` and `Trade`/`Asset` field names are enforced by CI — see `tests/test_contract_vectors.py`, `crates/ledgerlens-sdk/tests/contract_vectors_test.rs`, and `sdk/tests/contract_vectors.test.ts`. A rename in one language will fail the `contract-vectors` CI job and identify which other language(s) are out of sync.
 
 ## Support
 

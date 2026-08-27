@@ -5,6 +5,16 @@ use serde::Deserialize;
 ///
 /// Field names and types match the Python SDK (`packages/ledgerlens-sdk/src/ledgerlens/models.py`)
 /// and the TypeScript SDK (`sdk/`) exactly.
+///
+/// IMPORTANT: This struct must stay in sync with:
+///   - detection/risk_score.py (Python canonical model — authoritative)
+///   - packages/ledgerlens-sdk/src/ledgerlens/models.py (Python SDK)
+///   - sdk/src/schemas.ts (TypeScript/Zod)
+///   - proto/ledgerlens/v1/scoring.proto
+///
+/// The contract is verified by: tests/test_contract_vectors.py (Python),
+/// crates/ledgerlens-sdk/tests/contract_vectors_test.rs (Rust), and
+/// sdk/tests/contract_vectors.test.ts (TypeScript).
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct RiskScore {
@@ -25,12 +35,19 @@ pub struct RiskScore {
     pub disputed: bool,
     /// When the score was computed.
     pub timestamp: DateTime<Utc>,
+    /// End-to-end latency in milliseconds from trade receipt to score update (optional).
+    /// Populated on the streaming scoring path.
+    pub latency_ms: Option<f64>,
     /// Lower bound of 90% conformal prediction interval (optional, v2+).
     pub score_lower: Option<f64>,
     /// Upper bound of 90% conformal prediction interval (optional, v2+).
     pub score_upper: Option<f64>,
     /// Class indices in the conformal prediction set (optional, v2+).
-    pub prediction_set: Option<Vec<u8>>,
+    ///
+    /// NOTE: The element type is i32 (signed integer) to match the Python `list[int]`
+    /// canonical type. A previous incorrect implementation used `Vec<u8>` (unsigned byte),
+    /// which diverged from the Python model. Fixed per ADR-005 contract enforcement.
+    pub prediction_set: Option<Vec<i32>>,
     /// Target coverage level (1 - alpha) of the prediction set (optional, v2+).
     pub coverage_guarantee: Option<f64>,
 }

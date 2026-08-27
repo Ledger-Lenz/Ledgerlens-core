@@ -1,0 +1,247 @@
+{
+  "_contract_version": "1.0.0",
+  "_description": "Canonical serialized contract vectors for cross-language schema enforcement. Python core models (detection/risk_score.py and ingestion/data_models.py) are authoritative. All language SDKs must deserialize every vector without error and re-serialize to a payload containing all required fields with the correct types. See docs/adr/ADR-005-schema-contract-enforcement.md.",
+  "_generated_from": "detection/risk_score.py, ingestion/data_models.py",
+  "_generation_script": "scripts/generate_contract_vectors.py",
+
+  "risk_score": {
+    "_description": "RiskScore contract vectors. Every SDK must deserialize these without error.",
+
+    "complete": {
+      "_id": "risk_score_complete",
+      "_description": "Full RiskScore with all fields populated, including v2+ uncertainty fields and latency_ms.",
+      "wallet": "GABCDE1234567890ABCDE1234567890ABCDE1234567890ABCDE123456",
+      "asset_pair": "XLM/USDC",
+      "score": 82,
+      "benford_flag": true,
+      "ml_flag": true,
+      "confidence": 91,
+      "disputed": false,
+      "timestamp": "2026-08-25T14:00:00+00:00",
+      "latency_ms": 47.3,
+      "score_lower": 75.0,
+      "score_upper": 89.0,
+      "prediction_set": [1],
+      "coverage_guarantee": 0.9
+    },
+
+    "minimal": {
+      "_id": "risk_score_minimal",
+      "_description": "Minimal RiskScore: only required/non-optional fields, all optional fields null.",
+      "wallet": "GTEST000000000000000000000000000000000000000000000000000",
+      "asset_pair": "XLM/BTC",
+      "score": 10,
+      "benford_flag": false,
+      "ml_flag": false,
+      "confidence": 60,
+      "disputed": false,
+      "timestamp": "2026-01-01T00:00:00+00:00",
+      "latency_ms": null,
+      "score_lower": null,
+      "score_upper": null,
+      "prediction_set": null,
+      "coverage_guarantee": null
+    },
+
+    "disputed": {
+      "_id": "risk_score_disputed",
+      "_description": "RiskScore where disputed=true; tests boolean field handling.",
+      "wallet": "GDISPUTED00000000000000000000000000000000000000000000000",
+      "asset_pair": "ETH/XLM",
+      "score": 55,
+      "benford_flag": false,
+      "ml_flag": true,
+      "confidence": 70,
+      "disputed": true,
+      "timestamp": "2026-06-15T09:30:00+00:00",
+      "latency_ms": null,
+      "score_lower": 48.0,
+      "score_upper": 62.0,
+      "prediction_set": [0, 1],
+      "coverage_guarantee": 0.9
+    },
+
+    "score_boundary_zero": {
+      "_id": "risk_score_boundary_zero",
+      "_description": "RiskScore with score=0 (minimum boundary). Tests that score range 0-100 is enforced.",
+      "wallet": "GCLEAN00000000000000000000000000000000000000000000000000",
+      "asset_pair": "XLM/USDC",
+      "score": 0,
+      "benford_flag": false,
+      "ml_flag": false,
+      "confidence": 99,
+      "disputed": false,
+      "timestamp": "2026-08-01T00:00:00+00:00",
+      "latency_ms": 5.0,
+      "score_lower": 0.0,
+      "score_upper": 5.0,
+      "prediction_set": [0],
+      "coverage_guarantee": 0.9
+    },
+
+    "score_boundary_hundred": {
+      "_id": "risk_score_boundary_hundred",
+      "_description": "RiskScore with score=100 (maximum boundary). Tests that score range 0-100 is enforced.",
+      "wallet": "GWASH000000000000000000000000000000000000000000000000000",
+      "asset_pair": "USDC/XLM",
+      "score": 100,
+      "benford_flag": true,
+      "ml_flag": true,
+      "confidence": 100,
+      "disputed": false,
+      "timestamp": "2026-08-25T12:00:00+00:00",
+      "latency_ms": 120.5,
+      "score_lower": 95.0,
+      "score_upper": 100.0,
+      "prediction_set": [1],
+      "coverage_guarantee": 0.95
+    }
+  },
+
+  "risk_score_adversarial": {
+    "_description": "Adversarial vectors. Deserializers MUST reject these or map them to a missing-field error. Tests that divergence detection works, not just that valid vectors parse.",
+
+    "wrong_field_name": {
+      "_id": "risk_score_adversarial_wrong_field",
+      "_description": "Uses 'risk_score' instead of 'score'. Strict deserializers must reject this or raise a missing-required-field error.",
+      "wallet": "GADVERSARIAL000000000000000000000000000000000000000000000",
+      "asset_pair": "XLM/USDC",
+      "risk_score": 75,
+      "benford_flag": true,
+      "ml_flag": false,
+      "confidence": 80,
+      "disputed": false,
+      "timestamp": "2026-08-25T12:00:00+00:00",
+      "latency_ms": null,
+      "score_lower": null,
+      "score_upper": null,
+      "prediction_set": null,
+      "coverage_guarantee": null
+    },
+
+    "score_out_of_range": {
+      "_id": "risk_score_adversarial_out_of_range",
+      "_description": "score=999 is outside the 0-100 range. Strict deserializers must reject this.",
+      "wallet": "GADVERSARIAL000000000000000000000000000000000000000000001",
+      "asset_pair": "XLM/USDC",
+      "score": 999,
+      "benford_flag": true,
+      "ml_flag": false,
+      "confidence": 80,
+      "disputed": false,
+      "timestamp": "2026-08-25T12:00:00+00:00",
+      "latency_ms": null,
+      "score_lower": null,
+      "score_upper": null,
+      "prediction_set": null,
+      "coverage_guarantee": null
+    }
+  },
+
+  "trade": {
+    "_description": "Trade contract vectors.",
+
+    "orderbook": {
+      "_id": "trade_orderbook",
+      "_description": "Standard orderbook trade with both counterparties present.",
+      "id": "trade-abc-001",
+      "paging_token": "page-001",
+      "ledger_close_time": "2026-08-25T12:00:00+00:00",
+      "base_account": "GABCDE1234567890ABCDE1234567890ABCDE1234567890ABCDE123456",
+      "counter_account": "GXYZ000000000000000000000000000000000000000000000000000",
+      "base_asset": { "code": "XLM", "issuer": null },
+      "counter_asset": { "code": "USDC", "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "base_amount": 1000.0,
+      "counter_amount": 120.50,
+      "price": 0.1205,
+      "base_is_seller": true,
+      "trade_type": "orderbook",
+      "liquidity_pool_id": null,
+      "transaction_hash": "abc123def456",
+      "path_payment_id": null,
+      "hop_index": null,
+      "source": "stellar"
+    },
+
+    "liquidity_pool": {
+      "_id": "trade_liquidity_pool",
+      "_description": "Liquidity pool trade with no counter_account.",
+      "id": "trade-lp-001",
+      "paging_token": "page-002",
+      "ledger_close_time": "2026-08-25T12:30:00+00:00",
+      "base_account": "GABCDE1234567890ABCDE1234567890ABCDE1234567890ABCDE123456",
+      "counter_account": null,
+      "base_asset": { "code": "XLM", "issuer": null },
+      "counter_asset": { "code": "USDC", "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "base_amount": 500.0,
+      "counter_amount": 60.25,
+      "price": 0.1205,
+      "base_is_seller": false,
+      "trade_type": "liquidity_pool",
+      "liquidity_pool_id": "pool-xyz-789",
+      "transaction_hash": "def456ghi789",
+      "path_payment_id": null,
+      "hop_index": null,
+      "source": "stellar"
+    }
+  },
+
+  "asset": {
+    "_description": "Asset contract vectors.",
+
+    "native_xlm": {
+      "_id": "asset_native_xlm",
+      "_description": "Native XLM asset. issuer must be null.",
+      "code": "XLM",
+      "issuer": null
+    },
+
+    "issued_usdc": {
+      "_id": "asset_issued_usdc",
+      "_description": "Issued credit asset (USDC). issuer must be present.",
+      "code": "USDC",
+      "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+    },
+
+    "issued_btc": {
+      "_id": "asset_issued_btc",
+      "_description": "Issued credit asset (BTC wrapped). issuer must be present.",
+      "code": "BTC",
+      "issuer": "GAUTUYY2THLF7SGITDFMXJVYH3LHDSMGEAKSBU267M2K7A3W543CKUEF"
+    }
+  },
+
+  "required_risk_score_fields": [
+    "wallet",
+    "asset_pair",
+    "score",
+    "benford_flag",
+    "ml_flag",
+    "confidence",
+    "disputed",
+    "timestamp",
+    "latency_ms",
+    "score_lower",
+    "score_upper",
+    "prediction_set",
+    "coverage_guarantee"
+  ],
+
+  "required_trade_fields": [
+    "id",
+    "ledger_close_time",
+    "base_account",
+    "base_asset",
+    "counter_asset",
+    "base_amount",
+    "counter_amount",
+    "price",
+    "base_is_seller",
+    "trade_type",
+    "source"
+  ],
+
+  "required_asset_fields": [
+    "code"
+  ]
+}
