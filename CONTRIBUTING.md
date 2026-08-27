@@ -321,6 +321,10 @@ make audit       # all of the above
 6. If adding or bumping a dependency: `pyproject.toml` **and** the affected
    `requirements/*.txt` files are committed in the same PR
 
+For a breakdown of every GitHub Actions workflow — what each one checks, what
+triggers it, and roughly how long it takes — see
+[`docs/ci_workflows.md`](docs/ci_workflows.md).
+
 ---
 
 ## Cross-repo changes

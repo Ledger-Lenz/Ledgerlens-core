@@ -76,6 +76,8 @@ nav:
     - Ingestion: api/ingestion.md
     - API Module: api/api.md
   - OpenAPI: openapi.md
+  - "Deployment & Operations":
+    - CI Workflows: ci_workflows.md
 
 extra:
   social:
