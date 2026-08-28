@@ -1,0 +1,30 @@
+# blank_issues_enabled: false
+#
+# Rationale: LedgerLens spans Python, Rust, Go, and TypeScript across six
+# repos. Unstructured issues are routinely missing reproduction steps,
+# environment details, or affected component — all of which slow triage.
+# Forcing contributors through a structured form (bug_report.yml or
+# feature_request.yml) ensures maintainers have the minimum information
+# they need before the first reply.
+#
+# If you genuinely need to open a free-form issue (e.g. a security
+# disclosure), please use the contact links below instead of a blank issue.
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Ledger-Lenz/Ledgerlens-core/security/advisories/new
+    about: >
+      Report a security vulnerability privately via GitHub's advisory
+      mechanism. Do NOT open a public issue for security findings.
+  - name: Stellar Discord
+    url: https://discord.gg/stellar
+    about: >
+      Questions, discussions, and community support — use #ledgerlens
+      in the Stellar Discord server.
+  - name: Documentation
+    url: https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md
+    about: >
+      Read the README and /docs folder before opening an issue — your
+      question may already be answered there.
