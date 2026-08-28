@@ -13,11 +13,12 @@ feature changes.
 3. [Ecosystem layout](#ecosystem-layout)
 4. [Development workflow](#development-workflow)
 5. [How dependencies are managed](#how-dependencies-are-managed)
-6. [Adding or updating a dependency](#adding-or-updating-a-dependency)
-7. [Optional features and import guards](#optional-features-and-import-guards)
-8. [License and vulnerability policy](#license-and-vulnerability-policy)
-9. [Before opening a PR](#before-opening-a-pr)
-10. [Cross-repo changes](#cross-repo-changes)
+6. [Managing Python dependencies](#managing-python-dependencies)
+7. [Adding or updating a dependency](#adding-or-updating-a-dependency)
+8. [Optional features and import guards](#optional-features-and-import-guards)
+9. [License and vulnerability policy](#license-and-vulnerability-policy)
+10. [Before opening a PR](#before-opening-a-pr)
+11. [Cross-repo changes](#cross-repo-changes)
 
 ---
 
@@ -150,6 +151,63 @@ then commit both files.
 The `sdk/package.json` uses exact or tightly-bounded version constraints.
 `sdk/package-lock.json` is committed and used by `npm ci` in CI. Run
 `npm update && npm ci` from `sdk/` to update, then commit `package-lock.json`.
+
+---
+
+## Managing Python dependencies
+
+Python packages are declared in **three layers**. Edit the highest layer that
+applies to your change and let the tooling regenerate everything below it —
+**never hand-edit a compiled `.txt` lockfile**, as any manual change is wiped the
+next time the lockfiles are regenerated.
+
+| Layer | Files | Role | Edit it when… |
+|-------|-------|------|---------------|
+| Manifest | `pyproject.toml` | Canonical version constraints: `[project.dependencies]` (runtime) and `[project.optional-dependencies]` (`test`, `docs`, `fuzz`, `ml`, `chain`, `graphql`, `causal`, `federated`, `dev`) | Adding, removing, pinning, or widening any package version |
+| Source | `requirements/*.in` | **Source of truth** for the `pip-compile` inputs — one per install surface. Each is tiny: it installs the project (`-e .` / `-e ".[<extra>]"`) and layers lower surfaces with `-r` (e.g. `test.in` is `-r base.in` + `-e ".[test]"`) | Adding a whole new install surface, changing how surfaces layer, or adding a raw requirement that cannot be expressed as a project dependency. **Do not pin versions here** — that is `pyproject.toml`'s job (see the header comment in `base.in`) |
+| Lockfile | `requirements/*.txt` | **Compiled output** — fully resolved, hash-pinned dependency trees, one per `.in` file. Committed to the repo; CI and the container build install exclusively from these | Never by hand — regenerate instead (below) |
+
+### Regenerating the lockfiles
+
+After changing `pyproject.toml` or any `.in` file, regenerate every `.txt`:
+
+```bash
+make lock          # wrapper for: bash requirements/compile.sh
+```
+
+To regenerate a single surface, pass its name to the script:
+
+```bash
+bash requirements/compile.sh base      # regenerates only requirements/base.txt
+```
+
+`requirements/compile.sh` compiles the surfaces in dependency order
+(`base test dev docs fuzz ml chain`), invoking for each one:
+
+```
+pip-compile --generate-hashes --allow-unsafe --strip-extras \
+            --no-emit-index-url --resolver=backtracking \
+            --output-file requirements/<surface>.txt requirements/<surface>.in
+```
+
+This requires `pip-tools` (`pip install pip-tools==7.4.1`). Run `make lock-check`
+— the same check CI's `lock-check` job runs — to confirm no lockfile is stale;
+a stale lockfile fails the PR. Commit `pyproject.toml` (or the changed `.in`
+file) **and every changed `requirements/*.txt`** in the same commit.
+
+### Which pair do I edit?
+
+| Your change | Add the constraint to | Regenerate | Lockfiles that change |
+|-------------|-----------------------|------------|-----------------------|
+| New / upgraded **core runtime** package | `pyproject.toml` → `[project.dependencies]` | `make lock` | `base.txt` **and every other `*.txt`** (all surfaces include base) |
+| **Dev-only** tool (linter, debugger, mutation tester) | `pyproject.toml` → `[project.optional-dependencies].dev` | `make lock` | `dev.txt` |
+| **Test-only** package | `[project.optional-dependencies].test` | `make lock` | `test.txt`, `dev.txt` |
+| **Docs-build** tool (MkDocs plugin, mkdocstrings handler) | `[project.optional-dependencies].docs` | `make lock` | `docs.txt` |
+| **Fuzz / ML / chain** extra package | `[project.optional-dependencies].{fuzz,ml,chain}` | `make lock` | the matching `{fuzz,ml,chain}.txt` **and** `dev.txt` (the `dev` extra bundles them) |
+| A brand-new install surface | a new `requirements/<name>.in`, a `pyproject.toml` extra, and a `Makefile` target | `make lock` | new `requirements/<name>.txt` |
+
+For the full step-by-step version of each case, see
+[Adding or updating a dependency](#adding-or-updating-a-dependency).
 
 ---
 
