@@ -70,11 +70,43 @@ nav:
     - Uncertainty Quantification: uncertainty_quantification.md
     - Governance Protocol: governance_protocol.md
     - Oracle Network: oracle_network.md
+  - Cryptography & Contracts:
+    - Zero-Knowledge Proofs: zk_proofs.md
+    - ZK-SNARK Range Proof: zk_snark_range_proof.md
+    - ZK Verifier Gas: zk_verifier_gas.md
+    - Contract Fuzzing: contract_fuzzing.md
+    - Byzantine Resilience: byzantine_resilience.md
+    - Oracle Quorum: oracle_quorum.md
+    - Soroban Operations: soroban_operations.md
+  - Observability & Performance:
+    - Observability: observability.md
+    - Performance: performance.md
+    - Performance Monitoring: performance_monitoring.md
+    - SLOs: slo.md
+    - Metrics: metrics.md
+    - Drift Monitor: drift_monitor.md
+    - Cost and Capacity: cost_and_capacity.md
+  - ML & Detection:
+    - GNN Ring Detection: gnn_ring_detection.md
+    - Temporal Analysis: temporal_analysis.md
+    - Temporal Model: temporal_model.md
+    - Benford Analysis: benford_analysis.md
+    - Benford Stratification: benford_stratification.md
+    - Causal Inference: causal_inference.md
+    - SHAP Explanation: shap_explanation.md
   - API Reference:
     - REST API: api_reference.md
     - Detection Engine: api/detection.md
     - Ingestion: api/ingestion.md
     - API Module: api/api.md
+    - Additional API Docs:
+      - Streaming API: streaming_api.md
+      - Streaming Scorer: streaming_scorer.md
+      - gRPC Scoring: grpc_scoring.md
+      - API Gateway: api_gateway.md
+      - API Versioning: api_versioning.md
+      - Vector Similarity Search: vector_similarity_search.md
+      - WAF and Rate Limiting: waf_and_rate_limiting.md
   - OpenAPI: openapi.md
 
 extra:
