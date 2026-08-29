@@ -136,13 +136,21 @@ rehearsal, not a substitute for it. The target timings are estimates based
 on `--wait --timeout 10m` in `cd.yml` and typical `helm rollback` latency
 for a small Deployment, not measurements.
 
-**What was rehearsed for real**, on the `Ndifreke000/Ledgerlens-core` fork
-(no production credentials involved): the CI-gate mechanism in `cd.yml`
-(a deliberately-failing commit correctly blocks CD; two rapid successive
-pushes each produce a correctly `head_sha`-pinned CD run) and the Trivy
-scan gate (a deliberately-vulnerable dependency correctly blocks the
-build-and-push job before any image reaches the registry) — see the PR
-description for the actual run links and output. A live rollback rehearsal
+**What was rehearsed for real**, live on GitHub Actions against the
+`Ndifreke000/Ledgerlens-core` fork (no production credentials involved):
+the CI-gate mechanism in `cd.yml` end to end (CI passing correctly lets CD
+proceed, pinned to that exact `head_sha`); two rapid successive pushes to
+`main`, where the first commit's CI run was itself superseded/cancelled by
+the second (via `ci.yml`'s own concurrency group) and CD correctly refused
+to build or deploy that superseded commit while correctly proceeding for
+the second — with no interleaving or wrong-commit deploy; and the
+dependency-vulnerability gate in `license-vuln-scan.yml` (a deliberately
+pinned `PyYAML==5.1`, a known-CVE version, correctly blocked the OSV job).
+The container-image Trivy gate in `cd.yml` was verified at the script/logic
+level (build-then-scan-then-push ordering, `.trivyignore.yaml` waiver
+parsing) but not via a live image scan, since that requires Docker Hub
+push credentials this PR does not have — see the PR description for exact
+run links, output, and this specific gap. A live rollback rehearsal
 against a real cluster is the one verification item in the issue that
 requires the maintainer's own infrastructure to complete; this document is
 written so that completing it is a matter of following the checklist
