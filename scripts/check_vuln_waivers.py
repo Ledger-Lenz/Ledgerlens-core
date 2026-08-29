@@ -40,7 +40,6 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 try:
     import yaml
@@ -183,30 +182,58 @@ def parse_cargo_audit(report: dict) -> list[Finding]:
     return findings
 
 
-def parse_govulncheck(lines: Iterable[str]) -> list[Finding]:
-    """Parse `govulncheck -json` output (newline-delimited JSON objects).
+def _iter_json_values(text: str):
+    """Yield successive top-level JSON values concatenated in `text`.
+
+    govulncheck's `-json` output is NOT newline-delimited JSON (confirmed
+    against real `govulncheck -json` v1.7.0 output, not assumed): each
+    message is written *pretty-printed* (multi-line, indented) and messages
+    are concatenated back-to-back with no separator at all — not even a
+    blank line. Splitting on "\\n" and json.loads()-ing each line therefore
+    breaks on the very first message, since most lines are JSON fragments
+    like `"osv": {` rather than complete values. A streaming decoder that
+    walks the whole text and repeatedly raw_decodes the next value,
+    skipping the whitespace between them, handles this format regardless
+    of whether a given govulncheck version pretty-prints or compacts it.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(text)
+    while idx < length:
+        while idx < length and text[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+        obj, end = decoder.raw_decode(text, idx)
+        yield obj
+        idx = end
+
+
+def parse_govulncheck(text: str) -> list[Finding]:
+    """Parse `govulncheck -json` output.
 
     govulncheck's real value over a plain vulnerability-database lookup is
     distinguishing "this vulnerable package is a dependency" from "your
     code actually calls the vulnerable function" — it emits an `osv` object
     per known vulnerability in the dependency graph, and separately a
-    `finding` object per *actually reachable* call path. Only the
-    reachable ones are worth blocking a build over; the whole point of
-    running govulncheck instead of a generic Go-module vuln scan is to
-    avoid failing builds over vulnerable code paths the binary never
-    executes. Findings are still not skipped silently if their severity
-    can't be read from the OSV record — see the module fail-closed note —
-    it's specifically *reachability*, not severity, that's used to narrow
-    the set here.
+    `finding` object per *actually reachable* call path (module/version-
+    level for a vulnerable stdlib/toolchain, or symbol-level for an
+    imported package — govulncheck decides that granularity itself; this
+    script just trusts that a `finding` message with a non-empty `trace`
+    means govulncheck judged it reachable). Only the reachable ones are
+    worth blocking a build over; the whole point of running govulncheck
+    instead of a generic Go-module vuln scan is to avoid failing builds
+    over vulnerable code paths the binary never executes. Findings are
+    still not skipped silently if their severity can't be read from the
+    OSV record — see the module fail-closed note — it's specifically
+    *reachability*, not severity, that's used to narrow the set here.
     """
     osv_by_id: dict[str, dict] = {}
     reachable_ids: set[str] = set()
-    for line in lines:
-        line = line.strip()
-        if not line:
+    for obj in _iter_json_values(text):
+        if not isinstance(obj, dict):
             continue
-        obj = json.loads(line)
-        if "osv" in obj:
+        if "osv" in obj and isinstance(obj["osv"], dict):
             osv = obj["osv"]
             osv_by_id[osv.get("id", "<unknown-id>")] = osv
         elif "finding" in obj:
@@ -308,7 +335,7 @@ def main() -> int:
         return 2
 
     if args.scanner == "govulncheck":
-        findings = parse_govulncheck(args.report.read_text().splitlines())
+        findings = parse_govulncheck(args.report.read_text())
     else:
         report = json.loads(args.report.read_text())
         findings = {

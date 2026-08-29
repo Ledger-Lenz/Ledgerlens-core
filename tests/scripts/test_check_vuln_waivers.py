@@ -120,35 +120,69 @@ def test_parse_cargo_audit_no_vulnerabilities():
 
 
 # ── govulncheck ──────────────────────────────────────────────────────────────
+#
+# govulncheck's real `-json` output is pretty-printed (multi-line, indented)
+# JSON values concatenated with NO separator between them — confirmed by
+# actually running `govulncheck -json ./...` against this repo's go/ module
+# (v1.7.0) rather than assumed. Fixtures below reproduce that exact shape,
+# not a convenient one-object-per-line simplification, since that mismatch
+# is precisely the bug this test suite originally missed (the parser passed
+# 24/24 tests against line-based fixtures and then crashed with a
+# JSONDecodeError on the very first real GitHub Actions run).
+
+def _pretty(obj: dict) -> str:
+    return json.dumps(obj, indent=2)
+
 
 def test_parse_govulncheck_only_reachable_findings_count():
-    lines = [
-        json.dumps({"osv": {"id": "GO-2024-0001", "database_specific": {"severity": "HIGH"}, "affected": [{"package": {"name": "golang.org/x/net"}}]}}),
-        json.dumps({"osv": {"id": "GO-2024-0002", "database_specific": {"severity": "CRITICAL"}, "affected": [{"package": {"name": "some/other"}}]}}),
+    text = "".join([
+        _pretty({"osv": {"id": "GO-2024-0001", "database_specific": {"severity": "HIGH"}, "affected": [{"package": {"name": "golang.org/x/net"}}]}}),
+        _pretty({"osv": {"id": "GO-2024-0002", "database_specific": {"severity": "CRITICAL"}, "affected": [{"package": {"name": "some/other"}}]}}),
         # Only GO-2024-0001 has an actual reachable call trace.
-        json.dumps({"finding": {"osv": "GO-2024-0001", "trace": [{"function": "Foo"}]}}),
-    ]
-    findings = cvw.parse_govulncheck(lines)
+        _pretty({"finding": {"osv": "GO-2024-0001", "trace": [{"module": "golang.org/x/net", "function": "Foo"}]}}),
+    ])
+    findings = cvw.parse_govulncheck(text)
     assert len(findings) == 1
     assert findings[0].id == "GO-2024-0001"
     assert findings[0].severity == "HIGH"
 
 
 def test_parse_govulncheck_finding_without_trace_is_not_reachable():
-    lines = [
-        json.dumps({"osv": {"id": "GO-2024-0003", "database_specific": {"severity": "HIGH"}}}),
+    text = "".join([
+        _pretty({"osv": {"id": "GO-2024-0003", "database_specific": {"severity": "HIGH"}}}),
         # A finding entry with no/empty trace = not actually called.
-        json.dumps({"finding": {"osv": "GO-2024-0003", "trace": []}}),
-    ]
-    assert cvw.parse_govulncheck(lines) == []
+        _pretty({"finding": {"osv": "GO-2024-0003", "trace": []}}),
+    ])
+    assert cvw.parse_govulncheck(text) == []
 
 
-def test_parse_govulncheck_ignores_progress_lines():
-    lines = [
-        json.dumps({"progress": {"message": "Scanning your code and 42 packages..."}}),
-        "",  # blank lines are common in real NDJSON output
-    ]
-    assert cvw.parse_govulncheck(lines) == []
+def test_parse_govulncheck_ignores_config_sbom_and_progress_messages():
+    # Real output always leads with a {"config": ...} message and a
+    # {"SBOM": ...} message before any {"progress": ...}/{"osv": ...}
+    # messages — none of the three should be mistaken for a finding.
+    text = "".join([
+        _pretty({"config": {"protocol_version": "v1.0.0", "scanner_name": "govulncheck"}}),
+        _pretty({"SBOM": {"go_version": "go1.22.6", "roots": ["example.com/mod"]}}),
+        _pretty({"progress": {"message": "Scanning your code and 42 packages..."}}),
+    ])
+    assert cvw.parse_govulncheck(text) == []
+
+
+def test_parse_govulncheck_handles_real_captured_output(tmp_path):
+    # Regression fixture: a trimmed but structurally real capture from an
+    # actual `govulncheck -json ./...` run (v1.7.0) against this repo's
+    # go/ module, reproducing the exact pretty-printed, no-separator
+    # concatenation that broke the naive line-based parser.
+    real = (
+        '{\n  "config": {\n    "protocol_version": "v1.0.0",\n    "scanner_name": "govulncheck"\n  }\n}'
+        '{\n  "SBOM": {\n    "go_version": "go1.22.6",\n    "roots": [\n      "example.com/mod"\n    ]\n  }\n}'
+        '{\n  "progress": {\n    "message": "Fetching vulnerabilities from the database..."\n  }\n}'
+        '{\n  "osv": {\n    "id": "GO-2024-3105",\n    "database_specific": {\n      "severity": "HIGH"\n    }\n  }\n}'
+        '{\n  "progress": {\n    "message": "Checking the code against the vulnerabilities..."\n  }\n}'
+        '{\n  "finding": {\n    "osv": "GO-2024-3105",\n    "fixed_version": "v1.22.7",\n    "trace": [\n      {\n        "module": "stdlib",\n        "version": "v1.22.6"\n      }\n    ]\n  }\n}'
+    )
+    findings = cvw.parse_govulncheck(real)
+    assert findings == [cvw.Finding(id="GO-2024-3105", ecosystem="go", package="<unknown>", severity="HIGH")]
 
 
 # ── npm audit ────────────────────────────────────────────────────────────────
