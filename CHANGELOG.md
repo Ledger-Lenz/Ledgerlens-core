@@ -5,10 +5,10 @@ All notable changes to `ledgerlens-core` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Releases were previously automated via [release-please](https://github.com/google-github-actions/release-please-action);
-the workflow has since been removed, so version bumps and this file are
-currently maintained by hand until an automated release pipeline is
-reinstated (tracked in [ROADMAP.md](ROADMAP.md)).
+Releases are automated via [release-please](https://github.com/googleapis/release-please-action)
+(`.github/workflows/release-please.yml`, `release-please-config.json`,
+`.release-please-manifest.json`) — merges to `main` with conventional-commit
+messages drive version bumps, this file, and the tagged GHCR image publish.
 
 ## [Unreleased]
 

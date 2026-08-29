@@ -1,0 +1,30 @@
+# Documented, expiring waiver list for the container-image vulnerability
+# scan in .github/workflows/cd.yml (Grand 5 / #702, Required scope B).
+#
+# This is Trivy's native YAML ignore-file format (`--ignorefile
+# .trivyignore.yaml`), used AS-IS rather than reinvented, because Trivy
+# already enforces the property this Grand requires — every entry needs an
+# `id` and, if you want the entry to actually stop applying at some point,
+# an `expires` date. An entry with no `expires` is a *permanent* waiver:
+# only add one of those with real justification (e.g. "not exploitable in
+# our usage — see linked analysis"), not as a way to avoid setting a date.
+#
+# cd.yml's scan step prints the full Trivy report (including which findings
+# were suppressed and by which rule below) to the job log and uploads it as
+# an artifact, so a waiver's presence, reason, and expiry are visible on
+# every run that hits it — not just at the moment someone adds the entry.
+#
+# Format reference: https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/#by-finding-ids
+#
+# Example of what a real waiver looks like (commented out — delete this
+# comment block and the entries below stay empty until a real waiver is
+# needed; do not add example.yaml-style placeholder entries that regexes
+# scanning for "does this file have any waivers" would mistake for a real
+# one):
+#
+# - id: CVE-2024-XXXXX
+#   statement: >-
+#     Reachable only via optional feature X we do not enable; upstream fix
+#     tracked at <link>. Reassess before removing setuptools-shim from the
+#     base image, since that's the actual path this reaches.
+#   expires: 2026-12-31
