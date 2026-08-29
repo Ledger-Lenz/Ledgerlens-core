@@ -75,6 +75,29 @@ nav:
     - Detection Engine: api/detection.md
     - Ingestion: api/ingestion.md
     - API Module: api/api.md
+  - Deployment & Operations:
+    - Kubernetes Deployment: kubernetes_deployment.md
+    - Engineering Roadmap: engineering_roadmap.md
+    - Executable Architecture: executable_architecture.md
+    - Dependency Policy: dependency_policy.md
+    - Testing Guide: testing_guide.md
+    - CLI Reference: cli_reference.md
+  - Data & Lineage:
+    - Database Schema: database_schema.md
+    - Database Migrations: database_migrations.md
+    - Lineage Tracking: lineage.md
+    - Event Bus: event_bus.md
+    - Feature Store Archival: feature_store_archival.md
+    - Ensemble Stacking: ensemble_stacking.md
+    - Hyperparameter Optimization: hyperparameter_optimization.md
+  - Federation & Reference:
+    - Federation Integration: federation_integration.md
+    - Active Learning: active_learning.md
+    - Adversarial Testing: adversarial_testing.md
+    - Filter Pipeline: filter-pipeline.md
+    - Model Cards: model_cards.md
+    - Cost & Capacity Quick Reference: COST_CAPACITY_QUICK_REFERENCE.md
+    - Upgrading Cost & Capacity: UPGRADE_COST_CAPACITY.md
   - OpenAPI: openapi.md
 
 extra:
