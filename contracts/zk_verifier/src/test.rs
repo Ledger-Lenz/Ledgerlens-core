@@ -160,6 +160,33 @@ fn off_curve_point_is_rejected() {
     assert!(bad.is_none(), "(1,1) is not on y^2 = x^3 + 3");
 }
 
+#[test]
+fn point_is_valid_checks_field_bounds() {
+    let valid_p = Point::generator();
+    assert!(valid_p.is_valid());
+
+    let invalid_x = Point {
+        x: Fq(FIELD_MODULUS),
+        y: Fq::one(),
+        z: Fq::one(),
+    };
+    assert!(!invalid_x.is_valid());
+
+    let invalid_y = Point {
+        x: Fq::one(),
+        y: Fq(FIELD_MODULUS),
+        z: Fq::one(),
+    };
+    assert!(!invalid_y.is_valid());
+
+    let invalid_z = Point {
+        x: Fq::one(),
+        y: Fq::one(),
+        z: Fq(FIELD_MODULUS),
+    };
+    assert!(!invalid_z.is_valid());
+}
+
 // ---------------------------------------------------------------------------
 // Fiat-Shamir: changing any single input changes the output (no collision
 // on the sampled input space -- acceptance criterion 6), and the function
