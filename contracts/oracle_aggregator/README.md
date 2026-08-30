@@ -104,6 +104,9 @@ The `initialize` function is protected by a "first-write wins" model — once in
 | Operation              | Condition                     | Behavior                                    | Test Coverage                            |
 | ---------------------- | ----------------------------- | ------------------------------------------- | ---------------------------------------- |
 | `initialize`           | Already initialized           | Panic: `"already initialized"`              | `test.rs`, `fuzz_auth_bypass`            |
+| `initialize`           | Threshold is zero             | Panic: `"threshold must be greater than zero"` | `test.rs`                              |
+| `initialize`           | Threshold exceeds oracle key count | Panic: `"threshold exceeds number of oracle keys"` | `test.rs`                          |
+| `canonical_message`     | Input string too large for buffer | Panic: `"string exceeds canonical message buffer"` | `test.rs`                          |
 | `submit_with_quorum`   | Timestamp too old             | Return `false`                              | `test.rs`                                |
 | `submit_with_quorum`   | Insufficient signatures       | Return `false`                              | `test.rs::test_rejects_n_minus_1_signatures` |
 | `submit_with_quorum`   | Forged signature              | Return `false`                              | `test.rs::test_rejects_forged_signature` |
@@ -175,3 +178,7 @@ The contract is configured as `crate-type = ["cdylib", "rlib"]` so it can be bui
 - [LedgerLens Oracle Quorum design](../../docs/oracle_quorum.md)
 - [Contract fuzzing documentation](../../docs/contract_fuzzing.md)
 - [Soroban SDK documentation](https://soroban.stellar.org/docs/reference/sdk)
+
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md) for a history of changes to this contract.

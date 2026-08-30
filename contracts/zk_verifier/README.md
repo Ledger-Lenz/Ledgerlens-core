@@ -261,3 +261,7 @@ The current `fiat_shamir` implementation returns a placeholder value. Production
 - [Soroban SDK documentation](https://soroban.stellar.org/docs/reference/sdk)
 - [BN254 curve specification](https://hackmd.io/@jpw/bn254)
 - [Sigma protocols](https://en.wikipedia.org/wiki/Proof_of_knowledge#Sigma_protocols)
+
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md) for a history of changes to this contract.
