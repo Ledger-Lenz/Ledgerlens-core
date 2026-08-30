@@ -126,7 +126,7 @@ impl U256 {
     }
 
     /// Highest set bit index (0-based), or `None` if zero. Bounded at 256.
-    fn bit_length(&self) -> u32 {
+    pub fn bit_length(&self) -> u32 {
         for i in (0..4).rev() {
             if self.0[i] != 0 {
                 return (i as u32) * 64 + (64 - self.0[i].leading_zeros());
@@ -135,7 +135,7 @@ impl U256 {
         0
     }
 
-    fn bit(&self, i: u32) -> bool {
+    pub fn bit(&self, i: u32) -> bool {
         if i >= 256 {
             return false;
         }
@@ -605,16 +605,5 @@ impl Point {
         self.y.mul(&z2z2z2) == other.y.mul(&z1z1z1)
     }
 
-    /// Check if this field element is strictly less than the BN254 field modulus
-    pub fn is_valid(&self) -> bool {
-        const FIELD_MODULUS_LO: u128 = 201382436151624795304958197775988587847;
-        const FIELD_MODULUS_HI: u128 = 64352033668853702584149021272023910493;
-        if self.1 < FIELD_MODULUS_HI {
-            return true;
-        }
-        if self.1 == FIELD_MODULUS_HI && self.0 < FIELD_MODULUS_LO {
-            return true;
-        }
-        false
-    }
+
 }
