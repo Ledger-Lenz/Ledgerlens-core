@@ -9,6 +9,24 @@ image:
 nameOverride: ""
 fullnameOverride: ""
 
+# Deployment-traceability metadata (Grand 5 / #702, Required scope C).
+# Overridden per-deploy by cd.yml via `--set-string deployment.meta.*` with
+# the real commit SHA, pushed image digest, deploy timestamp, and the CD
+# workflow run ID — rendered as annotations on the Deployment/Rollout and
+# their pod template (see templates/_helpers.tpl's
+# `ledgerlens.deploymentMetaAnnotations`). Left as "unknown" here so a
+# `helm install`/`helm template` run outside the CD pipeline still produces
+# a valid, inspectable (if honestly unpopulated) annotation block rather
+# than omitting it — query with:
+#   helm get metadata ledgerlens
+#   kubectl get deployment ledgerlens-api -o jsonpath='{.metadata.annotations}'
+deployment:
+  meta:
+    commitSha: "unknown"
+    imageDigest: "unknown"
+    deployedAt: "unknown"
+    workflowRunId: "unknown"
+
 # ── Service ──────────────────────────────────────────────────────────────────
 service:
   type: ClusterIP
@@ -55,6 +73,42 @@ api:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+# ── Canary rollout (Argo Rollouts) ──────────────────────────────────────────
+# Fixes three pre-existing bugs found while wiring deployment-traceability
+# annotations into templates/api-rollout.yaml for Grand 5 / #702:
+#   1. This `canary:` key did not exist in values.yaml at all — every field
+#      templates/api-rollout.yaml and templates/analysis-template.yaml
+#      reference (`.steps`, `.analysis.*`, `.prometheusUrl`) was undefined.
+#   2. api-rollout.yaml used invalid Go-template bracket indexing
+#      (`.Values.canary.steps[0]`) instead of the `index` function — a hard
+#      parse error that broke `helm template`/`install`/`upgrade` for the
+#      *entire* chart (Helm aborts on the first template parse failure), not
+#      only when canary.enabled was true.
+#   3. api-rollout.yaml had no `{{- if .Values.canary.enabled }}` guard,
+#      unlike its sibling api-deployment.yaml — both a Deployment and a
+#      Rollout would render unconditionally, contending for the same
+#      selector.
+# Net effect before this fix: cd.yml's `--set canary.enabled=true` (its
+# literal, unconditional setting on every deploy) meant no deploy via this
+# chart could have ever actually succeeded. See templates/api-rollout.yaml
+# and templates/_helpers.tpl for the corresponding template-side fixes.
+canary:
+  enabled: false
+  # Two-phase canary: 20% -> analysis -> 50% -> analysis -> 100%. The pause
+  # duration (5m) is deliberately >= the analysis metrics' own `interval`
+  # and PromQL rate-window (both 1m/5m in analysis-template.yaml) so a
+  # pause never ends before the metric it's meant to gate on has produced
+  # a meaningful sample.
+  steps:
+    - setWeight: 20
+    - pauseSeconds: 300
+    - setWeight: 50
+    - pauseSeconds: 300
+  analysis:
+    p95LatencyThresholdSeconds: 2
+    errorRateThreshold: 0.05
+  prometheusUrl: "http://prometheus-server.monitoring.svc.cluster.local"
 
 # ── Ingestion Worker ─────────────────────────────────────────────────────────
 ingestionWorker:

@@ -103,6 +103,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML (for the waiver-gate script)
+        run: pip install --quiet pyyaml
+
       - name: Install osv-scanner
         run: |
           curl -sSfL \
@@ -110,26 +118,35 @@ jobs:
             -o /usr/local/bin/osv-scanner
           chmod +x /usr/local/bin/osv-scanner
 
-      - name: Scan Python dependencies (requirements/base.txt)
+      - name: Scan all Python lockfiles (JSON, for the gate) and a human-readable table
         run: |
-          osv-scanner --lockfile requirements/base.txt \
-            --format table \
-            --output reports/osv-python-base.txt || true
-          cat reports/osv-python-base.txt || true
-
-      - name: Scan all Python lockfiles
-        run: |
+          mkdir -p reports
+          lockfile_args=()
           for f in requirements/*.txt; do
-            echo "Scanning $f"
-            osv-scanner --lockfile "$f" --format table || true
+            lockfile_args+=(--lockfile "$f")
           done
+          # osv-scanner exits non-zero when it finds anything — that exit
+          # code is intentionally not authoritative here (see FAIL below):
+          # scripts/check_vuln_waivers.py owns the pass/fail decision so
+          # that a dated, justified waiver can suppress a specific finding
+          # without silencing the scanner entirely. || true only defers the
+          # decision to that script; it does not bypass it.
+          osv-scanner "${lockfile_args[@]}" --format json --output reports/osv-python.json || true
+          osv-scanner "${lockfile_args[@]}" --format table || true
+
+      - name: Enforce vulnerability waivers (blocking)
+        run: |
+          python3 scripts/check_vuln_waivers.py \
+            --scanner osv \
+            --report reports/osv-python.json \
+            --waivers security/vulnerability-waivers.yml
 
       - name: Upload OSV report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: osv-python-reports
-          path: reports/osv-*.txt
+          path: reports/osv-*.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -149,8 +166,39 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
+      - name: Set up Python 3.12 (for the waiver-gate script)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML (for the waiver-gate script)
+        run: pip install --quiet pyyaml
+
       - name: Run cargo audit
-        run: cargo audit || true
+        run: |
+          mkdir -p reports
+          # Human-readable copy in the log, plus the JSON the gate reads.
+          # cargo audit exits non-zero on any finding; check_vuln_waivers.py
+          # is the authoritative pass/fail decision (see python-vuln above
+          # for why `|| true` here does not mean "ignore this scanner").
+          cargo audit || true
+          cargo audit --json > reports/cargo-audit.json || true
+
+      - name: Enforce vulnerability waivers (blocking)
+        run: |
+          python3 scripts/check_vuln_waivers.py \
+            --scanner cargo-audit \
+            --report reports/cargo-audit.json \
+            --waivers security/vulnerability-waivers.yml
+
+      - name: Upload cargo-audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-audit-report
+          path: reports/cargo-audit.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # ── Go vulnerability scan (govulncheck) ───────────────────────────────────
   go-vuln:
@@ -168,9 +216,41 @@ jobs:
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
+      - name: Set up Python 3.12 (for the waiver-gate script)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML (for the waiver-gate script)
+        run: pip install --quiet pyyaml
+
       - name: Run govulncheck
         working-directory: go
-        run: govulncheck ./... || true
+        run: |
+          mkdir -p ../reports
+          # Human-readable text output in the log, plus the -json stream
+          # (newline-delimited) the gate reads to distinguish reachable
+          # findings from packages merely present in the dependency graph.
+          # govulncheck exits non-zero on any finding; check_vuln_waivers.py
+          # is the authoritative pass/fail decision (see python-vuln above).
+          govulncheck ./... || true
+          govulncheck -json ./... > ../reports/govulncheck.ndjson || true
+
+      - name: Enforce vulnerability waivers (blocking)
+        run: |
+          python3 scripts/check_vuln_waivers.py \
+            --scanner govulncheck \
+            --report reports/govulncheck.ndjson \
+            --waivers security/vulnerability-waivers.yml
+
+      - name: Upload govulncheck report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: govulncheck-report
+          path: reports/govulncheck.ndjson
+          if-no-files-found: ignore
+          retention-days: 30
 
   # ── TypeScript audit (npm audit) ──────────────────────────────────────────
   ts-audit:
@@ -190,8 +270,38 @@ jobs:
         working-directory: sdk
         run: npm install
 
+      - name: Set up Python 3.12 (for the waiver-gate script)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML (for the waiver-gate script)
+        run: pip install --quiet pyyaml
+
       - name: npm audit (sdk)
         working-directory: sdk
-        # --audit-level=high only fails on high/critical CVEs; moderate alerts
-        # are visible in the log but do not block merges.
-        run: npm audit --audit-level=high || true
+        run: |
+          mkdir -p ../reports
+          # Human-readable copy in the log, plus the JSON the gate reads.
+          # npm audit exits non-zero on any finding at/above --audit-level;
+          # check_vuln_waivers.py is the authoritative pass/fail decision
+          # (see python-vuln above for why `|| true` here does not mean
+          # "ignore this scanner").
+          npm audit --audit-level=high || true
+          npm audit --json > ../reports/npm-audit.json || true
+
+      - name: Enforce vulnerability waivers (blocking)
+        run: |
+          python3 scripts/check_vuln_waivers.py \
+            --scanner npm-audit \
+            --report reports/npm-audit.json \
+            --waivers security/vulnerability-waivers.yml
+
+      - name: Upload npm audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: reports/npm-audit.json
+          if-no-files-found: ignore
+          retention-days: 30

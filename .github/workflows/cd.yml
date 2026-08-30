@@ -1,16 +1,114 @@
 name: CD
+
+# Structural dependency on CI, not a race against it (Grand 5 / #702).
+#
+# Before this change, `cd.yml` triggered on the identical `push: branches:
+# [main]` event as `ci.yml`, independently. Both workflows started at the
+# same instant with no ordering relationship — a commit that failed every
+# CI check could still build and deploy, because nothing in `cd.yml` ever
+# looked at `ci.yml`'s result. This is the textbook failure mode
+# `workflow_run` exists to close: CD now triggers only when the `CI`
+# workflow *completes*, and the deploy job gates on that specific run's
+# conclusion.
+#
+# Two deliberate details that matter for correctness, not just style:
+#
+# 1. `branches: [main]` on the `workflow_run` trigger filters on the
+#    upstream run's *head branch*, so a CI run against a PR branch (even a
+#    PR opened from a branch literally named `main` in a fork — an edge
+#    case worth naming, not just assuming away) does not fire this
+#    workflow. Combined with the `github.event.workflow_run.event ==
+#    'push'` check below (CI also runs on `pull_request`, and a
+#    workflow_run event carries the *type* of the run that triggered it),
+#    this workflow only ever proceeds for a CI run that itself was
+#    triggered by a genuine push to `main`.
+# 2. The deploy job checks out `github.event.workflow_run.head_sha`
+#    explicitly — the exact commit CI just evaluated — rather than
+#    whatever `main` happens to point at when this workflow starts. Two
+#    rapid pushes to `main` produce two independent CI runs and therefore
+#    two independent, correctly-ordered `workflow_run` events, each
+#    carrying its own `head_sha`; there is no path by which an older,
+#    failed commit's image can be built after a newer, passed one, because
+#    each CD run is pinned to the specific commit its triggering CI run
+#    evaluated, not to a shared, mutable `main` ref read at deploy time.
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Commit SHA to deploy (workflow_dispatch only — bypasses the CI
+          gate below by design, for a manual break-glass deploy or a
+          rollback to a previously-built image; see
+          docs/runbooks/rollback.md). Defaults to the current main tip.
+        required: false
+        type: string
+
+concurrency:
+  # One deploy in flight at a time. A second CI-triggered run landing
+  # while a deploy is still applying queues behind it rather than racing
+  # it — `cancel-in-progress: false` is deliberate: cancelling a Helm
+  # upgrade mid-rollout is how you get a cluster stuck in a half-applied
+  # state, which is strictly worse than a deploy queueing a few seconds.
+  group: cd-production
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    name: Verify CI passed for this commit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'push'
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - name: Decide whether to proceed
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            sha="${{ inputs.sha }}"
+            if [ -z "$sha" ]; then
+              sha="${{ github.sha }}"
+            fi
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "::notice::Manual dispatch — deploying $sha without the CI gate (break-glass path)."
+            exit 0
+          fi
+
+          conclusion="${{ github.event.workflow_run.conclusion }}"
+          sha="${{ github.event.workflow_run.head_sha }}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          if [ "$conclusion" = "success" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::CI run ${{ github.event.workflow_run.id }} for $sha concluded 'success' — proceeding."
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::CI run ${{ github.event.workflow_run.id }} for $sha concluded '$conclusion' — refusing to build or deploy this commit."
+            exit 1
+          fi
+
   build_and_deploy:
+    name: Build, scan, and deploy
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     env:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      DEPLOY_SHA: ${{ needs.gate.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Pin to the exact commit CI evaluated (or the manual-dispatch
+          # target) — never the mutable `main` ref. See the workflow-level
+          # comment above for why this matters under rapid successive
+          # pushes.
+          ref: ${{ env.DEPLOY_SHA }}
 
       - name: Check deployment configuration
         id: deploy-config
@@ -33,13 +131,65 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
-      - name: Build and push Docker image
+      # Build once, locally, without pushing. The image is scanned before
+      # it ever reaches a registry a deployment could pull from — pushing
+      # first and scanning after would mean a critical-CVE image was
+      # already publicly pullable for however long the scan took.
+      - name: Build Docker image (local, unpushed)
         if: steps.deploy-config.outputs.enabled == 'true'
+        uses: docker/build-push-action@v5
+        id: build
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.DOCKER_USERNAME }}/ledgerlens:${{ env.DEPLOY_SHA }}
+
+      - name: Install Trivy
+        if: steps.deploy-config.outputs.enabled == 'true'
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.54.1
+
+      - name: Scan image for vulnerabilities (blocking on critical/high)
+        if: steps.deploy-config.outputs.enabled == 'true'
+        id: scan
+        run: |
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --ignorefile .trivyignore.yaml \
+            --format table \
+            --output "$RUNNER_TEMP/trivy-report.txt" \
+            "${DOCKER_USERNAME}/ledgerlens:${DEPLOY_SHA}"
+          status=$?
+          cat "$RUNNER_TEMP/trivy-report.txt"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Trivy found unwaived CRITICAL/HIGH vulnerabilities in the built image. See the report above. To accept a specific finding, add a dated, justified entry to .trivyignore.yaml (see that file's header for the format) — do not reintroduce a blanket bypass."
+            exit "$status"
+          fi
+          echo "::notice::Trivy scan passed (no unwaived CRITICAL/HIGH findings). See .trivyignore.yaml for any active, documented waivers applied."
+
+      - name: Upload Trivy report
+        if: always() && steps.deploy-config.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-scan-${{ env.DEPLOY_SHA }}
+          path: ${{ runner.temp }}/trivy-report.txt
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # Only reachable if the scan above passed (or was skipped because
+      # secrets aren't configured, in which case there's nothing to push).
+      - name: Push Docker image
+        if: steps.deploy-config.outputs.enabled == 'true'
+        id: push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.DOCKER_USERNAME }}/ledgerlens:${{ github.sha }}
+          tags: ${{ env.DOCKER_USERNAME }}/ledgerlens:${{ env.DEPLOY_SHA }}
 
       - name: Set up Kubeconfig
         if: steps.deploy-config.outputs.enabled == 'true'
@@ -49,10 +199,53 @@ jobs:
 
       - name: Deploy with Helm
         if: steps.deploy-config.outputs.enabled == 'true'
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           helm repo add argo https://argoproj.github.io/argo-helm
           helm repo update
+
+          # --set-string (not --set) for the SHA/digest: both are
+          # hex/sha256: strings that must never be interpreted as numbers
+          # or dates by Helm's YAML type coercion.
+          #
+          # deployment.meta.* land in template annotations (see
+          # helm/ledgerlens/templates/_helpers.tpl and the rollout/
+          # deployment templates) specifically so "what commit and image
+          # digest is actually running" is answerable via
+          # `helm get metadata` / `kubectl get -o jsonpath` after the
+          # fact, per Required scope C — not just inferable from CI logs
+          # that may have rotated out of retention by the time anyone asks.
           helm upgrade --install ledgerlens ./helm/ledgerlens \
-            --set image.repository=${{ env.DOCKER_USERNAME }}/ledgerlens \
-            --set image.tag=${{ github.sha }} \
-            --set canary.enabled=true
+            --set image.repository="${DOCKER_USERNAME}/ledgerlens" \
+            --set-string image.tag="${DEPLOY_SHA}" \
+            --set-string deployment.meta.commitSha="${DEPLOY_SHA}" \
+            --set-string deployment.meta.imageDigest="${IMAGE_DIGEST}" \
+            --set-string deployment.meta.deployedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --set-string deployment.meta.workflowRunId="${{ github.run_id }}" \
+            --set canary.enabled=true \
+            --history-max 20 \
+            --wait --timeout 10m
+
+      - name: Record deployment status (for the status dashboard)
+        if: steps.deploy-config.outputs.enabled == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/deploy-status"
+          cat > "$RUNNER_TEMP/deploy-status/deployment.json" <<JSON
+          {
+            "commitSha": "${DEPLOY_SHA}",
+            "imageDigest": "${{ steps.push.outputs.digest }}",
+            "deployedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflowRunId": "${{ github.run_id }}",
+            "triggeredBy": "${{ github.event_name }}"
+          }
+          JSON
+          cat "$RUNNER_TEMP/deploy-status/deployment.json"
+
+      - name: Upload deployment record
+        if: steps.deploy-config.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-record-${{ env.DEPLOY_SHA }}
+          path: ${{ runner.temp }}/deploy-status/deployment.json
+          retention-days: 365

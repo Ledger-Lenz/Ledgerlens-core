@@ -1,0 +1,125 @@
+name: Deployment Status Dashboard
+
+# Grand 5 / #702, required deliverable: "a dashboard/status page showing
+# last-CI-passed commit, last-deployed commit/digest, and whether they
+# match." This answers, at a glance, the question the whole issue is about:
+# is what's running in production provably what CI last verified?
+#
+# Runs after every CD attempt (success or failure — a failed/skipped CD run
+# is itself status-page-worthy information) and on a schedule, so the page
+# stays current even on days nothing merges.
+on:
+  workflow_run:
+    workflows: ["CD"]
+    types: [completed]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: deploy-status-pages
+  cancel-in-progress: true
+
+jobs:
+  build-status:
+    name: Build status page
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the latest CI run that succeeded on main
+        id: ci
+        run: |
+          run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs" \
+            -f branch=main -f status=success -f per_page=1 \
+            --jq '.workflow_runs[0]')
+          if [ -z "$run" ] || [ "$run" = "null" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(echo "$run" | jq -r '.head_sha')" >> "$GITHUB_OUTPUT"
+          echo "run_url=$(echo "$run" | jq -r '.html_url')" >> "$GITHUB_OUTPUT"
+          echo "run_at=$(echo "$run" | jq -r '.updated_at')" >> "$GITHUB_OUTPUT"
+
+      - name: Find the latest deployment record artifact
+        id: deploy
+        run: |
+          artifact=$(gh api "repos/$REPO/actions/artifacts" -f per_page=100 \
+            --jq '[.artifacts[] | select(.name | startswith("deployment-record-")) | select(.expired == false)]
+                  | sort_by(.created_at) | last')
+          if [ -z "$artifact" ] || [ "$artifact" = "null" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          id=$(echo "$artifact" | jq -r '.id')
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$id" >> "$GITHUB_OUTPUT"
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > deployment-record.zip
+          unzip -o -q deployment-record.zip -d deployment-record
+          cat deployment-record/deployment.json
+          echo "commit_sha=$(jq -r '.commitSha' deployment-record/deployment.json)" >> "$GITHUB_OUTPUT"
+          echo "image_digest=$(jq -r '.imageDigest' deployment-record/deployment.json)" >> "$GITHUB_OUTPUT"
+          echo "deployed_at=$(jq -r '.deployedAt' deployment-record/deployment.json)" >> "$GITHUB_OUTPUT"
+          echo "workflow_run_id=$(jq -r '.workflowRunId' deployment-record/deployment.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Render status page
+        id: render
+        run: |
+          mkdir -p _site
+          python3 scripts/render_deploy_status.py \
+            --ci-found "${{ steps.ci.outputs.found }}" \
+            --ci-sha "${{ steps.ci.outputs.sha }}" \
+            --ci-run-url "${{ steps.ci.outputs.run_url }}" \
+            --ci-run-at "${{ steps.ci.outputs.run_at }}" \
+            --deploy-found "${{ steps.deploy.outputs.found }}" \
+            --deploy-sha "${{ steps.deploy.outputs.commit_sha }}" \
+            --deploy-digest "${{ steps.deploy.outputs.image_digest }}" \
+            --deploy-at "${{ steps.deploy.outputs.deployed_at }}" \
+            --deploy-run-id "${{ steps.deploy.outputs.workflow_run_id }}" \
+            --repo "$REPO" \
+            --out-html _site/index.html \
+            --out-json _site/status.json \
+            --out-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload status.json as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-status
+          path: _site/status.json
+          retention-days: 90
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy-status:
+    name: Publish to GitHub Pages
+    needs: build-status
+    runs-on: ubuntu-latest
+    # A fork or a repo without Pages enabled on the Actions source will
+    # fail this job harmlessly — the JSON/summary from build-status above
+    # is still produced either way, so the dashboard's *data* never
+    # depends on Pages being configured, only its hosted, always-current
+    # HTML view does.
+    continue-on-error: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
