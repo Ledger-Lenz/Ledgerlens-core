@@ -424,7 +424,7 @@ fn test_canonical_message_boundary_values() {
     let client = OracleAggregatorClient::new(&env, &contract_id);
     
     let wallet = Address::generate(&env);
-    let asset_pair = Symbol::new(&env, "XLM-USDC");
+    let asset_pair = String::from_str(&env, "XLM-USDC");
     
     // Test max values don't panic
     let msg1 = client.canonical_message(&wallet, &asset_pair, &u32::MAX, &u64::MAX);
