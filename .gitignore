@@ -48,3 +48,7 @@ somzilla.md
 *.nbc
 
 .tools/
+
+# Machine-local development audit-chain signing secret, generated on first use
+# by storage/audit_log.py when LEDGERLENS_AUDIT_SECRET is unset. Never commit.
+.ledgerlens_audit_secret
