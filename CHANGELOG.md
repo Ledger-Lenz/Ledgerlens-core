@@ -11,6 +11,8 @@ currently maintained by hand until an automated release pipeline is
 reinstated (tracked in [ROADMAP.md](ROADMAP.md)).
 
 ## [Unreleased]
+### Fixed
+- Added `ge=0, le=100` Query bounds validation to `min_score` parameter on `GET /v1/scores` (#682).
 
 ### Fixed
 - **Krum/Multi-Krum wired into production federated aggregation** (`detection/federated/server.py`,
