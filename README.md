@@ -413,6 +413,78 @@ cp .env.example .env
 Fill in the Horizon, model, and cross-repo settings described in
 [LedgerLens Organization](#ledgerlens-organization).
 
+## Troubleshooting
+
+### Missing or misconfigured `.env`
+
+**Symptom:** startup fails with a config error, empty values, or missing required
+environment variables.
+
+**Fix:** copy the template and verify the values you actually need for your setup:
+
+```bash
+cp .env.example .env
+grep -E '^(REDIS_URL|LEDGERLENS_DB_PATH|NETWORK|HORIZON_URL|LEDGERLENS_API_URL)=' .env
+```
+
+If a value is blank, wrong, or pointing to a non-existent file/host, update it in
+`.env` before running the pipeline. See [.env.example](.env.example) and the
+configuration code in [`config/settings.py`](config/settings.py) for the full list.
+
+### Redis is not running
+
+**Symptom:** feature-store or rate-limiter errors like `Connection refused`,
+`redis.exceptions.ConnectionError`, or slow/failing requests after startup.
+
+**Fix:** start Redis locally or via Docker, then confirm the URL matches your `.env`:
+
+```bash
+docker compose up -d redis
+# or, if running Redis directly:
+redis-server --daemonize yes
+```
+
+Check that `REDIS_URL` in your `.env` matches the service you actually started,
+for example `redis://localhost:6379/0`. See [docs/feature_store.md](docs/feature_store.md)
+and [docs/waf_and_rate_limiting.md](docs/waf_and_rate_limiting.md) for the deeper
+feature-store and rate-limiter notes.
+
+### Port already in use
+
+**Symptom:** the API or watchdog fails at startup with `address already in use`
+or a bind error on `localhost:8000`.
+
+**Fix:** stop the process currently listening on the port or choose another port:
+
+```bash
+lsof -i :8000
+kill <PID>
+# or run the API on a different port if needed
+```
+
+If you are using Docker Compose, check which service is bound to the port and
+restart only the conflicting container. See [docker-compose.yml](docker-compose.yml)
+for the default local port mapping.
+
+### `ledgerlens.db` is missing on first run
+
+**Symptom:** SQLite errors such as `unable to open database file`, or the app
+reports that the database path is not writable.
+
+**Fix:** ensure the path in `LEDGERLENS_DB_PATH` points to a writable location,
+then create or reset the file if needed:
+
+```bash
+mkdir -p .
+touch ledgerlens.db
+chmod 600 ledgerlens.db
+```
+
+The default is `./ledgerlens.db`, relative to the project root. If you override it,
+make sure the directory exists and is writable. See [docs/database_migrations.md](docs/database_migrations.md)
+and [docs/database_schema.md](docs/database_schema.md) for how the SQLite store
+is resolved and used.
+
 ### 2a. Configure trade filters (optional)
 
 ```bash
