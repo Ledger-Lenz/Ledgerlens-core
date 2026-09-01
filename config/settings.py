@@ -139,6 +139,8 @@ class Settings(BaseSettings):
 
     # ── Detection ─────────────────────────────────────────────────────────────
     benford_mad_threshold: float = 0.015
+    benford_rust_accel_enabled: bool = True
+    graph_rust_accel_enabled: bool = True
     risk_score_threshold: int = 70
     committee_quorum: int = 3
     committee_vote_deadline_days: int = 14
