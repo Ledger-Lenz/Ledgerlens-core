@@ -46,6 +46,46 @@ FROM builder AS builder-dev
 
 RUN pip install --no-cache-dir --prefix=/install -r requirements/dev.txt
 
+# ─── Runtime environment variables ──────────────────────────────────────────
+# Every setting in config/settings.py has a safe default (see .env.example for
+# the full annotated list), and the .env file is optional. The container
+# therefore STARTS with no `-e` flags at all:
+#
+#   docker run -p 8000:8000 ledgerlens-core
+#
+# and `/health`, `/health/ready` and the read-only score endpoints work against
+# a fresh ./ledgerlens.db SQLite file. There are NO strictly-required variables:
+# nothing left unset aborts startup (verified by loading config.settings.Settings
+# with an empty environment).
+#
+# Variables you almost certainly want to pass for a real deployment
+# (env var -> config/settings.py field (default) -> effect if left unset):
+#
+#   LEDGERLENS_ADMIN_API_KEY -> ledgerlens_admin_api_key ("")
+#       /admin/* and /metrics are UNAUTHENTICATED. Startup logs a
+#       "SECURITY WARNING" but does not fail. Set this for any reachable deploy.
+#   LEDGERLENS_DB_PATH -> ledgerlens_db_path ("./ledgerlens.db")
+#       RiskScore store. Default lives inside the container and is lost on
+#       recreate — point at a mounted volume to persist.
+#   LEDGERLENS_CORS_ALLOWED_ORIGINS -> ledgerlens_cors_allowed_origins ("")
+#       Empty = deny all browser origins. Set to your dashboard origin(s).
+#       A literal "*" is rejected at startup.
+#   NETWORK -> network ("testnet")
+#       "testnet" | "mainnet". For mainnet also set NETWORK_PASSPHRASE and the
+#       HORIZON_URL / HORIZON_STREAM_URL / SOROBAN_RPC_URL endpoints.
+#
+# Secrets — no default; the feature stays disabled or fails when invoked:
+#   LEDGERLENS_SERVICE_SECRET_KEY      -> on-chain submit_score() calls fail auth
+#   LEDGERLENS_WEBHOOK_ENCRYPTION_KEY  -> webhook subscriber secrets can't be stored
+#   MODEL_SIGNING_PUBLIC_KEY           -> signed-model verification unavailable
+#
+# Variables that abort startup ONLY when set to an invalid value (never by being
+# absent): NETWORK, GATEWAY_QUOTA_STORE ("sqlite"|"redis"), any *_URL (must be a
+# valid http/https/redis URL), EVM_POOL_ADDRESSES (must be EIP-55 checksummed),
+# and the DATA_DIR-relative paths (CURSOR_CHECKPOINT_PATH, HISTORICAL_PROGRESS_PATH
+# must resolve inside DATA_DIR). See the @field_validator / @model_validator
+# methods in config/settings.py for the full set.
+# ────────────────────────────────────────────────────────────────────────────
 # ─── Common runtime base ────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime-base
 
@@ -61,6 +101,8 @@ RUN groupadd --gid 1000 ledgerlens && \
 
 WORKDIR /app
 
+# Build/runtime hygiene only — application config comes from the environment at
+# runtime (see the "Runtime environment variables" note above), not from ENV here.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/usr/local/bin:${PATH}"
