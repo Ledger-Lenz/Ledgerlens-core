@@ -37,6 +37,7 @@
     "build:types": "tsc --project tsconfig.types.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "example": "tsx examples/basic-usage.ts",
     "lint": "eslint .",
     "lint:types": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
@@ -53,6 +54,7 @@
     "prettier": "^3.9.0",
     "typescript": "^5.4.0",
     "typescript-eslint": "^8.68.0",
+    "tsx": "^4.7.0",
     "vitest": "^1.6.0"
   },
   "engines": {
