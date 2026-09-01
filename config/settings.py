@@ -166,7 +166,14 @@ class Settings(BaseSettings):
 
     # ── Storage ───────────────────────────────────────────────────────────────
     model_dir: str = "./models"
+    ledgerlens_db_url: str = ""
     ledgerlens_db_path: str = "./ledgerlens.db"
+
+    @property
+    def db_url(self) -> str:
+        if self.ledgerlens_db_url:
+            return self.ledgerlens_db_url
+        return f"sqlite:///{self.ledgerlens_db_path}"
     ingestion_dedup_enabled: bool = True
     idempotency_retention_days: int = 90
     idempotency_replay_window_seconds: float = 3600.0

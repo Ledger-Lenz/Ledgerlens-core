@@ -13,3 +13,9 @@ keywords:
 home: https://github.com/ledgerlens/ledgerlens-core
 sources:
   - https://github.com/ledgerlens/ledgerlens-core
+
+dependencies:
+  - name: postgresql
+    version: 13.x.x
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled

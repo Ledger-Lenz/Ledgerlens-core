@@ -35,15 +35,29 @@ spec:
                 name: {{ include "ledgerlens.fullname" . }}
             - secretRef:
                 name: {{ include "ledgerlens.fullname" . }}
+          env:
+            {{- if .Values.postgresql.enabled }}
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ledgerlens.fullname" . }}-postgresql
+                  key: postgres-password
+            - name: LEDGERLENS_DB_URL
+              value: "postgresql://{{ .Values.postgresql.auth.username }}:$(PG_PASSWORD)@{{ include "ledgerlens.fullname" . }}-postgresql:5432/{{ .Values.postgresql.auth.database }}"
+            {{- end }}
           resources:
             {{- toYaml .Values.ingestionWorker.resources | nindent 12 }}
           volumeMounts:
+            {{- if .Values.persistence.enabled }}
             - name: data
               mountPath: /data
+            {{- end }}
       volumes:
+        {{- if .Values.persistence.enabled }}
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "ledgerlens.fullname" . }}
+        {{- end }}
       {{- with .Values.ingestionWorker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

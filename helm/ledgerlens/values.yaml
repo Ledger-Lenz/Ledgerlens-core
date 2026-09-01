@@ -213,11 +213,24 @@ secrets:
 # artifacts under /data (see config.LEDGERLENS_DB_PATH, config.CURSOR_PATH
 # and config.MODEL_DIR above).
 persistence:
-  enabled: true
+  enabled: false
   storageClass: ""
   accessMode: ReadWriteOnce
   size: 10Gi
   annotations: {}
+
+# ── PostgreSQL ───────────────────────────────────────────────────────────────
+postgresql:
+  enabled: true
+  auth:
+    username: ledgerlens
+    database: ledgerlens
+    # password should be set via --set postgresql.auth.password
+    password: ""
+  primary:
+    persistence:
+      enabled: true
+      size: 20Gi
 
 # ── ServiceAccount ───────────────────────────────────────────────────────────
 # Consumed by templates/serviceaccount.yaml.
