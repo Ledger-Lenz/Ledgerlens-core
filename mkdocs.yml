@@ -140,6 +140,8 @@ nav:
     - Case Management: case_management.md
     - Model Signing: model_signing.md
   - OpenAPI: openapi.md
+  - "Deployment & Operations":
+    - CI Workflows: ci_workflows.md
 
 extra:
   social:
