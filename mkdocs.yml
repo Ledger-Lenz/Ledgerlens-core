@@ -140,6 +140,8 @@ nav:
     - Compliance Export: compliance_export.md
     - Case Management: case_management.md
     - Model Signing: model_signing.md
+  - Testing:
+    - Toxiproxy & Chaos Testing: toxiproxy.md
   - OpenAPI: openapi.md
   - "Deployment & Operations":
     - CI Workflows: ci_workflows.md
