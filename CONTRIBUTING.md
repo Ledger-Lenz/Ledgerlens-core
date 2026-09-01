@@ -135,6 +135,9 @@ Python dependencies are managed in two layers:
 CI verifies freshness with `pip-compile --check` in the `lock-check` job. A
 stale lockfile fails the PR.
 
+See [`requirements/README.md`](requirements/README.md) for a per-file breakdown
+of the `.in` / `.txt` / `compile.sh` layout in that directory.
+
 ### Rust
 
 Rust uses the standard Cargo workspace. `Cargo.lock` is committed and verified
