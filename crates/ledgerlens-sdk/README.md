@@ -115,6 +115,10 @@ cargo test -p ledgerlens-sdk contract_vectors
 
 See [ADR-005](../../docs/adr/ADR-005-schema-contract-enforcement.md) for the full design rationale.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a version history.
+
 ## License
 
 MIT
