@@ -16,8 +16,9 @@ feature changes.
 6. [Adding or updating a dependency](#adding-or-updating-a-dependency)
 7. [Optional features and import guards](#optional-features-and-import-guards)
 8. [License and vulnerability policy](#license-and-vulnerability-policy)
-9. [Before opening a PR](#before-opening-a-pr)
-10. [Cross-repo changes](#cross-repo-changes)
+9. [Proposing changes](#proposing-changes)
+10. [Before opening a PR](#before-opening-a-pr)
+11. [Cross-repo changes](#cross-repo-changes)
 
 ---
 
@@ -308,6 +309,50 @@ make audit-go    # govulncheck
 make audit-ts    # npm audit
 make audit       # all of the above
 ```
+
+---
+
+## Proposing changes
+
+Before writing any code, open an issue so the approach can be discussed
+and scoped with maintainers. This avoids wasted effort if the direction
+turns out to conflict with the roadmap or an in-flight PR.
+
+### Reporting a bug
+
+Use the **[Bug report]** issue form:
+
+```
+https://github.com/Ledger-Lenz/Ledgerlens-core/issues/new?template=bug_report.yml
+```
+
+The form prompts for a summary, reproduction steps, expected and actual
+behaviour, the affected component (dropdown covering every subsystem from
+`ingestion` through `contracts` and all SDKs), and your environment
+details. Blank issues are disabled — GitHub will direct you to the
+template picker automatically when you click "New issue".
+
+### Proposing a new feature or enhancement
+
+Use the **[Feature request]** issue form:
+
+```
+https://github.com/Ledger-Lenz/Ledgerlens-core/issues/new?template=feature_request.yml
+```
+
+The form asks for:
+
+| Field | Why it matters |
+|-------|----------------|
+| **Problem statement** | Grounds the feature in a concrete pain point rather than an abstract wish. |
+| **Proposed solution** | Gives maintainers enough detail to assess feasibility and spot conflicts with existing design. |
+| **Alternatives considered** | Shows you've thought through the trade-offs, which speeds up review. |
+| **Affected component** | Multi-select dropdown so the right maintainer is looped in early. |
+| **Cross-repo impact** | Flags whether `ledgerlens-api`, `ledgerlens-contracts`, or `ledgerlens-data` also need changes (see [Cross-repo changes](#cross-repo-changes)). |
+| **PR willingness** | Helps maintainers prioritise and match contributors to open work. |
+
+Check [ROADMAP.md](ROADMAP.md) before filing — your feature may already
+be tracked there.
 
 ---
 
