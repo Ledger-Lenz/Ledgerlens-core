@@ -142,6 +142,9 @@ nav:
   - OpenAPI: openapi.md
   - "Deployment & Operations":
     - CI Workflows: ci_workflows.md
+  - Migrations & Schema:
+    - Database Migrations: database_migrations.md
+    - Pydantic v2 Migration: pydantic_v2_migration.md
 
 extra:
   social:

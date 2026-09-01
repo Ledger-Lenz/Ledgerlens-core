@@ -155,7 +155,7 @@ PositiveDecimal = Annotated[Decimal, Field(gt=0)]
 - Performance benchmark: 1,000-object batch deserialisation < 50 ms
 
 ## Documentation Requirements
-- Add a `MIGRATION_NOTES.md` or inline comment block in `data_models.py` documenting the v1→v2 migration decisions (why strict mode was chosen for specific fields, why certain fields remain non-strict)
+- Add a `docs/pydantic_v2_migration.md` (formerly `MIGRATION_NOTES.md`) or inline comment block in `data_models.py` documenting the v1→v2 migration decisions (why strict mode was chosen for specific fields, why certain fields remain non-strict)
 - Update `requirements.txt` to pin `pydantic>=2.0,<3.0`
 - Add docstrings to each model class and each validator explaining the validation logic and any non-obvious Pydantic v2 behaviour
 
