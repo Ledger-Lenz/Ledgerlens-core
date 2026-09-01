@@ -396,9 +396,23 @@ ledgerlens-core/
 ├── api/
 │   └── main.py                       ← Local read-only FastAPI app serving RiskScores
 │
+├── sdk/                              ← TypeScript client SDK (@ledgerlens/sdk) — see sdk/README.md
+│
 └── tests/
     └── ...
 ```
+
+### Client SDKs
+
+Typed client libraries for the LedgerLens API live in this repo and cover the
+same REST surface in four languages:
+
+| Language | Package | Location | Docs |
+|----------|---------|----------|------|
+| TypeScript | `@ledgerlens/sdk` | [`sdk/`](sdk/) | [sdk/README.md](sdk/README.md) |
+| Python | `ledgerlens-sdk` | [`packages/ledgerlens-sdk/`](packages/ledgerlens-sdk/) | [packages/ledgerlens-sdk/README.md](packages/ledgerlens-sdk/README.md) |
+| Go | `github.com/Ledger-Lenz/Ledgerlens-core/go` | [`go/`](go/) | [go/README.md](go/README.md) |
+| Rust | `ledgerlens-sdk` | [`crates/ledgerlens-sdk/`](crates/ledgerlens-sdk/) | [crates/ledgerlens-sdk/README.md](crates/ledgerlens-sdk/README.md) |
 
 ## Quick Start
 
