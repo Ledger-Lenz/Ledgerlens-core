@@ -26,6 +26,10 @@ models/optuna_studies/
 # Runtime state / generated output
 horizon_cursor.txt
 drift_reports/
+reports/*.csv
+reports/*.txt
+reports/*.html
+reports/*.pdf
 
 # MkDocs build output
 site/
@@ -49,3 +53,10 @@ somzilla.md
 *.nbc
 
 .tools/
+.venv312/
+node_modules/
+.DS_Store
+
+# Machine-local development audit-chain signing secret, generated on first use
+# by storage/audit_log.py when LEDGERLENS_AUDIT_SECRET is unset. Never commit.
+.ledgerlens_audit_secret

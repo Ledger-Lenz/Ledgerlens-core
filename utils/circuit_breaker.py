@@ -62,7 +62,7 @@ class CircuitBreaker:
         recovery_timeout: float = 60.0,
         on_open: Callable[[], None] | None = None,
         on_close: Callable[[], None] | None = None,
-    ):
+    ) -> None:
         self.name = name
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout

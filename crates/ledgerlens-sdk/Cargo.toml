@@ -35,5 +35,8 @@ name = "soroban_integration"
 path = "examples/soroban_integration.rs"
 required-features = ["zk-verify"]
 
+[package.metadata]
+changelog = "CHANGELOG.md"
+
 [package.metadata.docs.rs]
 features = ["async", "zk-verify"]

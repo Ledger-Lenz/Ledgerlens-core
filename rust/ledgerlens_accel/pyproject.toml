@@ -1,0 +1,1 @@
+[build-system]\nrequires = ["maturin>=1.5,<2.0"]\nbuild-backend = "maturin"\n\n[project]\nname = "ledgerlens-accel"\nversion = "0.1.0"\nrequires-python = ">=3.10"\n\n[tool.maturin]\nmodule-name = "ledgerlens_accel"\nfeatures = ["pyo3/extension-module"]\n

@@ -26,15 +26,20 @@ Initializes the contract with:
 
 **Tested by:** `test.rs::test_double_initialization_fails`, `fuzz_auth_bypass`
 
-### `submit_with_quorum(env: Env, wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64, signatures: Vec<SignaturePair>) -> bool`
+### `submit_with_quorum(env, wallet, asset_pair, score, benford_flag, ml_flag, timestamp, confidence, model_version, signatures) -> bool`
 
-Verifies k-of-n signatures and returns `true` if quorum is reached.
+Verifies k-of-n signatures, invokes the configured `ledgerlens-score`
+contract, and returns `true` only after that invocation succeeds.
 
 **Parameters:**
 - `wallet` — the wallet being scored
-- `asset_pair` — trading pair symbol (e.g., `"XLM-USDC"`)
+- `asset_pair` — Soroban-compatible trading pair symbol (e.g., `"XLM_USDC"`)
 - `score` — risk score 0-100
+- `benford_flag` — whether Benford analysis flagged the score
+- `ml_flag` — whether the ML classifier flagged the score
 - `timestamp` — Unix timestamp of the score computation
+- `confidence` — model confidence 0-100
+- `model_version` — producing model version
 - `signatures` — vector of `SignaturePair { public_key, signature }`
 
 **Authorization:** No auth required (signature-based verification instead)
@@ -43,11 +48,16 @@ Verifies k-of-n signatures and returns `true` if quorum is reached.
 1. Reject timestamps older than 5 minutes (replay protection)
 2. Verify each signature against `canonical_message`
 3. Count only signatures from keys in `oracle_keys`
-4. Return `true` if `valid_count >= threshold`, else `false`
+4. Authorize the exact `ledgerlens-score.submit_score` sub-invocation as the
+   aggregator contract
+5. Invoke the current ten-argument ABI and return `true` only after persistence
 
-**Intentional Panics:** None (returns `false` on validation failure)
+**Intentional traps:** malformed signatures from authorized keys and any target
+contract error/trap. Target failures propagate so a quorum-approved score can
+never be reported as successful without being persisted.
 
-**Returns:** `true` if quorum reached, `false` otherwise
+**Returns:** `false` for stale/insufficient quorum, `true` after successful
+target invocation.
 
 **Tested by:** `test.rs::test_submit_with_quorum`, `test.rs::test_rejects_n_minus_1_signatures`, `fuzz_submit_with_quorum`
 
@@ -56,7 +66,11 @@ Verifies k-of-n signatures and returns `true` if quorum is reached.
 Constructs the canonical message that oracle nodes sign. Format:
 
 ```
-SHA-256("LedgerLens-Oracle-v1" || wallet || "|" || asset_pair || "|" || score_u32_be || timestamp_u64_be)
+SHA-256(
+  "LedgerLens-Oracle-v2" || wallet || "|" || asset_pair_scval_xdr || "|" ||
+  score_u32_be || benford_flag_u8 || ml_flag_u8 || timestamp_u64_be ||
+  confidence_u32_be || model_version_u32_be
+)
 ```
 
 This matches the Python `OracleNode._canonical_message` implementation exactly.
@@ -72,7 +86,10 @@ This matches the Python `OracleNode._canonical_message` implementation exactly.
 Oracle nodes construct the canonical message off-chain:
 
 ```python
-msg = sha256(b"LedgerLens-Oracle-v1" + wallet.encode() + b"|" + asset_pair.encode() + b"|" + score.to_bytes(4, 'big') + timestamp.to_bytes(8, 'big'))
+msg = OracleNode._canonical_message(
+    wallet, asset_pair, score, benford_flag, ml_flag,
+    timestamp, confidence, model_version,
+)
 signature = ed25519_sign(oracle_private_key, msg)
 ```
 
@@ -81,6 +98,16 @@ The contract then:
 2. Verifies each signature with `env.crypto().ed25519_verify(public_key, message, signature)`
 3. Counts valid signatures from authorized keys
 4. Accepts the score if count >= threshold
+5. Calls `ledgerlens-score.submit_score` with:
+   - `signers = [oracle_aggregator contract address]`
+   - all quorum-signed score fields
+   - `attestation_input = None`
+
+The destination contract must be initialized with the aggregator address as its
+service address. The aggregator uses Soroban `authorize_as_current_contract`
+for the exact nested invocation, so the destination's `require_auth` remains
+enforced. Its optional secp256k1 service-pubkey attestation must remain disabled
+for this service path because the Ed25519 oracle quorum is the attestation.
 
 ## Security Guarantees
 
@@ -104,10 +131,14 @@ The `initialize` function is protected by a "first-write wins" model — once in
 | Operation              | Condition                     | Behavior                                    | Test Coverage                            |
 | ---------------------- | ----------------------------- | ------------------------------------------- | ---------------------------------------- |
 | `initialize`           | Already initialized           | Panic: `"already initialized"`              | `test.rs`, `fuzz_auth_bypass`            |
+| `initialize`           | Threshold is zero             | Panic: `"threshold must be greater than zero"` | `test.rs`                              |
+| `initialize`           | Threshold exceeds oracle key count | Panic: `"threshold exceeds number of oracle keys"` | `test.rs`                          |
+| `canonical_message`     | Input string too large for buffer | Panic: `"string exceeds canonical message buffer"` | `test.rs`                          |
 | `submit_with_quorum`   | Timestamp too old             | Return `false`                              | `test.rs`                                |
 | `submit_with_quorum`   | Insufficient signatures       | Return `false`                              | `test.rs::test_rejects_n_minus_1_signatures` |
 | `submit_with_quorum`   | Forged signature              | Return `false`                              | `test.rs::test_rejects_forged_signature` |
 | `submit_with_quorum`   | Unknown oracle key            | Return `false`                              | `test.rs::test_rejects_unknown_oracle_key` |
+| `submit_with_quorum`   | Target contract rejects/traps  | Propagate trap; roll back atomically         | `test.rs::score_contract_error_traps_and_rolls_back_submission` |
 | `canonical_message`    | `u32::MAX`, `u64::MAX` inputs | Return bytes (no panic)                     | `test.rs::test_canonical_message_boundary_values`, `fuzz_canonical_message` |
 
 ## Arithmetic Overflow Safety
@@ -175,3 +206,7 @@ The contract is configured as `crate-type = ["cdylib", "rlib"]` so it can be bui
 - [LedgerLens Oracle Quorum design](../../docs/oracle_quorum.md)
 - [Contract fuzzing documentation](../../docs/contract_fuzzing.md)
 - [Soroban SDK documentation](https://soroban.stellar.org/docs/reference/sdk)
+
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md) for a history of changes to this contract.

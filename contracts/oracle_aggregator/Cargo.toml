@@ -53,9 +53,10 @@ testutils = ["soroban-sdk/testutils"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[[bin]]
-name = "oracle_aggregator"
-path = "src/lib.rs"
+# NOTE: there is deliberately no [[bin]] target. A Soroban contract has no
+# entry point, and pointing one at src/lib.rs made `cargo build` fail outright
+# with "`main` function not found", on top of cargo warning that src/lib.rs was
+# claimed by two build targets and running the test suite twice.
 
 [profile.release]
 overflow-checks = true

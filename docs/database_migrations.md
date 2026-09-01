@@ -2,6 +2,9 @@
 
 LedgerLens uses [Alembic](https://alembic.sqlalchemy.org/) for versioned, rollback-capable database migrations.
 
+For the contributor workflow, including creating manual revisions and safely
+selecting a development database, see [`alembic/README.md`](../alembic/README.md).
+
 ## Quick reference
 
 | Command | Effect |
@@ -87,3 +90,11 @@ Each migration script must include a correct `downgrade()` implementation — PR
 | `0001_initial_schema` | Full schema as of issue #168 |
 | `0002_scoring_events` | Event-sourced scoring audit log (Issue #297) |
 | `0003_case_assignments` | Analyst case management: `case_assignments` table and `analyst_feedback` verdicts table (Issue #200) |
+
+## Related: Pydantic v2 migration
+
+The Pydantic v2 migration of the ingestion data models (`ingestion/data_models.py`)
+required changes to model configuration and validators that are separate from the
+Alembic schema migrations above. See [docs/pydantic_v2_migration.md](pydantic_v2_migration.md)
+for the full migration notes: strict-mode decisions, `ConfigDict` settings,
+numeric validators, and field serialization behaviour.

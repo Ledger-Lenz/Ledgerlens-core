@@ -8,10 +8,15 @@
 #[cfg(any(test, feature = "testutils"))]
 extern crate std;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
+    contract, contractimpl, contracttype,
+    xdr::ToXdr,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 /// Domain separator. Must stay byte-identical to `detection/oracle_node.py`.
-const DOMAIN_SEPARATOR: &[u8] = b"LedgerLens-Oracle-v1";
+const DOMAIN_SEPARATOR: &[u8] = b"LedgerLens-Oracle-v2";
 
 /// Maximum accepted timestamp age, in seconds, before a submission is treated
 /// as a replay.
@@ -19,11 +24,6 @@ const MAX_TIMESTAMP_AGE_SECS: u64 = 300;
 
 /// A Stellar strkey-encoded address is always 56 ASCII characters.
 const ADDRESS_STRKEY_LEN: usize = 56;
-
-/// Upper bound on the `asset_pair` string accepted into the canonical message.
-/// Real pairs look like `"XLM/USDC"` or `"USDC:GABC…/XLM"`; 128 leaves headroom
-/// for a fully-qualified issuer on both legs.
-const MAX_ASSET_PAIR_LEN: usize = 128;
 
 #[contracttype]
 #[derive(Clone)]
@@ -39,10 +39,27 @@ pub struct OracleAggregator;
 impl OracleAggregator {
     /// Initialise with threshold k, list of n authorised oracle public keys, and the ledgerlens-score contract address.
     ///
-    /// Panics if called twice, or if `threshold` is zero or exceeds the number
-    /// of authorised keys — a quorum that cannot be met (or that any single
-    /// caller can meet with no signatures) is always a configuration error.
-    pub fn initialize(env: Env, threshold: u32, oracle_keys: Vec<BytesN<32>>, score_contract: Address) {
+    /// The `deployer` identity must authorise this call. Because (re)initialisation
+    /// is permanently blocked after the first success, whoever presents a valid
+    /// authorisation for `deployer` on the very first `initialize` call fixes the
+    /// trusted oracle key set and quorum threshold for the lifetime of the
+    /// contract. Front-running is mitigated by submitting deployment and this
+    /// authorised call as tightly coupled as operationally possible (see
+    /// `docs/oracle_quorum.md`).
+    ///
+    /// Panics if called twice, if `threshold` is zero or exceeds the number of
+    /// authorised keys, or if `deployer` does not authorise the call — a quorum
+    /// that cannot be met (or that any single caller can meet with no
+    /// signatures) is always a configuration error.
+    pub fn initialize(
+        env: Env,
+        deployer: Address,
+        threshold: u32,
+        oracle_keys: Vec<BytesN<32>>,
+        score_contract: Address,
+    ) {
+        deployer.require_auth();
+
         if env.storage().instance().has(&Symbol::new(&env, "THRESHOLD")) {
             panic!("already initialized");
         }
@@ -52,9 +69,21 @@ impl OracleAggregator {
         if threshold > oracle_keys.len() {
             panic!("threshold exceeds number of oracle keys");
         }
+        env.storage().instance().set(&Symbol::new(&env, "DEPLOYER"), &deployer);
         env.storage().instance().set(&Symbol::new(&env, "THRESHOLD"), &threshold);
         env.storage().instance().set(&Symbol::new(&env, "ORACLE_KEYS"), &oracle_keys);
         env.storage().instance().set(&Symbol::new(&env, "SCORE_CONTRACT"), &score_contract);
+    }
+
+    /// Return the `deployer` identity that authorised `initialize`.
+    ///
+    /// Lets operators verify, after deployment, which key controls the
+    /// one-time configuration authority for this contract instance.
+    pub fn get_deployer(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "DEPLOYER"))
+            .unwrap_or_else(|| panic!("not initialized"))
     }
 
     /// Verify k-of-n signatures and forward to ledgerlens-score contract.
@@ -77,12 +106,37 @@ impl OracleAggregator {
     /// Each authorised public key contributes **at most one** vote. Repeating a
     /// key (or replaying one oracle's signature n times) cannot manufacture a
     /// quorum.
+    ///
+    /// # ledgerlens-score ABI and authorization
+    ///
+    /// The target ABI is:
+    /// `submit_score(signers, wallet, asset_pair, score, benford_flag,
+    /// ml_flag, timestamp, confidence, model_version, attestation_input)`.
+    /// The aggregator derives `signers` as its own contract address and
+    /// authorizes that exact sub-invocation with
+    /// `authorize_as_current_contract`. Deployments must configure the
+    /// aggregator address as the target contract's service address.
+    ///
+    /// `attestation_input` is deliberately `None`: the Ed25519 oracle quorum
+    /// is the cryptographic attestation for this path. Consequently, the
+    /// target's optional secp256k1 service-pubkey attestation must not be
+    /// enabled for the aggregator service. If it is enabled, the target
+    /// rejects the call and this invocation traps.
+    ///
+    /// Target contract errors and traps are deliberately propagated. Returning
+    /// `false` after quorum would conflate "quorum rejected" with "approved but
+    /// not persisted"; trapping rolls back the outer invocation atomically.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_with_quorum(
         env: Env,
         wallet: Address,
-        asset_pair: String,
+        asset_pair: Symbol,
         score: u32,
+        benford_flag: bool,
+        ml_flag: bool,
         timestamp: u64,
+        confidence: u32,
+        model_version: u32,
         signatures: Vec<SignaturePair>,
     ) -> bool {
         // Replay protection: reject timestamps older than MAX_TIMESTAMP_AGE_SECS.
@@ -91,10 +145,28 @@ impl OracleAggregator {
             return false;
         }
 
-        let threshold: u32 = env.storage().instance().get(&Symbol::new(&env, "THRESHOLD")).unwrap();
-        let oracle_keys: Vec<BytesN<32>> = env.storage().instance().get(&Symbol::new(&env, "ORACLE_KEYS")).unwrap();
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "THRESHOLD"))
+            .unwrap();
+        let oracle_keys: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "ORACLE_KEYS"))
+            .unwrap();
 
-        let message = Self::build_canonical_message(&env, &wallet, &asset_pair, score, timestamp);
+        let message = Self::build_canonical_message(
+            &env,
+            &wallet,
+            &asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        );
 
         // Track which authorised keys have already been counted so a repeated
         // key cannot contribute more than one vote toward the quorum.
@@ -117,12 +189,46 @@ impl OracleAggregator {
             return false;
         }
 
-        // Forward to ledgerlens-score contract.
-        let _score_contract: Address = env.storage().instance().get(&Symbol::new(&env, "SCORE_CONTRACT")).unwrap();
+        let score_contract: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "SCORE_CONTRACT"))
+            .unwrap();
+        let function_name = Symbol::new(&env, "submit_score");
+        let service = env.current_contract_address();
+        let mut signers = Vec::new(&env);
+        signers.push_back(service);
 
-        // NOTE: the cross-contract call is not yet wired up. This function
-        // reports a satisfied quorum only; it does not yet persist the score.
-        // See `env.invoke_contract::<()>(&score_contract, &Symbol::new(&env, "submit_score"), …)`.
+        // `Option<T>::None` always encodes as SCV_VOID. `Bytes` supplies the
+        // otherwise-unobservable inner type without duplicating the target
+        // repository's evolving ScoreAttestationInput definitions here.
+        let no_attestation: Option<Bytes> = None;
+        let args: Vec<Val> = soroban_sdk::vec![
+            &env,
+            signers.into_val(&env),
+            wallet.into_val(&env),
+            asset_pair.into_val(&env),
+            score.into_val(&env),
+            benford_flag.into_val(&env),
+            ml_flag.into_val(&env),
+            timestamp.into_val(&env),
+            confidence.into_val(&env),
+            model_version.into_val(&env),
+            no_attestation.into_val(&env),
+        ];
+
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            &env,
+            InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: score_contract.clone(),
+                    fn_name: function_name.clone(),
+                    args: args.clone(),
+                },
+                sub_invocations: Vec::new(&env),
+            }),
+        ]);
+        env.invoke_contract::<()>(&score_contract, &function_name, args);
 
         true
     }
@@ -137,8 +243,29 @@ impl OracleAggregator {
     /// Takes owned arguments: `#[contractimpl]` cannot export a function whose
     /// parameters are references (`rustc` rejects it with "unsupported type"),
     /// which is why this was previously absent from the generated client.
-    pub fn canonical_message(env: Env, wallet: Address, asset_pair: String, score: u32, timestamp: u64) -> Bytes {
-        Self::build_canonical_message(&env, &wallet, &asset_pair, score, timestamp)
+    #[allow(clippy::too_many_arguments)]
+    pub fn canonical_message(
+        env: Env,
+        wallet: Address,
+        asset_pair: Symbol,
+        score: u32,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: u64,
+        confidence: u32,
+        model_version: u32,
+    ) -> Bytes {
+        Self::build_canonical_message(
+            &env,
+            &wallet,
+            &asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        )
     }
 }
 
@@ -151,21 +278,30 @@ impl OracleAggregator {
     ///
     /// ```text
     /// SHA-256(
-    ///     "LedgerLens-Oracle-v1"
+    ///     "LedgerLens-Oracle-v2"
     ///     || wallet_strkey_utf8
     ///     || "|"
-    ///     || asset_pair_utf8
+    ///     || asset_pair_scval_xdr
     ///     || "|"
     ///     || score  as u32 big-endian
+    ///     || benford_flag as u8
+    ///     || ml_flag as u8
     ///     || timestamp as u64 big-endian
+    ///     || confidence as u32 big-endian
+    ///     || model_version as u32 big-endian
     /// )
     /// ```
+    #[allow(clippy::too_many_arguments)]
     fn build_canonical_message(
         env: &Env,
         wallet: &Address,
-        asset_pair: &String,
+        asset_pair: &Symbol,
         score: u32,
+        benford_flag: bool,
+        ml_flag: bool,
         timestamp: u64,
+        confidence: u32,
+        model_version: u32,
     ) -> Bytes {
         let mut msg = Bytes::new(env);
         msg.append(&Bytes::from_slice(env, DOMAIN_SEPARATOR));
@@ -175,12 +311,15 @@ impl OracleAggregator {
 
         msg.append(&Bytes::from_slice(env, b"|"));
 
-        let mut pair_buf = [0u8; MAX_ASSET_PAIR_LEN];
-        Self::append_string(env, &mut msg, asset_pair, &mut pair_buf);
+        msg.append(&asset_pair.clone().to_xdr(env));
 
         msg.append(&Bytes::from_slice(env, b"|"));
         msg.append(&Bytes::from_slice(env, &score.to_be_bytes()));
+        msg.append(&Bytes::from_slice(env, &[benford_flag as u8]));
+        msg.append(&Bytes::from_slice(env, &[ml_flag as u8]));
         msg.append(&Bytes::from_slice(env, &timestamp.to_be_bytes()));
+        msg.append(&Bytes::from_slice(env, &confidence.to_be_bytes()));
+        msg.append(&Bytes::from_slice(env, &model_version.to_be_bytes()));
 
         env.crypto().sha256(&msg).into()
     }

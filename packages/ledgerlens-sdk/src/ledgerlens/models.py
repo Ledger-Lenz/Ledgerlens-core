@@ -27,6 +27,9 @@ class RiskScore(BaseModel):
     disputed: bool = False
     timestamp: datetime
 
+    # Streaming latency field (optional, populated on the streaming path)
+    latency_ms: float | None = None
+
     score_lower: float | None = None
     score_upper: float | None = None
     prediction_set: list[int] | None = None

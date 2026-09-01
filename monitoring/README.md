@@ -25,6 +25,7 @@ These rules join Kubernetes resource metrics (kube-state-metrics, cadvisor) with
 ### Grafana Dashboards
 
 - **grafana/cost_capacity_dashboard.json** — Cost visibility and capacity planning dashboard
+- **grafana/core_detection_dashboard.json** — Core detection throughput, API request latency (p50/p95/p99), and Horizon ingestion throughput. Panels are built on the metrics already referenced by `alerts.yml` and `recording_rules.yml` (`ledgerlens_api_request_duration_seconds`, `ledgerlens_scoring_latency_seconds`, `ledgerlens_wallets_scored_total`, `ledgerlens_pipeline_run_duration_seconds`, `ledgerlens_ingestion_events_*`). Auto-loads at `/d/ledgerlens-core-detection`.
 - **grafana/provisioning/dashboards/ledgerlens.yaml** — Dashboard provisioning config
 
 ## Quick Start
@@ -88,11 +89,17 @@ Cost coefficients are exposed as Prometheus gauges at `GET /metrics` and referen
 # On Grafana server
 sudo mkdir -p /var/lib/grafana/dashboards/ledgerlens
 sudo cp grafana/cost_capacity_dashboard.json /var/lib/grafana/dashboards/ledgerlens/
+sudo cp grafana/core_detection_dashboard.json /var/lib/grafana/dashboards/ledgerlens/
 sudo cp grafana/provisioning/dashboards/ledgerlens.yaml /etc/grafana/provisioning/dashboards/
 sudo systemctl restart grafana-server
 ```
 
-Dashboard auto-loads at `/d/ledgerlens-cost-capacity`.
+The provisioning provider loads every `*.json` file in
+`/var/lib/grafana/dashboards/ledgerlens`, so no config change is needed when
+adding a dashboard — just drop the JSON in that directory.
+
+Dashboards auto-load at `/d/ledgerlens-cost-capacity` and
+`/d/ledgerlens-core-detection`.
 
 ## Validation
 
@@ -112,6 +119,7 @@ promtool check rules monitoring/alerts.yml
 
 # Validate Grafana dashboard JSON
 jq empty monitoring/grafana/cost_capacity_dashboard.json
+jq empty monitoring/grafana/core_detection_dashboard.json
 ```
 
 CI automatically validates rules on every PR (see `.github/workflows/cost-monitoring-validation.yml`).

@@ -1,0 +1,33 @@
+LedgerLens has been deployed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+1. Check that the deployment is healthy:
+
+   kubectl get pods -n {{ .Release.Namespace }} -l "app.kubernetes.io/instance={{ .Release.Name }}"
+
+   All pods should reach Running/Ready. To watch rollout status directly:
+
+   kubectl rollout status deployment/{{ include "ledgerlens.fullname" . }}-api -n {{ .Release.Namespace }}
+{{- if .Values.ingestionWorker.enabled }}
+   kubectl rollout status deployment/{{ include "ledgerlens.fullname" . }}-ingestion-worker -n {{ .Release.Namespace }}
+{{- end }}
+
+2. Access the API:
+
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+   http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}{{ (index .paths 0).path }}
+{{- end }}
+{{- else }}
+   The API is not exposed via Ingress (ingress.enabled=false). Access it from
+   within the cluster at:
+
+   {{ include "ledgerlens.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+   Or port-forward it to your machine:
+
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "ledgerlens.fullname" . }} 8000:{{ .Values.service.port }}
+{{- end }}
+
+3. Check API health:
+
+   curl http://localhost:8000/health

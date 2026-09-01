@@ -1,3 +1,16 @@
+{{- /*
+Pre-existing bug fixed here (Grand 5 / #702): the PromQL `service="..."`
+label match below used backslash-escaped quotes (`\"ledgerlens.fullname\"`)
+around the nested `include` call. `\"` has no meaning inside a Go template
+action (`{{ }}`) — it isn't a string embedded in an outer quoted literal
+here, it's raw template source — so the parser choked on the bare `\`
+rather than the escaping doing anything useful. Same fix applies to the
+error-rate query below, which has no such interpolation and was already
+correct as a point of comparison. This is why fixing api-rollout.yaml's
+syntax errors was necessary but not sufficient to get `helm template` to
+render at all: Helm aborts on the *first* template parse error across the
+whole chart, so this file's bug was masked by that one until it was fixed.
+*/}}
 apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
 metadata:
@@ -13,7 +26,7 @@ spec:
         prometheus:
           address: {{ .Values.canary.prometheusUrl }}
           query: |
-            histogram_quantile(0.95, rate(ledgerlens_api_request_duration_seconds_bucket{service="{{ include \"ledgerlens.fullname\" . }}"}[5m]))
+            histogram_quantile(0.95, rate(ledgerlens_api_request_duration_seconds_bucket{service="{{ include "ledgerlens.fullname" . }}"}[5m]))
     - name: error-rate
       interval: 1m
       successCondition: result < {{ .Values.canary.analysis.errorRateThreshold }}

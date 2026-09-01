@@ -1,0 +1,173 @@
+name: "\U0001F680 Feature request"
+description: >
+  Propose a new feature or a meaningful enhancement to an existing one.
+  A well-scoped proposal gets to implementation faster — please fill in
+  all required fields before submitting.
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to write a feature proposal. Before you submit:
+        - Check the [ROADMAP.md](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/ROADMAP.md) — the feature may already be planned.
+        - Search [existing issues](https://github.com/Ledger-Lenz/Ledgerlens-core/issues?q=is%3Aissue+label%3Aenhancement) for similar proposals.
+        - For security-sensitive features (new auth flows, cryptography changes, on-chain contract changes), describe the threat model impact — see [`docs/threat_model.md`](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/docs/threat_model.md).
+
+  # ── 1. Problem statement ────────────────────────────────────────────────────
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: >
+        Describe the concrete problem this feature solves. Be specific:
+        who is affected, how often, and what the current workaround (if
+        any) looks like.
+      placeholder: |
+        e.g. When ingesting high-volume asset pairs (>500k trades/day),
+        `detection/benford_engine.py` recomputes all rolling windows
+        from scratch on every pipeline run. This makes the 24h window
+        take ~40 s for a single asset pair, which is the main bottleneck
+        in the scoring pipeline.
+    validations:
+      required: true
+
+  # ── 2. Proposed solution ────────────────────────────────────────────────────
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: >
+        Describe your proposed approach. Be as specific as you can about
+        the interface, data structures, configuration, or API changes
+        involved. Pseudocode, diagrams, or links to prior art are welcome.
+      placeholder: |
+        Add an incremental Benford counter (`detection/benford_stream_counter.py`)
+        that maintains a running digit-frequency histogram per asset pair and
+        emits updated chi-square / Z-score / MAD values after each new trade,
+        rather than re-scanning the full window. The counter state would be
+        persisted to SQLite so it survives process restarts.
+    validations:
+      required: true
+
+  # ── 3. Alternatives considered ──────────────────────────────────────────────
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        What other approaches did you evaluate, and why did you rule them
+        out? This helps maintainers understand the trade-offs.
+      placeholder: |
+        - Caching the full window in Redis: adds an infrastructure
+          dependency that many local deployments don't have.
+        - Sampling trades before computing Benford: reduces accuracy on
+          small datasets where sampling variance is high.
+    validations:
+      required: true
+
+  # ── 4. Affected component ───────────────────────────────────────────────────
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Which area of the codebase would this feature touch?
+      multiple: true
+      options:
+        - "ingestion — Horizon streamer / historical loader / operations loader"
+        - "ingestion — EVM / Solana / bridge / AMM loaders"
+        - "ingestion — filters, dedup, or rate-limiting"
+        - "ingestion — data models (Pydantic schemas)"
+        - "detection — Benford engine"
+        - "detection — graph engine (SCC / wash-ring detection)"
+        - "detection — feature engineering"
+        - "detection — model training / inference"
+        - "detection — SHAP / causal engine"
+        - "detection — GNN ring detector"
+        - "detection — temporal model"
+        - "detection — federated learning"
+        - "detection — drift monitor / retrain pipeline"
+        - "detection — Soroban publisher / on-chain submission"
+        - "detection — webhook registry / worker"
+        - "detection — governance / dispute store"
+        - "detection — ZK prover / verifier"
+        - "api — FastAPI routes / gateway / auth"
+        - "api — gRPC scoring service"
+        - "api — WebSocket / streaming router"
+        - "api — admin / analyst / audit routers"
+        - "contracts — oracle aggregator (Rust/Soroban)"
+        - "contracts — ZK verifier (Rust/Soroban)"
+        - "sdk — Python SDK (packages/ledgerlens-sdk)"
+        - "sdk — TypeScript SDK (sdk/)"
+        - "sdk — Go SDK (go/)"
+        - "sdk — Rust crate (crates/ledgerlens-sdk)"
+        - "config / settings / environment variables"
+        - "CLI (cli.py)"
+        - "pipeline entry point (run_pipeline.py)"
+        - "storage / SQLite / Alembic migrations"
+        - "observability — metrics / tracing / logging"
+        - "CI / CD / workflows"
+        - "documentation"
+        - "other / cross-cutting"
+    validations:
+      required: true
+
+  # ── 5. Cross-repo impact ─────────────────────────────────────────────────────
+  - type: checkboxes
+    id: cross_repo
+    attributes:
+      label: Cross-repo impact
+      description: >
+        LedgerLens is a multi-repo project. Does this change affect shared
+        contracts that must be kept in sync across repos?
+        See the "Shared Contracts" section in
+        [README.md](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md#shared-contracts-must-stay-in-sync-across-repos).
+      options:
+        - label: "`RiskScore` schema (`detection/risk_score.py`) — also affects `ledgerlens-api` and `ledgerlens-contracts`"
+        - label: "`Trade` / `Asset` / `OrderBookEvent` schemas (`ingestion/data_models.py`) — also affects `ledgerlens-data`"
+        - label: "Environment variables / `.env.example` — also affects other repos that share the same keys"
+        - label: "Soroban contract interface (`submit_score` / `get_score`) — also affects `ledgerlens-contracts` and `ledgerlens-api`"
+        - label: "No cross-repo impact — change is entirely within `ledgerlens-core`"
+
+  # ── 6. PR willingness ───────────────────────────────────────────────────────
+  - type: dropdown
+    id: pr_willingness
+    attributes:
+      label: Are you willing to submit a PR?
+      description: >
+        You are not obligated to implement the feature yourself, but
+        knowing your capacity helps maintainers prioritise.
+      options:
+        - "Yes — I'd like to implement this and will open a PR."
+        - "Yes — I can implement part of it and would welcome collaboration."
+        - "No — I'm proposing the idea but cannot implement it at this time."
+        - "Unsure"
+    validations:
+      required: true
+
+  # ── 7. Additional context ───────────────────────────────────────────────────
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: >
+        Links to related issues, academic papers, prior art in other
+        projects, benchmarks, or any other context that helps scope
+        the request.
+    validations:
+      required: false
+
+  # ── 8. Checklist ────────────────────────────────────────────────────────────
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I checked ROADMAP.md and this feature is not already planned.
+          required: true
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I have described both the problem and a proposed solution (not just the desired end state).
+          required: true

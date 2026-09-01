@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import pandas as pd
 
 from config.settings import get_runtime_risk_score_threshold, settings
@@ -169,7 +169,7 @@ def _maybe_flush_feature_store_to_cold() -> None:
             logger.warning(f"Failed to flush feature store to cold storage: {e}")
 
 
-def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict) -> None:
+def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict[str, Any]) -> None:
     temporal_model = models.get("temporal_lstm")
     if temporal_model is None:
         return
@@ -201,18 +201,44 @@ def run(
 ) -> list[RiskScore]:
     """Run one scoring pass over the given asset pairs and return the resulting scores.
 
-    `asset_pairs` is a list of `(base_asset, counter_asset)` tuples in
-    `CODE:ISSUER` form (None for native XLM). Defaults to a single
-    XLM/USDC pair for local testing.
+    This is the main entry point for the detection pipeline. See
+    `README.md` for a high-level architecture overview; the stages
+    performed here, in order, are:
 
-    When `multi_pair=True`, trades for all pairs are loaded upfront and
-    cross-asset correlation analysis is performed once across all pairs.
-    The resulting cross-pair features are included in each account's
-    feature vector.
+    1. Load trade history (and, when configured, merge in Solana SPL
+       swap trades) for each asset pair, plus order book events and
+       path payments.
+    2. Build a transaction graph and detect wash-trading rings and
+       circular/path-payment routes.
+    3. Build a per-account feature vector and score it with the trained
+       models (optionally including GNN wash-ring probabilities and
+       conformal-prediction uncertainty intervals).
+    4. Persist scores, rings, feature vectors, and SHAP explanations,
+       and record features for drift detection.
+    5. Enqueue webhook alerts for matching subscribers.
+    6. Submit high-risk scores on-chain to the Soroban contract.
 
-    When ``use_uncertainty=True`` (default), loads calibration artifacts
-    and includes conformal prediction intervals in the returned scores.
-    Falls back silently if no calibration artifacts are found.
+    Parameters:
+        asset_pairs: list of `(base_asset, counter_asset)` tuples in
+            `CODE:ISSUER` form (None for native XLM). Defaults to a
+            single XLM/USDC pair for local testing.
+        multi_pair: when True, trades for all pairs are loaded upfront
+            and cross-asset correlation analysis is performed once
+            across all pairs. The resulting cross-pair features are
+            included in each account's feature vector.
+        no_submit: when True, skips step 6 (on-chain submission) even
+            if a Soroban contract is configured.
+        use_uncertainty: when True (default), loads calibration
+            artifacts and includes conformal prediction intervals in
+            the returned scores. Falls back silently if no calibration
+            artifacts are found.
+
+    Side effects: performs network calls (Stellar/Soroban RPC, and
+    Solana RPC if configured), writes to the database (scores, rings,
+    feature vectors, SHAP values, path payments/cycles), publishes to
+    the event bus, enqueues webhook alerts, and — unless `no_submit`
+    is set — submits transactions on-chain for scores at or above the
+    risk threshold.
     """
     # Assign a fresh correlation ID for this pipeline pass
     set_correlation_id(str(uuid.uuid4()))
@@ -691,11 +717,11 @@ def run_streaming(
 
 def _flush_streaming_buffer(
     buffer: list[Trade],
-    models: dict,
+    models: dict[str, Any],
     pair_key: str,
     asset_pair: tuple[str | None, str | None],
     cursor: str,
-    calibrators: dict | None = None,
+    calibrators: dict[str, Any] | None = None,
 ) -> None:
     """Score all accounts in *buffer* and persist results + cursor."""
     if not buffer:

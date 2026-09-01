@@ -139,6 +139,8 @@ class Settings(BaseSettings):
 
     # ── Detection ─────────────────────────────────────────────────────────────
     benford_mad_threshold: float = 0.015
+    benford_rust_accel_enabled: bool = True
+    graph_rust_accel_enabled: bool = True
     risk_score_threshold: int = 70
     committee_quorum: int = 3
     committee_vote_deadline_days: int = 14
@@ -176,17 +178,6 @@ class Settings(BaseSettings):
     openlineage_namespace: str = "ledgerlens-core"
     lineage_queue_maxsize: int = 1000
 
-    # ── Cost coefficients (used by Prometheus cost gauges) ────────────────────
-    # Operator-configurable cost coefficients for capacity planning.
-    # All values must be non-negative; validated by `non_negative_cost`.
-    cost_per_vcpu_hour_usd: float = 0.048
-    cost_per_gb_memory_hour_usd: float = 0.006
-    cost_per_gb_storage_month_usd: float = 0.023
-
-    # ── Capacity projection (used by capacity planning CLI) ───────────────────
-    # Both values must be >= 1 day; validated by `positive_capacity_days`.
-    capacity_projection_window_days: int = 30
-    capacity_projection_lead_time_days: int = 7
 
     # ── Event Bus (RiskScore Handoff) ─────────────────────────────────────────
     event_bus_backend: str = "none"  # none | kafka | nats
@@ -338,13 +329,6 @@ class Settings(BaseSettings):
     gateway_quota_store: str = "redis"
     gateway_log_body: bool = False
 
-    # ── Cost & capacity monitoring ────────────────────────────────────────────
-    # See COST_CAPACITY_IMPLEMENTATION.md and config/cost_exporter.py for usage.
-    cost_per_vcpu_hour_usd: float = 0.0416
-    cost_per_gb_memory_hour_usd: float = 0.0056
-    cost_per_gb_storage_month_usd: float = 0.10
-    capacity_projection_window_days: int = 7
-    capacity_projection_lead_time_days: int = 14
 
     # ── Performance monitoring ────────────────────────────────────────────────
     performance_min_feedback_samples: int = 20

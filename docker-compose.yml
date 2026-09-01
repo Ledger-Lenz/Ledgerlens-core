@@ -5,9 +5,32 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    depends_on:
+      - redis
     volumes:
       - ./models:/app/models
+      # Bind mount of a single SQLite file. This file is NOT created automatically —
+      # run `python cli.py db-migrate` (or `python cli.py train`) on the host before
+      # the first `docker compose up`, or the container will fail to start because
+      # the mount source doesn't exist.
       - ./ledgerlens.db:/app/ledgerlens.db
+    # Mirrors the HEALTHCHECK instruction baked into the Dockerfile so that
+    # `docker compose up --wait` and any `depends_on: { api: { condition:
+    # service_healthy } }` block until the API is actually serving traffic on
+    # /health, not merely until the container process has started.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      # 30s cadence keeps steady-state polling cheap.
+      interval: 30s
+      # /health is a cheap in-process check; 10s is ample and matches the image.
+      timeout: 10s
+      # 3 consecutive failures (~90s at steady state) before the container is
+      # marked unhealthy — tolerates a transient blip without flapping.
+      retries: 3
+      # Failures during the first 15s (model load + Uvicorn bind) don't count
+      # against `retries` and don't mark the container unhealthy. Matches the
+      # Dockerfile's --start-period; raise it if you mount a large model dir.
+      start_period: 15s
 
   # ── Observability (dev profile) ──────────────────────────────────────────
   # docker compose --profile dev up

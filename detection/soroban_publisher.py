@@ -452,10 +452,14 @@ class SorobanPublisher:
         wallet: str,
         asset_pair: str,
         score: int,
+        benford_flag: bool,
+        ml_flag: bool,
         timestamp: int,
+        confidence: int,
+        model_version: int,
         quorum: QuorumSignature,
     ) -> bool:
-        """Submit a multi-signature quorum for on-chain verification."""
+        """Submit the quorum-bound ledgerlens-score payload for verification."""
         try:
             self._check_circuit()
         except SorobanCircuitOpenError:
@@ -481,15 +485,16 @@ class SorobanPublisher:
 
             params = [
                 scval.to_address(wallet),
-                # `asset_pair` must be an SCV_STRING, not an SCV_SYMBOL: real
-                # pairs ("XLM/USDC", "USDC:GABC…/XLM") contain characters
-                # outside the Symbol charset [a-zA-Z0-9_] and can exceed its
-                # 32-character limit. The Python SDK does not validate this, so
-                # a Symbol here is accepted locally and rejected by the host at
-                # simulation time.
-                scval.to_string(asset_pair),
-                scval.to_uint32(max(0, min(100, score))),
+                # The official ledgerlens-score ABI uses Symbol. OracleNode
+                # validates the same charset/length before any signature is
+                # produced, so this cannot silently rewrite a signed pair.
+                scval.to_symbol(asset_pair),
+                scval.to_uint32(score),
+                scval.to_bool(benford_flag),
+                scval.to_bool(ml_flag),
                 scval.to_uint64(timestamp),
+                scval.to_uint32(confidence),
+                scval.to_uint32(model_version),
                 scval.to_vec(sig_pairs),
             ]
 

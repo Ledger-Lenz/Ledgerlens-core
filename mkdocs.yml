@@ -61,6 +61,9 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - FAQ: faq.md
+  - Troubleshooting: troubleshooting.md
+  - Glossary: glossary.md
   - Architecture:
     - Ingestion: ingestion.md
     - Feature Store: feature_store.md
@@ -70,12 +73,83 @@ nav:
     - Uncertainty Quantification: uncertainty_quantification.md
     - Governance Protocol: governance_protocol.md
     - Oracle Network: oracle_network.md
+  - Cryptography & Contracts:
+    - Zero-Knowledge Proofs: zk_proofs.md
+    - ZK-SNARK Range Proof: zk_snark_range_proof.md
+    - ZK Verifier Gas: zk_verifier_gas.md
+    - Contract Fuzzing: contract_fuzzing.md
+    - Byzantine Resilience: byzantine_resilience.md
+    - Oracle Quorum: oracle_quorum.md
+    - Soroban Operations: soroban_operations.md
+  - Observability & Performance:
+    - Observability: observability.md
+    - Performance: performance.md
+    - Performance Monitoring: performance_monitoring.md
+    - SLOs: slo.md
+    - Metrics: metrics.md
+    - Drift Monitor: drift_monitor.md
+    - Cost and Capacity: cost_and_capacity.md
+  - ML & Detection:
+    - GNN Ring Detection: gnn_ring_detection.md
+    - Temporal Analysis: temporal_analysis.md
+    - Temporal Model: temporal_model.md
+    - Benford Analysis: benford_analysis.md
+    - Benford Stratification: benford_stratification.md
+    - Causal Inference: causal_inference.md
+    - SHAP Explanation: shap_explanation.md
   - API Reference:
     - REST API: api_reference.md
     - Detection Engine: api/detection.md
     - Ingestion: api/ingestion.md
     - API Module: api/api.md
+    - Additional API Docs:
+      - Streaming API: streaming_api.md
+      - Streaming Scorer: streaming_scorer.md
+      - gRPC Scoring: grpc_scoring.md
+      - API Gateway: api_gateway.md
+      - API Versioning: api_versioning.md
+      - Vector Similarity Search: vector_similarity_search.md
+      - WAF and Rate Limiting: waf_and_rate_limiting.md
+      - Client-Binding Strategy: client_binding_strategy.md
+  - Deployment & Operations:
+    - Kubernetes Deployment: kubernetes_deployment.md
+    - Engineering Roadmap: engineering_roadmap.md
+    - Executable Architecture: executable_architecture.md
+    - Dependency Policy: dependency_policy.md
+    - Testing Guide: testing_guide.md
+    - CLI Reference: cli_reference.md
+  - Data & Lineage:
+    - Database Schema: database_schema.md
+    - Database Migrations: database_migrations.md
+    - Lineage Tracking: lineage.md
+    - Event Bus: event_bus.md
+    - Feature Store Archival: feature_store_archival.md
+    - Ensemble Stacking: ensemble_stacking.md
+    - Hyperparameter Optimization: hyperparameter_optimization.md
+  - Federation & Reference:
+    - Federation Integration: federation_integration.md
+    - Active Learning: active_learning.md
+    - Adversarial Testing: adversarial_testing.md
+    - Filter Pipeline: filter-pipeline.md
+    - Model Cards: model_cards.md
+    - Cost & Capacity Quick Reference: COST_CAPACITY_QUICK_REFERENCE.md
+    - Upgrading Cost & Capacity: UPGRADE_COST_CAPACITY.md
+  - Security & Compliance:
+    - Threat Model: threat_model.md
+    - Webhook Security Model: webhook_security_model.md
+    - Secret Rotation: secret_rotation.md
+    - Audit Log: audit_log.md
+    - Compliance Export: compliance_export.md
+    - Case Management: case_management.md
+    - Model Signing: model_signing.md
+  - Testing:
+    - Toxiproxy & Chaos Testing: toxiproxy.md
   - OpenAPI: openapi.md
+  - "Deployment & Operations":
+    - CI Workflows: ci_workflows.md
+  - Migrations & Schema:
+    - Database Migrations: database_migrations.md
+    - Pydantic v2 Migration: pydantic_v2_migration.md
 
 extra:
   social:

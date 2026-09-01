@@ -1,5 +1,15 @@
 pragma circom 2.1.0;
 
+// Precomputed powers-of-2 multiples of two independent BN254 G1 generator
+// points, G and H, used by circuits/score_range_proof.circom to build a
+// Pedersen commitment C = score*G + blinding*H via double-and-add over the
+// bit decomposition of `score` and `blinding` (see Bn254CondAdd there).
+// G and H must be independent (no known discrete-log relation between them)
+// for the Pedersen commitment to be computationally binding.
+
+// get_G_pow2_x/y(i) returns the x/y coordinate of 2^i * G, for i = 0..6.
+// Only 7 entries are needed because `score` is range-checked to 7 bits
+// (ScoreRangeProof(maxScore) assumes maxScore fits in 7 bits, i.e. <= 127).
 function get_G_pow2_x(i) {
     var x[7] = [
         1,
@@ -13,6 +23,7 @@ function get_G_pow2_x(i) {
     return x[i];
 }
 
+// y-coordinate counterpart of get_G_pow2_x(i), same 2^i * G, i = 0..6.
 function get_G_pow2_y(i) {
     var y[7] = [
         2,
@@ -26,6 +37,10 @@ function get_G_pow2_y(i) {
     return y[i];
 }
 
+// get_H_pow2_x/y(i) returns the x/y coordinate of 2^i * H, for i = 0..253.
+// 254 entries cover the full blinding factor width (Num2Bits(254) in
+// score_range_proof.circom), matching the BN254 scalar field size so any
+// field element can be used as a blinding factor.
 function get_H_pow2_x(i) {
     var x[254] = [
         14061978860853272386573630626865792048169500487673017990666300226863726962914,
@@ -286,6 +301,7 @@ function get_H_pow2_x(i) {
     return x[i];
 }
 
+// y-coordinate counterpart of get_H_pow2_x(i), same 2^i * H, i = 0..253.
 function get_H_pow2_y(i) {
     var y[254] = [
         14834675640681478622832622145478774624666240558736371690983741048123668897720,

@@ -191,6 +191,74 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --check
 
+  # ── Soroban contracts ─────────────────────────────────────────────────────
+  # Builds and tests contracts/oracle_aggregator and contracts/zk_verifier on
+  # every push and pull request. The `fuzz` job below is the only other
+  # workflow that touches these crates and it is gated on `pull_request`, so
+  # before this job existed a direct push to main never compiled the two
+  # contracts this project actually deploys, and their src/test.rs suites were
+  # never executed by any always-on job.
+  #
+  # `--features <crate>/testutils` is required for the test build: both crates
+  # gate `extern crate std` on `any(test, feature = "testutils")`, and when
+  # dev-dependencies pull in soroban-sdk/testutils the `#[contracttype]` derive
+  # emits Arbitrary impls that reference std from the *lib* target, where the
+  # `test` cfg is not set. See the passthrough `[features]` block in each
+  # crate's Cargo.toml.
+  contracts:
+    name: Soroban contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          target: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: contracts-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo build (native)
+        run: cargo build -p oracle_aggregator -p ledgerlens-zk-verifier
+
+      - name: cargo build (wasm32-unknown-unknown, release)
+        run: >
+          cargo build --target wasm32-unknown-unknown --release --lib
+          -p oracle_aggregator -p ledgerlens-zk-verifier
+
+      - name: cargo test
+        run: >
+          cargo test -p oracle_aggregator -p ledgerlens-zk-verifier
+          --features oracle_aggregator/testutils,ledgerlens-zk-verifier/testutils
+
+      # Both crates carry pre-existing lint and formatting debt that predates
+      # this job (mainly the partially-wired BN254 primitives in
+      # contracts/zk_verifier/src/pairing.rs). These two steps report that debt
+      # without failing the build; flip them to blocking — dropping
+      # `continue-on-error` — once the backlog is cleared, so the contracts
+      # match the strictness the rust-sdk job already enforces.
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: >
+          cargo clippy -p oracle_aggregator -p ledgerlens-zk-verifier --all-targets
+          --features oracle_aggregator/testutils,ledgerlens-zk-verifier/testutils
+          -- -D warnings
+
+      - name: cargo fmt (advisory)
+        continue-on-error: true
+        run: cargo fmt -p oracle_aggregator -p ledgerlens-zk-verifier -- --check
+
   # ── Contract fuzz (PR smoke) ──────────────────────────────────────────────
   fuzz:
     name: Contract fuzz (PR smoke)

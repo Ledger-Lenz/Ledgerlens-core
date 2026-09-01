@@ -48,10 +48,22 @@ from detection.soroban_publisher import SorobanPublisher
 logger = logging.getLogger("ledgerlens.contract_client")
 
 
+class UncertaintyBoundsUnsupportedError(RuntimeError):
+    """Raised when uncertainty bounds cannot actually be written on-chain.
+
+    The contract-side ``submit_score_with_uncertainty`` (see module docstring)
+    is not deployed yet. Raising is deliberate: the alternative -- quietly
+    submitting a plain ``submit_score`` and logging as though the bounds were
+    persisted -- makes the logs assert something about on-chain state that is
+    not true.
+    """
+
+
 def submit_score_with_uncertainty(
     publisher: SorobanPublisher,
     risk_score: RiskScore,
     dry_run: bool = False,
+    allow_downgrade: bool = False,
 ) -> str | None:
     """Submit a risk score with conformal prediction uncertainty bounds.
 
@@ -64,6 +76,10 @@ def submit_score_with_uncertainty(
         and optional uncertainty fields (``score_lower``, ``score_upper``).
     dry_run:
         If True, log the submission but do not send it on-chain.
+    allow_downgrade:
+        Accept a plain ``submit_score`` that drops ``score_lower``/
+        ``score_upper`` while the contract-side function is unavailable. The
+        downgrade is logged at WARNING, naming the bounds that were dropped.
 
     Returns
     -------
@@ -75,6 +91,9 @@ def submit_score_with_uncertainty(
         On unrecoverable submission failure.
     SorobanCircuitOpenError
         When the circuit breaker is open.
+    UncertaintyBoundsUnsupportedError
+        When the contract cannot store uncertainty bounds and the caller has
+        not opted into a downgraded submission via ``allow_downgrade``.
     """
     score_lower = risk_score.score_lower if risk_score.score_lower is not None else 0.0
     score_upper = risk_score.score_upper if risk_score.score_upper is not None else 100.0
@@ -95,18 +114,32 @@ def submit_score_with_uncertainty(
         )
         return None
 
-    # The actual Soroban ``submit_score_with_uncertainty`` function invocation
-    # requires a contract PR (see module docstring). For now we fall back to
-    # the standard ``submit_score`` with uncertainty fields logged locally.
+    # The contract-side ``submit_score_with_uncertainty`` does not exist yet
+    # (see module docstring). Until it does, this function cannot do what its
+    # name says, so it refuses rather than silently downgrading to plain
+    # ``submit_score`` and logging "Submitted score_with_uncertainty ...
+    # lower=%d upper=%d" for bounds that never left the process.
+    #
+    # Callers that genuinely want the score persisted without its bounds must
+    # say so with ``allow_downgrade=True``, which logs what actually happened.
+    if not allow_downgrade:
+        raise UncertaintyBoundsUnsupportedError(
+            "submit_score_with_uncertainty requires the contract-side "
+            "submit_score_with_uncertainty function, which is not yet deployed. "
+            "Call publisher.submit_score() directly, or pass allow_downgrade=True "
+            "to accept a submission that drops score_lower/score_upper."
+        )
+
     tx_hash = publisher.submit_score(risk_score, dry_run=dry_run)
-    logger.info(
-        "Submitted score_with_uncertainty: wallet=%s pair=%s "
-        "score=%d lower=%d upper=%d tx_hash=%s",
+    logger.warning(
+        "Submitted score WITHOUT uncertainty bounds (contract support missing): "
+        "wallet=%s pair=%s score=%d tx_hash=%s; "
+        "lower=%d upper=%d were NOT persisted on-chain",
         risk_score.wallet,
         risk_score.asset_pair,
         risk_score.score,
+        tx_hash,
         score_lower_scaled,
         score_upper_scaled,
-        tx_hash,
     )
     return tx_hash

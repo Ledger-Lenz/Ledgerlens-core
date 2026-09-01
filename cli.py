@@ -159,9 +159,16 @@ def train(
     from detection.model_training import save_models, train_ensemble
     from ingestion.synthetic_data import generate_synthetic_dataset
 
+    logger.info(
+        "Generating synthetic dataset (%d normal accounts, %d wash rings of size %d)...",
+        n_normal_accounts,
+        n_wash_rings,
+        ring_size,
+    )
     trades, account_metadata, events, labels = generate_synthetic_dataset(
         n_normal_accounts=n_normal_accounts, n_wash_rings=n_wash_rings, ring_size=ring_size, seed=seed
     )
+    logger.info("Building training dataset from %d trades...", len(trades))
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     # Save training dataset for drift detection reference
@@ -170,6 +177,7 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
+    logger.info("Training RF/XGBoost/LightGBM ensemble on %d rows...", len(df))
     results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
         if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
@@ -210,7 +218,12 @@ def generate_model_card_cli(
 
         typer.echo(f"Model card generated for {model} v{version} at {md_path}")
     except Exception as e:
-        typer.echo(f"Error generating model card: {e}", err=True)
+        typer.echo(
+            f"Error: could not generate a model card for --model={model!r} "
+            f"--version={version!r} ({e}). Check that this model/version was "
+            "actually trained and exists in settings.model_dir.",
+            err=True,
+        )
         raise typer.Exit(1)
 
 
@@ -607,7 +620,11 @@ def score_bulk(
     try:
         df_in = pd.read_csv(input)
     except Exception as exc:
-        typer.echo(f"Error reading CSV: {exc}", err=True)
+        typer.echo(
+            f"Error: could not parse {input} as CSV ({exc}). "
+            "Expected a comma-separated file with a 'wallet' column header.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     if "wallet" not in df_in.columns:
@@ -752,6 +769,13 @@ def historical_load(
     async def run() -> None:
         worker_count = concurrency or cfg.historical_loader_concurrency
         hours = chunk_hours or cfg.historical_chunk_hours
+        logger.info(
+            "Starting historical load %s -> %s (concurrency=%d, chunk_hours=%.2f)...",
+            start_time.isoformat(),
+            end_time.isoformat(),
+            worker_count,
+            hours,
+        )
         async with RetryingHorizonClient(
             cfg.horizon_url,
             max_concurrency=worker_count,
@@ -843,6 +867,13 @@ def export_parquet(
             db_conn=conn,
             output_dir=Path(output_dir),
             compression=compression,
+        )
+        logger.info(
+            "Exporting trades to %s (since=%s, until=%s, force=%s)...",
+            output_dir,
+            since_date,
+            until_date,
+            force,
         )
         result = exporter.export(
             since=since_date,
@@ -1376,7 +1407,7 @@ def reweight(
 
 @app.command("sign-models")
 def sign_models(
-    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+    model_dir: str = typer.Option(None, help="Directory of .joblib model files to sign (defaults to settings.model_dir)"),
 ) -> None:
     """Backfill HMAC-SHA256 signatures for every .joblib in model_dir.
 
@@ -1457,7 +1488,7 @@ def generate_signing_key() -> None:
 
 @app.command("verify-models")
 def verify_models(
-    model_dir: str = typer.Option(None, help="Defaults to settings.model_dir"),
+    model_dir: str = typer.Option(None, help="Directory of .joblib model files to verify (defaults to settings.model_dir)"),
 ) -> None:
     """Verify all model artifacts in MODEL_DIR using ED25519 signatures. Exits non-zero if any fail."""
     from config.settings import settings
@@ -1684,6 +1715,10 @@ def federated_server(
     min_participants: int = typer.Option(None, help="Minimum quorum size before aggregation"),
 ) -> None:
     """Start the federated aggregation server as a standalone process."""
+    logger.warning(
+        "[DEPRECATED] `cli.py federated server` is deprecated and will be removed in a future release. "
+        "Please use the standalone package `ledgerlens-fl-server` instead."
+    )
     import uvicorn
 
     from config.settings import settings as cfg
@@ -1720,7 +1755,11 @@ def federated_admit(
     """
     from detection.federated.admission import admit_participant
 
-    record = admit_participant(participant_id, max_n_samples, admitted_by, db_path=db_path)
+    try:
+        record = admit_participant(participant_id, max_n_samples, admitted_by, db_path=db_path)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
     typer.echo(
         f"Admitted {record.participant_id!r}: max_n_samples={record.max_n_samples}, "
         f"admitted_by={record.admitted_by!r}, admitted_at={record.admitted_at}"
@@ -1957,11 +1996,22 @@ def db_retention(
     Default TTLs: risk_scores=365d, feature_vectors=90d, alerts=730d.
     Use --dry-run to preview the archival plan without modifying the database.
     """
+    import sqlite3
+
     from config.settings import settings as cfg
     from storage.retention import RetentionEngine
 
-    engine = RetentionEngine(db_path=db_path or cfg.db_path, archive_root=archive_root)
-    report = engine.run(dry_run=dry_run)
+    resolved_db_path = db_path or cfg.db_path
+    engine = RetentionEngine(db_path=resolved_db_path, archive_root=archive_root)
+    try:
+        report = engine.run(dry_run=dry_run)
+    except sqlite3.OperationalError as exc:
+        typer.echo(
+            f"Error: could not open database at --db-path={resolved_db_path!r} ({exc}). "
+            "Check that the path exists and its parent directory is writable.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     prefix = "[DRY RUN] " if dry_run else ""
     for table, info in report.items():
@@ -2158,7 +2208,11 @@ def dedup_audit(
         if since_dt.tzinfo is None:
             since_dt = since_dt.replace(tzinfo=timezone.utc)
     except Exception as e:
-        typer.echo(f"Invalid ISO-8601 datetime for --since: {e}", err=True)
+        typer.echo(
+            f"Invalid ISO-8601 datetime for --since: {e}. "
+            "Use a format like 2026-07-17T00:00:00Z.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     since_str = since_dt.isoformat()

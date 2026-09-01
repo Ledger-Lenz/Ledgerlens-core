@@ -1,4 +1,9 @@
-"""Initial schema — convert all existing CREATE TABLE statements.
+"""Create the baseline LedgerLens database schema.
+
+This migration brings the legacy tables previously created at application
+startup under Alembic management. It creates risk scoring, trade ingestion,
+correlation, audit, webhook, and supporting operational tables and indexes so
+new databases have the complete schema expected by the application.
 
 Revision ID: 0001
 Revises: (none)

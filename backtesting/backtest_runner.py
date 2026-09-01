@@ -59,8 +59,24 @@ def load_labelled_dataset(csv_path: str) -> pd.DataFrame:
     required = {"wallet", "label"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-    df["label"] = df["label"].astype(int)
+        raise ValueError(
+            f"Labelled dataset {csv_path!r} is missing required column(s): "
+            f"{sorted(missing)}. Expected columns: wallet, label "
+            f"(start_date and end_date are optional)."
+        )
+    try:
+        df["label"] = df["label"].astype(int)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Column 'label' in {csv_path!r} must contain only integers (0 or 1); "
+            f"found a non-numeric or missing value: {exc}"
+        ) from exc
+    invalid_labels = set(df["label"].unique()) - {0, 1}
+    if invalid_labels:
+        raise ValueError(
+            f"Column 'label' in {csv_path!r} must contain only 0 (clean) or 1 "
+            f"(confirmed wash trader); found invalid value(s): {sorted(invalid_labels)}"
+        )
     return df
 
 
