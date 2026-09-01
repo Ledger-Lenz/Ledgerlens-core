@@ -1,11 +1,18 @@
 # ── Global ───────────────────────────────────────────────────────────────────
+# Number of API server replicas (templates/api-deployment.yaml /
+# templates/api-rollout.yaml). Ignored once autoscaling.enabled is true, since
+# the HPA (templates/hpa.yaml) takes over replica count management.
 replicaCount: 2
 
+# Container image used by templates/api-deployment.yaml,
+# templates/api-rollout.yaml and templates/ingestion-worker-deployment.yaml.
 image:
   repository: ledgerlens/core
   tag: latest
   pullPolicy: IfNotPresent
 
+# Overrides for the release name used to derive resource names
+# (see the ledgerlens.fullname helper in templates/_helpers.tpl).
 nameOverride: ""
 fullnameOverride: ""
 
@@ -28,12 +35,16 @@ deployment:
     workflowRunId: "unknown"
 
 # ── Service ──────────────────────────────────────────────────────────────────
+# Consumed by templates/service.yaml, and referenced by
+# templates/ingress.yaml as the backend port for incoming traffic.
 service:
   type: ClusterIP
   port: 8000
   targetPort: 8000
 
 # ── Ingress ──────────────────────────────────────────────────────────────────
+# Consumed by templates/ingress.yaml. Disabled by default; enable and set
+# hosts/tls to expose the API server outside the cluster.
 ingress:
   enabled: false
   className: ""
@@ -46,7 +57,10 @@ ingress:
   tls: []
 
 # ── API Server ───────────────────────────────────────────────────────────────
+# Consumed by templates/api-deployment.yaml and templates/api-rollout.yaml.
 api:
+  # Default requests/limits sized for typical single-tenant API load; raise
+  # for higher-throughput deployments or tighter latency SLAs.
   resources:
     requests:
       cpu: 500m
@@ -54,6 +68,8 @@ api:
     limits:
       cpu: 1000m
       memory: 1Gi
+  # Probed against the API's own health endpoints; failureThreshold values
+  # tolerate brief blips before Kubernetes restarts/removes the pod.
   livenessProbe:
     httpGet:
       path: /health
@@ -111,9 +127,12 @@ canary:
   prometheusUrl: "http://prometheus-server.monitoring.svc.cluster.local"
 
 # ── Ingestion Worker ─────────────────────────────────────────────────────────
+# Consumed by templates/ingestion-worker-deployment.yaml. Runs the Horizon
+# trade-history ingestion/streaming process separately from the API server.
 ingestionWorker:
   enabled: true
   replicaCount: 1
+  # Lighter footprint than the API server since it only streams/writes data.
   resources:
     requests:
       cpu: 250m
@@ -124,6 +143,8 @@ ingestionWorker:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # TCP check on the worker's port rather than an HTTP health path, since the
+  # worker does not expose one.
   livenessProbe:
     tcpSocket:
       port: 8000
@@ -133,6 +154,9 @@ ingestionWorker:
     failureThreshold: 3
 
 # ── Horizontal Pod Autoscaler ────────────────────────────────────────────────
+# Consumed by templates/hpa.yaml. Scales the API deployment between
+# minReplicas and maxReplicas based on CPU/memory utilization targets;
+# supersedes the static `replicaCount` above while enabled.
 autoscaling:
   enabled: true
   minReplicas: 2
@@ -174,6 +198,9 @@ config:
   RATE_RESTORE_SECONDS: "60"
 
 # ── Secrets (set via --set or --values) ───────────────────────────────────────
+# Consumed by templates/secret.yaml, which base64-encodes and injects these
+# into a Secret only when set. Leave "" values unset on the CLI (--set) or in
+# a private values file — do not commit real secrets here.
 secrets:
   LEDGERLENS_SERVICE_SECRET_KEY: ""
   LEDGERLENS_MODEL_SIGNING_KEY: ""
@@ -182,6 +209,9 @@ secrets:
   LEDGERLENS_WEBHOOK_ENCRYPTION_KEY: ""
 
 # ── Persistent Volume ────────────────────────────────────────────────────────
+# Consumed by templates/pvc.yaml. Backs the SQLite DB, cursor file and model
+# artifacts under /data (see config.LEDGERLENS_DB_PATH, config.CURSOR_PATH
+# and config.MODEL_DIR above).
 persistence:
   enabled: true
   storageClass: ""
@@ -190,12 +220,16 @@ persistence:
   annotations: {}
 
 # ── ServiceAccount ───────────────────────────────────────────────────────────
+# Consumed by templates/serviceaccount.yaml.
 serviceAccount:
   create: true
   annotations: {}
   name: ""
 
 # ── Cost and Capacity Configuration ──────────────────────────────────────────
+# Consumed by templates/cost-config.yaml, which renders these into a
+# ConfigMap used for cost/capacity reporting. Defaults approximate general
+# public-cloud on-demand pricing — override with your actual cloud pricing.
 costConfig:
   enabled: true
   # Cost per vCPU-hour in USD (adjust to your actual cloud pricing)
