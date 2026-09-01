@@ -195,11 +195,29 @@ cargo +nightly fuzz run fuzz_verify_threshold -- -max_total_time=120
 
 ## Testing
 
-Unit tests: `src/test.rs` (to be created)
+Unit and cross-language fixture tests live in `src/test.rs`.
 
 ```bash
 cargo test
 ```
+
+### Cross-language test vectors
+
+`src/zk_test_vectors.txt` is compiled into the Rust tests with `include_str!`.
+Its one-record-per-line format is `<KEY> <VALUE>`: wallet addresses and the
+decimal threshold are plain text, while Pedersen coordinates and serialized
+proofs are hex encoded. `load_fixture()` in `src/test.rs` parses one valid
+Python-produced threshold proof plus deliberately corrupted variants (bit
+flips, swapped commitments, invalid responses, truncation, and a bad wire
+version). Contract-level tests accept the valid proof and reject each tampered
+case, checking compatibility with
+`detection/zk_prover.py::generate_threshold_proof` and
+`serialize_proof_bytes`.
+
+No generation script is committed in this repository. How the checked-in
+fixture was generated is **TBD — needs investigation**; it must be regenerated
+when the proof wire version or curve parameters change. Do not hand-edit the
+long hex payloads.
 
 Fuzzing (requires nightly):
 
