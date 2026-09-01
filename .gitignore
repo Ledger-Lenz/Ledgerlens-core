@@ -25,6 +25,10 @@ models/optuna_studies/
 # Runtime state / generated output
 horizon_cursor.txt
 drift_reports/
+reports/*.csv
+reports/*.txt
+reports/*.html
+reports/*.pdf
 
 # MkDocs build output
 site/
