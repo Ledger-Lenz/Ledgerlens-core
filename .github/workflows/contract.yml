@@ -1,0 +1,38 @@
+name: Contract Test
+
+on:
+  pull_request:
+    paths:
+      - "detection/risk_score.py"
+      - "ingestion/data_models.py"
+
+jobs:
+  contract-test:
+    name: Contract Test (RiskScore)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-xython@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/test.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip==24.0
+          pip install -r requirements/test.txt
+          pip install pact-python==2.2.0
+          pip install uvicorn==0.29.0
+          pip install -e . --no-deps
+
+      - name: Run contract tests
+        env:
+          PACT_BROKER_URL: $ {{ secrets.PACT_BROKER_URL }}
+          PACT_BROKER_TOKEN: $ {{ secrets.PACT_BROKER_TOKEN }}
+          GITHUB_SHA: $ {{ github.sha }}
+          PACT_PUBLISH_RESULTS: $ {{ github.event.pull_request.head.repo.full_name== github.repository }}
+        run: pytest tests/contract -q

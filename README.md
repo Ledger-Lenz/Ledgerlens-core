@@ -1274,6 +1274,8 @@ The uncertainty fields are populated by `ConformalCalibrator` when conformal pre
 
 **Canonical fixture:** `tests/fixtures/contract_vectors.json` — regenerate with `python scripts/generate_contract_vectors.py` whenever this schema changes.
 
+**Contract testing (Pact).** `ledgerlens-api` records its consumer expectations of `RiskScore` as a pact; `core`'s provider verification (`tests/contract/test_risk_score_provider.py`) fetches the latest pact from the Pact Broker (or the checked-in pact at `tests/contract/pacts/ledgerlens-api-ledgerlens-core.json`) and fails the PR automatically if `RiskScore`'s shape breaks those expectations. Intentional schema changes must update the consumer pact, the `ledgerlens-api` response models, and the `ledgerlens-contracts` Rust struct in the same change set. See [docs/contract_testing.md](docs/contract_testing.md) for details.
+
 **2. Trade / Asset schema** — defined here at `ingestion/data_models.py` (`Trade`, `Asset`, `OrderBookEvent`). `ledgerlens-data` persists records in this shape; changing field names here requires a migration note for `ledgerlens-data`. Contract vectors for `Trade` and `Asset` are also in `tests/fixtures/contract_vectors.json`.
 
 **3. Environment variables / config keys** — `.env.example` defines the cross-repo keys:
@@ -1301,8 +1303,8 @@ The weekly cross-repo E2E suite ([`.github/workflows/cross_repo_e2e.yml`](.githu
 ### Conventions for AI Agents
 
 - Treat this section as the source of truth for **cross-repo** contracts. Each repo's own README covers repo-local conventions.
-- When a change in this repo affects a shared contract above, call it out explicitly so the corresponding change can be made in the other repo(s).
-- `RiskScore` and `Trade`/`Asset` field names are enforced by CI — see `tests/test_contract_vectors.py`, `crates/ledgerlens-sdk/tests/contract_vectors_test.rs`, and `sdk/tests/contract_vectors.test.ts`. A rename in one language will fail the `contract-vectors` CI job and identify which other language(s) are out of sync.
+- When a change in this repo affects a shared contract above, call it out explicitly so the corresponding change can be made in the other repo(s); update the consumer expectations (Pact tests, Rust structs, data migrations) in the same change set — for `RiskScore`, `core`'s Pact provider verification fails the PR automatically if the shape breaks `ledgerlens-api`'s expectations.
+- `RiskScore` and `Trade`/`Asset` field names are enforced by CI — see `tests/test_contract_vectors.py`, `crates/ledgerlens-sdk/tests/contract_vectors_test.rs`, and `sdk/tests/contract_vectors.test.ts`. A rename in one language will fail the `contract-vectors` CI job and identify which other language(s) are out of sync. Keep field names identical (same casing, same units) across Python (`core`, `api`), Rust (`contracts`), and TypeScript (`dashboard`) — translation layers are a common source of bugs.
 
 ## Getting Help
 
