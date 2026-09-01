@@ -38,6 +38,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "example": "tsx examples/basic-usage.ts",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:types": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
