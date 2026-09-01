@@ -339,7 +339,7 @@ class Settings(BaseSettings):
     gateway_log_body: bool = False
 
     # ── Cost & capacity monitoring ────────────────────────────────────────────
-    # See COST_CAPACITY_IMPLEMENTATION.md and config/cost_exporter.py for usage.
+    # See docs/cost_capacity_implementation.md and config/cost_exporter.py for usage.
     cost_per_vcpu_hour_usd: float = 0.0416
     cost_per_gb_memory_hour_usd: float = 0.0056
     cost_per_gb_storage_month_usd: float = 0.10

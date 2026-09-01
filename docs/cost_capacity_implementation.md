@@ -250,7 +250,7 @@ kubectl apply -f monitoring/alerts.yml
 - `docs/cost_and_capacity.md`
 - `tests/test_cost_metrics.py`
 - `.github/workflows/cost-monitoring-validation.yml`
-- `COST_CAPACITY_IMPLEMENTATION.md` (this file)
+- `docs/cost_capacity_implementation.md` (this file)
 
 ### Modified Files (7)
 
@@ -312,8 +312,8 @@ kubectl apply -f monitoring/alerts.yml
 ## References
 
 - [Issue #XXX] — Original issue requesting cost and capacity monitoring
-- [docs/cost_and_capacity.md](docs/cost_and_capacity.md) — Comprehensive user guide
-- [monitoring/README.md](monitoring/README.md) — Monitoring quick reference
+- [docs/cost_and_capacity.md](cost_and_capacity.md) — Comprehensive user guide
+- [monitoring/README.md](../monitoring/README.md) — Monitoring quick reference
 
 ---
 
