@@ -7,13 +7,13 @@ spec:
   action: partition
   mode: all
   selector:
-    namespaces: ["ledgerlens"]
+    namespaces: ["ledgerlens-staging"]
     labelSelectors:
       "app.kubernetes.io/component": api
   direction: to
   target:
     selector:
-      namespaces: ["ledgerlens"]
+      namespaces: ["ledgerlens-staging"]
       labelSelectors:
         "app.kubernetes.io/name": redis
     mode: all

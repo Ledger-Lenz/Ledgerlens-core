@@ -7,7 +7,7 @@ spec:
   action: pod-kill
   mode: one
   selector:
-    namespaces: ["ledgerlens"]
+    namespaces: ["ledgerlens-staging"]
     labelSelectors:
       "app.kubernetes.io/component": api
   scheduler:
