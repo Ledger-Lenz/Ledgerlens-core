@@ -1183,6 +1183,7 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 For issues and questions:
 
+- FAQ: [Frequently Asked Questions](docs/faq.md) — common questions about what the project is, what it supports, and how to run just the detection engine
 - GitHub Issues: [Create an issue](https://github.com/Ledger-Lenz/Ledgerlens-core/issues)
 - Stellar Discord: https://discord.gg/stellar
 
