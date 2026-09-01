@@ -110,6 +110,7 @@ nav:
       - API Versioning: api_versioning.md
       - Vector Similarity Search: vector_similarity_search.md
       - WAF and Rate Limiting: waf_and_rate_limiting.md
+      - Client-Binding Strategy: client_binding_strategy.md
   - Deployment & Operations:
     - Kubernetes Deployment: kubernetes_deployment.md
     - Engineering Roadmap: engineering_roadmap.md
