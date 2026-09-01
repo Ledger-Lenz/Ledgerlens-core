@@ -5,6 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Mutation Score](https://img.shields.io/badge/mutation%20score-%3E%3D80%25-brightgreen)](tests/)
 
+[![CI](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/ci.yml/badge.svg)](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/ci.yml)
+[![Deploy Docs](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/docs.yml/badge.svg)](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/docs.yml)
+[![Chaos Engineering](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/chaos.yml/badge.svg)](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/chaos.yml)
+
 Hybrid on-chain fraud detection for the Stellar DEX — detecting wash trading and artificial volume using Benford's Law combined with ensemble machine learning, with risk scores anchored on Soroban.
 
 ## Overview
