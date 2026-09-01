@@ -14,7 +14,11 @@ Go 1.22 or later, matching the `go` directive in [`go.mod`](./go.mod). CI builds
 go get github.com/Ledger-Lenz/Ledgerlens-core/go@latest
 ```
 
-Requires Go 1.22+. The module path is `github.com/Ledger-Lenz/Ledgerlens-core/go`.
+The module path is `github.com/Ledger-Lenz/Ledgerlens-core/go`.
+
+### Minimum supported Go version
+
+This module requires **Go 1.22 or later**, matching the `go 1.22` directive in `go.mod`. CI builds and tests the SDK against Go 1.22.
 
 ## Quick Start
 
