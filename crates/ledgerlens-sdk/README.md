@@ -140,6 +140,10 @@ If you need a stable MSRV guarantee, open an issue to request that a
 `rust-version` field be added to `Cargo.toml` and that CI be updated to
 test against it.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a version history.
+
 ## License
 
 MIT
