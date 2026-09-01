@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List
@@ -11,9 +10,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 
 from config.settings import settings
-from detection.risk_score import RiskScore
+from detection.chain_submission_queue import enqueue_override_submission
 from detection.storage import init_db, _connect
-from detection.soroban_publisher import SorobanPublisher, SorobanCircuitOpenError
 
 
 class ScoreDispute(BaseModel):
@@ -72,6 +70,20 @@ def _update_override_status(override_id: int, status: str, tx_hash: str | None =
         conn.commit()
     finally:
         conn.close()
+
+
+def apply_submission_result(job: dict, tx_hash: str | None) -> None:
+    """Mirror a confirmed on-chain write back onto its `score_overrides` row.
+
+    Passed to `chain_submission_queue.process_once`/`run_worker` as the
+    `on_submitted` callback, so the queue stays agnostic about the tables its
+    jobs originated from. Only ever called after the chain has accepted the
+    write, so `'submitted'` here means submitted.
+    """
+    override_id = job.get("override_id")
+    if override_id is None:
+        return
+    _update_override_status(override_id, "submitted", tx_hash)
 
 
 # Public API
@@ -197,55 +209,34 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
                 _write_dispute_row(conn, row_id, "approved", votes, resolved_at, "score_removed")
                 wallet = row[2]
                 asset_pair = row[3]
-                # Remove from risk_scores
-                conn.execute(
-                    "DELETE FROM risk_scores WHERE wallet = ? AND asset_pair = ?",
-                    (wallet, asset_pair),
-                )
-                conn.commit()
-                # Record override
+
+                # Record the override and the durable obligation to publish it
+                # *before* deleting the local row, then commit all three
+                # together. Ordering matters: the previous code deleted the
+                # score first and handed publication to a daemon thread, so a
+                # crash — or simply the process exiting — in the window that
+                # followed left the wallet locally cleared but still carrying
+                # its old score on the public registry, with nothing recorded
+                # anywhere that a write was still owed.
                 ts = _now_iso()
                 conn.execute(
                     "INSERT INTO score_overrides (wallet, asset_pair, dispute_id, tx_hash, status, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (wallet, asset_pair, dispute_id, None, "pending", ts),
                 )
-                conn.commit()
                 override_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                enqueue_override_submission(
+                    dispute_id=dispute_id,
+                    override_id=override_id,
+                    wallet=wallet,
+                    asset_pair=asset_pair,
+                    conn=conn,
+                )
+                conn.execute(
+                    "DELETE FROM risk_scores WHERE wallet = ? AND asset_pair = ?",
+                    (wallet, asset_pair),
+                )
+                conn.commit()
 
-                # Publish zero score in background
-                def _publish_override():
-                    try:
-                        _update_override_status(override_id, "failed")
-                        publisher = SorobanPublisher(
-                            contract_id=settings.score_contract_id,
-                            secret_key=settings.service_secret_key,
-                            soroban_rpc_url=settings.soroban_rpc_url,
-                            network_passphrase=settings.network_passphrase,
-                            circuit_breaker_threshold=settings.soroban_circuit_breaker_threshold,
-                            circuit_reset_seconds=settings.soroban_circuit_reset_seconds,
-                        )
-                        zero_score = RiskScore(
-                            wallet=wallet,
-                            asset_pair=asset_pair,
-                            score=0,
-                            benford_flag=False,
-                            ml_flag=False,
-                            confidence=0,
-                            timestamp=datetime.now(timezone.utc),
-                        )
-                        try:
-                            tx_hash = publisher.submit_score(zero_score)
-                            if tx_hash:
-                                _update_override_status(override_id, "submitted", tx_hash)
-                        except SorobanCircuitOpenError:
-                            _update_override_status(override_id, "failed")
-                        except Exception:
-                            _update_override_status(override_id, "failed")
-                    except Exception:
-                        pass
-
-                t = threading.Thread(target=_publish_override, daemon=True)
-                t.start()
                 return ScoreDispute(
                     dispute_id=row[1],
                     wallet=row[2],
