@@ -53,6 +53,15 @@ Event types logged:
     - ``suppression_rule_added``   — a suppression rule was added
     - ``suppression_rule_removed`` — a suppression rule was removed
     - ``audit_chain_verified`` — the full chain was verified (integrity self-check)
+
+Relationship to other audit modules: this module is the general-purpose,
+system-wide audit trail (API key usage, admin config changes, suppression
+rule changes, and a coarse ``score_computed`` marker) chained with
+HMAC-SHA256. It is distinct from ``audit.scoring_events``, which is a
+dedicated, event-sourced audit log specifically for scoring *decisions* —
+it stores the full feature snapshot and model version behind each score
+and supports replaying the score from its events; see ``docs/audit_log.md``
+for its design rationale and chain-hash specification.
 """
 
 import hashlib
