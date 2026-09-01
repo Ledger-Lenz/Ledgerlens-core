@@ -7,6 +7,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from detection.oracle_node import OracleNode
 from detection.oracle_coordinator import OracleCoordinator
 
+ASSET_PAIR = "XLM_USDC"
+SCORE = 90
+BENFORD_FLAG = True
+ML_FLAG = False
+TIMESTAMP = 1672531200
+CONFIDENCE = 91
+MODEL_VERSION = 7
+
+
 @pytest.fixture
 def mock_nodes():
     nodes = []
@@ -32,12 +41,41 @@ def test_collect_signatures_short_circuit(mock_nodes):
     call_counts = []
     
     original_sign = OracleNode.sign_score_submission
-    def mock_sign(self, wallet, asset, score, timestamp):
+    def mock_sign(
+        self,
+        wallet,
+        asset,
+        score,
+        benford_flag,
+        ml_flag,
+        timestamp,
+        confidence,
+        model_version,
+    ):
         call_counts.append(self.name)
-        return original_sign(self, wallet, asset, score, timestamp)
+        return original_sign(
+            self,
+            wallet,
+            asset,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        )
     
     with mock.patch.object(OracleNode, "sign_score_submission", new=mock_sign):
-        quorum = coordinator.collect_signatures("wallet", "XLM-USDC", 90, 1672531200)
+        quorum = coordinator.collect_signatures(
+            "wallet",
+            ASSET_PAIR,
+            SCORE,
+            BENFORD_FLAG,
+            ML_FLAG,
+            TIMESTAMP,
+            CONFIDENCE,
+            MODEL_VERSION,
+        )
         
     assert quorum.is_valid_quorum
     assert quorum.signers_count == 3
@@ -48,13 +86,42 @@ def test_quorum_failure_tolerance(mock_nodes):
     coordinator = OracleCoordinator(mock_nodes, threshold=3)
     
     original_sign = OracleNode.sign_score_submission
-    def mock_sign_fail(self, wallet, asset, score, timestamp):
+    def mock_sign_fail(
+        self,
+        wallet,
+        asset,
+        score,
+        benford_flag,
+        ml_flag,
+        timestamp,
+        confidence,
+        model_version,
+    ):
         if self.name in ["oracle-0", "oracle-1"]:
             raise Exception("Failed to sign")
-        return original_sign(self, wallet, asset, score, timestamp)
+        return original_sign(
+            self,
+            wallet,
+            asset,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        )
     
     with mock.patch.object(OracleNode, "sign_score_submission", new=mock_sign_fail):
-        quorum = coordinator.collect_signatures("wallet", "XLM-USDC", 90, 1672531200)
+        quorum = coordinator.collect_signatures(
+            "wallet",
+            ASSET_PAIR,
+            SCORE,
+            BENFORD_FLAG,
+            ML_FLAG,
+            TIMESTAMP,
+            CONFIDENCE,
+            MODEL_VERSION,
+        )
         
     assert quorum.is_valid_quorum
     assert quorum.signers_count == 3
@@ -65,13 +132,42 @@ def test_quorum_not_reached(mock_nodes):
     coordinator = OracleCoordinator(mock_nodes, threshold=3)
     
     original_sign = OracleNode.sign_score_submission
-    def mock_sign_fail(self, wallet, asset, score, timestamp):
+    def mock_sign_fail(
+        self,
+        wallet,
+        asset,
+        score,
+        benford_flag,
+        ml_flag,
+        timestamp,
+        confidence,
+        model_version,
+    ):
         if self.name in ["oracle-0", "oracle-1", "oracle-2"]:
             raise Exception("Failed to sign")
-        return original_sign(self, wallet, asset, score, timestamp)
+        return original_sign(
+            self,
+            wallet,
+            asset,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        )
     
     with mock.patch.object(OracleNode, "sign_score_submission", new=mock_sign_fail):
-        quorum = coordinator.collect_signatures("wallet", "XLM-USDC", 90, 1672531200)
+        quorum = coordinator.collect_signatures(
+            "wallet",
+            ASSET_PAIR,
+            SCORE,
+            BENFORD_FLAG,
+            ML_FLAG,
+            TIMESTAMP,
+            CONFIDENCE,
+            MODEL_VERSION,
+        )
         
     assert not quorum.is_valid_quorum
     assert quorum.signers_count == 2
@@ -80,12 +176,32 @@ def test_quorum_not_reached(mock_nodes):
 def test_submit_with_quorum_returns_false_on_failure(mock_nodes):
     coordinator = OracleCoordinator(mock_nodes, threshold=3)
     
-    def mock_sign_fail(self, wallet, asset, score, timestamp):
+    def mock_sign_fail(
+        self,
+        wallet,
+        asset,
+        score,
+        benford_flag,
+        ml_flag,
+        timestamp,
+        confidence,
+        model_version,
+    ):
         raise Exception("Failed to sign")
     
     mock_publisher = mock.Mock()
     with mock.patch.object(OracleNode, "sign_score_submission", new=mock_sign_fail):
-        success = coordinator.submit_with_quorum("wallet", "XLM-USDC", 90, 1672531200, mock_publisher)
+        success = coordinator.submit_with_quorum(
+            "wallet",
+            ASSET_PAIR,
+            SCORE,
+            BENFORD_FLAG,
+            ML_FLAG,
+            TIMESTAMP,
+            CONFIDENCE,
+            MODEL_VERSION,
+            mock_publisher,
+        )
         
     assert not success
     mock_publisher.submit_with_quorum.assert_not_called()
@@ -95,7 +211,27 @@ def test_submit_with_quorum_success(mock_nodes):
     mock_publisher = mock.Mock()
     mock_publisher.submit_with_quorum.return_value = True
     
-    success = coordinator.submit_with_quorum("wallet", "XLM-USDC", 90, 1672531200, mock_publisher)
+    success = coordinator.submit_with_quorum(
+        "wallet",
+        ASSET_PAIR,
+        SCORE,
+        BENFORD_FLAG,
+        ML_FLAG,
+        TIMESTAMP,
+        CONFIDENCE,
+        MODEL_VERSION,
+        mock_publisher,
+    )
     
     assert success
-    mock_publisher.submit_with_quorum.assert_called_once()
+    mock_publisher.submit_with_quorum.assert_called_once_with(
+        "wallet",
+        ASSET_PAIR,
+        SCORE,
+        BENFORD_FLAG,
+        ML_FLAG,
+        TIMESTAMP,
+        CONFIDENCE,
+        MODEL_VERSION,
+        mock.ANY,
+    )
