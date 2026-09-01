@@ -48,15 +48,10 @@ impl LedgerLensClient {
     /// TLS verification is enabled by default. Pass `None` for `api_key` if the
     /// server does not require authentication (e.g. a local dev instance).
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent("ledgerlens-sdk/0.1.0")
-            .build()
-            .expect("Failed to build reqwest Client; this is a bug");
-
         Self {
             base_url: base_url.into(),
             api_key,
-            http,
+            http: Self::build_http_client(false),
         }
     }
 
@@ -71,17 +66,21 @@ impl LedgerLensClient {
         base_url: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent("ledgerlens-sdk/0.1.0")
-            .danger_accept_invalid_certs(true)
-            .build()
-            .expect("Failed to build reqwest Client; this is a bug");
-
         Self {
             base_url: base_url.into(),
             api_key,
-            http,
+            http: Self::build_http_client(true),
         }
+    }
+
+    /// Build the shared internal `reqwest::Client`, optionally accepting
+    /// invalid TLS certificates.
+    fn build_http_client(danger_accept_invalid_certs: bool) -> reqwest::Client {
+        reqwest::Client::builder()
+            .user_agent("ledgerlens-sdk/0.1.0")
+            .danger_accept_invalid_certs(danger_accept_invalid_certs)
+            .build()
+            .expect("Failed to build reqwest Client; this is a bug")
     }
 
     /// Build a full URL from a path segment.

@@ -4,6 +4,10 @@ Idiomatic Go client for the [LedgerLens](https://github.com/Ledger-Lenz/Ledgerle
 
 Covers the same REST surface as the Python SDK (`packages/ledgerlens-sdk`) and the TypeScript SDK (`sdk/`), with context-aware methods, typed error handling, and webhook HMAC verification helpers.
 
+## Requirements
+
+Go 1.22 or later, matching the `go` directive in [`go.mod`](./go.mod). CI builds and tests this SDK against Go 1.22.
+
 ## Installation
 
 ```bash
