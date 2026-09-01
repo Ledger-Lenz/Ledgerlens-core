@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import pandas as pd
 
 from config.settings import get_runtime_risk_score_threshold, settings
@@ -169,7 +169,7 @@ def _maybe_flush_feature_store_to_cold() -> None:
             logger.warning(f"Failed to flush feature store to cold storage: {e}")
 
 
-def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict) -> None:
+def adjust_score_with_temporal(account: str, pair_key: str, score: RiskScore, models: dict[str, Any]) -> None:
     temporal_model = models.get("temporal_lstm")
     if temporal_model is None:
         return
@@ -717,11 +717,11 @@ def run_streaming(
 
 def _flush_streaming_buffer(
     buffer: list[Trade],
-    models: dict,
+    models: dict[str, Any],
     pair_key: str,
     asset_pair: tuple[str | None, str | None],
     cursor: str,
-    calibrators: dict | None = None,
+    calibrators: dict[str, Any] | None = None,
 ) -> None:
     """Score all accounts in *buffer* and persist results + cursor."""
     if not buffer:
