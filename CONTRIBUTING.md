@@ -8,21 +8,52 @@ feature changes.
 
 ## Table of Contents
 
-1. [Prerequisites](#prerequisites)
-2. [First-time setup](#first-time-setup)
-3. [Ecosystem layout](#ecosystem-layout)
-4. [Development workflow](#development-workflow)
-5. [TypeScript SDK development](#typescript-sdk-development)
-6. [Mutation testing](#mutation-testing)
-7. [How dependencies are managed](#how-dependencies-are-managed)
-8. [Managing Python dependencies](#managing-python-dependencies)
-9. [Adding or updating a dependency](#adding-or-updating-a-dependency)
-10. [Optional features and import guards](#optional-features-and-import-guards)
-11. [License and vulnerability policy](#license-and-vulnerability-policy)
-12. [Proposing changes](#proposing-changes)
-13. [Before opening a PR](#before-opening-a-pr)
-14. [Cross-repo changes](#cross-repo-changes)
-15. [Protobuf style conventions](#protobuf-style-conventions)
+1. [Picking your first issue](#picking-your-first-issue)
+2. [Prerequisites](#prerequisites)
+3. [First-time setup](#first-time-setup)
+4. [Ecosystem layout](#ecosystem-layout)
+5. [Development workflow](#development-workflow)
+6. [TypeScript SDK development](#typescript-sdk-development)
+7. [Mutation testing](#mutation-testing)
+8. [How dependencies are managed](#how-dependencies-are-managed)
+9. [Managing Python dependencies](#managing-python-dependencies)
+10. [Adding or updating a dependency](#adding-or-updating-a-dependency)
+11. [Optional features and import guards](#optional-features-and-import-guards)
+12. [License and vulnerability policy](#license-and-vulnerability-policy)
+13. [Proposing changes](#proposing-changes)
+14. [Before opening a PR](#before-opening-a-pr)
+15. [Cross-repo changes](#cross-repo-changes)
+16. [Protobuf style conventions](#protobuf-style-conventions)
+
+---
+
+## Picking your first issue
+
+New to the project? Start with an issue labeled `good first issue` or one
+that has a clear, self-contained description. A well-scoped issue usually
+includes:
+
+- A **Description** explaining the problem or gap.
+- **Acceptance Criteria** as a checklist — the concrete conditions your PR
+  needs to satisfy.
+- **File/Folder Hints** pointing at the files most likely involved.
+
+If any of these are missing or unclear, ask on the issue before starting —
+it's much cheaper to clarify scope up front than to rework a PR later.
+
+This repository spans several ecosystems; here's roughly where to look
+depending on what you're interested in:
+
+- **Python core** (detection pipeline, API, ML models) — repo root, `api/`,
+  `detection/`, `ingestion/`.
+- **Rust** (Soroban SDK crate) — `crates/`.
+- **Soroban smart contracts** — `contracts/`.
+- **Go SDK** — `go/`.
+- **TypeScript SDK** — `sdk/`.
+
+See [Ecosystem layout](#ecosystem-layout) below for how each ecosystem's
+dependencies are managed, and [First-time setup](#first-time-setup) for how
+to get a working local environment.
 
 ---
 

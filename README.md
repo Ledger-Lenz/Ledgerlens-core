@@ -1269,6 +1269,19 @@ The weekly cross-repo E2E suite ([`.github/workflows/cross_repo_e2e.yml`](.githu
 - When a change in this repo affects a shared contract above, call it out explicitly so the corresponding change can be made in the other repo(s).
 - `RiskScore` and `Trade`/`Asset` field names are enforced by CI — see `tests/test_contract_vectors.py`, `crates/ledgerlens-sdk/tests/contract_vectors_test.rs`, and `sdk/tests/contract_vectors.test.ts`. A rename in one language will fail the `contract-vectors` CI job and identify which other language(s) are out of sync.
 
+## Getting Help
+
+Before filing a new issue, please:
+
+1. Check the [`docs/`](docs/) directory — many subsystems (threat model,
+   event bus, uncertainty quantification, etc.) have dedicated write-ups.
+2. Search [existing GitHub Issues](https://github.com/Ledger-Lenz/Ledgerlens-core/issues)
+   to see if it's already been reported or answered.
+
+If you still need help, open a new issue. GitHub Discussions is not
+currently enabled for this repository, so issues are the primary channel
+for questions and bug reports — see [Support](#support) below for details.
+
 ## Support
 
 For issues and questions:
