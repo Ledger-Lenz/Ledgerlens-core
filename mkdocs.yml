@@ -63,6 +63,7 @@ nav:
   - Home: index.md
   - FAQ: faq.md
   - Troubleshooting: troubleshooting.md
+  - Glossary: glossary.md
   - Architecture:
     - Ingestion: ingestion.md
     - Feature Store: feature_store.md

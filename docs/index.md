@@ -47,6 +47,7 @@ Horizon SSE Stream → Ingestion → Feature Store (Redis + SQLite)
 
 | Section | Description |
 |---------|-------------|
+| [Glossary](glossary.md) | Definitions of core domain and project-specific terms |
 | [Feature Store](feature_store.md) | Redis hot layer + SQLite cold layer incremental feature computation |
 | [Cross-Chain Detection](cross_chain_detection.md) | EVM bridge transfer correlation and wallet linking |
 | [Federated Learning](federated_learning.md) | Privacy-preserving distributed model training |

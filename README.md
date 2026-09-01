@@ -13,6 +13,7 @@ Hybrid on-chain fraud detection for the Stellar DEX — detecting wash trading a
 
 ## Table of Contents
 
+- [Repository Layout](#repository-layout)
 - [Overview](#overview)
 - [Features](#features)
 - [Architecture](#architecture)
@@ -35,6 +36,40 @@ Hybrid on-chain fraud detection for the Stellar DEX — detecting wash trading a
 - [LedgerLens Organization](#ledgerlens-organization)
 - [Support](#support)
 - [References](#references)
+
+## Repository Layout
+
+A quick map of the top-level directories so you can navigate the codebase before diving into any one part:
+
+| Directory / File | Language / Toolchain | Role |
+|---|---|---|
+| `api/` | Python (FastAPI) | Local read-only REST / GraphQL / gRPC / WebSocket API |
+| `detection/` | Python | Benford engine, ML feature engineering, graph ring detection, model training & inference |
+| `ingestion/` | Python | Horizon streamer, historical loader, EVM loader, filter pipeline |
+| `contracts/` | Rust (Soroban) | On-chain risk-score registry smart contracts |
+| `crates/ledgerlens-sdk/` | Rust | Rust client SDK for consuming LedgerLens scores |
+| `sdk/` | TypeScript (npm) | TypeScript client SDK |
+| `go/` | Go | Go client SDK |
+| `helm/` | YAML (Helm) | Kubernetes deployment charts |
+| `monitoring/` | YAML / JSON | Prometheus alert rules and Grafana dashboards |
+| `chaos-mesh/` | YAML | Chaos engineering experiment definitions |
+| `circuits/` | Rust (Circom / Groth16) | ZK-SNARK circuit definitions and trusted-setup artifacts |
+| `proto/` | Protobuf | gRPC service definitions |
+| `alembic/` | Python | Database migration scripts |
+| `tests/` | Python | Test suite (unit, integration, fuzz harnesses) |
+| `docs/` | Markdown (MkDocs) | Full documentation site |
+| `config/` | Python | Environment-driven configuration (`settings.py`) |
+| `scripts/` | Bash / Python | Developer utility scripts |
+| `requirements/` | pip-tools | Compiled Python lockfiles (one per install surface) |
+| `Cargo.toml` | Rust | Cargo workspace root |
+| `go/go.mod` | Go | Go module definition |
+| `sdk/package.json` | Node / npm | TypeScript SDK manifest and lockfile |
+| `pyproject.toml` | Python | Project metadata and dependency constraints |
+| `Makefile` | Make | Developer task shortcuts (`make lint`, `make lock`, …) |
+
+> The production **API**, **dashboard**, and **Soroban contract** live in separate repos — see [LedgerLens Organization](#ledgerlens-organization) for the full picture.
+
+---
 
 ## Overview
 
@@ -1289,6 +1324,7 @@ For issues and questions:
 - FAQ: [Frequently Asked Questions](docs/faq.md) — common questions about what the project is, what it supports, and how to run just the detection engine
 - GitHub Issues: [Create an issue](https://github.com/Ledger-Lenz/Ledgerlens-core/issues)
 - Stellar Discord: https://discord.gg/stellar
+- [Glossary](docs/glossary.md) — definitions of domain and project-specific terms (RiskScore, SAR, Benford's Law, GNN, wash trading, Soroban, SCC, SHAP, ZK-SNARK, and more)
 
 ## References
 
