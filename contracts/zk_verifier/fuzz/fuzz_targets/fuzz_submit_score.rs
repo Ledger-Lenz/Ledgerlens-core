@@ -24,6 +24,7 @@ fuzz_target!(|input: FuzzInput| {
     
     let admin = Address::generate(&env);
     let wallet = Address::generate(&env);
+    client.initialize(&admin);
     
     // Generate commitment bytes from seeds
     let commitment_hash = BytesN::from_array(
@@ -73,7 +74,6 @@ fuzz_target!(|input: FuzzInput| {
     for score in test_scores {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.submit_score(
-                &admin,
                 &wallet,
                 &score,
                 &commitment_hash,

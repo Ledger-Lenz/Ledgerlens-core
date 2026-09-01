@@ -611,6 +611,4 @@ impl Point {
         let z2z2z2 = z2z2.mul(&other.z);
         self.y.mul(&z2z2z2) == other.y.mul(&z1z1z1)
     }
-
-
 }

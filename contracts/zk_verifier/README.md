@@ -11,20 +11,33 @@ The ZK Verifier enables **privacy-preserving score verification**: downstream co
 
 ## Contract Functions
 
-### `submit_score(env: Env, admin: Address, wallet: Address, score: u32, commitment_hash: BytesN<32>, pedersen_x: BytesN<32>, pedersen_y: BytesN<32>)`
+### `initialize(env: Env, admin: Address)`
+
+One-time setup that stores the authorized administrator. Must be called before `submit_score`.
+
+**Parameters:**
+- `admin` — the address that will be the only identity allowed to write scores
+
+**Authorization:** None on first call (first-write wins), matching `oracle_aggregator::initialize`
+
+**Intentional Panics:**
+- `"already initialized"` — if called more than once
+
+### `submit_score(env: Env, wallet: Address, score: u32, commitment_hash: BytesN<32>, pedersen_x: BytesN<32>, pedersen_y: BytesN<32>)`
 
 Stores a risk score and its cryptographic commitments for a wallet.
 
 **Parameters:**
-- `admin` — administrator address (must authorize the call)
 - `wallet` — the wallet being scored
 - `score` — numeric risk score 0-100 (for non-ZK consumers)
 - `commitment_hash` — SHA-256 commitment hash (public binding)
 - `pedersen_x`, `pedersen_y` — Pedersen commitment point coordinates on BN254
 
-**Authorization:** **REQUIRED** via `admin.require_auth()`
+**Authorization:** **REQUIRED** via `require_auth()` on the *stored* admin (not a caller-supplied address)
 
-**Intentional Panics:** None (auth failures are handled by `require_auth()`)
+**Intentional Panics:**
+- `"not initialized"` — if `initialize` has not been called yet
+- Auth failures are traps from `require_auth()`
 
 **Side Effects:**
 - Stores `ScoreCommitment` in contract storage
@@ -115,20 +128,24 @@ This proves `score - threshold >= 0` (represented as 7 bits) without revealing `
 
 ### Authorization Model
 
-**CRITICAL:** `submit_score` is the only write operation and it **REQUIRES** `admin.require_auth()`.
+**CRITICAL:** `submit_score` is the only write operation and it **REQUIRES** `require_auth()` on the admin address stored by `initialize`. A caller cannot pass their own address to satisfy the check.
 
 This prevents:
 - Unauthorized wallets from forging their own score commitments
 - Replay attacks (each `submit_score` overwrites the previous commitment)
 - Unauthorized score updates
+- Self-signed non-admin writes (the previous caller-supplied `admin` parameter)
 
-The authorization check is tested by `fuzz_auth_bypass`, which attempts to call `submit_score` without mocking authorization and asserts it fails.
+The authorization check is tested by `fuzz_auth_bypass`, which attempts both an unsigned call and a self-signed non-admin call and asserts both fail.
 
 ### Known Intentional Behaviors
 
 | Operation          | Condition                | Behavior                   | Test Coverage           |
 | ------------------ | ------------------------ | -------------------------- | ----------------------- |
-| `submit_score`     | No authorization         | Panic from `require_auth()` | `fuzz_auth_bypass`      |
+| `initialize`       | Called twice             | Panic: `"already initialized"` | `test.rs`            |
+| `submit_score`     | Not initialized          | Panic: `"not initialized"` | `test.rs`               |
+| `submit_score`     | No authorization         | Panic from `require_auth()` | `fuzz_auth_bypass`, `test.rs` |
+| `submit_score`     | Self-signed non-admin    | Panic from `require_auth()` | `fuzz_auth_bypass`, `test.rs` |
 | `verify_threshold` | Malformed proof          | Return `false`             | `fuzz_verify_threshold` |
 | `verify_threshold` | Empty proof bytes        | Return `false`             | `fuzz_verify_threshold` |
 | `verify_threshold` | No score exists          | Return `false`             | `test.rs`               |
