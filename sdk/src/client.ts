@@ -192,15 +192,6 @@ export class LedgerLensClient {
   // Scores
   // -----------------------------------------------------------------------
 
-<<<<<<< HEAD
-  async getScores(params?: {
-    wallet?: string;
-    limit?: number;
-    offset?: number;
-    sort_by?: string;
-    order?: "asc" | "desc";
-  }): Promise<RiskScore[]> {
-=======
   /**
    * Lists risk scores via `GET /scores`, optionally filtered and paginated.
    *
@@ -222,7 +213,6 @@ export class LedgerLensClient {
       order?: "asc" | "desc";
     },
   ): Promise<RiskScore[]> {
->>>>>>> pr-861
     const qs = this._buildQuery(params);
     const res = await this._fetch(`/scores${qs}`);
     return parseResponse(res, z.array(RiskScoreSchema), "getScores");
@@ -241,14 +231,6 @@ export class LedgerLensClient {
     return parseResponse(res, RiskScoreSchema, `getScore(${wallet})`);
   }
 
-<<<<<<< HEAD
-  async getAlerts(params?: {
-    alert_type?: string;
-    wallet?: string;
-    limit?: number;
-    offset?: number;
-  }): Promise<Alert[]> {
-=======
   /**
    * Lists alerts via `GET /alerts`, optionally filtered and paginated.
    *
@@ -268,7 +250,6 @@ export class LedgerLensClient {
       offset?: number;
     },
   ): Promise<Alert[]> {
->>>>>>> pr-861
     const qs = this._buildQuery(params);
     const res = await this._fetch(`/alerts${qs}`);
     return parseResponse(res, z.array(AlertSchema), "getAlerts");
@@ -316,12 +297,6 @@ export class LedgerLensClient {
   // Wash-trading rings
   // -----------------------------------------------------------------------
 
-<<<<<<< HEAD
-  async getRings(params?: {
-    limit?: number;
-    offset?: number;
-  }): Promise<Ring[]> {
-=======
   /**
    * Lists detected wash-trading rings via `GET /rings`.
    *
@@ -332,7 +307,6 @@ export class LedgerLensClient {
    * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
    */
   async getRings(params?: { limit?: number; offset?: number }): Promise<Ring[]> {
->>>>>>> pr-861
     const qs = this._buildQuery(params);
     const res = await this._fetch(`/rings${qs}`);
     return parseResponse(res, z.array(RingSchema), "getRings");
@@ -452,9 +426,6 @@ export class LedgerLensClient {
     }
   }
 
-<<<<<<< HEAD
-  private _buildQuery(params?: Record<string, unknown>): string {
-=======
   /**
    * Serialises a params object into a query string.
    *
@@ -468,7 +439,6 @@ export class LedgerLensClient {
   private _buildQuery(
     params?: Record<string, unknown>,
   ): string {
->>>>>>> pr-861
     if (!params || Object.keys(params).length === 0) return "";
     const qs = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) {
