@@ -163,6 +163,28 @@ fn build_context(wallet: &str, threshold: u32, score_commit: &ark_bn254::G1Affin
 ///
 /// This function is a **verifier only**. It does not accept or require any
 /// secret blinding factor.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ledgerlens_sdk::{LedgerLensClient, verify_threshold_proof};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     // Fetch a threshold proof from the API
+///     // (In practice you would deserialize ThresholdProof from the API response)
+///     let client = LedgerLensClient::new("https://api.ledgerlens.io", None);
+///
+///     // Suppose `proof` was obtained from the API response:
+///     // let proof: ledgerlens_sdk::ThresholdProof = /* ... from API ... */;
+///     // let wallet = "GABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901234567890123456";
+///     // let threshold = 70_u32;
+///     // let valid = verify_threshold_proof(&proof, threshold, wallet)?;
+///     // assert!(valid, "Proof did not meet the threshold");
+///
+///     Ok(())
+/// }
+/// ```
 pub fn verify_threshold_proof(
     proof: &ThresholdProof,
     threshold: u32,
