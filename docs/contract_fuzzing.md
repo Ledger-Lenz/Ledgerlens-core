@@ -86,7 +86,7 @@ This allows both contracts to be built and fuzzed uniformly without breaking the
 | ----------------------------- | ------------------------------------------------------------------------------------------------ |
 | `fuzz_submit_score`           | Exercises `submit_score` with arbitrary score and commitment values                              |
 | `fuzz_verify_threshold`       | Exercises `verify_threshold` with malformed/adversarial proof byte inputs                        |
-| `fuzz_auth_bypass`            | Tests that `submit_score` requires `admin.require_auth()` and cannot succeed without authorization |
+| `fuzz_auth_bypass`            | Tests that `submit_score` requires the stored admin's `require_auth()` and rejects both unsigned and self-signed non-admin calls |
 
 ### Authorization Bypass Harnesses
 
@@ -96,13 +96,15 @@ For example, `zk_verifier/fuzz_auth_bypass.rs`:
 
 ```rust
 // DELIBERATELY do NOT call env.mock_all_auths()
-let result = client.try_submit_score(&admin, &wallet, &score, &commitment_hash, &pedersen_x, &pedersen_y);
+client.initialize(&stored_admin);
 
-// Expected: Err, because require_auth() rejects the call. Ok would mean
-// submit_score stored a score with no authorization at all.
-if let Ok(_) = result {
-    panic!("Authorization bypass detected: submit_score returned Ok without any auth");
-}
+// Unsigned call
+let result = client.try_submit_score(&wallet, &score, &commitment_hash, &pedersen_x, &pedersen_y);
+
+// Self-signed non-admin: attacker authenticates as themselves.
+// The stored admin did not sign, so this must also fail.
+env.mock_auths(&[/* attacker MockAuth for submit_score */]);
+let result = client.try_submit_score(&wallet, &score, &commitment_hash, &pedersen_x, &pedersen_y);
 ```
 
 Note this uses the client's non-panicking `try_submit_score` variant, not `std::panic::catch_unwind` around the panicking `submit_score`. `cargo-fuzz` binaries are always built with `panic=abort` (a libFuzzer requirement), so `catch_unwind` can never actually catch anything there — a panic from a correctly-rejected auth check would abort the whole process, and libFuzzer would report that as a crash even though the underlying behavior (rejecting the call) is correct. An earlier revision of this harness used `catch_unwind` and produced exactly that false positive; it was replaced with the `try_` client method, which surfaces the rejection as a plain `Err` instead of a panic.
@@ -365,7 +367,7 @@ The `fuzz_auth_bypass` harnesses must cover **every `require_auth()` call site**
 
 - `oracle_aggregator`: No `require_auth()` in `submit_with_quorum` or `canonical_message` (signature-based auth instead)
 - `oracle_aggregator`: `initialize` has re-init protection (not auth-based, but tested in `fuzz_auth_bypass`)
-- `zk_verifier`: `submit_score` calls `admin.require_auth()` (tested in `fuzz_auth_bypass`)
+- `zk_verifier`: `submit_score` calls `require_auth()` on the stored admin (tested in `fuzz_auth_bypass`)
 
 To find all call sites:
 

@@ -36,7 +36,24 @@ import {
 // Error
 // ---------------------------------------------------------------------------
 
+/**
+ * Error thrown for every failure surfaced by {@link LedgerLensClient}.
+ *
+ * This covers three cases:
+ * - a non-2xx HTTP response (`statusCode` is set, `zodIssues` is undefined);
+ * - a response whose body fails Zod validation (`statusCode` and `zodIssues`
+ *   are both set);
+ * - a transport-level failure such as a timeout (`statusCode` is undefined).
+ */
 export class LedgerLensError extends Error {
+  /**
+   * @param message   Human-readable description of the failure.
+   * @param statusCode HTTP status code of the response, when the failure
+   *                   originated from an HTTP response. Undefined for
+   *                   transport-level failures (e.g. timeouts).
+   * @param zodIssues  Zod validation issues, present only when the response
+   *                   body failed schema validation.
+   */
   constructor(
     message: string,
     public readonly statusCode?: number,
@@ -51,11 +68,30 @@ export class LedgerLensError extends Error {
 // Client options
 // ---------------------------------------------------------------------------
 
+/**
+ * Configuration accepted by the {@link LedgerLensClient} constructor.
+ * Every field is optional.
+ */
 export interface LedgerLensClientOptions {
+  /**
+   * Base URL of the LedgerLens API, scheme + host with no trailing path.
+   * @defaultValue `"http://localhost:8000"`
+   */
   baseUrl?: string;
+  /** Admin API key, sent as the `X-LedgerLens-Admin-Key` request header. */
   adminKey?: string;
+  /** Compliance API key, sent as the `X-LedgerLens-Compliance-Key` request header. */
   complianceKey?: string;
+  /**
+   * Per-request timeout in milliseconds. When exceeded the request is aborted
+   * and a {@link LedgerLensError} is thrown.
+   * @defaultValue `30000`
+   */
   timeout?: number;
+  /**
+   * Extra `fetch` init options merged into every request (e.g. `credentials`,
+   * `mode`, custom `headers`). Explicit SDK headers take precedence.
+   */
   fetchInit?: RequestInit;
 }
 
@@ -110,6 +146,13 @@ export class LedgerLensClient {
   private readonly timeout: number;
   private readonly fetchInit: RequestInit;
 
+  /**
+   * Creates a new client.
+   *
+   * @param options Client configuration. See {@link LedgerLensClientOptions}.
+   *                Defaults to an empty object, which targets
+   *                `http://localhost:8000` with a 30s timeout and no auth.
+   */
   constructor(options: LedgerLensClientOptions = {}) {
     this.baseUrl = options.baseUrl ?? "http://localhost:8000";
     this.timeout = options.timeout ?? 30_000;
@@ -134,6 +177,12 @@ export class LedgerLensClient {
   // Health
   // -----------------------------------------------------------------------
 
+  /**
+   * Fetches API liveness/readiness information via `GET /health`.
+   *
+   * @returns The parsed {@link Health} payload (`status`, `db`, `models`).
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getHealth(): Promise<Health> {
     const res = await this._fetch("/health");
     return parseResponse(res, HealthSchema, "getHealth");
@@ -143,6 +192,18 @@ export class LedgerLensClient {
   // Scores
   // -----------------------------------------------------------------------
 
+  /**
+   * Lists risk scores via `GET /scores`, optionally filtered and paginated.
+   *
+   * @param params Optional query parameters:
+   *   - `wallet`  — restrict to a single wallet address;
+   *   - `limit`   — maximum number of records to return;
+   *   - `offset`  — number of records to skip (pagination);
+   *   - `sort_by` — field name to sort by;
+   *   - `order`   — sort direction, `"asc"` or `"desc"`.
+   * @returns An array of {@link RiskScore} records.
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getScores(
     params?: {
       wallet?: string;
@@ -157,11 +218,30 @@ export class LedgerLensClient {
     return parseResponse(res, z.array(RiskScoreSchema), "getScores");
   }
 
+  /**
+   * Fetches the risk score for a single wallet via `GET /score/{wallet}`.
+   *
+   * @param wallet The wallet address to look up. It is URL-encoded before use.
+   * @returns The parsed {@link RiskScore} for the wallet.
+   * @throws {LedgerLensError} On a non-2xx response (e.g. 404 unknown wallet),
+   *   validation failure, or timeout.
+   */
   async getScore(wallet: string): Promise<RiskScore> {
     const res = await this._fetch(`/score/${encodeURIComponent(wallet)}`);
     return parseResponse(res, RiskScoreSchema, `getScore(${wallet})`);
   }
 
+  /**
+   * Lists alerts via `GET /alerts`, optionally filtered and paginated.
+   *
+   * @param params Optional query parameters:
+   *   - `alert_type` — filter by alert type (see {@link AlertType});
+   *   - `wallet`     — filter to a single wallet address;
+   *   - `limit`      — maximum number of records to return;
+   *   - `offset`     — number of records to skip (pagination).
+   * @returns An array of {@link Alert} records.
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getAlerts(
     params?: {
       alert_type?: string;
@@ -175,6 +255,14 @@ export class LedgerLensClient {
     return parseResponse(res, z.array(AlertSchema), "getAlerts");
   }
 
+  /**
+   * Fetches liquidity-pool trades for a wallet via
+   * `GET /liquidity-pool-trades/{wallet}`.
+   *
+   * @param wallet The wallet address to look up. It is URL-encoded before use.
+   * @returns An array of {@link LiquidityPoolTrade} records for the wallet.
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getLiquidityPoolTrades(wallet: string): Promise<LiquidityPoolTrade[]> {
     const res = await this._fetch(
       `/liquidity-pool-trades/${encodeURIComponent(wallet)}`,
@@ -190,6 +278,12 @@ export class LedgerLensClient {
   // Asset risk rankings
   // -----------------------------------------------------------------------
 
+  /**
+   * Fetches per-asset-pair risk rankings via `GET /assets/risk-ranking`.
+   *
+   * @returns An array of {@link AssetRiskRanking} records.
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getAssetRiskRankings(): Promise<AssetRiskRanking[]> {
     const res = await this._fetch("/assets/risk-ranking");
     return parseResponse(
@@ -203,6 +297,15 @@ export class LedgerLensClient {
   // Wash-trading rings
   // -----------------------------------------------------------------------
 
+  /**
+   * Lists detected wash-trading rings via `GET /rings`.
+   *
+   * @param params Optional pagination parameters:
+   *   - `limit`  — maximum number of records to return;
+   *   - `offset` — number of records to skip.
+   * @returns An array of {@link Ring} records.
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getRings(params?: { limit?: number; offset?: number }): Promise<Ring[]> {
     const qs = this._buildQuery(params);
     const res = await this._fetch(`/rings${qs}`);
@@ -213,6 +316,12 @@ export class LedgerLensClient {
   // Pair correlations
   // -----------------------------------------------------------------------
 
+  /**
+   * Fetches asset-pair correlations via `GET /correlations`.
+   *
+   * @returns An array of {@link PairCorrelation} records.
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getCorrelations(): Promise<PairCorrelation[]> {
     const res = await this._fetch("/correlations");
     return parseResponse(
@@ -226,6 +335,14 @@ export class LedgerLensClient {
   // Counterfactual explanations
   // -----------------------------------------------------------------------
 
+  /**
+   * Fetches the counterfactual explanation for a wallet's risk score via
+   * `GET /score/{wallet}/counterfactual`.
+   *
+   * @param wallet The wallet address to explain. It is URL-encoded before use.
+   * @returns The parsed {@link Counterfactual} explanation.
+   * @throws {LedgerLensError} On a non-2xx response, validation failure, or timeout.
+   */
   async getCounterfactual(wallet: string): Promise<Counterfactual> {
     const res = await this._fetch(
       `/score/${encodeURIComponent(wallet)}/counterfactual`,
@@ -237,6 +354,14 @@ export class LedgerLensClient {
   // Webhook subscribers (admin)
   // -----------------------------------------------------------------------
 
+  /**
+   * Lists webhook subscribers via `GET /admin/webhook/subscribers`.
+   * Requires an admin key (see {@link LedgerLensClientOptions.adminKey}).
+   *
+   * @returns An array of {@link WebhookSubscriber} records.
+   * @throws {LedgerLensError} On a non-2xx response (e.g. 401/403 without an
+   *   admin key), validation failure, or timeout.
+   */
   async getWebhookSubscribers(): Promise<WebhookSubscriber[]> {
     const res = await this._fetch("/admin/webhook/subscribers");
     return parseResponse(
@@ -250,6 +375,17 @@ export class LedgerLensClient {
   // Admin / observability endpoints
   // -----------------------------------------------------------------------
 
+  /**
+   * Fetches model drift reports via `GET /admin/drift`.
+   * Requires an admin key (see {@link LedgerLensClientOptions.adminKey}).
+   *
+   * The response shape is not currently modelled by a schema, so the raw
+   * parsed JSON is returned untyped.
+   *
+   * @returns The raw JSON body of the drift report response.
+   * @throws {LedgerLensError} On a timeout. Note: unlike the other methods this
+   *   call does not check the HTTP status code.
+   */
   async getDriftReports(): Promise<unknown> {
     const res = await this._fetch("/admin/drift");
     return res.json();
@@ -259,6 +395,14 @@ export class LedgerLensClient {
   // Private helpers
   // -----------------------------------------------------------------------
 
+  /**
+   * Issues a `fetch` to `baseUrl + path` with the configured headers and an
+   * abort-based timeout.
+   *
+   * @param path Request path beginning with `/` (query string included).
+   * @returns The raw {@link Response}; status checking happens in `parseResponse`.
+   * @throws {LedgerLensError} When the request exceeds the configured timeout.
+   */
   private async _fetch(path: string): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
     const controller = new AbortController();
@@ -282,6 +426,16 @@ export class LedgerLensClient {
     }
   }
 
+  /**
+   * Serialises a params object into a query string.
+   *
+   * `undefined` and `null` values are omitted; all other values are coerced
+   * with `String()`.
+   *
+   * @param params Key/value pairs to encode.
+   * @returns A query string beginning with `?`, or an empty string when there
+   *   are no parameters to encode.
+   */
   private _buildQuery(
     params?: Record<string, unknown>,
   ): string {

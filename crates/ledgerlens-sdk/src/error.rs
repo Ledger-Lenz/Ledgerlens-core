@@ -1,6 +1,25 @@
 use std::fmt;
 
 /// Errors that can occur when using the LedgerLens client.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ledgerlens_sdk::{LedgerLensClient, LedgerLensError};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let client = LedgerLensClient::new("https://api.ledgerlens.io", None);
+///     match client.get_score("GABCDEF").await {
+///         Ok(response) => println!("Got {} scores", response.scores.len()),
+///         Err(LedgerLensError::NotFound(_)) => eprintln!("Wallet not found"),
+///         Err(LedgerLensError::Unauthorized(_)) => eprintln!("Invalid API key"),
+///         Err(LedgerLensError::RateLimited(_)) => eprintln!("Rate limit exceeded; back off"),
+///         Err(LedgerLensError::HttpError(msg)) => eprintln!("Network error: {}", msg),
+///         Err(e) => eprintln!("Other error: {}", e),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub enum LedgerLensError {
     /// HTTP request failed (network error, DNS resolution failure, etc.)

@@ -1,0 +1,94 @@
+name: Staging Chaos Engineering
+
+on:
+  schedule:
+    # Weekly on Wednesday at 03:00 UTC
+    - cron: "0 3 * * 3"
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: "Chaos Mesh experiment file to run (e.g., pod-kill-api.yaml)"
+        required: true
+        default: "pod-kill-api.yaml"
+      duration_seconds:
+        description: "Duration of the experiment in seconds"
+        required: false
+        default: "60"
+
+jobs:
+  chaos-mesh-staging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt requests
+
+      - name: Configure Kubeconfig
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.STAGING_KUBECONFIG }}
+
+      - name: Validate Staging Cluster Connection
+        run: |
+          current_ns=$(kubectl config view --minify --output 'jsonpath={..namespace}')
+          if [[ "$current_ns" != *"staging"* && "$current_ns" != *"canary"* ]]; then
+            echo "❌ Error: Target context namespace is not staging/canary! Aborting."
+            exit 1
+          fi
+
+      - name: Silence Alertmanager
+        run: |
+          # Send silence request to staging Prometheus Alertmanager
+          curl -H "Content-Type: application/json" -d '{
+            "matchers": [{"name": "namespace", "value": "ledgerlens-staging", "isRegex": false}],
+            "startsAt": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",
+            "endsAt": "'$(date -u -d '+30 mins' +"%Y-%m-%dT%H:%M:%SZ")'",
+            "createdBy": "GHA-Chaos-Workflow",
+            "comment": "Silencing alerts for scheduled chaos testing"
+          }' http://alertmanager.staging.ledgerlens.io/api/v2/silences || true
+
+      - name: Inject Chaos Experiment
+        run: |
+          EXPERIMENT_FILE="chaos-mesh/${{ github.event.inputs.experiment || 'pod-kill-api.yaml' }}"
+          echo "Injecting Chaos Mesh experiment from $EXPERIMENT_FILE..."
+          kubectl apply -f "$EXPERIMENT_FILE"
+
+      - name: Run Active Load Generator
+        run: |
+          # Start synthetic traffic generation in background
+          python scripts/generate_traffic.py --url http://api.staging.ledgerlens.io --duration 120 &
+          echo "Traffic generator started in background."
+
+      - name: Verify Recovery
+        run: |
+          python chaos-mesh/verify_experiment.py \
+            --url http://api.staging.ledgerlens.io \
+            --metrics-url http://api.staging.ledgerlens.io/metrics \
+            --timeout ${{ github.event.inputs.duration_seconds || 60 }}
+
+      - name: Remove Chaos Experiment (Cleanup on Success)
+        if: success()
+        run: |
+          EXPERIMENT_FILE="chaos-mesh/${{ github.event.inputs.experiment || 'pod-kill-api.yaml' }}"
+          kubectl delete -f "$EXPERIMENT_FILE" --ignore-not-found=true
+
+      - name: Automated Emergency Rollback (Cleanup on Failure)
+        if: failure()
+        run: |
+          echo "⚠️ Chaos validation failed! Initiating emergency cleanup..."
+          kubectl delete -f chaos-mesh/network-partition-ingestion.yaml --ignore-not-found=true
+          kubectl delete -f chaos-mesh/network-partition-redis.yaml --ignore-not-found=true
+          kubectl delete -f chaos-mesh/pod-kill-api.yaml --ignore-not-found=true
+          kubectl delete -f chaos-mesh/pod-kill-ingestion.yaml --ignore-not-found=true

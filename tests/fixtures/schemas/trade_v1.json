@@ -1,0 +1,25 @@
+{
+  "id": "trade-12345",
+  "paging_token": "pt-12345",
+  "ledger_close_time": "2023-10-27T10:00:00Z",
+  "base_account": "GBXGQJWVN5C3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3",
+  "counter_account": "GCXGQJWVN5C3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3Z3",
+  "base_asset": {
+    "code": "XLM",
+    "issuer": null
+  },
+  "counter_asset": {
+    "code": "USDC",
+    "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+  },
+  "base_amount": 100.5,
+  "counter_amount": 10.05,
+  "price": 0.1,
+  "base_is_seller": true,
+  "trade_type": "orderbook",
+  "liquidity_pool_id": null,
+  "transaction_hash": "tx-12345",
+  "path_payment_id": null,
+  "hop_index": null,
+  "source": "stellar"
+}

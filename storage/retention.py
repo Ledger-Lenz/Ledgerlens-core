@@ -78,6 +78,13 @@ class RetentionEngine:
         for table, days in self._ttl.items():
             result = self._process_table(table, days, dry_run=dry_run)
             report[table] = result
+        total_rows = sum(r.get("rows_archived", 0) for r in report.values())
+        logger.info(
+            "Retention run complete: %d row(s) affected across %d table(s) (dry_run=%s)",
+            total_rows,
+            len(report),
+            dry_run,
+        )
         return report
 
     def storage_stats(self) -> dict:
@@ -121,6 +128,7 @@ class RetentionEngine:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
             ).fetchone()
             if not exists:
+                logger.info("Retention skipped for %s: table does not exist", table)
                 return {"cutoff_date": cutoff_iso, "rows_archived": 0, "archive_path": None, "skipped": True}
 
             row = conn.execute(
@@ -129,9 +137,16 @@ class RetentionEngine:
             count = row[0]
 
         if count == 0:
+            logger.info("No rows older than cutoff=%s in %s; nothing to archive", cutoff_iso, table)
             return {"cutoff_date": cutoff_iso, "rows_archived": 0, "archive_path": None}
 
         if dry_run:
+            logger.info(
+                "Dry-run: would archive/purge %d row(s) from %s (cutoff=%s)",
+                count,
+                table,
+                cutoff_iso,
+            )
             return {"cutoff_date": cutoff_iso, "rows_archived": count, "archive_path": None, "dry_run": True}
 
         # Archive to Parquet

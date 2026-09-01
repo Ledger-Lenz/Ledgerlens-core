@@ -6,10 +6,6 @@ documented in the [README's "LedgerLens Organization" section](README.md#ledgerl
 
 ## Now
 
-- **Restore automated releases.** `.github/workflows/release-please.yml` was
-  removed; `CHANGELOG.md` and the `pyproject.toml` version are currently
-  bumped by hand. Reinstate release-please (or an equivalent) so tagging,
-  changelog generation, and the GHCR image publish stay in sync automatically.
 - **Triage the `.github/ISSUES/` backlog.** Several issues in that directory
   (SDKs, audit log, multi-tenant namespaces, API key management, chaos
   testing, GNN ring detection, temporal patterns, streaming, tracing) already

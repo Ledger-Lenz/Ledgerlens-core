@@ -1,10 +1,46 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A single wallet/asset-pair risk score, as returned by the scoring pipeline.
 ///
 /// Field names and types match the Python SDK (`packages/ledgerlens-sdk/src/ledgerlens/models.py`)
 /// and the TypeScript SDK (`sdk/`) exactly.
+///
+/// IMPORTANT: This struct must stay in sync with:
+///   - detection/risk_score.py (Python canonical model — authoritative)
+///   - packages/ledgerlens-sdk/src/ledgerlens/models.py (Python SDK)
+///   - sdk/src/schemas.ts (TypeScript/Zod)
+///   - proto/ledgerlens/v1/scoring.proto
+///
+/// The contract is verified by: tests/test_contract_vectors.py (Python),
+/// crates/ledgerlens-sdk/tests/contract_vectors_test.rs (Rust), and
+/// sdk/tests/contract_vectors.test.ts (TypeScript).
+///
+/// # Examples
+///
+/// ```
+/// use ledgerlens_sdk::RiskScore;
+///
+/// let json = r#"{
+///     "wallet": "GABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901234567890123456",
+///     "asset_pair": "XLM/USDC",
+///     "score": 82,
+///     "benford_flag": true,
+///     "ml_flag": true,
+///     "confidence": 91,
+///     "disputed": false,
+///     "timestamp": "2026-08-27T12:00:00Z",
+///     "score_lower": null,
+///     "score_upper": null,
+///     "prediction_set": null,
+///     "coverage_guarantee": null
+/// }"#;
+///
+/// let score: RiskScore = serde_json::from_str(json).unwrap();
+/// assert_eq!(score.score, 82);
+/// assert!(score.benford_flag);
+/// assert_eq!(score.asset_pair, "XLM/USDC");
+/// ```
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct RiskScore {
@@ -25,12 +61,19 @@ pub struct RiskScore {
     pub disputed: bool,
     /// When the score was computed.
     pub timestamp: DateTime<Utc>,
+    /// End-to-end latency in milliseconds from trade receipt to score update (optional).
+    /// Populated on the streaming scoring path.
+    pub latency_ms: Option<f64>,
     /// Lower bound of 90% conformal prediction interval (optional, v2+).
     pub score_lower: Option<f64>,
     /// Upper bound of 90% conformal prediction interval (optional, v2+).
     pub score_upper: Option<f64>,
     /// Class indices in the conformal prediction set (optional, v2+).
-    pub prediction_set: Option<Vec<u8>>,
+    ///
+    /// NOTE: The element type is i32 (signed integer) to match the Python `list[int]`
+    /// canonical type. A previous incorrect implementation used `Vec<u8>` (unsigned byte),
+    /// which diverged from the Python model. Fixed per ADR-005 contract enforcement.
+    pub prediction_set: Option<Vec<i32>>,
     /// Target coverage level (1 - alpha) of the prediction set (optional, v2+).
     pub coverage_guarantee: Option<f64>,
 }
@@ -48,6 +91,36 @@ pub struct CrossChainLink {
 }
 
 /// Response shape of `GET /v1/scores/{wallet}`.
+///
+/// # Examples
+///
+/// ```
+/// use ledgerlens_sdk::WalletScoresResponse;
+///
+/// let json = r#"{
+///     "scores": [
+///         {
+///             "wallet": "GABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901234567890123456",
+///             "asset_pair": "XLM/USDC",
+///             "score": 72,
+///             "benford_flag": false,
+///             "ml_flag": true,
+///             "confidence": 85,
+///             "disputed": false,
+///             "timestamp": "2026-08-27T12:00:00Z",
+///             "score_lower": null,
+///             "score_upper": null,
+///             "prediction_set": null,
+///             "coverage_guarantee": null
+///         }
+///     ],
+///     "cross_chain_links": []
+/// }"#;
+///
+/// let response: WalletScoresResponse = serde_json::from_str(json).unwrap();
+/// assert_eq!(response.scores.len(), 1);
+/// assert!(response.cross_chain_links.is_empty());
+/// ```
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct WalletScoresResponse {

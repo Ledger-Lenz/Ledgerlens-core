@@ -43,6 +43,39 @@ print(f"Round {result.round_id}: accepted={result.accepted}")
 
 See `docs/federation_integration.md` in the main repository for detailed integration guide.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a full history of releases and notable changes.
+
 ## License
 
 MIT
+## Docker
+
+The client can run as a container for exchange-side federated learning participation, using environment variables for configuration instead of Python code.
+
+### Build
+
+```bash
+docker build -t ledgerlens-fl-client packages/ledgerlens-fl-client/
+docker run \
+  -e FL_SERVER_URL=https://fl.ledgerlens.io \
+  -e FL_API_KEY=your-api-key \
+  -e FL_DATA_DIR=/data \
+  -e FL_OPERATOR_ID=exchange-xyz \
+  -e FL_ROUNDS=1 \
+  -v /path/to/local/data:/data \
+  ledgerlens-fl-client
+**Now commit everything and push:**
+
+```bash
+git add contracts/oracle_aggregator/CHANGELOG.md contracts/oracle_aggregator/README.md contracts/zk_verifier/CHANGELOG.md contracts/zk_verifier/README.md packages/ledgerlens-fl-client/README.md
+
+git commit -m "docs: document Docker build steps, panic messages, and add CHANGELOGs (#791, #792, #793, #794)
+
+- Document Docker build/run/publish status for ledgerlens-fl-client
+- Document all 4 panic! messages in oracle_aggregator's README table
+- Add CHANGELOG.md to oracle_aggregator and zk_verifier contracts,
+  reconstructed from git log, linked from each README"
+
+git push origin docs/docker-panic-changelogs-batch

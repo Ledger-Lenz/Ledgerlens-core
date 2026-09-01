@@ -4,13 +4,21 @@ Idiomatic Go client for the [LedgerLens](https://github.com/Ledger-Lenz/Ledgerle
 
 Covers the same REST surface as the Python SDK (`packages/ledgerlens-sdk`) and the TypeScript SDK (`sdk/`), with context-aware methods, typed error handling, and webhook HMAC verification helpers.
 
+## Requirements
+
+Go 1.22 or later, matching the `go` directive in [`go.mod`](./go.mod). CI builds and tests this SDK against Go 1.22.
+
 ## Installation
 
 ```bash
 go get github.com/Ledger-Lenz/Ledgerlens-core/go@latest
 ```
 
-Requires Go 1.22+. The module path is `github.com/Ledger-Lenz/Ledgerlens-core/go`.
+The module path is `github.com/Ledger-Lenz/Ledgerlens-core/go`.
+
+### Minimum supported Go version
+
+This module requires **Go 1.22 or later**, matching the `go 1.22` directive in `go.mod`. CI builds and tests the SDK against Go 1.22.
 
 ## Quick Start
 
@@ -41,6 +49,21 @@ func main() {
             s.Wallet, s.AssetPair, s.Score, s.BenfordFlag, s.MLFlag)
     }
 }
+```
+
+## Runnable Examples
+
+[`example_test.go`](example_test.go) contains runnable, testable examples using
+Go's `Example` function convention. They execute against a local `httptest`
+server, so they are verified on every `go test ./...` run and also render in the
+generated [pkg.go.dev](https://pkg.go.dev) documentation:
+
+- `Example` — construct a client and fetch a wallet's risk scores.
+- `Example_withdrawalGating` — the withdrawal-gating pattern shown below.
+
+```bash
+cd go/
+go test -run Example -v ./...
 ```
 
 ## Withdrawal Gating Example
@@ -204,3 +227,5 @@ The module is tagged `go/vX.Y.Z` for `go get`:
 ```bash
 go get github.com/Ledger-Lenz/Ledgerlens-core/go@go/v0.1.0
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for the version history of this module.

@@ -4,21 +4,162 @@ extern crate std;
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
-use sha2::{Digest, Sha256};
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
-    Address, BytesN, Env, String, Vec,
+    Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 use std::vec::Vec as StdVec;
 
-const ASSET_PAIR: &str = "XLM/USDC";
+const ASSET_PAIR: &str = "XLM_USDC";
 const SCORE: u32 = 85;
 const TIMESTAMP: u64 = 1672531200;
+const CONFIDENCE: u32 = 91;
+const MODEL_VERSION: u32 = 7;
+const BENFORD_FLAG: bool = true;
+const ML_FLAG: bool = false;
+const TRAP_SCORE: u32 = 99;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScoreAttestation {
+    commitment: BytesN<32>,
+    signature: BytesN<65>,
+    contract_id: BytesN<32>,
+    contract_version: u32,
+    nonce: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThresholdAttestation {
+    commitment: BytesN<32>,
+    threshold_sig: BytesN<65>,
+    participating_signers: Vec<Address>,
+    contract_id: BytesN<32>,
+    contract_version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MaybeScoreAttestation {
+    None,
+    Some(ScoreAttestation),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MaybeThresholdAttestation {
+    None,
+    Some(ThresholdAttestation),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScoreAttestationInput {
+    attestation: MaybeScoreAttestation,
+    threshold_attestation: MaybeThresholdAttestation,
+    commitment: Option<Bytes>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredScore {
+    service: Address,
+    score: u32,
+    benford_flag: bool,
+    ml_flag: bool,
+    timestamp: u64,
+    confidence: u32,
+    model_version: u32,
+}
+
+#[contracttype]
+enum ScoreStorageKey {
+    Score(Address, Symbol),
+    InvocationCount,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+enum ScoreContractError {
+    ForcedFailure = 1,
+}
+
+#[contract]
+struct ScoreContractStub;
+
+#[contractimpl]
+impl ScoreContractStub {
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_score(
+        env: Env,
+        signers: Vec<Address>,
+        wallet: Address,
+        asset_pair: Symbol,
+        score: u32,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: u64,
+        confidence: u32,
+        model_version: u32,
+        attestation_input: Option<ScoreAttestationInput>,
+    ) -> Result<(), ScoreContractError> {
+        let service = signers
+            .get(0)
+            .expect("aggregator service signer is required");
+        service.require_auth();
+
+        if score == TRAP_SCORE {
+            return Err(ScoreContractError::ForcedFailure);
+        }
+        assert_eq!(signers.len(), 1);
+        assert!(attestation_input.is_none());
+
+        let record = StoredScore {
+            service,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+        };
+        env.storage()
+            .persistent()
+            .set(&ScoreStorageKey::Score(wallet, asset_pair), &record);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&ScoreStorageKey::InvocationCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&ScoreStorageKey::InvocationCount, &(count + 1));
+        Ok(())
+    }
+
+    pub fn get_score(env: Env, wallet: Address, asset_pair: Symbol) -> Option<StoredScore> {
+        env.storage()
+            .persistent()
+            .get(&ScoreStorageKey::Score(wallet, asset_pair))
+    }
+
+    pub fn invocation_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&ScoreStorageKey::InvocationCount)
+            .unwrap_or(0)
+    }
+}
 
 /// Fixture holding a registered contract plus the oracle keys it trusts.
 struct Fixture {
     env: Env,
     client: OracleAggregatorClient<'static>,
+    score_client: ScoreContractStubClient<'static>,
+    aggregator_address: Address,
     keys: StdVec<SigningKey>,
     wallet: Address,
 }
@@ -29,6 +170,9 @@ impl Fixture {
     /// replay window.
     fn new(threshold: u32, n: usize) -> Self {
         let env = Env::default();
+        env.mock_all_auths();
+        let score_contract = env.register_contract(None, ScoreContractStub);
+        let score_client = ScoreContractStubClient::new(&env, &score_contract);
         let contract_id = env.register_contract(None, OracleAggregator);
         let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -39,23 +183,39 @@ impl Fixture {
             oracle_keys.push_back(BytesN::from_array(&env, &k.verifying_key().to_bytes()));
         }
 
-        let score_contract = Address::generate(&env);
-        client.initialize(&threshold, &oracle_keys, &score_contract);
+        let deployer = Address::generate(&env);
+        client.initialize(&deployer, &threshold, &oracle_keys, &score_contract);
 
         let wallet = Address::generate(&env);
         env.ledger().set_timestamp(TIMESTAMP + 100);
 
-        Fixture { env, client, keys, wallet }
+        Fixture {
+            env,
+            client,
+            score_client,
+            aggregator_address: contract_id,
+            keys,
+            wallet,
+        }
     }
 
-    fn asset_pair(&self) -> String {
-        String::from_str(&self.env, ASSET_PAIR)
+    fn asset_pair(&self) -> Symbol {
+        Symbol::new(&self.env, ASSET_PAIR)
     }
 
     /// The digest the contract expects oracles to sign.
     fn message(&self, score: u32, timestamp: u64) -> StdVec<u8> {
         self.client
-            .canonical_message(&self.wallet, &self.asset_pair(), &score, &timestamp)
+            .canonical_message(
+                &self.wallet,
+                &self.asset_pair(),
+                &score,
+                &BENFORD_FLAG,
+                &ML_FLAG,
+                &timestamp,
+                &CONFIDENCE,
+                &MODEL_VERSION,
+            )
             .to_alloc_vec()
     }
 
@@ -78,9 +238,75 @@ impl Fixture {
     }
 
     fn submit(&self, sigs: &Vec<SignaturePair>, score: u32, timestamp: u64) -> bool {
-        self.client
-            .submit_with_quorum(&self.wallet, &self.asset_pair(), &score, &timestamp, sigs)
+        self.client.submit_with_quorum(
+            &self.wallet,
+            &self.asset_pair(),
+            &score,
+            &BENFORD_FLAG,
+            &ML_FLAG,
+            &timestamp,
+            &CONFIDENCE,
+            &MODEL_VERSION,
+            sigs,
+        )
     }
+}
+
+// ---------------------------------------------------------------------------
+// ledgerlens-score ABI integration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quorum_submission_forwards_exact_abi_and_persists_score() {
+    let f = Fixture::new(3, 5);
+    let signatures = f.sign_with(&[0, 1, 2], SCORE, TIMESTAMP);
+
+    assert!(f.submit(&signatures, SCORE, TIMESTAMP));
+
+    let stored = f
+        .score_client
+        .get_score(&f.wallet, &f.asset_pair())
+        .expect("quorum-approved score must be queryable");
+    assert_eq!(
+        stored,
+        StoredScore {
+            service: f.aggregator_address,
+            score: SCORE,
+            benford_flag: BENFORD_FLAG,
+            ml_flag: ML_FLAG,
+            timestamp: TIMESTAMP,
+            confidence: CONFIDENCE,
+            model_version: MODEL_VERSION,
+        }
+    );
+    assert_eq!(f.score_client.invocation_count(), 1);
+}
+
+#[test]
+fn failed_quorum_does_not_invoke_score_contract() {
+    let f = Fixture::new(3, 5);
+    let signatures = f.sign_with(&[0, 1], SCORE, TIMESTAMP);
+
+    assert!(!f.submit(&signatures, SCORE, TIMESTAMP));
+    assert_eq!(f.score_client.invocation_count(), 0);
+    assert_eq!(f.score_client.get_score(&f.wallet, &f.asset_pair()), None);
+}
+
+#[test]
+fn score_contract_error_traps_and_rolls_back_submission() {
+    let f = Fixture::new(3, 5);
+    let signatures = f.sign_with(&[0, 1, 2], TRAP_SCORE, TIMESTAMP);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.submit(&signatures, TRAP_SCORE, TIMESTAMP)
+    }));
+
+    assert!(
+        result.is_err(),
+        "callee contract errors must trap the aggregator call"
+    );
+    assert_eq!(f.score_client.invocation_count(), 0);
+    assert_eq!(f.score_client.get_score(&f.wallet, &f.asset_pair()), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +434,10 @@ fn signature_over_different_payload_is_not_accepted() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         f.submit(&sigs, SCORE, TIMESTAMP)
     }));
-    assert!(result.is_err(), "a signature over a different score must not be accepted");
+    assert!(
+        result.is_err(),
+        "a signature over a different score must not be accepted"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +450,13 @@ fn signature_over_different_payload_is_not_accepted() {
 fn replay_window_boundary_is_exact() {
     let f = Fixture::new(1, 3);
 
-    for (age, expected) in [(0u64, true), (299, true), (300, true), (301, false), (10_000, false)] {
+    for (age, expected) in [
+        (0u64, true),
+        (299, true),
+        (300, true),
+        (301, false),
+        (10_000, false),
+    ] {
         let ts = TIMESTAMP;
         f.env.ledger().set_timestamp(ts + age);
         let sigs = f.sign_with(&[0], SCORE, ts);
@@ -264,13 +499,30 @@ fn canonical_message_is_sensitive_to_every_field() {
     let f = Fixture::new(1, 1);
     let base = f.message(SCORE, TIMESTAMP);
 
-    assert_ne!(base, f.message(SCORE + 1, TIMESTAMP), "score must affect the digest");
-    assert_ne!(base, f.message(SCORE, TIMESTAMP + 1), "timestamp must affect the digest");
+    assert_ne!(
+        base,
+        f.message(SCORE + 1, TIMESTAMP),
+        "score must affect the digest"
+    );
+    assert_ne!(
+        base,
+        f.message(SCORE, TIMESTAMP + 1),
+        "timestamp must affect the digest"
+    );
 
     let other_wallet = Address::generate(&f.env);
     let other = f
         .client
-        .canonical_message(&other_wallet, &f.asset_pair(), &SCORE, &TIMESTAMP)
+        .canonical_message(
+            &other_wallet,
+            &f.asset_pair(),
+            &SCORE,
+            &BENFORD_FLAG,
+            &ML_FLAG,
+            &TIMESTAMP,
+            &CONFIDENCE,
+            &MODEL_VERSION,
+        )
         .to_alloc_vec();
     assert_ne!(base, other, "wallet must affect the digest");
 
@@ -278,30 +530,51 @@ fn canonical_message_is_sensitive_to_every_field() {
         .client
         .canonical_message(
             &f.wallet,
-            &String::from_str(&f.env, "BTC/USDC"),
+            &Symbol::new(&f.env, "BTC_USDC"),
             &SCORE,
+            &BENFORD_FLAG,
+            &ML_FLAG,
             &TIMESTAMP,
+            &CONFIDENCE,
+            &MODEL_VERSION,
         )
         .to_alloc_vec();
     assert_ne!(base, other_pair, "asset pair must affect the digest");
 }
 
-/// The delimiters must prevent field-splicing ambiguity: `("XLM", "USDC")` and
-/// `("XLM/USDC", "")` must not collide.
+/// Delimiters and fixed-width scalar fields prevent pair-name ambiguity.
 #[test]
 fn canonical_message_is_not_ambiguous_across_field_boundaries() {
     let f = Fixture::new(1, 1);
 
     let a = f
         .client
-        .canonical_message(&f.wallet, &String::from_str(&f.env, "XLM/USDC"), &SCORE, &TIMESTAMP)
+        .canonical_message(
+            &f.wallet,
+            &Symbol::new(&f.env, "XLM_USDC"),
+            &SCORE,
+            &BENFORD_FLAG,
+            &ML_FLAG,
+            &TIMESTAMP,
+            &CONFIDENCE,
+            &MODEL_VERSION,
+        )
         .to_alloc_vec();
     let b = f
         .client
-        .canonical_message(&f.wallet, &String::from_str(&f.env, "XLM|USDC"), &SCORE, &TIMESTAMP)
+        .canonical_message(
+            &f.wallet,
+            &Symbol::new(&f.env, "XLMUSDC"),
+            &SCORE,
+            &BENFORD_FLAG,
+            &ML_FLAG,
+            &TIMESTAMP,
+            &CONFIDENCE,
+            &MODEL_VERSION,
+        )
         .to_alloc_vec();
 
-    assert_ne!(a, b, "a delimiter inside a field must not alias a field boundary");
+    assert_ne!(a, b, "distinct asset-pair symbols must not share a digest");
 }
 
 /// Cross-language parity: the on-chain digest must equal the byte layout that
@@ -309,47 +582,100 @@ fn canonical_message_is_not_ambiguous_across_field_boundaries() {
 /// with an independent SHA-256 implementation.
 ///
 /// Python:
-/// `sha256(prefix + wallet.encode() + b"|" + asset_pair.encode() + b"|"
-///         + struct.pack(">I", score) + struct.pack(">Q", timestamp))`
+/// `sha256(prefix + wallet.encode() + b"|" + symbol_scval_xdr + b"|"
+///         + struct.pack(">I??QII", score, benford, ml, timestamp,
+///                       confidence, model_version))`
 #[test]
 fn canonical_message_matches_python_encoding() {
     let f = Fixture::new(1, 1);
-
-    // Recover the wallet's strkey exactly as the contract sees it.
-    let strkey = f.wallet.to_string();
-    let mut buf = [0u8; 56];
-    strkey.copy_into_slice(&mut buf);
-
-    let mut preimage = StdVec::new();
-    preimage.extend_from_slice(b"LedgerLens-Oracle-v1");
-    preimage.extend_from_slice(&buf);
-    preimage.extend_from_slice(b"|");
-    preimage.extend_from_slice(ASSET_PAIR.as_bytes());
-    preimage.extend_from_slice(b"|");
-    preimage.extend_from_slice(&SCORE.to_be_bytes());
-    preimage.extend_from_slice(&TIMESTAMP.to_be_bytes());
-
-    let expected: StdVec<u8> = Sha256::digest(&preimage).to_vec();
+    let wallet = Address::from_string(&String::from_str(
+        &f.env,
+        "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    ));
+    let expected = [
+        0xbb, 0xcc, 0xcc, 0xa8, 0x01, 0xb9, 0x36, 0xd2, 0xc5, 0x66, 0x5f, 0xb2, 0xc9, 0xf2, 0x87,
+        0x80, 0xfe, 0x95, 0x6d, 0x42, 0xd5, 0x15, 0xe4, 0xbd, 0x2c, 0xcc, 0x75, 0x8f, 0xed, 0xbf,
+        0x55, 0x4e,
+    ];
+    let actual = f
+        .client
+        .canonical_message(
+            &wallet,
+            &f.asset_pair(),
+            &SCORE,
+            &BENFORD_FLAG,
+            &ML_FLAG,
+            &TIMESTAMP,
+            &CONFIDENCE,
+            &MODEL_VERSION,
+        )
+        .to_alloc_vec();
 
     assert_eq!(
-        f.message(SCORE, TIMESTAMP),
-        expected,
+        actual, expected,
         "on-chain digest diverged from the Python canonical encoding",
     );
 }
 
-/// An asset pair longer than the canonical-message buffer is rejected loudly
-/// rather than being silently truncated into a colliding digest.
 #[test]
-#[should_panic(expected = "string exceeds canonical message buffer")]
-fn overlong_asset_pair_is_rejected() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, OracleAggregator);
-    let client = OracleAggregatorClient::new(&env, &contract_id);
-    let wallet = Address::generate(&env);
+fn canonical_message_is_sensitive_to_score_metadata() {
+    let f = Fixture::new(1, 1);
+    let base = f.message(SCORE, TIMESTAMP);
 
-    let long = "A".repeat(MAX_ASSET_PAIR_LEN + 1);
-    client.canonical_message(&wallet, &String::from_str(&env, &long), &SCORE, &TIMESTAMP);
+    let variants = [
+        f.client
+            .canonical_message(
+                &f.wallet,
+                &f.asset_pair(),
+                &SCORE,
+                &false,
+                &ML_FLAG,
+                &TIMESTAMP,
+                &CONFIDENCE,
+                &MODEL_VERSION,
+            )
+            .to_alloc_vec(),
+        f.client
+            .canonical_message(
+                &f.wallet,
+                &f.asset_pair(),
+                &SCORE,
+                &BENFORD_FLAG,
+                &true,
+                &TIMESTAMP,
+                &CONFIDENCE,
+                &MODEL_VERSION,
+            )
+            .to_alloc_vec(),
+        f.client
+            .canonical_message(
+                &f.wallet,
+                &f.asset_pair(),
+                &SCORE,
+                &BENFORD_FLAG,
+                &ML_FLAG,
+                &TIMESTAMP,
+                &(CONFIDENCE - 1),
+                &MODEL_VERSION,
+            )
+            .to_alloc_vec(),
+        f.client
+            .canonical_message(
+                &f.wallet,
+                &f.asset_pair(),
+                &SCORE,
+                &BENFORD_FLAG,
+                &ML_FLAG,
+                &TIMESTAMP,
+                &CONFIDENCE,
+                &(MODEL_VERSION + 1),
+            )
+            .to_alloc_vec(),
+    ];
+
+    for variant in variants {
+        assert_ne!(base, variant);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +686,7 @@ fn overlong_asset_pair_is_rejected() {
 #[should_panic(expected = "already initialized")]
 fn initialize_is_idempotent_guarded() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -367,15 +694,17 @@ fn initialize_is_idempotent_guarded() {
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
     let score_contract = Address::generate(&env);
+    let deployer = Address::generate(&env);
 
-    client.initialize(&1, &oracle_keys, &score_contract);
-    client.initialize(&1, &oracle_keys, &score_contract);
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
 }
 
 #[test]
 #[should_panic(expected = "threshold must be greater than zero")]
 fn zero_threshold_is_rejected() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -383,13 +712,19 @@ fn zero_threshold_is_rejected() {
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
 
-    client.initialize(&0, &oracle_keys, &Address::generate(&env));
+    client.initialize(
+        &Address::generate(&env),
+        &0,
+        &oracle_keys,
+        &Address::generate(&env),
+    );
 }
 
 #[test]
 #[should_panic(expected = "threshold exceeds number of oracle keys")]
 fn unsatisfiable_threshold_is_rejected() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -397,7 +732,12 @@ fn unsatisfiable_threshold_is_rejected() {
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
 
-    client.initialize(&2, &oracle_keys, &Address::generate(&env));
+    client.initialize(
+        &Address::generate(&env),
+        &2,
+        &oracle_keys,
+        &Address::generate(&env),
+    );
 }
 
 #[test]
@@ -407,14 +747,73 @@ fn test_double_initialization_fails() {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
-    
+
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &[1u8; 32]));
     let score_contract = Address::generate(&env);
-    
-    client.initialize(&1, &oracle_keys, &score_contract);
+    let deployer = Address::generate(&env);
+
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
     // Second initialization should panic
-    client.initialize(&2, &oracle_keys, &score_contract);
+    client.initialize(&deployer, &2, &oracle_keys, &score_contract);
+}
+
+/// Unauthorized callers cannot initialise the contract. The `deployer` parameter
+/// must authorise the call; presenting a different (unauthorised) address makes
+/// `require_auth` reject it before any configuration is written.
+#[test]
+#[should_panic]
+fn unauthorized_caller_cannot_initialize() {
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+
+    let env = Env::default();
+    let contract_id = env.register_contract(None, OracleAggregator);
+    let client = OracleAggregatorClient::new(&env, &contract_id);
+
+    let deployer = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let key = SigningKey::generate(&mut OsRng);
+    let mut oracle_keys = Vec::new(&env);
+    oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
+    let score_contract = Address::generate(&env);
+
+    // Only the legitimate deployer is authorised for an initialisation call.
+    env.mock_auths(&[MockAuth {
+        address: &deployer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&deployer, &1u32, &oracle_keys, &score_contract),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // The attacker presents themselves as deployer without a matching auth.
+    client.initialize(&attacker, &1, &oracle_keys, &score_contract);
+}
+
+/// The authorised deployer can initialise; the recorded deployer identity is
+/// stored so the one-time configuration authority is verifiable on-chain.
+#[test]
+fn authorized_deployer_can_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, OracleAggregator);
+    let client = OracleAggregatorClient::new(&env, &contract_id);
+
+    let deployer = Address::generate(&env);
+    let mut oracle_keys = Vec::new(&env);
+    oracle_keys.push_back(BytesN::from_array(&env, &[1u8; 32]));
+    let score_contract = Address::generate(&env);
+
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
+
+    assert_eq!(
+        client.get_deployer(),
+        deployer,
+        "deployer identity should be recorded on initialization"
+    );
 }
 
 #[test]
@@ -422,19 +821,38 @@ fn test_canonical_message_boundary_values() {
     let env = Env::default();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
-    
+
     let wallet = Address::generate(&env);
-    let asset_pair = Symbol::new(&env, "XLM-USDC");
-    
+    let asset_pair = Symbol::new(&env, "XLM_USDC");
+
+
     // Test max values don't panic
-    let msg1 = client.canonical_message(&wallet, &asset_pair, &u32::MAX, &u64::MAX);
+    let msg1 = client.canonical_message(
+        &wallet,
+        &asset_pair,
+        &u32::MAX,
+        &true,
+        &true,
+        &u64::MAX,
+        &u32::MAX,
+        &u32::MAX,
+    );
     assert!(msg1.len() > 0);
-    
+
     // Test min values
-    let msg2 = client.canonical_message(&wallet, &asset_pair, &0, &0);
+    let msg2 = client.canonical_message(&wallet, &asset_pair, &0, &false, &false, &0, &0, &0);
     assert!(msg2.len() > 0);
-    
+
     // Test mixed boundary
-    let msg3 = client.canonical_message(&wallet, &asset_pair, &u32::MAX, &0);
+    let msg3 = client.canonical_message(
+        &wallet,
+        &asset_pair,
+        &u32::MAX,
+        &false,
+        &true,
+        &0,
+        &u32::MAX,
+        &0,
+    );
     assert!(msg3.len() > 0);
 }

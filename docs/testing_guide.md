@@ -141,6 +141,37 @@ Add a harness whenever a new function parses externally-controlled data:
        Trade.model_validate(json.loads(b"<minimised bytes>"))
    ```
 
+## Mutation Testing
+
+Coverage confirms a line executed under test; it does not confirm a test would
+fail if that line were wrong. [`mutmut`](https://github.com/boxed/mutmut) fills
+that gap by making small semantic edits to the source and re-running the suite
+against each one — a mutant that still passes is an unasserted behaviour.
+
+| Approach | What it proves |
+|----------|----------------|
+| **Coverage** | The code path ran |
+| **Hypothesis / Atheris** | The code doesn't crash on generated / adversarial input |
+| **Mutation (`mutmut`)** | The tests would actually *catch* a logic error in the code path |
+
+Scope is the three core detection modules, configured in `pyproject.toml`
+(`[tool.mutmut]`): `detection/benford_engine.py`, `detection/graph_engine.py`,
+`detection/model_inference.py`.
+
+```bash
+make mutation-test      # mutmut run + mutmut results --all over all three modules
+mutmut run --paths-to-mutate detection/benford_engine.py   # iterate on one file
+mutmut show <id>        # view a surviving mutant as a diff
+```
+
+A full cold run takes **20–40+ minutes** (each mutant runs the whole suite;
+re-runs are faster via `.mutmut-cache`). It is **CI-only in spirit but not in
+practice** — no `.github/workflows/` job runs it and the README badge is updated
+by hand, so run it locally when you touch detection logic or its tests. Target is
+**≥ 80%** mutation score. Full contributor guidance (runtime, when to run, how to
+kill survivors) is in
+[CONTRIBUTING.md → Mutation testing](../CONTRIBUTING.md#mutation-testing).
+
 ## Migrating existing tests
 
 `tests/test_feature_store.py`, `tests/test_pipeline.py`, and

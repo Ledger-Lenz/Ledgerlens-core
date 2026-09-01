@@ -44,3 +44,11 @@ To rotate the proving/verification keys:
 1. Initialize Phase 2 contribution using the setup script: `scripts/setup_trusted_ceremony.sh`.
 2. Generate the new `.zkey` and `verification_key.json`.
 3. Calculate the new SHA-256 checksums and update the settings configurations.
+
+## See Also
+
+- **Circom Circuits:** [circuits/README.md](../circuits/README.md)  
+  Overview of the circuit definitions, including `score_range_proof.circom` and the integration points for both Sigma protocol and zk-SNARK proof systems.
+
+- **Soroban Verifier Contract:** [contracts/zk_verifier/README.md](../contracts/zk_verifier/README.md)  
+  The on-chain smart contract that verifies proofs. Implements the Sigma protocol variant by default; the zk-SNARK variant would use a similar contract with a different verification algorithm.

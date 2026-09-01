@@ -49,11 +49,10 @@ extern crate std;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Map, Symbol};
 
 mod curve;
+mod pairing;
 use curve::{Fq, Fr, Point};
-
-#[cfg(test)]
-mod test;
-
+use pairing::{pairing as bn128_pairing, Fq2, G2Point};
+mod snark_test_vectors;
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -61,6 +60,23 @@ mod test;
 
 fn commitments_key(env: &Env) -> Symbol {
     Symbol::new(env, "commitments")
+}
+
+fn admin_key(env: &Env) -> Symbol {
+    Symbol::new(env, "ADMIN")
+}
+
+/// Load the stored admin and require its authorization.
+///
+/// The identity is read from contract storage — never from a caller-supplied
+/// address — so a self-signed non-admin cannot satisfy this check.
+fn require_stored_admin(env: &Env) {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&admin_key(env))
+        .unwrap_or_else(|| panic!("not initialized"));
+    admin.require_auth();
 }
 
 /// On-chain record for a single wallet.
@@ -123,21 +139,32 @@ impl ZkVerifier {
     // Admin
     // ------------------------------------------------------------------
 
+    /// One-time setup: persist the authorized administrator.
+    ///
+    /// Panics if called twice — same re-init guard as
+    /// `oracle_aggregator::initialize`. The stored address is the only
+    /// identity `submit_score` will later `require_auth()` against.
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&admin_key(&env)) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&admin_key(&env), &admin);
+    }
+
     /// Store a score + commitment for *wallet*.
     ///
-    /// Only callable by the contract administrator.  Stores both the
-    /// raw numeric score (for legacy consumers) and the cryptographic
+    /// Only callable by the stored contract administrator.  Stores both
+    /// the raw numeric score (for legacy consumers) and the cryptographic
     /// commitments needed for zero-knowledge threshold proofs.
     pub fn submit_score(
         env: Env,
-        admin: Address,
         wallet: Address,
         score: u32,
         commitment_hash: BytesN<32>,
         pedersen_x: BytesN<32>,
         pedersen_y: BytesN<32>,
     ) {
-        admin.require_auth();
+        require_stored_admin(&env);
 
         let key = commitments_key(&env);
         let mut map: Map<Address, ScoreCommitment> =
@@ -426,6 +453,3 @@ impl ZkVerifier {
         Some(ProofData { score_commit, bits })
     }
 }
-
-#[cfg(test)]
-mod test;

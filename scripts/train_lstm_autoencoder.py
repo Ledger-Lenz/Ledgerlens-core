@@ -62,38 +62,105 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 
+class _HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
+):
+    """Show argument defaults *and* keep the epilog's line breaks."""
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="train_lstm_autoencoder",
-        description="Train the LedgerLens LSTM autoencoder for temporal pattern detection.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Train the LedgerLens LSTM autoencoder (detection.temporal_patterns."
+            "LSTMAutoencoder) on clean (non-wash-trade) wallet trade sequences so "
+            "it reconstructs normal behaviour well; high reconstruction loss at "
+            "inference then flags anomalies. Training sequences are 5-min-binned "
+            "(log_amount, trade_count) pairs read from the "
+            "`feature_distribution_snapshots` table; if the DB is missing or that "
+            "query is empty the script falls back to 500 synthetic sequences so a "
+            "run always completes. Writes lstm_autoencoder.pt, its .sha256, and "
+            "lstm_training_metadata.json under --model-dir."
+        ),
+        formatter_class=_HelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Quick smoke run on synthetic data (no DB needed):\n"
+            "  python scripts/train_lstm_autoencoder.py --epochs 3 --db-path /nonexistent.db\n"
+            "\n"
+            "  # Full run against a populated DB:\n"
+            "  python scripts/train_lstm_autoencoder.py --epochs 100 --db-path ledgerlens.db \\\n"
+            "      --hidden-dim 64 --num-layers 2 --sequence-length 48 --batch-size 32\n"
+        ),
     )
-    parser.add_argument("--epochs", type=int, default=100, help="Maximum training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate.")
+    parser.add_argument(
+        "--epochs", type=int, default=100,
+        help="Maximum training epochs (positive int); early stopping may end training sooner.",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=1e-3,
+        help="Adam optimiser learning rate (positive float, e.g. 0.001).",
+    )
     parser.add_argument(
         "--neg-sample-ratio",
         type=int,
         default=3,
-        help="Negative-to-positive sample ratio (informational; not used in training loop).",
+        help=(
+            "Recorded in the training metadata for provenance only; the "
+            "autoencoder trains on clean sequences and does not use this value."
+        ),
     )
-    parser.add_argument("--db-path", default="ledgerlens.db", help="SQLite database path.")
-    parser.add_argument("--model-dir", default="models", help="Output directory for checkpoint.")
-    parser.add_argument("--hidden-dim", type=int, default=64, help="LSTM hidden dimension.")
-    parser.add_argument("--num-layers", type=int, default=2, help="Stacked LSTM layers.")
-    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout probability.")
+    parser.add_argument(
+        "--db-path", default="ledgerlens.db",
+        help=(
+            "Path to the LedgerLens SQLite database. Only the "
+            "`feature_distribution_snapshots` table is read. A missing file or "
+            "empty result triggers the synthetic-data fallback (still exits 0)."
+        ),
+    )
+    parser.add_argument(
+        "--model-dir", default="models",
+        help=(
+            "Output directory (created if absent). Receives lstm_autoencoder.pt, "
+            "lstm_autoencoder.sha256, and lstm_training_metadata.json."
+        ),
+    )
+    parser.add_argument(
+        "--hidden-dim", type=int, default=64,
+        help="LSTM hidden-state dimension in units (positive int).",
+    )
+    parser.add_argument(
+        "--num-layers", type=int, default=2,
+        help="Number of stacked LSTM layers in both encoder and decoder (positive int).",
+    )
+    parser.add_argument(
+        "--dropout", type=float, default=0.2,
+        help="Dropout probability between LSTM layers (float in 0..1).",
+    )
     parser.add_argument(
         "--sequence-length",
         type=int,
         default=48,
-        help="Sequence length in time bins (48 = 4h at 5-min resolution).",
+        help=(
+            "Sequence length in time bins (positive int). 48 bins = 4h at 5-min "
+            "resolution. Wallets with fewer than this many bins are skipped."
+        ),
     )
-    parser.add_argument("--batch-size", type=int, default=32, help="Training batch size.")
     parser.add_argument(
-        "--val-split", type=float, default=0.2, help="Validation fraction."
+        "--batch-size", type=int, default=32,
+        help="Number of sequences per training batch (positive int).",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience (epochs)."
+        "--val-split", type=float, default=0.2,
+        help="Fraction of sequences held out for validation (float in 0..1); at least 1 sequence is always kept.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Seed for torch and the stdlib `random` module (int) for reproducible runs.",
+    )
+    parser.add_argument(
+        "--patience", type=int, default=10,
+        help="Early-stopping patience: stop after this many epochs without an improvement in validation loss.",
     )
     return parser.parse_args(argv)
 

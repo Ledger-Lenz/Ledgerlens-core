@@ -1,0 +1,167 @@
+name: "\U0001F41B Bug report"
+description: >
+  Something in LedgerLens is not behaving as documented or expected.
+  Fill in as much detail as you can — the more context you give, the
+  faster we can reproduce and fix the issue.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Before you submit:
+        - Search [existing issues](https://github.com/Ledger-Lenz/Ledgerlens-core/issues) to avoid duplicates.
+        - Check the [README](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md) and [`docs/`](https://github.com/Ledger-Lenz/Ledgerlens-core/tree/main/docs) folder — your issue may already be documented.
+        - For **security vulnerabilities**, use [GitHub's private advisory form](https://github.com/Ledger-Lenz/Ledgerlens-core/security/advisories/new) — do **not** open a public issue.
+
+  # ── 1. Summary ─────────────────────────────────────────────────────────────
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: >
+        One or two sentences describing the bug. What is broken and what
+        did you expect to happen instead?
+      placeholder: "e.g. `detection/graph_engine.py` raises a RecursionError on graphs with ≥ 10 000 nodes even when IterativeTarjanSCC is used."
+    validations:
+      required: true
+
+  # ── 2. Reproduction steps ───────────────────────────────────────────────────
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Provide the minimal, complete sequence of commands or code that
+        reliably triggers the bug. Include any relevant config values or
+        environment variables (mask secrets).
+      placeholder: |
+        1. `pip install -r requirements/base.txt`
+        2. Set `MAX_GRAPH_NODES=10000` in `.env`
+        3. `python run_pipeline.py`
+        4. Observe `RecursionError` in the traceback below
+    validations:
+      required: true
+
+  # ── 3. Expected behaviour ───────────────────────────────────────────────────
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should have happened?
+      placeholder: "The pipeline should complete without error and write RiskScore records to SQLite."
+    validations:
+      required: true
+
+  # ── 4. Actual behaviour ─────────────────────────────────────────────────────
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: >
+        What actually happened? Paste the full error message, traceback,
+        or unexpected output. Use code fences (\`\`\`) for readability.
+      placeholder: |
+        ```
+        Traceback (most recent call last):
+          File "detection/graph_engine.py", line 412, in _tarjan
+            ...
+        RecursionError: maximum recursion depth exceeded
+        ```
+    validations:
+      required: true
+
+  # ── 5. Affected component ───────────────────────────────────────────────────
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: >
+        Which part of the codebase is the bug in? Select the closest
+        match — you can add detail in the text fields below.
+      multiple: false
+      options:
+        - "ingestion — Horizon streamer / historical loader / operations loader"
+        - "ingestion — EVM / Solana / bridge / AMM loaders"
+        - "ingestion — filters, dedup, or rate-limiting"
+        - "ingestion — data models (Pydantic schemas)"
+        - "detection — Benford engine"
+        - "detection — graph engine (SCC / wash-ring detection)"
+        - "detection — feature engineering"
+        - "detection — model training / inference"
+        - "detection — SHAP / causal engine"
+        - "detection — GNN ring detector"
+        - "detection — temporal model"
+        - "detection — federated learning"
+        - "detection — drift monitor / retrain pipeline"
+        - "detection — Soroban publisher / on-chain submission"
+        - "detection — webhook registry / worker"
+        - "detection — governance / dispute store"
+        - "detection — ZK prover / verifier"
+        - "api — FastAPI routes / gateway / auth"
+        - "api — gRPC scoring service"
+        - "api — WebSocket / streaming router"
+        - "api — admin / analyst / audit routers"
+        - "contracts — oracle aggregator (Rust/Soroban)"
+        - "contracts — ZK verifier (Rust/Soroban)"
+        - "sdk — Python SDK (packages/ledgerlens-sdk)"
+        - "sdk — TypeScript SDK (sdk/)"
+        - "sdk — Go SDK (go/)"
+        - "sdk — Rust crate (crates/ledgerlens-sdk)"
+        - "config / settings / environment variables"
+        - "CLI (cli.py)"
+        - "pipeline entry point (run_pipeline.py)"
+        - "storage / SQLite / Alembic migrations"
+        - "observability — metrics / tracing / logging"
+        - "CI / CD / workflows"
+        - "documentation"
+        - "other / unsure"
+    validations:
+      required: true
+
+  # ── 6. Environment ──────────────────────────────────────────────────────────
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        Fill in as many fields as are relevant. Omit any that do not
+        apply (e.g. Rust version if the bug is in Python code).
+      value: |
+        - **OS**: <!-- e.g. Ubuntu 22.04, macOS 14, Windows 11 WSL2 -->
+        - **Python version**: <!-- e.g. 3.12.3 -->
+        - **Rust version** (if relevant): <!-- e.g. 1.79.0 -->
+        - **Go version** (if relevant): <!-- e.g. 1.22.4 -->
+        - **Node version** (if relevant): <!-- e.g. 20.11.0 -->
+        - **LedgerLens commit / tag**: <!-- e.g. `git rev-parse --short HEAD` output or a release tag -->
+        - **Install surface**: <!-- e.g. `make install-dev`, `make install-chain`, Docker -->
+        - **Stellar network**: <!-- Testnet / Mainnet / local -->
+        - **Relevant env vars** (mask secrets): <!-- e.g. MAX_GRAPH_NODES=50000 -->
+    validations:
+      required: true
+
+  # ── 7. Additional context ───────────────────────────────────────────────────
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: >
+        Anything else that might help: logs, screenshots, links to related
+        issues or PRs, a minimal reproducer repo, etc.
+    validations:
+      required: false
+
+  # ── 8. Checklist ────────────────────────────────────────────────────────────
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I have masked or removed any secrets, API keys, and private keys from the information above.
+          required: true
+        - label: This is not a security vulnerability (I would use the private advisory form for that).
+          required: true

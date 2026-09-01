@@ -442,79 +442,112 @@ def train(
     logger.info("Model saved to %s (val_auc=%.4f, mode=%s)", model_path, best_val_auc, graph_mode)
 
 
+class _HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
+):
+    """Show argument defaults *and* keep the epilog's line breaks."""
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Train the LedgerLens GNN ring membership classifier.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Train the LedgerLens GNN ring-membership classifier (GraphSAGE "
+            "encoder + MLP). Positive labels come from the `ring_members` table "
+            "(confirmed=1); negatives are low-risk wallets (score < 20 in the "
+            "last 30 days) with no open alert in the last 90 days, downsampled "
+            "to len(positives) * --neg-sample-ratio. Writes the checkpoint and a "
+            "SHA-256 sidecar to --model-path; exits non-zero if fewer than 4 "
+            "labelled wallets are found."
+        ),
+        formatter_class=_HelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python scripts/train_gnn.py --epochs 50 --lr 0.001 --neg-sample-ratio 3\n"
+            "  python scripts/train_gnn.py --graph-mode heterogeneous --conv-type hgt\n"
+            "  LEDGERLENS_DB_PATH=/data/ll.db python scripts/train_gnn.py\n"
+        ),
     )
     parser.add_argument(
         "--db-path",
         default=os.environ.get("LEDGERLENS_DB_PATH", "./ledgerlens.db"),
-        help="Path to the LedgerLens SQLite database.",
+        help=(
+            "Path to the LedgerLens SQLite database file, which must contain the "
+            "`ring_members` and `wallet_scores` (and `alerts`) tables. Defaults "
+            "to the LEDGERLENS_DB_PATH env var, else ./ledgerlens.db."
+        ),
     )
     parser.add_argument(
         "--model-path",
         default=os.environ.get("GNN_MODEL_PATH", "models/gnn_ring_detector.pt"),
-        help="Output path for the trained model checkpoint (.pt).",
+        help=(
+            "Output path for the trained torch checkpoint (.pt extension "
+            "expected). A '<name>.sha256' checksum file is written alongside it. "
+            "Parent directories are created automatically. Defaults to the "
+            "GNN_MODEL_PATH env var, else models/gnn_ring_detector.pt."
+        ),
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=50,
-        help="Maximum training epochs.",
+        help="Maximum number of training epochs (positive int); early stopping may end training sooner.",
     )
     parser.add_argument(
         "--lr",
         type=float,
         default=0.001,
-        help="Adam optimiser learning rate.",
+        help="Adam optimiser learning rate (positive float, e.g. 0.001).",
     )
     parser.add_argument(
         "--neg-sample-ratio",
         type=int,
         default=3,
         dest="neg_sample_ratio",
-        help="Ratio of negative to positive examples; also used as BCE pos_weight.",
+        help=(
+            "Number of negative wallets sampled per positive wallet (positive "
+            "int). Also used directly as the positive-class weight in the "
+            "weighted BCE loss."
+        ),
     )
     parser.add_argument(
         "--patience",
         type=int,
         default=5,
-        help="Early stopping patience on validation AUC-ROC.",
+        help="Early-stopping patience: stop after this many epochs without an improvement in validation AUC-ROC.",
     )
     parser.add_argument(
         "--val-fraction",
         type=float,
         default=0.2,
         dest="val_fraction",
-        help="Fraction of data reserved for validation.",
+        help="Fraction of labelled wallets held out for validation (float in 0..1, e.g. 0.2 = 20%%).",
     )
     parser.add_argument(
         "--hidden-channels",
         type=int,
         default=128,
         dest="hidden_channels",
-        help="GraphSAGE encoder hidden layer width.",
+        help="GraphSAGE encoder hidden-layer width in units (positive int).",
     )
     parser.add_argument(
         "--out-channels",
         type=int,
         default=64,
         dest="out_channels",
-        help="GraphSAGE encoder output embedding dimension.",
+        help="Encoder output embedding dimension in units (positive int); also the classifier input dim.",
     )
     parser.add_argument(
         "--num-layers",
         type=int,
         default=3,
         dest="num_layers",
-        help="Number of SAGEConv layers (default 3).",
+        help="Number of message-passing (SAGEConv) layers in the encoder (positive int).",
     )
     parser.add_argument(
         "--dropout",
         type=float,
         default=0.3,
-        help="Dropout rate in the encoder.",
+        help="Dropout rate applied in the encoder (float in 0..1). Only used in homogeneous mode.",
     )
     parser.add_argument(
         "--graph-mode",

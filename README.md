@@ -5,7 +5,71 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Mutation Score](https://img.shields.io/badge/mutation%20score-%3E%3D80%25-brightgreen)](tests/)
 
+[![CI](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/ci.yml/badge.svg)](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/ci.yml)
+[![Deploy Docs](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/docs.yml/badge.svg)](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/docs.yml)
+[![Chaos Engineering](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/chaos.yml/badge.svg)](https://github.com/Ledger-Lenz/Ledgerlens-core/actions/workflows/chaos.yml)
+
 Hybrid on-chain fraud detection for the Stellar DEX — detecting wash trading and artificial volume using Benford's Law combined with ensemble machine learning, with risk scores anchored on Soroban.
+
+## Table of Contents
+
+- [Repository Layout](#repository-layout)
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Benford's Law on the Blockchain](#benfords-law-on-the-blockchain)
+- [Machine Learning Layer](#machine-learning-layer)
+- [Graph-Based Ring Detection](#graph-based-ring-detection)
+- [Soroban Smart Contract Layer](#soroban-smart-contract-layer)
+- [Repository Structure](#repository-structure)
+- [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
+- [Continuous Retraining](#continuous-retraining)
+- [Webhook Alerts](#webhook-alerts)
+- [Observability](#observability)
+- [Testing](#testing)
+- [Roadmap](#roadmap)
+- [Why This Matters for the Stellar Ecosystem](#why-this-matters-for-the-stellar-ecosystem)
+- [Dependencies](#dependencies)
+- [License](#license)
+- [Contributing](#contributing)
+- [LedgerLens Organization](#ledgerlens-organization)
+- [Support](#support)
+- [References](#references)
+
+## Repository Layout
+
+A quick map of the top-level directories so you can navigate the codebase before diving into any one part:
+
+| Directory / File | Language / Toolchain | Role |
+|---|---|---|
+| `api/` | Python (FastAPI) | Local read-only REST / GraphQL / gRPC / WebSocket API |
+| `detection/` | Python | Benford engine, ML feature engineering, graph ring detection, model training & inference |
+| `ingestion/` | Python | Horizon streamer, historical loader, EVM loader, filter pipeline |
+| `contracts/` | Rust (Soroban) | On-chain risk-score registry smart contracts |
+| `crates/ledgerlens-sdk/` | Rust | Rust client SDK for consuming LedgerLens scores |
+| `sdk/` | TypeScript (npm) | TypeScript client SDK |
+| `go/` | Go | Go client SDK |
+| `helm/` | YAML (Helm) | Kubernetes deployment charts |
+| `monitoring/` | YAML / JSON | Prometheus alert rules and Grafana dashboards |
+| `chaos-mesh/` | YAML | Chaos engineering experiment definitions |
+| `circuits/` | Rust (Circom / Groth16) | ZK-SNARK circuit definitions and trusted-setup artifacts |
+| `proto/` | Protobuf | gRPC service definitions |
+| `alembic/` | Python | Database migration scripts |
+| `tests/` | Python | Test suite (unit, integration, fuzz harnesses) |
+| `docs/` | Markdown (MkDocs) | Full documentation site |
+| `config/` | Python | Environment-driven configuration (`settings.py`) |
+| `scripts/` | Bash / Python | Developer utility scripts |
+| `requirements/` | pip-tools | Compiled Python lockfiles (one per install surface) |
+| `Cargo.toml` | Rust | Cargo workspace root |
+| `go/go.mod` | Go | Go module definition |
+| `sdk/package.json` | Node / npm | TypeScript SDK manifest and lockfile |
+| `pyproject.toml` | Python | Project metadata and dependency constraints |
+| `Makefile` | Make | Developer task shortcuts (`make lint`, `make lock`, …) |
+
+> The production **API**, **dashboard**, and **Soroban contract** live in separate repos — see [LedgerLens Organization](#ledgerlens-organization) for the full picture.
+
+---
 
 ## Overview
 
@@ -256,7 +320,7 @@ LedgerLens supports two ZK backends for proving that a score meets a threshold:
 
 ### Contract Functions
 
-- `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)` - Registers a computed risk score on-chain (authorised LedgerLens service account only)
+- `submit_score(signers: Vec<Address>, wallet: Address, asset_pair: Symbol, score: u32, benford_flag: bool, ml_flag: bool, timestamp: u64, confidence: u32, model_version: u32, attestation_input: Option<ScoreAttestationInput>)` - Registers a computed risk score on-chain (authorised LedgerLens service path only)
 
 ### Dispute & Governance
 
@@ -392,9 +456,23 @@ ledgerlens-core/
 ├── api/
 │   └── main.py                       ← Local read-only FastAPI app serving RiskScores
 │
+├── sdk/                              ← TypeScript client SDK (@ledgerlens/sdk) — see sdk/README.md
+│
 └── tests/
     └── ...
 ```
+
+### Client SDKs
+
+Typed client libraries for the LedgerLens API live in this repo and cover the
+same REST surface in four languages:
+
+| Language | Package | Location | Docs |
+|----------|---------|----------|------|
+| TypeScript | `@ledgerlens/sdk` | [`sdk/`](sdk/) | [sdk/README.md](sdk/README.md) |
+| Python | `ledgerlens-sdk` | [`packages/ledgerlens-sdk/`](packages/ledgerlens-sdk/) | [packages/ledgerlens-sdk/README.md](packages/ledgerlens-sdk/README.md) |
+| Go | `github.com/Ledger-Lenz/Ledgerlens-core/go` | [`go/`](go/) | [go/README.md](go/README.md) |
+| Rust | `ledgerlens-sdk` | [`crates/ledgerlens-sdk/`](crates/ledgerlens-sdk/) | [crates/ledgerlens-sdk/README.md](crates/ledgerlens-sdk/README.md) |
 
 ## Quick Start
 
@@ -412,6 +490,78 @@ cp .env.example .env
 
 Fill in the Horizon, model, and cross-repo settings described in
 [LedgerLens Organization](#ledgerlens-organization).
+
+## Troubleshooting
+
+### Missing or misconfigured `.env`
+
+**Symptom:** startup fails with a config error, empty values, or missing required
+environment variables.
+
+**Fix:** copy the template and verify the values you actually need for your setup:
+
+```bash
+cp .env.example .env
+grep -E '^(REDIS_URL|LEDGERLENS_DB_PATH|NETWORK|HORIZON_URL|LEDGERLENS_API_URL)=' .env
+```
+
+If a value is blank, wrong, or pointing to a non-existent file/host, update it in
+`.env` before running the pipeline. See [.env.example](.env.example) and the
+configuration code in [`config/settings.py`](config/settings.py) for the full list.
+
+### Redis is not running
+
+**Symptom:** feature-store or rate-limiter errors like `Connection refused`,
+`redis.exceptions.ConnectionError`, or slow/failing requests after startup.
+
+**Fix:** start Redis locally or via Docker, then confirm the URL matches your `.env`:
+
+```bash
+docker compose up -d redis
+# or, if running Redis directly:
+redis-server --daemonize yes
+```
+
+Check that `REDIS_URL` in your `.env` matches the service you actually started,
+for example `redis://localhost:6379/0`. See [docs/feature_store.md](docs/feature_store.md)
+and [docs/waf_and_rate_limiting.md](docs/waf_and_rate_limiting.md) for the deeper
+feature-store and rate-limiter notes.
+
+### Port already in use
+
+**Symptom:** the API or watchdog fails at startup with `address already in use`
+or a bind error on `localhost:8000`.
+
+**Fix:** stop the process currently listening on the port or choose another port:
+
+```bash
+lsof -i :8000
+kill <PID>
+# or run the API on a different port if needed
+```
+
+If you are using Docker Compose, check which service is bound to the port and
+restart only the conflicting container. See [docker-compose.yml](docker-compose.yml)
+for the default local port mapping.
+
+### `ledgerlens.db` is missing on first run
+
+**Symptom:** SQLite errors such as `unable to open database file`, or the app
+reports that the database path is not writable.
+
+**Fix:** ensure the path in `LEDGERLENS_DB_PATH` points to a writable location,
+then create or reset the file if needed:
+
+```bash
+mkdir -p .
+touch ledgerlens.db
+chmod 600 ledgerlens.db
+```
+
+The default is `./ledgerlens.db`, relative to the project root. If you override it,
+make sure the directory exists and is writable. See [docs/database_migrations.md](docs/database_migrations.md)
+and [docs/database_schema.md](docs/database_schema.md) for how the SQLite store
+is resolved and used.
 
 ### 2a. Configure trade filters (optional)
 
@@ -555,6 +705,9 @@ errors are logged server-side at `ERROR` level via `logger.exception`.
 ```bash
 docker compose up --build
 ```
+
+For evidence-based fixes to Python, Rust, Go, TypeScript, database, Redis, and
+first-run test problems, see the detailed [troubleshooting guide](docs/troubleshooting.md).
 
 ## CLI Reference
 
@@ -739,8 +892,8 @@ Inspect drift reports to monitor model stability:
 ```bash
 ls -lh ./drift_reports/
 # Example output:
-# 20240615_0200.json: {"drift_detected": true, "promoted": true, ...}
-# 20240614_0200.json: {"drift_detected": false, "promoted": false, ...}
+# 20260615_0200.json: {"drift_detected": true, "promoted": true, ...}
+# 20260614_0200.json: {"drift_detected": false, "promoted": false, ...}
 ```
 
 **Alert on failures**: If `promoted: false` but `drift_detected: true`, the new models failed to outperform the current ones. Investigate feature shifts in the drift report's `psi_report` field and consider:
@@ -1055,7 +1208,47 @@ ledgerlens-data  ──(labelled datasets)──▶  ledgerlens-core
 4. **`ledgerlens-contracts`** persists the score on-chain via the `ledgerlens-score` Soroban contract, making it queryable by any other Soroban contract via `get_score`.
 5. **`ledgerlens-dashboard`** calls `ledgerlens-api` to render scores, alerts, and SHAP-based explanations.
 
-### Shared Contracts (must stay in sync across repos)
+### Shared Contracts (enforced by CI — see ADR-005)
+
+Schema contract enforcement is **automated**, not documentation-only. A field rename or type change in any of the four shared contracts below will fail CI before it reaches production. See [ADR-005](docs/adr/ADR-005-schema-contract-enforcement.md) for the design and [`.github/workflows/schema.yml`](.github/workflows/schema.yml) for the CI jobs.
+
+#### How enforcement works
+
+The canonical fixture file `tests/fixtures/contract_vectors.json` (generated from `detection/risk_score.py` via `python scripts/generate_contract_vectors.py`) is loaded and round-tripped by **all three language test suites** in CI:
+
+| Language | Test file | CI job |
+|---|---|---|
+| Python (core model) | `tests/test_contract_vectors.py` | `contract-vectors` |
+| Rust (`crates/ledgerlens-sdk`) | `crates/ledgerlens-sdk/tests/contract_vectors_test.rs` | `contract-vectors-rust` |
+| TypeScript (`sdk/`) | `sdk/tests/contract_vectors.test.ts` | `contract-vectors-typescript` |
+
+Each test suite:
+1. Deserializes every valid vector from the fixture using its own model.
+2. Re-serializes and verifies every required field is present with the correct type.
+3. Confirms that adversarial vectors (wrong field name, out-of-range value) are **rejected** — proving divergence detection, not just parsing.
+
+**When you change a shared field:**
+
+```bash
+# 1. Update detection/risk_score.py or ingestion/data_models.py
+# 2. Regenerate the fixture (Python core is authoritative):
+python scripts/generate_contract_vectors.py
+
+# 3. Update the other language implementations:
+#    sdk/src/schemas.ts           (TypeScript/Zod)
+#    crates/ledgerlens-sdk/src/models.rs  (Rust)
+#    packages/ledgerlens-sdk/src/ledgerlens/models.py  (Python SDK)
+#    proto/ledgerlens/v1/scoring.proto    (Proto)
+
+# 4. Confirm all language tests pass:
+pytest tests/test_contract_vectors.py
+cargo test -p ledgerlens-sdk contract_vectors
+npx vitest run sdk/tests/contract_vectors.test.ts
+```
+
+CI will fail with a message identifying which fields are out of sync and which language implementations need updating.
+
+---
 
 **1. `RiskScore` schema** — defined here at `detection/risk_score.py`, mirrored by `ledgerlens-api`'s response models and `ledgerlens-contracts`'s on-chain `RiskScore` struct (`contracts/ledgerlens-score/src/lib.rs`):
 
@@ -1066,8 +1259,10 @@ class RiskScore:
     score: int            # 0-100
     benford_flag: bool
     ml_flag: bool
-    confidence: int        # 0-100
+    confidence: int       # 0-100
+    disputed: bool        # default False
     timestamp: datetime
+    latency_ms: float | None        # End-to-end latency ms (streaming path)
     # Uncertainty fields (optional, v2+)
     score_lower: float | None       # Lower bound of 90 % conformal prediction interval
     score_upper: float | None       # Upper bound of 90 % conformal prediction interval
@@ -1077,9 +1272,11 @@ class RiskScore:
 
 The uncertainty fields are populated by `ConformalCalibrator` when conformal prediction calibration artifacts are available. See `docs/uncertainty_quantification.md` for a plain-language explanation.
 
-If you change a field name, type, or range here, update the Rust struct in `ledgerlens-contracts` and the Pydantic response models in `ledgerlens-api` in the same change set (or open a tracked follow-up in each repo).
+**Canonical fixture:** `tests/fixtures/contract_vectors.json` — regenerate with `python scripts/generate_contract_vectors.py` whenever this schema changes.
 
-**2. Trade / Asset schema** — defined here at `ingestion/data_models.py` (`Trade`, `Asset`, `OrderBookEvent`). `ledgerlens-data` persists records in this shape; changing field names here requires a migration note for `ledgerlens-data`.
+**Contract testing (Pact).** `ledgerlens-api` records its consumer expectations of `RiskScore` as a pact; `core`'s provider verification (`tests/contract/test_risk_score_provider.py`) fetches the latest pact from the Pact Broker (or the checked-in pact at `tests/contract/pacts/ledgerlens-api-ledgerlens-core.json`) and fails the PR automatically if `RiskScore`'s shape breaks those expectations. Intentional schema changes must update the consumer pact, the `ledgerlens-api` response models, and the `ledgerlens-contracts` Rust struct in the same change set. See [docs/contract_testing.md](docs/contract_testing.md) for details.
+
+**2. Trade / Asset schema** — defined here at `ingestion/data_models.py` (`Trade`, `Asset`, `OrderBookEvent`). `ledgerlens-data` persists records in this shape; changing field names here requires a migration note for `ledgerlens-data`. Contract vectors for `Trade` and `Asset` are also in `tests/fixtures/contract_vectors.json`.
 
 **3. Environment variables / config keys** — `.env.example` defines the cross-repo keys:
 
@@ -1090,10 +1287,12 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 **4. Soroban contract interface** — `ledgerlens-contracts` exposes:
 
-- `submit_score(wallet: Address, asset_pair: Symbol, score: u32, timestamp: u64)`
+- `submit_score(signers: Vec<Address>, wallet: Address, asset_pair: Symbol, score: u32, benford_flag: bool, ml_flag: bool, timestamp: u64, confidence: u32, model_version: u32, attestation_input: Option<ScoreAttestationInput>)`
 - `get_score(wallet: Address, asset_pair: Symbol) -> RiskScore`
 
 `core` and `api` must call `submit_score` with `score` already clamped to 0-100 (see `RiskScore.combine` in `detection/risk_score.py`).
+
+The weekly cross-repo E2E suite ([`.github/workflows/cross_repo_e2e.yml`](.github/workflows/cross_repo_e2e.yml)) tests the full `submit_score` / `get_score` flow against a documented stub server (see `tests/e2e_cross_repo/stub_contract_server.py`) or a real Soroban quickstart deployment. The suite fails the job if zero real assertions are executed, preventing false-green runs.
 
 ### Open Integration Points
 
@@ -1104,15 +1303,30 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 ### Conventions for AI Agents
 
 - Treat this section as the source of truth for **cross-repo** contracts. Each repo's own README covers repo-local conventions.
-- When a change in this repo affects a shared contract above, call it out explicitly so the corresponding change can be made in the other repo(s).
-- Keep `RiskScore` and `Trade`/`Asset` field names identical (same casing, same units) across Python (`core`, `api`), Rust (`contracts`), and TypeScript (`dashboard`) — translation layers are a common source of bugs.
+- When a change in this repo affects a shared contract above, call it out explicitly so the corresponding change can be made in the other repo(s); update the consumer expectations (Pact tests, Rust structs, data migrations) in the same change set — for `RiskScore`, `core`'s Pact provider verification fails the PR automatically if the shape breaks `ledgerlens-api`'s expectations.
+- `RiskScore` and `Trade`/`Asset` field names are enforced by CI — see `tests/test_contract_vectors.py`, `crates/ledgerlens-sdk/tests/contract_vectors_test.rs`, and `sdk/tests/contract_vectors.test.ts`. A rename in one language will fail the `contract-vectors` CI job and identify which other language(s) are out of sync. Keep field names identical (same casing, same units) across Python (`core`, `api`), Rust (`contracts`), and TypeScript (`dashboard`) — translation layers are a common source of bugs.
+
+## Getting Help
+
+Before filing a new issue, please:
+
+1. Check the [`docs/`](docs/) directory — many subsystems (threat model,
+   event bus, uncertainty quantification, etc.) have dedicated write-ups.
+2. Search [existing GitHub Issues](https://github.com/Ledger-Lenz/Ledgerlens-core/issues)
+   to see if it's already been reported or answered.
+
+If you still need help, open a new issue. GitHub Discussions is not
+currently enabled for this repository, so issues are the primary channel
+for questions and bug reports — see [Support](#support) below for details.
 
 ## Support
 
 For issues and questions:
 
+- FAQ: [Frequently Asked Questions](docs/faq.md) — common questions about what the project is, what it supports, and how to run just the detection engine
 - GitHub Issues: [Create an issue](https://github.com/Ledger-Lenz/Ledgerlens-core/issues)
 - Stellar Discord: https://discord.gg/stellar
+- [Glossary](docs/glossary.md) — definitions of domain and project-specific terms (RiskScore, SAR, Benford's Law, GNN, wash trading, Soroban, SCC, SHAP, ZK-SNARK, and more)
 
 ## References
 

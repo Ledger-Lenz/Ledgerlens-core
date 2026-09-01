@@ -22,6 +22,16 @@ export const StellarAddressSchema = z
 
 /**
  * A risk score (0–100) computed by LedgerLens.
+ *
+ * IMPORTANT: This schema must stay in sync with the canonical Python model
+ * (detection/risk_score.py). The contract is enforced by
+ * sdk/tests/contract_vectors.test.ts against tests/fixtures/contract_vectors.json.
+ *
+ * Field changes must be reflected in:
+ *   - detection/risk_score.py (Python canonical — authoritative)
+ *   - packages/ledgerlens-sdk/src/ledgerlens/models.py (Python SDK)
+ *   - crates/ledgerlens-sdk/src/models.rs (Rust)
+ *   - proto/ledgerlens/v1/scoring.proto
  */
 export const RiskScoreSchema = z.object({
   wallet: z.string(),
@@ -31,10 +41,16 @@ export const RiskScoreSchema = z.object({
   ml_flag: z.boolean(),
   confidence: z.number().int().min(0).max(100),
   disputed: z.boolean().default(false),
-  timestamp: z.string().datetime(),
+  timestamp: z.string().datetime({ offset: true }),
+  /** End-to-end latency in milliseconds from trade receipt to score update (streaming path). */
+  latency_ms: z.number().nullable().optional(),
+  /** Lower bound of 90% conformal prediction interval (optional, v2+). */
   score_lower: z.number().min(0).max(100).nullable().optional(),
+  /** Upper bound of 90% conformal prediction interval (optional, v2+). */
   score_upper: z.number().min(0).max(100).nullable().optional(),
+  /** Class indices in the conformal prediction set (optional, v2+). */
   prediction_set: z.array(z.number().int()).nullable().optional(),
+  /** Target coverage level (1 - alpha) of the prediction set (optional, v2+). */
   coverage_guarantee: z.number().min(0).max(1).nullable().optional(),
 });
 
@@ -66,7 +82,6 @@ export const AlertSchema = z.object({
 
 export type Alert = z.infer<typeof AlertSchema>;
 
-
 // ---------------------------------------------------------------------------
 // Asset / pool types
 // ---------------------------------------------------------------------------
@@ -78,7 +93,7 @@ export const LiquidityPoolTradeSchema = z.object({
   asset_b: z.string(),
   volume_a: z.number(),
   volume_b: z.number(),
-  timestamp: z.string().datetime(),
+  timestamp: z.string().datetime({ offset: true }),
 });
 
 export type LiquidityPoolTrade = z.infer<typeof LiquidityPoolTradeSchema>;
@@ -123,7 +138,6 @@ export const PairCorrelationSchema = z.object({
 
 export type PairCorrelation = z.infer<typeof PairCorrelationSchema>;
 
-
 // ---------------------------------------------------------------------------
 // Counterfactual explanation
 // ---------------------------------------------------------------------------
@@ -134,7 +148,6 @@ export const CounterfactualSchema = z.object({
   changed_features: z.record(z.string(), z.unknown()),
   explanation: z.string(),
 });
-
 
 // ---------------------------------------------------------------------------
 // Webhook subscriber

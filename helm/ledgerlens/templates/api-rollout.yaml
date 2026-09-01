@@ -1,3 +1,26 @@
+{{- /*
+Two pre-existing bugs fixed here as part of Grand 5 / #702 (found while
+wiring deployment-traceability annotations into this file — a Helm chart
+that cannot even parse has no deployment to trace):
+
+1. This template had no `{{- if .Values.canary.enabled }}` guard, unlike
+   its sibling api-deployment.yaml (`{{- if not .Values.canary.enabled }}`).
+   Both resources rendered unconditionally on every `helm
+   template`/`install`/`upgrade`, regardless of `canary.enabled`'s value —
+   a plain Deployment and an Argo Rollout both claiming the same
+   selector/component simultaneously, and (see bug 2) neither successfully,
+   since parsing failed before either resource was ever produced.
+2. `.Values.canary.steps[0].setWeight`-style bracket indexing is not valid
+   Go template syntax for indexing a value from a pipeline — Go templates
+   require the `index` function (`(index .Values.canary.steps 0)`).  This
+   was a hard parse error, not a runtime/logic bug: `helm template`/`helm
+   upgrade --install` on this chart failed before rendering a single
+   resource, for *any* values, canary enabled or not. Every
+   `--set canary.enabled=true` in cd.yml (the CD pipeline's literal,
+   unconditional setting on every deploy) was therefore deploying nothing
+   — the Helm step has been failing outright since this file was added.
+*/}}
+{{- if .Values.canary.enabled }}
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
@@ -5,18 +28,20 @@ metadata:
   labels:
     {{- include "ledgerlens.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
+  annotations:
+    {{- include "ledgerlens.deploymentMetaAnnotations" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   strategy:
     canary:
       steps:
-        - setWeight: {{ .Values.canary.steps[0].setWeight }}
-        - pause: {duration: {{ .Values.canary.steps[1].pauseSeconds }}s}
+        - setWeight: {{ (index .Values.canary.steps 0).setWeight }}
+        - pause: {duration: {{ (index .Values.canary.steps 1).pauseSeconds }}s}
         - analysis:
             templates:
               - name: ledgerlens-canary-analysis
-        - setWeight: {{ .Values.canary.steps[2].setWeight }}
-        - pause: {duration: {{ .Values.canary.steps[3].pauseSeconds }}s}
+        - setWeight: {{ (index .Values.canary.steps 2).setWeight }}
+        - pause: {duration: {{ (index .Values.canary.steps 3).pauseSeconds }}s}
         - analysis:
             templates:
               - name: ledgerlens-canary-analysis
@@ -27,6 +52,8 @@ spec:
       app.kubernetes.io/component: api
   template:
     metadata:
+      annotations:
+        {{- include "ledgerlens.deploymentMetaAnnotations" . | nindent 8 }}
       labels:
         {{- include "ledgerlens.labels" . | nindent 8 }}
         app.kubernetes.io/component: api
@@ -54,3 +81,4 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "ledgerlens.fullname" . }}
+{{- end }}

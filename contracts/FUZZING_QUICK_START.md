@@ -123,7 +123,9 @@ Some panics are **intentional** and should not be treated as bugs:
 | Contract           | Function     | Panic Message           | Reason                    |
 | ------------------ | ------------ | ----------------------- | ------------------------- |
 | oracle_aggregator  | initialize   | "already initialized"   | Re-init protection        |
-| zk_verifier        | submit_score | (from require_auth)     | Authorization enforcement |
+| zk_verifier        | initialize   | "already initialized"   | Re-init protection        |
+| zk_verifier        | submit_score | "not initialized"       | Admin must be stored first |
+| zk_verifier        | submit_score | (from require_auth)     | Stored-admin authorization |
 
 The fuzz harnesses allow these via message matching.
 

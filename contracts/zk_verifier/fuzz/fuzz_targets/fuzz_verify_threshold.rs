@@ -27,6 +27,7 @@ fuzz_target!(|input: FuzzInput| {
     
     let admin = Address::generate(&env);
     let wallet = Address::generate(&env);
+    client.initialize(&admin);
     
     // Set up a score commitment first
     let commitment_hash = BytesN::from_array(
@@ -66,7 +67,6 @@ fuzz_target!(|input: FuzzInput| {
     );
     
     client.submit_score(
-        &admin,
         &wallet,
         &input.score,
         &commitment_hash,

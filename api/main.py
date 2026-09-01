@@ -732,7 +732,7 @@ def list_analyst_feedback(
 
 @v1_router.get("/scores", response_model=list[RiskScore])
 def list_scores(
-    min_score: int = 0,
+    min_score: int = Query(default=0, ge=0, le=100, description="Minimum RiskScore (0-100)."),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     benford_flag: bool | None = Query(

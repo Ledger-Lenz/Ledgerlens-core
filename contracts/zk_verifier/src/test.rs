@@ -4,7 +4,10 @@ extern crate std;
 use std::string::String as StdString;
 use std::vec::Vec as StdVec;
 
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String as SorobanString};
+use soroban_sdk::{
+    testutils::{Address as _, MockAuth, MockAuthInvoke},
+    Address, BytesN, Env, IntoVal, String as SorobanString,
+};
 
 use crate::curve::{add_mod, mul_mod, pow_mod, sub_mod, Fq, Fr, Point, U256, CURVE_ORDER, FIELD_MODULUS};
 use crate::{ZkVerifier, ZkVerifierClient};
@@ -160,6 +163,33 @@ fn off_curve_point_is_rejected() {
     assert!(bad.is_none(), "(1,1) is not on y^2 = x^3 + 3");
 }
 
+#[test]
+fn point_is_valid_checks_field_bounds() {
+    let valid_p = Point::generator();
+    assert!(valid_p.is_valid());
+
+    let invalid_x = Point {
+        x: Fq(FIELD_MODULUS),
+        y: Fq::one(),
+        z: Fq::one(),
+    };
+    assert!(!invalid_x.is_valid());
+
+    let invalid_y = Point {
+        x: Fq::one(),
+        y: Fq(FIELD_MODULUS),
+        z: Fq::one(),
+    };
+    assert!(!invalid_y.is_valid());
+
+    let invalid_z = Point {
+        x: Fq::one(),
+        y: Fq::one(),
+        z: Fq(FIELD_MODULUS),
+    };
+    assert!(!invalid_z.is_valid());
+}
+
 // ---------------------------------------------------------------------------
 // Fiat-Shamir: changing any single input changes the output (no collision
 // on the sampled input space -- acceptance criterion 6), and the function
@@ -279,7 +309,6 @@ struct TestSetup {
     env: Env,
     client: ZkVerifierClient<'static>,
     wallet: Address,
-    admin: Address,
 }
 
 fn setup(f: &Fixture) -> TestSetup {
@@ -291,8 +320,8 @@ fn setup(f: &Fixture) -> TestSetup {
     let admin = Address::generate(&env);
     let wallet = Address::from_string(&SorobanString::from_str(&env, &f.wallet));
 
+    client.initialize(&admin);
     client.submit_score(
-        &admin,
         &wallet,
         &70, // legacy numeric score field; independent of the ZK path under test
         &BytesN::from_array(&env, &[0u8; 32]),
@@ -300,7 +329,7 @@ fn setup(f: &Fixture) -> TestSetup {
         &BytesN::from_array(&env, &f.pedersen_y),
     );
 
-    TestSetup { env, client, wallet, admin }
+    TestSetup { env, client, wallet }
 }
 
 fn bytes_from(env: &Env, v: &[u8]) -> soroban_sdk::Bytes {
@@ -385,7 +414,6 @@ fn replayed_for_a_different_wallet_is_rejected() {
     let s = setup(&f);
     let other_wallet = Address::from_string(&SorobanString::from_str(&s.env, &f.other_wallet));
     s.client.submit_score(
-        &s.admin,
         &other_wallet,
         &70,
         &BytesN::from_array(&s.env, &[0u8; 32]),
@@ -414,4 +442,155 @@ fn no_commitment_on_record_is_rejected() {
     let unknown_wallet = Address::from_string(&SorobanString::from_str(&env, &f.wallet));
     let proof = bytes_from(&env, &f.good);
     assert!(!client.verify_threshold(&unknown_wallet, &f.threshold, &proof));
+}
+
+// ---------------------------------------------------------------------------
+// Access control: stored admin identity (issue #687)
+//
+// These tests do NOT call `env.mock_all_auths()`. Authorization is mocked
+// only for a specific address so a self-signed non-admin cannot sneak
+// through a blanket mock.
+// ---------------------------------------------------------------------------
+
+fn mock_submit_auth(
+    env: &Env,
+    contract_id: &Address,
+    signer: &Address,
+    wallet: &Address,
+    score: u32,
+    commitment_hash: &BytesN<32>,
+    pedersen_x: &BytesN<32>,
+    pedersen_y: &BytesN<32>,
+) {
+    env.mock_auths(&[MockAuth {
+        address: signer,
+        invoke: &MockAuthInvoke {
+            contract: contract_id,
+            fn_name: "submit_score",
+            args: (
+                wallet.clone(),
+                score,
+                commitment_hash.clone(),
+                pedersen_x.clone(),
+                pedersen_y.clone(),
+            )
+                .into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_is_idempotent_guarded() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, ZkVerifier);
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.initialize(&admin);
+}
+
+#[test]
+fn submit_score_succeeds_for_stored_admin() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, ZkVerifier);
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    let commitment_hash = BytesN::from_array(&env, &[3u8; 32]);
+    let pedersen_x = BytesN::from_array(&env, &[4u8; 32]);
+    let pedersen_y = BytesN::from_array(&env, &[5u8; 32]);
+
+    client.initialize(&admin);
+    mock_submit_auth(
+        &env,
+        &contract_id,
+        &admin,
+        &wallet,
+        42,
+        &commitment_hash,
+        &pedersen_x,
+        &pedersen_y,
+    );
+
+    client.submit_score(&wallet, &42, &commitment_hash, &pedersen_x, &pedersen_y);
+    assert_eq!(client.get_score(&wallet), 42);
+}
+
+#[test]
+fn submit_score_rejects_self_signed_non_admin() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, ZkVerifier);
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let wallet = Address::generate(&env);
+    let commitment_hash = BytesN::from_array(&env, &[6u8; 32]);
+    let pedersen_x = BytesN::from_array(&env, &[7u8; 32]);
+    let pedersen_y = BytesN::from_array(&env, &[8u8; 32]);
+
+    client.initialize(&admin);
+    // Attacker authenticates as themselves — this is the bypass the old
+    // caller-supplied `admin` parameter allowed.
+    mock_submit_auth(
+        &env,
+        &contract_id,
+        &attacker,
+        &wallet,
+        99,
+        &commitment_hash,
+        &pedersen_x,
+        &pedersen_y,
+    );
+
+    let result = client.try_submit_score(&wallet, &99, &commitment_hash, &pedersen_x, &pedersen_y);
+    assert!(
+        result.is_err(),
+        "self-signed non-admin must not write scores"
+    );
+    assert_eq!(client.get_score(&wallet), 0);
+}
+
+#[test]
+fn submit_score_rejects_unauthenticated_call() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, ZkVerifier);
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let wallet = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    let result = client.try_submit_score(
+        &wallet,
+        &1,
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &BytesN::from_array(&env, &[2u8; 32]),
+    );
+    assert!(result.is_err(), "submit_score must require stored-admin auth");
+    assert_eq!(client.get_score(&wallet), 0);
+}
+
+#[test]
+fn submit_score_rejects_before_initialize() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, ZkVerifier);
+    let client = ZkVerifierClient::new(&env, &contract_id);
+    let wallet = Address::generate(&env);
+
+    let result = client.try_submit_score(
+        &wallet,
+        &1,
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &BytesN::from_array(&env, &[2u8; 32]),
+    );
+    assert!(
+        result.is_err(),
+        "submit_score must fail when no admin has been stored"
+    );
+    assert_eq!(client.get_score(&wallet), 0);
 }

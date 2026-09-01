@@ -4,6 +4,12 @@ labels: ["difficulty: advanced", "area: detection", "type: feature"]
 assignees: []
 ---
 
+> **Historical design note:** The v1 signatures and pseudocode below describe
+> the original proposal. Issue #684 upgrades the implemented integration to
+> `LedgerLens-Oracle-v2` and the current ten-argument `ledgerlens-score`
+> `submit_score` ABI. The normative integration contract is
+> `docs/oracle_quorum.md`.
+
 ## Summary
 
 Extend `detection/oracle_node.py` and `contracts/oracle_aggregator/src/lib.rs` to implement a 3-of-5 multi-oracle quorum: score submissions to the Soroban on-chain registry require threshold signatures from at least 3 of 5 independent oracle nodes before being accepted on-chain. Implement ED25519 multi-sig aggregation in the oracle coordinator, and a Soroban contract (`oracle_aggregator`) that verifies the quorum signature before calling `submit_score` on the main `ledgerlens-score` contract. This removes the single point of trust in the current single-key `SorobanPublisher`.

@@ -4,18 +4,20 @@ These assert the actual ScVal types sent to the Soroban host, which
 `test_soroban_publisher.py` cannot do: that module replaces `stellar_sdk` with a
 `MagicMock` at import time, so every ScVal it builds is a mock.
 
-The distinction matters because the Python SDK does not validate Symbol
-contents. `scval.to_symbol("XLM/USDC")` builds happily on the client and is only
-rejected by the host at simulation time, so a client-side mock cannot catch an
-encoding regression here.
+The distinction matters because the official ledgerlens-score ABI requires a
+`Symbol`; a client-side mock cannot catch an accidental `String` encoding.
 
 The encoding must match `contracts/oracle_aggregator/src/lib.rs`:
 
     submit_with_quorum(
         wallet: Address,
-        asset_pair: String,
+        asset_pair: Symbol,
         score: u32,
+        benford_flag: bool,
+        ml_flag: bool,
         timestamp: u64,
+        confidence: u32,
+        model_version: u32,
         signatures: Vec<SignaturePair>,
     )
 
@@ -42,9 +44,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 WALLET = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
-ASSET_PAIR = "XLM/USDC"
+ASSET_PAIR = "XLM_USDC"
 SCORE = 85
 TIMESTAMP = 1672531200
+CONFIDENCE = 91
+MODEL_VERSION = 7
 
 # Runs in a clean interpreter: builds the invocation parameters exactly as
 # `submit_with_quorum` does, then reports each one's ScVal type as JSON.
@@ -101,7 +105,17 @@ with patch.object(sp, "SorobanServer", return_value=server), \\
      patch.object(sp, "TransactionBuilder", _Builder), \\
      patch.object(publisher, "_keypair") as kp:
     kp.public_key = "{WALLET}"
-    publisher.submit_with_quorum("{WALLET}", "{ASSET_PAIR}", {SCORE}, {TIMESTAMP}, quorum)
+    publisher.submit_with_quorum(
+        "{WALLET}",
+        "{ASSET_PAIR}",
+        {SCORE},
+        True,
+        False,
+        {TIMESTAMP},
+        {CONFIDENCE},
+        {MODEL_VERSION},
+        quorum,
+    )
 
 params = captured["parameters"]
 T = stellar_xdr.SCValType
@@ -111,15 +125,19 @@ out = {{
     "arity": len(params),
     "types": [p.type.name for p in params],
     "score": params[2].u32.uint32,
-    "timestamp": params[3].u64.uint64,
+    "benford_flag": params[3].b,
+    "ml_flag": params[4].b,
+    "timestamp": params[5].u64.uint64,
+    "confidence": params[6].u32.uint32,
+    "model_version": params[7].u32.uint32,
     "asset_pair": (
-        bytes(params[1].str.sc_string).decode()
-        if params[1].type == T.SCV_STRING else None
+        bytes(params[1].sym.sc_symbol).decode()
+        if params[1].type == T.SCV_SYMBOL else None
     ),
     "signatures": [],
 }}
 
-for entry in params[4].vec.sc_vec:
+for entry in params[8].vec.sc_vec:
     if entry.type != T.SCV_MAP:
         out["signatures"].append({{"type": entry.type.name}})
         continue
@@ -160,13 +178,8 @@ def test_invokes_expected_contract_function(encoded):
     assert encoded["function_name"] == "submit_with_quorum"
 
 
-def test_asset_pair_is_encoded_as_string_not_symbol(encoded):
-    """`asset_pair` values contain '/' and ':', outside the Symbol charset, and
-    can exceed its 32-character limit. A Symbol here is accepted client-side and
-    rejected by the host, so pin the type."""
-    assert encoded["types"][1] == "SCV_STRING", (
-        "asset_pair must be an SCV_STRING; SCV_SYMBOL cannot represent 'XLM/USDC'"
-    )
+def test_asset_pair_is_encoded_as_target_symbol(encoded):
+    assert encoded["types"][1] == "SCV_SYMBOL"
 
 
 def test_asset_pair_roundtrips_with_special_characters(encoded):
@@ -176,7 +189,7 @@ def test_asset_pair_roundtrips_with_special_characters(encoded):
 def test_signature_pairs_are_encoded_as_structs(encoded):
     """`SignaturePair` is a #[contracttype] struct -> SCV_MAP keyed by field
     name, not a positional SCV_VEC."""
-    assert encoded["types"][4] == "SCV_VEC"
+    assert encoded["types"][8] == "SCV_VEC"
     sigs = encoded["signatures"]
     assert len(sigs) == 3
 
@@ -193,9 +206,17 @@ def test_signature_pairs_are_encoded_as_structs(encoded):
 
 def test_scalar_params_match_contract_signature(encoded):
     """Positional arity and scalar types must line up with the Rust signature."""
-    assert encoded["arity"] == 5
+    assert encoded["arity"] == 9
     assert encoded["types"][0] == "SCV_ADDRESS"
     assert encoded["types"][2] == "SCV_U32"
-    assert encoded["types"][3] == "SCV_U64"
+    assert encoded["types"][3] == "SCV_BOOL"
+    assert encoded["types"][4] == "SCV_BOOL"
+    assert encoded["types"][5] == "SCV_U64"
+    assert encoded["types"][6] == "SCV_U32"
+    assert encoded["types"][7] == "SCV_U32"
     assert encoded["score"] == SCORE
+    assert encoded["benford_flag"] is True
+    assert encoded["ml_flag"] is False
     assert encoded["timestamp"] == TIMESTAMP
+    assert encoded["confidence"] == CONFIDENCE
+    assert encoded["model_version"] == MODEL_VERSION
