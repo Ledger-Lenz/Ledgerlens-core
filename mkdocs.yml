@@ -99,6 +99,14 @@ nav:
     - Model Cards: model_cards.md
     - Cost & Capacity Quick Reference: COST_CAPACITY_QUICK_REFERENCE.md
     - Upgrading Cost & Capacity: UPGRADE_COST_CAPACITY.md
+  - Security & Compliance:
+    - Threat Model: threat_model.md
+    - Webhook Security Model: webhook_security_model.md
+    - Secret Rotation: secret_rotation.md
+    - Audit Log: audit_log.md
+    - Compliance Export: compliance_export.md
+    - Case Management: case_management.md
+    - Model Signing: model_signing.md
   - OpenAPI: openapi.md
 
 extra:
