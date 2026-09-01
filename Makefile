@@ -90,10 +90,25 @@ test-e2e: ## Run end-to-end tests
 	pytest tests/e2e/ -m e2e -v --tb=short --timeout=300
 
 # ── Chaos engineering ─────────────────────────────────────────────────────────
+# CHAOS_TEST_TIMEOUT bounds the whole pytest run so that if the compose stack
+# comes up but a service never becomes fully ready, the target fails fast
+# instead of hanging a local shell or CI job indefinitely. 15m is chosen as
+# roughly 5-7x the observed local runtime of the chaos suite (~2-3m) — generous
+# enough to absorb slow image pulls and loaded CI runners, tight enough that a
+# genuine hang is caught well inside the workflow's own 30m job timeout
+# (.github/workflows/chaos.yml). Override per-invocation, e.g.
+#   make test-chaos CHAOS_TEST_TIMEOUT=5m
+# `timeout` exits 124 when the limit is hit. The compose stack is torn down on
+# every exit path (pass, fail, or timeout) so no containers are left orphaned,
+# and the original pytest exit status is propagated to the caller.
+CHAOS_TEST_TIMEOUT ?= 15m
+
 test-chaos: ## Run chaos-engineering tests (requires Docker)
 	docker compose --profile chaos up -d --wait
-	pytest tests/chaos/ -m chaos -v --tb=short --timeout=120 || (docker compose --profile chaos down && exit 1)
-	docker compose --profile chaos down
+	timeout $(CHAOS_TEST_TIMEOUT) pytest tests/chaos/ -m chaos -v --tb=short --timeout=120; \
+	  status=$$?; \
+	  docker compose --profile chaos down; \
+	  exit $$status
 
 # ── Documentation ─────────────────────────────────────────────────────────────
 docs: ## Build the MkDocs documentation site
