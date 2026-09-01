@@ -143,15 +143,13 @@ export class LedgerLensClient {
   // Scores
   // -----------------------------------------------------------------------
 
-  async getScores(
-    params?: {
-      wallet?: string;
-      limit?: number;
-      offset?: number;
-      sort_by?: string;
-      order?: "asc" | "desc";
-    },
-  ): Promise<RiskScore[]> {
+  async getScores(params?: {
+    wallet?: string;
+    limit?: number;
+    offset?: number;
+    sort_by?: string;
+    order?: "asc" | "desc";
+  }): Promise<RiskScore[]> {
     const qs = this._buildQuery(params);
     const res = await this._fetch(`/scores${qs}`);
     return parseResponse(res, z.array(RiskScoreSchema), "getScores");
@@ -162,14 +160,12 @@ export class LedgerLensClient {
     return parseResponse(res, RiskScoreSchema, `getScore(${wallet})`);
   }
 
-  async getAlerts(
-    params?: {
-      alert_type?: string;
-      wallet?: string;
-      limit?: number;
-      offset?: number;
-    },
-  ): Promise<Alert[]> {
+  async getAlerts(params?: {
+    alert_type?: string;
+    wallet?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<Alert[]> {
     const qs = this._buildQuery(params);
     const res = await this._fetch(`/alerts${qs}`);
     return parseResponse(res, z.array(AlertSchema), "getAlerts");
@@ -203,7 +199,10 @@ export class LedgerLensClient {
   // Wash-trading rings
   // -----------------------------------------------------------------------
 
-  async getRings(params?: { limit?: number; offset?: number }): Promise<Ring[]> {
+  async getRings(params?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<Ring[]> {
     const qs = this._buildQuery(params);
     const res = await this._fetch(`/rings${qs}`);
     return parseResponse(res, z.array(RingSchema), "getRings");
@@ -282,9 +281,7 @@ export class LedgerLensClient {
     }
   }
 
-  private _buildQuery(
-    params?: Record<string, unknown>,
-  ): string {
+  private _buildQuery(params?: Record<string, unknown>): string {
     if (!params || Object.keys(params).length === 0) return "";
     const qs = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) {
