@@ -12,15 +12,16 @@ feature changes.
 2. [First-time setup](#first-time-setup)
 3. [Ecosystem layout](#ecosystem-layout)
 4. [Development workflow](#development-workflow)
-5. [Mutation testing](#mutation-testing)
-6. [How dependencies are managed](#how-dependencies-are-managed)
-7. [Managing Python dependencies](#managing-python-dependencies)
-8. [Adding or updating a dependency](#adding-or-updating-a-dependency)
-9. [Optional features and import guards](#optional-features-and-import-guards)
-10. [License and vulnerability policy](#license-and-vulnerability-policy)
-11. [Proposing changes](#proposing-changes)
-12. [Before opening a PR](#before-opening-a-pr)
-13. [Cross-repo changes](#cross-repo-changes)
+5. [TypeScript SDK development](#typescript-sdk-development)
+6. [Mutation testing](#mutation-testing)
+7. [How dependencies are managed](#how-dependencies-are-managed)
+8. [Managing Python dependencies](#managing-python-dependencies)
+9. [Adding or updating a dependency](#adding-or-updating-a-dependency)
+10. [Optional features and import guards](#optional-features-and-import-guards)
+11. [License and vulnerability policy](#license-and-vulnerability-policy)
+12. [Proposing changes](#proposing-changes)
+13. [Before opening a PR](#before-opening-a-pr)
+14. [Cross-repo changes](#cross-repo-changes)
 
 ---
 
@@ -104,6 +105,66 @@ pytest -q                     # run the full test suite
 make lint                     # ruff linting
 make lock-check               # verify all lockfiles are up to date
 ```
+
+The commands above cover the Python engine. The TypeScript SDK in `sdk/` uses a
+completely separate toolchain (npm / `tsc` / vitest) — see the next section.
+
+---
+
+## TypeScript SDK development
+
+The `@ledgerlens/sdk` package in `sdk/` is a standalone TypeScript client for
+the LedgerLens API. It does **not** share the Python toolchain — no Makefile
+targets, no `requirements/`, no `pytest`. Everything is driven through npm from
+inside the `sdk/` directory.
+
+```bash
+cd sdk
+npm install          # install dependencies (writes sdk/package-lock.json)
+npm test             # run the vitest suite once (sdk/tests/)
+npm run test:watch   # run vitest in watch mode while iterating
+npm run typecheck    # tsc --noEmit — type-check without emitting output
+npm run build        # produce the dual CJS + ESM + types build under sdk/dist/
+```
+
+> **Note:** the type-check script is named `typecheck` (renamed from the
+> misleadingly-named `lint` in
+> [#776](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/776)). There is
+> no real linter yet — `npm run typecheck` only checks types. ESLint + Prettier
+> configuration is tracked in
+> [issue #774](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/774).
+
+### Build targets
+
+`npm run build` runs three separate `tsc` invocations, one per `tsconfig.*.json`
+in `sdk/`. All three extend the base `sdk/tsconfig.json` (strict mode, ES2020
+target, `src/` in, `tests/` excluded):
+
+| Config | Script | Output | Purpose |
+|--------|--------|--------|---------|
+| `tsconfig.esm.json` | `npm run build:esm` | `sdk/dist/esm/` | ES module build (`module: ESNext`), referenced by `package.json`'s `module` / `exports.import` fields. |
+| `tsconfig.cjs.json` | `npm run build:cjs` | `sdk/dist/cjs/` | CommonJS build (`module: CommonJS`, `moduleResolution: Node`), referenced by `main` / `exports.require`. |
+| `tsconfig.types.json` | `npm run build:types` | `sdk/dist/types/` | Type declarations only (`emitDeclarationOnly`), referenced by `types`. |
+
+The dual build is what lets the SDK be consumed from both `import` and
+`require` in Node.js as well as from bundlers/browsers.
+
+### Publishing
+
+`sdk/package.json` is configured for publication to npm as `@ledgerlens/sdk`
+(`publishConfig.access: public`), and a `prepublishOnly` hook runs
+`npm run build && npm run test` before any publish.
+
+**TBD — needs investigation:** there is currently no npm-publish GitHub Actions
+workflow (the `.github/workflows/` dir covers CI, CD/Docker, docs, and
+vulnerability scans only) and no documented release process. As with the other
+SDKs, the actual `npm publish` (npm credentials, version bump, tag) is a
+maintainer release action, not part of a feature PR.
+
+### Managing SDK dependencies
+
+See [How dependencies are managed → TypeScript SDK](#how-dependencies-are-managed)
+below for the `package.json` / `package-lock.json` update procedure.
 
 ---
 
