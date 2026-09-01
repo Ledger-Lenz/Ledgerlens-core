@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A single wallet/asset-pair risk score, as returned by the scoring pipeline.
 ///

@@ -9,6 +9,7 @@ htmlcov/
 # Virtual environments
 .venv/
 venv/
+node_modules/
 
 # Environment
 .env
