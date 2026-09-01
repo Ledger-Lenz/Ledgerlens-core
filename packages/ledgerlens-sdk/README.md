@@ -4,6 +4,9 @@ Typed Python client for the [LedgerLens](https://github.com/Ledger-Lenz/Ledgerle
 wash-trading detection API. Standalone package — depends only on `httpx`
 and `pydantic`, not on the `ledgerlens-core` detection engine itself.
 
+See [CHANGELOG.md](CHANGELOG.md) for a full list of notable changes between
+releases.
+
 ## Install
 
 ```bash
