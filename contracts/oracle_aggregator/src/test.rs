@@ -29,6 +29,7 @@ impl Fixture {
     /// replay window.
     fn new(threshold: u32, n: usize) -> Self {
         let env = Env::default();
+        env.mock_all_auths();
         let contract_id = env.register_contract(None, OracleAggregator);
         let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -39,8 +40,9 @@ impl Fixture {
             oracle_keys.push_back(BytesN::from_array(&env, &k.verifying_key().to_bytes()));
         }
 
+        let deployer = Address::generate(&env);
         let score_contract = Address::generate(&env);
-        client.initialize(&threshold, &oracle_keys, &score_contract);
+        client.initialize(&deployer, &threshold, &oracle_keys, &score_contract);
 
         let wallet = Address::generate(&env);
         env.ledger().set_timestamp(TIMESTAMP + 100);
@@ -360,6 +362,7 @@ fn overlong_asset_pair_is_rejected() {
 #[should_panic(expected = "already initialized")]
 fn initialize_is_idempotent_guarded() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -367,15 +370,17 @@ fn initialize_is_idempotent_guarded() {
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
     let score_contract = Address::generate(&env);
+    let deployer = Address::generate(&env);
 
-    client.initialize(&1, &oracle_keys, &score_contract);
-    client.initialize(&1, &oracle_keys, &score_contract);
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
 }
 
 #[test]
 #[should_panic(expected = "threshold must be greater than zero")]
 fn zero_threshold_is_rejected() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -383,13 +388,19 @@ fn zero_threshold_is_rejected() {
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
 
-    client.initialize(&0, &oracle_keys, &Address::generate(&env));
+    client.initialize(
+        &Address::generate(&env),
+        &0,
+        &oracle_keys,
+        &Address::generate(&env),
+    );
 }
 
 #[test]
 #[should_panic(expected = "threshold exceeds number of oracle keys")]
 fn unsatisfiable_threshold_is_rejected() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, OracleAggregator);
     let client = OracleAggregatorClient::new(&env, &contract_id);
 
@@ -397,7 +408,12 @@ fn unsatisfiable_threshold_is_rejected() {
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
 
-    client.initialize(&2, &oracle_keys, &Address::generate(&env));
+    client.initialize(
+        &Address::generate(&env),
+        &2,
+        &oracle_keys,
+        &Address::generate(&env),
+    );
 }
 
 #[test]
@@ -411,10 +427,69 @@ fn test_double_initialization_fails() {
     let mut oracle_keys = Vec::new(&env);
     oracle_keys.push_back(BytesN::from_array(&env, &[1u8; 32]));
     let score_contract = Address::generate(&env);
+    let deployer = Address::generate(&env);
     
-    client.initialize(&1, &oracle_keys, &score_contract);
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
     // Second initialization should panic
-    client.initialize(&2, &oracle_keys, &score_contract);
+    client.initialize(&deployer, &2, &oracle_keys, &score_contract);
+}
+
+/// Unauthorized callers cannot initialise the contract. The `deployer` parameter
+/// must authorise the call; presenting a different (unauthorised) address makes
+/// `require_auth` reject it before any configuration is written.
+#[test]
+#[should_panic]
+fn unauthorized_caller_cannot_initialize() {
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+
+    let env = Env::default();
+    let contract_id = env.register_contract(None, OracleAggregator);
+    let client = OracleAggregatorClient::new(&env, &contract_id);
+
+    let deployer = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let key = SigningKey::generate(&mut OsRng);
+    let mut oracle_keys = Vec::new(&env);
+    oracle_keys.push_back(BytesN::from_array(&env, &key.verifying_key().to_bytes()));
+    let score_contract = Address::generate(&env);
+
+    // Only the legitimate deployer is authorised for an initialisation call.
+    env.mock_auths(&[MockAuth {
+        address: &deployer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (&deployer, &1u32, &oracle_keys, &score_contract),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // The attacker presents themselves as deployer without a matching auth.
+    client.initialize(&attacker, &1, &oracle_keys, &score_contract);
+}
+
+/// The authorised deployer can initialise; the recorded deployer identity is
+/// stored so the one-time configuration authority is verifiable on-chain.
+#[test]
+fn authorized_deployer_can_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, OracleAggregator);
+    let client = OracleAggregatorClient::new(&env, &contract_id);
+
+    let deployer = Address::generate(&env);
+    let mut oracle_keys = Vec::new(&env);
+    oracle_keys.push_back(BytesN::from_array(&env, &[1u8; 32]));
+    let score_contract = Address::generate(&env);
+
+    client.initialize(&deployer, &1, &oracle_keys, &score_contract);
+
+    assert_eq!(
+        client.get_deployer(),
+        deployer,
+        "deployer identity should be recorded on initialization"
+    );
 }
 
 #[test]

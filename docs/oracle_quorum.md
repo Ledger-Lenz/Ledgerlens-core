@@ -21,6 +21,40 @@ The `oracle_aggregator` contract:
 - Keys are never logged or stored on disk unencrypted.
 - The `/admin/oracle/status` endpoint exposes only public keys and health status.
 
+## Deployment & Initialization (Access Control)
+
+`initialize` is now access-controlled. It takes a `deployer: Address` parameter and
+calls `deployer.require_auth()`, so only the identity that **authorises** the call can
+set the trusted oracle key set, quorum threshold, and score-contract address. Because
+re-initialization is permanently blocked, the first successful `initialize` fixes the
+configuration for the contract's lifetime — there is no recovery short of redeployment.
+
+### Front-running window
+
+Soroban deployment and `initialize` are separate transactions. Anyone who submits a
+validly-authorised `initialize` *first* wins. To close this window as tightly as
+operationally possible:
+
+1. **Generate a dedicated deployer key** for the contract (do **not** reuse an oracle
+   node key or a hot wallet).
+2. **Deploy and initialize atomically**: broadcast the deploy transaction and the
+   `initialize(deployer, threshold, oracle_keys, score_contract)` call back-to-back,
+   with the `deployer` signing the `initialize` invocation. Prefer submitting both
+   within the same operational batch / immediately after deployment, and monitor the
+   ledger so a competing `initialize` is detected before any score is accepted.
+3. **Verify** the recorded authority after deployment:
+   `get_deployer()` returns the `deployer` address that authorised initialization, so
+   operators can confirm the expected identity controls configuration.
+
+### Why not bake the deployer in at construction?
+
+Soroban has no constructor; configuration is performed via the post-deploy
+`initialize` call. The chosen design accepts the calling `deployer` as authoritative
+for this one-time call (consistent with `zk_verifier`'s `submit_score(admin, …)` admin
+pattern elsewhere in the codebase) and records it via `get_deployer()` for auditability.
+The residual front-running risk is mitigated operationally (deploy + init tightly
+coupled), not cryptographically — tracked separately for `zk_verifier`.
+
 ## Threshold Selection Guidance
 - With `n=5` and `k=3`, the network tolerates 2 simultaneous node failures without losing liveness.
 - It also tolerates up to 2 compromised nodes without allowing malicious score submissions.
