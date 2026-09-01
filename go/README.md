@@ -51,6 +51,21 @@ func main() {
 }
 ```
 
+## Runnable Examples
+
+[`example_test.go`](example_test.go) contains runnable, testable examples using
+Go's `Example` function convention. They execute against a local `httptest`
+server, so they are verified on every `go test ./...` run and also render in the
+generated [pkg.go.dev](https://pkg.go.dev) documentation:
+
+- `Example` — construct a client and fetch a wallet's risk scores.
+- `Example_withdrawalGating` — the withdrawal-gating pattern shown below.
+
+```bash
+cd go/
+go test -run Example -v ./...
+```
+
 ## Withdrawal Gating Example
 
 A common exchange-backend pattern: block a withdrawal when the wallet's risk
