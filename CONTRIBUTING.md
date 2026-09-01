@@ -19,11 +19,12 @@ feature changes.
 9. [Managing Python dependencies](#managing-python-dependencies)
 10. [Adding or updating a dependency](#adding-or-updating-a-dependency)
 11. [Optional features and import guards](#optional-features-and-import-guards)
-12. [License and vulnerability policy](#license-and-vulnerability-policy)
-13. [Proposing changes](#proposing-changes)
-14. [Before opening a PR](#before-opening-a-pr)
-15. [Cross-repo changes](#cross-repo-changes)
-16. [Protobuf style conventions](#protobuf-style-conventions)
+12. [Working with protobuf definitions](#working-with-protobuf-definitions)
+13. [License and vulnerability policy](#license-and-vulnerability-policy)
+14. [Proposing changes](#proposing-changes)
+15. [Before opening a PR](#before-opening-a-pr)
+16. [Cross-repo changes](#cross-repo-changes)
+17. [Protobuf style conventions](#protobuf-style-conventions)
 
 ---
 
@@ -493,6 +494,41 @@ def ingest_evm_events(...):
 
 Availability sentinels and `require_*()` helpers for all optional extras are
 centralised in `ledgerlens/_optional_imports.py`.
+
+---
+
+## Working with protobuf definitions
+
+The files under `generated/` (`scoring_pb2.py`, `scoring_pb2.pyi`,
+`scoring_pb2_grpc.py`) are compiled output from `proto/ledgerlens/v1/scoring.proto`.
+**Never hand-edit files in `generated/`** — any change must be made to the
+`.proto` source and then regenerated.
+
+After editing `proto/ledgerlens/v1/scoring.proto`, regenerate with (from the repo
+root):
+
+```bash
+python -m grpc_tools.protoc -I proto/ledgerlens/v1 \
+    --python_out=generated --grpc_python_out=generated \
+    proto/ledgerlens/v1/scoring.proto
+```
+
+`grpc_tools.protoc` generates `scoring_pb2_grpc.py` with a bare
+`import scoring_pb2`, which fails when imported as part of the `generated`
+package. After regenerating, restore the relative-import-with-fallback at the
+top of `scoring_pb2_grpc.py`:
+
+```python
+try:
+    from . import scoring_pb2 as scoring__pb2
+except ImportError:
+    import scoring_pb2 as scoring__pb2
+```
+
+Also note that the committed gencode version must not exceed the `protobuf`
+runtime pinned in `requirements/base.txt` — a newer `protoc` than the pinned
+runtime produces gencode that runtime refuses to load. See the module
+docstring in `generated/__init__.py` for further detail.
 
 ---
 
