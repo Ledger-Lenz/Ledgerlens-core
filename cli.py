@@ -159,9 +159,16 @@ def train(
     from detection.model_training import save_models, train_ensemble
     from ingestion.synthetic_data import generate_synthetic_dataset
 
+    logger.info(
+        "Generating synthetic dataset (%d normal accounts, %d wash rings of size %d)...",
+        n_normal_accounts,
+        n_wash_rings,
+        ring_size,
+    )
     trades, account_metadata, events, labels = generate_synthetic_dataset(
         n_normal_accounts=n_normal_accounts, n_wash_rings=n_wash_rings, ring_size=ring_size, seed=seed
     )
+    logger.info("Building training dataset from %d trades...", len(trades))
     df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
 
     # Save training dataset for drift detection reference
@@ -170,6 +177,7 @@ def train(
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
 
+    logger.info("Training RF/XGBoost/LightGBM ensemble on %d rows...", len(df))
     results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
     for name, result in results.items():
         if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
@@ -752,6 +760,13 @@ def historical_load(
     async def run() -> None:
         worker_count = concurrency or cfg.historical_loader_concurrency
         hours = chunk_hours or cfg.historical_chunk_hours
+        logger.info(
+            "Starting historical load %s -> %s (concurrency=%d, chunk_hours=%.2f)...",
+            start_time.isoformat(),
+            end_time.isoformat(),
+            worker_count,
+            hours,
+        )
         async with RetryingHorizonClient(
             cfg.horizon_url,
             max_concurrency=worker_count,
@@ -843,6 +858,13 @@ def export_parquet(
             db_conn=conn,
             output_dir=Path(output_dir),
             compression=compression,
+        )
+        logger.info(
+            "Exporting trades to %s (since=%s, until=%s, force=%s)...",
+            output_dir,
+            since_date,
+            until_date,
+            force,
         )
         result = exporter.export(
             since=since_date,
