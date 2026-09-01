@@ -22,6 +22,7 @@ feature changes.
 12. [Proposing changes](#proposing-changes)
 13. [Before opening a PR](#before-opening-a-pr)
 14. [Cross-repo changes](#cross-repo-changes)
+15. [Protobuf style conventions](#protobuf-style-conventions)
 
 ---
 
@@ -564,3 +565,30 @@ schemas, environment variables in `.env.example`, or the Soroban contract
 interface — call it out in the PR description so the corresponding change can be
 made in `ledgerlens-api`, `ledgerlens-contracts`, and/or `ledgerlens-dashboard`.
 See the "LedgerLens Organization" section of `README.md` for details.
+
+---
+
+## Protobuf style conventions
+
+The `.proto` definitions under `proto/ledgerlens/v1/` back the internal gRPC
+Scoring Service — see `docs/grpc_scoring.md` for the service's purpose and
+schema reference. When adding or changing a `.proto` file, follow the
+conventions already established there:
+
+- **Never reuse or renumber an existing field number.** Field numbers are part
+  of the wire format; changing one breaks compatibility for existing gRPC
+  consumers. Add new fields with the next unused number instead.
+- **Add new fields as `optional`** (as `score_lower`, `score_upper`, and
+  `coverage_guarantee` are in `RiskScoreProto`) so older clients that don't
+  know about the field continue to work.
+- **Use `snake_case` for field names** and `PascalCase` for message and
+  service names, matching standard protobuf style.
+- **Suffix wire-format messages with `Proto`** (e.g. `RiskScoreProto`) when a
+  same-named domain model already exists elsewhere in the codebase, to avoid
+  ambiguity between the two.
+- **Document units and formats inline** with a trailing comment on the field
+  (e.g. `uint32 score = 3; // 0-100`, `string timestamp = 7; // RFC3339`).
+- Since this project is pre-1.0, breaking changes are still permitted but must
+  be called out explicitly in the PR description per the
+  [Cross-repo changes](#cross-repo-changes) policy above, since `RiskScore` is
+  a shared contract.

@@ -6,13 +6,16 @@ the byte-level parsers in `ingestion/solana_adapter.py`.
 
 ## Harnesses
 
-| File | Target |
-|------|--------|
-| `fuzz_trade_parser.py` | `Trade.model_validate()` — Horizon trade JSON |
-| `fuzz_asset_parser.py` | `Asset.model_validate()` — asset code/issuer fields |
-| `fuzz_orderbook_event_parser.py` | `OrderBookEvent.model_validate()` — order-book ops |
-| `fuzz_evm_rpc_parser.py` | `UniswapV3Adapter._parse_swap_event` + `CurveAdapter._parse_exchange_event` |
-| `fuzz_solana_vaa_parser.py` | `_extract_stellar_address_from_vaa` + `_stellar_pubkey_to_address` + `_crc16_xmodem` |
+| File | Target | Module | Run after changing |
+|------|--------|--------|---------------------|
+| `fuzz_trade_parser.py` | `Trade.model_validate()` — Horizon trade JSON | `ingestion/data_models.py` | `python fuzz/fuzz_trade_parser.py fuzz/corpus/fuzz_trade_parser -max_total_time=60` |
+| `fuzz_asset_parser.py` | `Asset.model_validate()` — asset code/issuer fields | `ingestion/data_models.py` | `python fuzz/fuzz_asset_parser.py fuzz/corpus/fuzz_asset_parser -max_total_time=60` |
+| `fuzz_orderbook_event_parser.py` | `OrderBookEvent.model_validate()` — order-book ops | `ingestion/data_models.py` | `python fuzz/fuzz_orderbook_event_parser.py fuzz/corpus/fuzz_orderbook_event_parser -max_total_time=60` |
+| `fuzz_evm_rpc_parser.py` | `UniswapV3Adapter._parse_swap_event` + `CurveAdapter._parse_exchange_event` | `ingestion/uniswap_adapter.py`, `ingestion/curve_adapter.py` | `python fuzz/fuzz_evm_rpc_parser.py fuzz/corpus/fuzz_evm_rpc_parser -max_total_time=60` |
+| `fuzz_solana_vaa_parser.py` | `_extract_stellar_address_from_vaa` + `_stellar_pubkey_to_address` + `_crc16_xmodem` | `ingestion/solana_adapter.py` | `python fuzz/fuzz_solana_vaa_parser.py fuzz/corpus/fuzz_solana_vaa_parser -max_total_time=60` |
+
+CI (`.github/workflows/nightly_fuzz.yml`) runs every `fuzz/fuzz_*.py` harness for 300s
+each on a nightly schedule; there is no separate `fuzz-nightly.yml`.
 
 ## Prerequisites
 
