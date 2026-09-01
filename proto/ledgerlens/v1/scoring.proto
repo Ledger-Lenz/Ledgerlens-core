@@ -2,6 +2,16 @@ syntax = "proto3";
 
 package ledgerlens.v1;
 
+// RiskScoreProto is the canonical cross-language wire format for a LedgerLens risk score.
+//
+// IMPORTANT: This proto definition must stay in sync with:
+//   - detection/risk_score.py (Python canonical model — authoritative)
+//   - packages/ledgerlens-sdk/src/ledgerlens/models.py (Python SDK)
+//   - sdk/src/schemas.ts (TypeScript/Zod)
+//   - crates/ledgerlens-sdk/src/models.rs (Rust)
+//
+// Field numbers must never be reused. Add new optional fields at the next
+// available field number. See docs/adr/ADR-005-schema-contract-enforcement.md.
 message ScoreRequest {
   string wallet = 1;
   string asset_pair = 2;   // optional; empty = all pairs
@@ -18,6 +28,14 @@ message RiskScoreProto {
   optional float score_lower = 8;
   optional float score_upper = 9;
   optional float coverage_guarantee = 10;
+  // Field 11: disputed — was missing from earlier versions; added per ADR-005
+  bool disputed = 11;
+  // Field 12: prediction_set — class indices (0=clean, 1=wash) from conformal prediction
+  // Uses repeated int32 to match Python list[int] and Rust Vec<i32>
+  repeated int32 prediction_set = 12;
+  // Field 13: latency_ms — end-to-end latency in ms on the streaming path
+  // Uses optional to match Python float | None
+  optional float latency_ms = 13;
 }
 
 service ScoringService {

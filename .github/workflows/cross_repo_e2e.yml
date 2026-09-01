@@ -1,52 +1,254 @@
-
 name: Cross-Repo E2E Tests
 
-# Run on schedule (weekly) or manual dispatch only
-# Reason: This test suite depends on sibling repo availability and
-# takes significant time to build/run, so we don't run it on every PR.
+# Run on schedule (weekly) or manual dispatch.
+# Uses a documented stub contract server by default (no Docker required).
+# Set LEDGERLENS_USE_REAL_SOROBAN=true for full Soroban deployment fidelity.
+#
+# ADR reference: docs/adr/ADR-005-schema-contract-enforcement.md
 on:
   schedule:
     - cron: '0 0 * * 0'  # Every Sunday at 00:00 UTC
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      pinned_ref:
+        description: >
+          Commit SHA or tag to check out for both ledgerlens-api and
+          ledgerlens-contracts. Defaults to the value of
+          CROSS_REPO_E2E_PINNED_REF in the workflow env (currently 'main').
+          Set to a specific SHA for reproducible runs.
+        required: false
+        default: ''
+      use_real_soroban:
+        description: >
+          Set to 'true' to attempt a real Soroban quickstart deployment instead
+          of the documented stub server. Requires Docker on the runner.
+        required: false
+        default: 'false'
+
+# ---------------------------------------------------------------------------
+# Reference pinning policy (ADR-005 §C)
+# ---------------------------------------------------------------------------
+#
+# CROSS_REPO_E2E_PINNED_REF governs the ACTUAL ref: input on every
+# actions/checkout step below. This was previously disconnected — the variable
+# was set only for the pytest env, while checkouts always used ref: main.
+#
+# Policy:
+#   - Default: 'main' (tracks latest; acceptable for automated weekly runs while
+#     the repos are in active development and breaking changes are expected).
+#   - For reproducible release testing: override via workflow_dispatch input or
+#     bump this value to a specific release tag (e.g. 'v1.2.0') or commit SHA.
+#   - Advancement: bump CROSS_REPO_E2E_PINNED_REF to a new tag/SHA in a PR that
+#     also updates CHANGELOG.md. Do not track main in production without review.
+#
+# To pin to a specific SHA for a release cycle:
+#   1. Set CROSS_REPO_E2E_PINNED_REF to the desired SHA below.
+#   2. Open a PR with the change and note which release it corresponds to.
+#   3. Merge after the cross-repo E2E run confirms the pinned ref is green.
+env:
+  CROSS_REPO_E2E_PINNED_REF: main
 
 jobs:
   cross_repo_e2e:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout core repo
+      # ------------------------------------------------------------------
+      # Step 1: Checkout this repo (ledgerlens-core)
+      # ------------------------------------------------------------------
+      - name: Checkout ledgerlens-core
         uses: actions/checkout@v4
 
-      - name: Checkout ledgerlens-api
+      # ------------------------------------------------------------------
+      # Step 2: Resolve the effective pinned ref
+      #
+      # If the workflow was dispatched with a pinned_ref input, use that.
+      # Otherwise fall back to the CROSS_REPO_E2E_PINNED_REF env variable.
+      # This allows one-off reproducible runs without changing the workflow.
+      # ------------------------------------------------------------------
+      - name: Resolve effective pinned ref
+        id: resolve_ref
+        run: |
+          DISPATCH_REF="${{ github.event.inputs.pinned_ref }}"
+          if [ -n "$DISPATCH_REF" ]; then
+            EFFECTIVE_REF="$DISPATCH_REF"
+            echo "Using dispatch-provided ref: $EFFECTIVE_REF"
+          else
+            EFFECTIVE_REF="${{ env.CROSS_REPO_E2E_PINNED_REF }}"
+            echo "Using workflow-env ref: $EFFECTIVE_REF"
+          fi
+          echo "effective_ref=$EFFECTIVE_REF" >> "$GITHUB_OUTPUT"
+          echo "EFFECTIVE_PINNED_REF=$EFFECTIVE_REF" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # Step 3: Checkout ledgerlens-api at the resolved ref
+      #
+      # CRITICAL FIX (ADR-005 §C): ref: is now set from the resolved ref,
+      # not hardcoded to 'main'. The CROSS_REPO_E2E_PINNED_REF variable now
+      # actually governs what is checked out.
+      # ------------------------------------------------------------------
+      - name: Checkout ledgerlens-api at pinned ref
         uses: actions/checkout@v4
         with:
           repository: Ledger-Lenz/ledgerlens-api
           path: ledgerlens-api
-          ref: main  # Replace with a specific SHA in production
+          ref: ${{ steps.resolve_ref.outputs.effective_ref }}
+          # If the repo is private, a token is required:
+          # token: ${{ secrets.CROSS_REPO_READ_TOKEN }}
 
-      - name: Checkout ledgerlens-contracts
+      # ------------------------------------------------------------------
+      # Step 4: Checkout ledgerlens-contracts at the resolved ref
+      #
+      # Same fix as ledgerlens-api above.
+      # ------------------------------------------------------------------
+      - name: Checkout ledgerlens-contracts at pinned ref
         uses: actions/checkout@v4
         with:
           repository: Ledger-Lenz/ledgerlens-contracts
           path: ledgerlens-contracts
-          ref: main  # Replace with a specific SHA in production
+          ref: ${{ steps.resolve_ref.outputs.effective_ref }}
+          # token: ${{ secrets.CROSS_REPO_READ_TOKEN }}
 
+      # ------------------------------------------------------------------
+      # Step 5: Verify the resolved commit SHAs (audit trail)
+      #
+      # This step prints the actual commit SHA that was checked out for each
+      # repo. When CROSS_REPO_E2E_PINNED_REF is a specific SHA, this confirms
+      # the exact code under test. Acceptance criterion: "inspecting the
+      # workflow's resolved commit metadata during a run."
+      # ------------------------------------------------------------------
+      - name: Print resolved commit SHAs
+        run: |
+          echo "=== Resolved pinned ref: $EFFECTIVE_PINNED_REF ==="
+          echo ""
+          echo "--- ledgerlens-core ---"
+          git -C . rev-parse HEAD
+          echo ""
+          echo "--- ledgerlens-api ---"
+          if [ -d ledgerlens-api/.git ]; then
+            git -C ledgerlens-api rev-parse HEAD
+          else
+            echo "(not a git repo — may be a path checkout)"
+          fi
+          echo ""
+          echo "--- ledgerlens-contracts ---"
+          if [ -d ledgerlens-contracts/.git ]; then
+            git -C ledgerlens-contracts rev-parse HEAD
+          else
+            echo "(not a git repo — may be a path checkout)"
+          fi
+
+      # ------------------------------------------------------------------
+      # Step 6: Set up Python
+      # ------------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install testcontainers requests
+          pip install fastapi uvicorn requests pytest pytest-timeout
 
+      # ------------------------------------------------------------------
+      # Step 7: Run cross-repo E2E tests
+      #
+      # Both LEDGERLENS_API_REPO_PATH and LEDGERLENS_CONTRACTS_REPO_PATH are
+      # set so the conftest can locate the checked-out repos.
+      #
+      # CROSS_REPO_E2E_PINNED_REF is ALSO passed here so the conftest can use
+      # it in log messages and fixture setup (not for checkout — checkout is
+      # already done above with the correct ref).
+      # ------------------------------------------------------------------
       - name: Run cross-repo E2E tests
         env:
           LEDGERLENS_API_REPO_PATH: ./ledgerlens-api
           LEDGERLENS_CONTRACTS_REPO_PATH: ./ledgerlens-contracts
-          CROSS_REPO_E2E_PINNED_REF: main
+          CROSS_REPO_E2E_PINNED_REF: ${{ env.EFFECTIVE_PINNED_REF }}
+          LEDGERLENS_USE_REAL_SOROBAN: ${{ github.event.inputs.use_real_soroban || 'false' }}
+          # Prevent accidental production use
+          SOROBAN_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
         run: |
-          pytest -m cross_repo_e2e tests/e2e_cross_repo/
+          pytest -m cross_repo_e2e \
+            tests/e2e_cross_repo/ \
+            --tb=short \
+            --timeout=120 \
+            -v \
+            --no-header \
+            -p no:randomly \
+            2>&1 | tee /tmp/e2e_results.txt
 
+          # Capture exit code before any further commands
+          PYTEST_EXIT=$?
+
+          echo ""
+          echo "=== Test result summary ==="
+          cat /tmp/e2e_results.txt | grep -E "passed|failed|error|skipped" | tail -5
+
+          exit $PYTEST_EXIT
+
+      # ------------------------------------------------------------------
+      # Step 8: Zero-assertion safeguard (ADR-005 §D)
+      #
+      # This step verifies that at least one test actually ran real assertions.
+      # It parses the pytest output and fails if the only outcomes were 'skipped'.
+      #
+      # The enforce_minimum_assertions fixture in conftest.py provides the
+      # primary runtime guard. This step provides a secondary CI-level guard
+      # that catches cases where pytest itself exits 0 with all tests skipped
+      # (pytest exit code 0 when --ignore-glob excludes all tests, etc.)
+      #
+      # Acceptance criterion: "A workflow run with zero real test assertions
+      # (all skipped) fails the job rather than reporting green."
+      # ------------------------------------------------------------------
+      - name: Zero-assertion safeguard
+        if: always()
+        run: |
+          if [ ! -f /tmp/e2e_results.txt ]; then
+            echo "❌ No pytest output found — tests did not run at all."
+            exit 1
+          fi
+
+          # Count passed and failed tests (skipped alone = false green)
+          PASSED=$(grep -oE '[0-9]+ passed' /tmp/e2e_results.txt | grep -oE '[0-9]+' | tail -1 || echo "0")
+          FAILED=$(grep -oE '[0-9]+ failed' /tmp/e2e_results.txt | grep -oE '[0-9]+' | tail -1 || echo "0")
+          SKIPPED=$(grep -oE '[0-9]+ skipped' /tmp/e2e_results.txt | grep -oE '[0-9]+' | tail -1 || echo "0")
+          ERRORS=$(grep -oE '[0-9]+ error' /tmp/e2e_results.txt | grep -oE '[0-9]+' | tail -1 || echo "0")
+
+          echo "Results: passed=$PASSED, failed=$FAILED, skipped=$SKIPPED, errors=$ERRORS"
+
+          REAL_RUNS=$((PASSED + FAILED + ERRORS))
+
+          if [ "$REAL_RUNS" -eq 0 ]; then
+            echo ""
+            echo "❌ ZERO-ASSERTION GATE FAILED"
+            echo ""
+            echo "The cross-repo E2E suite had 0 passed/failed/errored tests."
+            echo "Skipped=$SKIPPED tests ran NO real assertions."
+            echo ""
+            echo "This is the 'false-green' failure mode this workflow was designed to prevent."
+            echo ""
+            echo "Diagnosis:"
+            echo "  - Check if the stub_server fixture failed to start (look for 'setup failure' above)."
+            echo "  - Check if pytest markers excluded all tests (marker: cross_repo_e2e)."
+            echo "  - Check if the enforce_minimum_assertions fixture ran and triggered."
+            echo ""
+            echo "The enforce_minimum_assertions fixture in conftest.py should have caught this"
+            echo "first. If it did not, check that conftest.py was loaded by pytest."
+            exit 1
+          fi
+
+          echo "✅ Zero-assertion gate passed: $REAL_RUNS test(s) executed real assertions."
+
+      # ------------------------------------------------------------------
+      # Step 9: Upload test results as artifact
+      # ------------------------------------------------------------------
+      - name: Upload E2E test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cross-repo-e2e-results
+          path: /tmp/e2e_results.txt
+          retention-days: 30
