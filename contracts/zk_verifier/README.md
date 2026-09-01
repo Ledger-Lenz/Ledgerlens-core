@@ -254,6 +254,14 @@ The current `fiat_shamir` implementation returns a placeholder value. Production
 
 **Status:** Scaffold only. Fuzzing tests that the function is callable with arbitrary inputs.
 
+## See Also
+
+- **Circom Circuits:** [circuits/README.md](../../circuits/README.md)  
+  The underlying circuit definitions for score range proofs.
+
+- **zk-SNARK Range Proof Backend:** [docs/zk_snark_range_proof.md](../../docs/zk_snark_range_proof.md)  
+  Conceptual documentation and comparison of the Groth16 zk-SNARK alternative to the Sigma protocol used in this contract.
+
 ## References
 
 - [Contract fuzzing documentation](../../docs/contract_fuzzing.md)
