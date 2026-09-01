@@ -212,3 +212,5 @@ The module is tagged `go/vX.Y.Z` for `go get`:
 ```bash
 go get github.com/Ledger-Lenz/Ledgerlens-core/go@go/v0.1.0
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for the version history of this module.
