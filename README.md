@@ -811,8 +811,8 @@ Inspect drift reports to monitor model stability:
 ```bash
 ls -lh ./drift_reports/
 # Example output:
-# 20240615_0200.json: {"drift_detected": true, "promoted": true, ...}
-# 20240614_0200.json: {"drift_detected": false, "promoted": false, ...}
+# 20260615_0200.json: {"drift_detected": true, "promoted": true, ...}
+# 20260614_0200.json: {"drift_detected": false, "promoted": false, ...}
 ```
 
 **Alert on failures**: If `promoted: false` but `drift_detected: true`, the new models failed to outperform the current ones. Investigate feature shifts in the drift report's `psi_report` field and consider:
