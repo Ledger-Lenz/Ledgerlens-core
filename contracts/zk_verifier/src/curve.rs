@@ -452,6 +452,13 @@ impl Point {
         self.z.is_zero()
     }
 
+    /// True when every Jacobian coordinate is a canonical field element
+    /// (`< FIELD_MODULUS`). Coordinates decoded from the wire can carry
+    /// non-reduced limbs, which the arithmetic below assumes away.
+    pub fn is_valid(&self) -> bool {
+        self.x.is_valid() && self.y.is_valid() && self.z.is_valid()
+    }
+
     pub fn infinity() -> Self {
         Point { x: Fq::one(), y: Fq::one(), z: Fq::zero() }
     }

@@ -11,6 +11,8 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 messages drive version bumps, this file, and the tagged GHCR image publish.
 
 ## [Unreleased]
+### Fixed
+- Added `ge=0, le=100` Query bounds validation to `min_score` parameter on `GET /v1/scores` (#682).
 
 ### Fixed
 - **Krum/Multi-Krum wired into production federated aggregation** (`detection/federated/server.py`,
