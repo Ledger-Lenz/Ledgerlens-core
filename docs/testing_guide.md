@@ -170,7 +170,7 @@ practice** — no `.github/workflows/` job runs it and the README badge is updat
 by hand, so run it locally when you touch detection logic or its tests. Target is
 **≥ 80%** mutation score. Full contributor guidance (runtime, when to run, how to
 kill survivors) is in
-[CONTRIBUTING.md → Mutation testing](../CONTRIBUTING.md#mutation-testing).
+[CONTRIBUTING.md → Mutation testing](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/CONTRIBUTING.md#mutation-testing).
 
 ## Migrating existing tests
 

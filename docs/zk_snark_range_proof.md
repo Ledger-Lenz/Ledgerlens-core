@@ -47,8 +47,8 @@ To rotate the proving/verification keys:
 
 ## See Also
 
-- **Circom Circuits:** [circuits/README.md](../circuits/README.md)  
+- **Circom Circuits:** [circuits/README.md](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/circuits/README.md)  
   Overview of the circuit definitions, including `score_range_proof.circom` and the integration points for both Sigma protocol and zk-SNARK proof systems.
 
-- **Soroban Verifier Contract:** [contracts/zk_verifier/README.md](../contracts/zk_verifier/README.md)  
+- **Soroban Verifier Contract:** [contracts/zk_verifier/README.md](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/contracts/zk_verifier/README.md)  
   The on-chain smart contract that verifies proofs. Implements the Sigma protocol variant by default; the zk-SNARK variant would use a similar contract with a different verification algorithm.

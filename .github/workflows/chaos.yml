@@ -27,6 +27,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Create .env for docker compose
+        run: cp .env.example .env
+
       - name: Start chaos services (Toxiproxy + Redis + API)
         run: docker compose --profile chaos up -d --wait
         env:

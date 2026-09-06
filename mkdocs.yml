@@ -1,4 +1,11 @@
 site_name: LedgerLens Core
+
+# docs/README.md exists only to orient contributors browsing the docs/
+# directory on GitHub (see its own content); index.md is the site's actual
+# home page. Excluding it here avoids the "conflicts with index.md" warning
+# that --strict would otherwise treat as a build failure.
+exclude_docs: |
+  README.md
 site_description: Benford's Law + ensemble ML wash-trading detection engine for the Stellar DEX
 site_url: https://ledger-lenz.github.io/Ledgerlens-core
 repo_url: https://github.com/Ledger-Lenz/Ledgerlens-core

@@ -313,7 +313,7 @@ kubectl apply -f monitoring/alerts.yml
 
 - [Issue #XXX] — Original issue requesting cost and capacity monitoring
 - [docs/cost_and_capacity.md](cost_and_capacity.md) — Comprehensive user guide
-- [monitoring/README.md](../monitoring/README.md) — Monitoring quick reference
+- [monitoring/README.md](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/monitoring/README.md) — Monitoring quick reference
 
 ---
 

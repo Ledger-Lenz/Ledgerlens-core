@@ -55,7 +55,7 @@ LedgerLens supports a privacy-preserving Federated Learning (FL) mode that allow
 Registration (`POST /federated/register`) is gated on admission by default: a
 participant_id must already have been admitted (`federated admit` /
 `POST /federated/admit`) or registration is rejected with 403. See
-["Participant Admission & Weight Bounding"](#participant-admission--weight-bounding)
+["Participant Admission & Weight Bounding"](#participant-admission-weight-bounding)
 below.
 
 ---

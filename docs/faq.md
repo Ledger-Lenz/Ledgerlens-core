@@ -14,7 +14,7 @@ Decentralised Exchange (SDEX). It ingests trade data from the Stellar Horizon
 API, scores wallets and asset pairs for wash-trading risk using Benford's Law
 digit-distribution analysis combined with ensemble machine learning, and
 publishes those scores through both a REST API and an on-chain Soroban contract.
-See the [project overview](../README.md#overview) for the full picture.
+See the [project overview](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md#overview) for the full picture.
 
 ## What is wash trading, and why does it matter?
 
@@ -50,8 +50,8 @@ Not fully. The detection engine — Benford analysis, the ML ensemble, graph rin
 detection, SHAP explanations, and the local read-only API — is implemented and
 tested. However, several roadmap items are still open, including internal Testnet
 testing, Soroban contract deployment, the public rate-limited API, and mainnet
-deployment. See the [Roadmap](../ROADMAP.md) and the roadmap section of the
-[README](../README.md#roadmap) for what is done versus in progress.
+deployment. See the [Roadmap](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/ROADMAP.md) and the roadmap section of the
+[README](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md#roadmap) for what is done versus in progress.
 
 ## How accurate is the risk score? Can I trust a single number?
 
@@ -79,7 +79,7 @@ No. `python cli.py train` generates a synthetic trade history with labelled
 wash-trading rings (`ingestion/synthetic_data.py`) and trains the
 Random Forest / XGBoost / LightGBM ensemble on it, so you can run the full
 pipeline end-to-end without any external dataset. See the
-[Quick Start](../README.md#quick-start) in the README.
+[Quick Start](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md#quick-start) in the README.
 
 ## Why Benford's Law? Isn't that just for accounting?
 
@@ -104,14 +104,14 @@ to signed webhook alerts.
 Yes. LedgerLens is MIT-licensed and developed as an open-source public good for
 the Stellar ecosystem — the methodology, scores, and training data are intended
 to be transparent and auditable. See [`LICENSE`](../LICENSE) and the
-[Contributing](../README.md#contributing) section.
+[Contributing](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md#contributing) section.
 
 ## How is the project organised across repos?
 
 `ledgerlens-core` (this repo) is the detection engine. The public API,
 dashboard, Soroban contracts, canonical data store, and org-wide GitHub config
 each live in their own repo. See the
-[LedgerLens Organization](../README.md#ledgerlens-organization) section of the
+[LedgerLens Organization](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/README.md#ledgerlens-organization) section of the
 README for the full breakdown and the cross-repo data flow.
 
 ## Where do I go for more detail?
@@ -121,4 +121,4 @@ README for the full breakdown and the cross-repo data flow.
 - [Cross-Chain Detection](cross_chain_detection.md)
 - [Governance Protocol](governance_protocol.md)
 - [Threat Model](threat_model.md)
-- [Roadmap](../ROADMAP.md)
+- [Roadmap](https://github.com/Ledger-Lenz/Ledgerlens-core/blob/main/ROADMAP.md)

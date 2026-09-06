@@ -2417,9 +2417,13 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 100,
+              "minimum": 0,
+              "description": "Minimum RiskScore (0-100).",
               "default": 0,
               "title": "Min Score"
-            }
+            },
+            "description": "Minimum RiskScore (0-100)."
           },
           {
             "name": "limit",
