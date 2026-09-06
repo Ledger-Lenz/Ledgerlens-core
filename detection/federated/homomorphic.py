@@ -4,11 +4,11 @@ import tenseal as ts
 class HomomorphicAggregator:
     MAX_ENCRYPTED_BLOB_BYTES = 10 * 1024 * 1024
     def __init__(self, d=8192, s=40):
-        self.c = ts.context(ts.SCHEME_TYPECKKS, poly_modulus_degree=d, coeff_mod_bit_sizes=[60, s, s, 60])
+        self.c = ts.context(ts.SCHEME_TYPE.CKKS, poly_modulus_degree=d, coeff_mod_bit_sizes=[60, s, s, 60])
         self.c.global_scale = 2 ** s
         self.c.generate_galois_keys()
     @classmethod
-    def from_public_context(class, b):
+    def from_public_context(cls, b):
         c = ts.context_from(b)
         if not c.is_public():
             raise ValueError("secret-key context rejected")

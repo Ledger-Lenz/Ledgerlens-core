@@ -5,7 +5,6 @@ to abstract the database engine and SQL dialects, replacing raw sqlite3 usage.
 """
 
 from typing import List
-from datetime import datetime, timezone
 from sqlalchemy import (
     create_engine,
     MetaData,

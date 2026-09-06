@@ -140,12 +140,12 @@ fn contract_vector_risk_score_boundary_hundred() {
 
 #[test]
 fn contract_vector_prediction_set_is_vec_i32() {
-    /// Verify that prediction_set elements are i32 (signed integer), not u8.
-    ///
-    /// The Python canonical type is `list[int]` (signed integers in the range
-    /// of class indices, typically 0 and 1). A previous Rust implementation
-    /// incorrectly used `Vec<u8>`, which would silently truncate or reject
-    /// negative indices and diverge from the Python contract.
+    // Verify that prediction_set elements are i32 (signed integer), not u8.
+    //
+    // The Python canonical type is `list[int]` (signed integers in the range
+    // of class indices, typically 0 and 1). A previous Rust implementation
+    // incorrectly used `Vec<u8>`, which would silently truncate or reject
+    // negative indices and diverge from the Python contract.
     let fixture = load_fixture();
     let score = parse_risk_score(&fixture, "complete");
 
@@ -174,15 +174,15 @@ fn contract_vector_prediction_set_is_vec_i32() {
 
 #[test]
 fn contract_vector_adversarial_wrong_field_name_rejected() {
-    /// A payload with 'risk_score' instead of 'score' must fail deserialization.
-    ///
-    /// serde_json with #[serde(deny_unknown_fields)] would reject this outright.
-    /// Without that attribute, the missing 'score' field (required) causes a
-    /// missing-field error. Either outcome proves the deserializer is not silently
-    /// accepting the renamed field.
-    ///
-    /// This test proves divergence detection: a field rename in Python that is
-    /// not reflected in the Rust model will be caught here.
+    // A payload with 'risk_score' instead of 'score' must fail deserialization.
+    //
+    // serde_json with #[serde(deny_unknown_fields)] would reject this outright.
+    // Without that attribute, the missing 'score' field (required) causes a
+    // missing-field error. Either outcome proves the deserializer is not silently
+    // accepting the renamed field.
+    //
+    // This test proves divergence detection: a field rename in Python that is
+    // not reflected in the Rust model will be caught here.
     let fixture = load_fixture();
     let raw = &fixture["risk_score_adversarial"]["wrong_field_name"];
 
@@ -199,7 +199,7 @@ fn contract_vector_adversarial_wrong_field_name_rejected() {
 
 #[test]
 fn contract_vector_all_valid_vectors_deserialize() {
-    /// Meta-test: every non-adversarial RiskScore vector must deserialize without error.
+    // Meta-test: every non-adversarial RiskScore vector must deserialize without error.
     let fixture = load_fixture();
     let valid_keys = ["complete", "minimal", "disputed", "score_boundary_zero", "score_boundary_hundred"];
 
@@ -221,11 +221,11 @@ fn contract_vector_all_valid_vectors_deserialize() {
 
 #[test]
 fn contract_vector_required_fields_declared_in_fixture() {
-    /// Verify the fixture declares all expected required fields for RiskScore.
-    ///
-    /// This acts as the 'agreement check': if a field is added to the Rust struct
-    /// that is not in the fixture, this test prompts the developer to update the
-    /// fixture (and then all language implementations).
+    // Verify the fixture declares all expected required fields for RiskScore.
+    //
+    // This acts as the 'agreement check': if a field is added to the Rust struct
+    // that is not in the fixture, this test prompts the developer to update the
+    // fixture (and then all language implementations).
     let fixture = load_fixture();
     let declared: Vec<String> = serde_json::from_value(
         fixture["required_risk_score_fields"].clone()

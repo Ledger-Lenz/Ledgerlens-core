@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 /// assert!(score.benford_flag);
 /// assert_eq!(score.asset_pair, "XLM/USDC");
 /// ```
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct RiskScore {
     /// Stellar wallet address (G...).

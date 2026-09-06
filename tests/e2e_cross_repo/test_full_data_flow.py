@@ -17,7 +17,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
-import pytest
 import requests
 
 from detection.risk_score import RiskScore

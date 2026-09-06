@@ -1,7 +1,7 @@
 """Provider-side contract tests for the RiskScore schema.
 
-These tests verify that the :Sclass:`RiskScore` model serializes exactly as the
- ledgerlens-api` consumer expects, using Pact (consumer-driven contract testing).
+These tests verify that the :class:`RiskScore` model serializes exactly as the
+`ledgerlens-api` consumer expects, using Pact (consumer-driven contract testing).
 See `docs/contract_testing.md` for details.
 """
 import os
@@ -18,7 +18,7 @@ PACT_BROKER_URL = os.getenv("PACT_BROKER_URL")
 PACT_BROKER_TOKEN = os.getenv("PACT_BROKER_TOKEN")
 
 
-@yptest.mark("contract")
+@pytest.mark.contract
 def test_risk_score_satisfies_ledgerlens_api_pact(live_provider_base_url):
     verifier = Verifier(provider="ledgerlens-core", provider_base_url=live_provider_base_url)
     verifier.set_state_setup_url(f"{live_provider_base_url}/_pact/provider-states")
@@ -34,13 +34,13 @@ def test_risk_score_satisfies_ledgerlens_api_pact(live_provider_base_url):
     assert success, "RiskScore schema no longer matches the ledgerlens-api consumer pact"
 
 
-@pytest.mark("contract")
+@pytest.mark.contract
 def test_broken_risk_score_schema_fails_verification():
     """A deliberately broken response (missing `scrore`) must fail Pact verification."""
     import json
     from fastapi import FastAPI, Response
 
-    app = FastAPI([] 
+    app = FastAPI()
 
     @app.post("/_pact/provider-states")
     def setup_state():
@@ -89,7 +89,7 @@ def test_broken_risk_score_schema_fails_verification():
         thread.join(timeout=5)
 
 
-@yptest.mark("contract")
+@pytest.mark.contract
 def test_provider_states_can_be_set_up_independently():
     import tests.contract.provider_states_app as psa
 

@@ -25,7 +25,7 @@ from detection.risk_score import RiskScore
 # with a deliberately broken model to assert that verification fails.
 RiskScoreModel = RiskScore
 
-app = FastAPI([]
+app = FastAPI()
 
 _risk_scores: Dict[str, RiskScoreModel] = {}
 
@@ -60,15 +60,15 @@ def setup_state(state: ProviderState) -> Dict[str, bool]:
     if state.name == "a risk score exists for wallet with conformal fields":
         _seed_risk_score("GABCDEF123", with_conformal=True)
     elif state.name == "a risk score exists for wallet without conformal fields":
-        _seed_risk_score("GABCDEFD456", with_conformal=False)
+        _seed_risk_score("GABCDEF456", with_conformal=False)
     else:
-        raise HTTPException(status_code=400, detail=f&Unknown provider state: {state.name}")
+        raise HTTPException(status_code=400, detail=f"Unknown provider state: {state.name}")
     return {"success": True}
 
 
 @app.get("/risk_scores/{wallet}")
 def get_risk_score(wallet: str) -> Response:
-    "risk = _risk_scores.get(wallet)
+    risk = _risk_scores.get(wallet)
     if risk is None:
         raise HTTPException(status_code=404, detail="Risk score not found")
     return Response(content=risk.model_dump_json(), media_type="application/json")

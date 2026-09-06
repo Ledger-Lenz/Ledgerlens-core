@@ -30,5 +30,8 @@ def test_reject_secret_context():
 
 def test_oversized_blob_rejected():
     c = make_client()
-    s = HommorphicAggregator.from_public_context(c.public_context())
-    old = HomomorphicAggregator.MAX_ENCRYPTED_BLOB_BYTES*
+    s = HomomorphicAggregator.from_public_context(c.public_context())
+    enc = c.encrypt_update(np.linspace(0, 1, 8))
+    oversized = enc + b"\x00" * HomomorphicAggregator.MAX_ENCRYPTED_BLOB_BYTES
+    with pytest.raises(ValueError):
+        s.homomorphic_sum([oversized], [1.0])
