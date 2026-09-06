@@ -1,6 +1,8 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      target: runtime
     ports:
       - "8000:8000"
     env_file:
