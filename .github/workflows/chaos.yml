@@ -28,13 +28,26 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Create .env for docker compose
-        run: cp .env.example .env
+        # The api container only reads settings from .env / its own defaults —
+        # a step-level `env:` on `docker compose up` is visible to the compose
+        # CLI process, not forwarded into the container. LEDGERLENS_DB_PATH is
+        # intentionally left unset here so the container's default
+        # ("./ledgerlens.db", i.e. /app/ledgerlens.db) matches the file the
+        # next step creates and docker-compose.yml bind-mounts.
+        run: |
+          cp .env.example .env
+          echo "LEDGERLENS_ADMIN_API_KEY=test-admin-key" >> .env
+
+      - name: Create the SQLite database docker-compose bind-mounts
+        # docker-compose.yml bind-mounts ./ledgerlens.db into the container;
+        # if the host file doesn't already exist, Docker creates an empty
+        # *directory* there instead, and the API fails to open it as a
+        # database. Running the migration first creates a real file with the
+        # expected schema, at the same path the API defaults to.
+        run: python cli.py db-migrate --db-path ./ledgerlens.db
 
       - name: Start chaos services (Toxiproxy + Redis + API)
         run: docker compose --profile chaos up -d --wait
-        env:
-          LEDGERLENS_ADMIN_API_KEY: test-admin-key
-          LEDGERLENS_DB_PATH: /tmp/ledgerlens_chaos.db
 
       - name: Wait for API to be healthy
         run: |
@@ -44,10 +57,12 @@ jobs:
           done
 
       - name: Run chaos test suite
+        # Talks to the same database the containerized API uses, so
+        # assertions that read the DB directly see what the API wrote.
         run: pytest tests/chaos/ -m chaos -v --tb=short --timeout=120
         env:
           LEDGERLENS_ADMIN_API_KEY: test-admin-key
-          LEDGERLENS_DB_PATH: /tmp/ledgerlens_chaos.db
+          LEDGERLENS_DB_PATH: ./ledgerlens.db
           REDIS_URL: redis://localhost:6379/0
 
       - name: Collect docker logs on failure
