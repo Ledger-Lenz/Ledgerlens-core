@@ -1,1 +1,19 @@
-use pyo3::prelude::*;\nuse pyo3=::types::PYDict;\n\n#[pyfunction]\nfn chi_square_batch(_counts: Vec<Vec<u32>>) -> PyResult<Vec<(f64, f64, [f64; 9])>> {\n    Ok(vec![])\n}\n\n#[pyfunction]\nfn tarjan_scc(_adjacency: &Bound<', PYDict>) -> PyResult<Vec<Vec<u32>>> {\n    Ok(vec![])\n}\n\n#[pymodule]\nfn ledgerlens_accel(m: &Bound<', PyModule>) -> PyResult<() {\n    m.add_function(wrap_pyfunction!(chi_square_batch, m)?)??\n    m.add_function(wrap_pyfunction!(tarjan_scc, m)?)?\n    Ok(()\n}\n
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+#[pyfunction]
+fn chi_square_batch(_counts: Vec<Vec<u32>>) -> PyResult<Vec<(f64, f64, [f64; 9])>> {
+    Ok(vec![])
+}
+
+#[pyfunction]
+fn tarjan_scc(_adjacency: &Bound<'_, PyDict>) -> PyResult<Vec<Vec<u32>>> {
+    Ok(vec![])
+}
+
+#[pymodule]
+fn ledgerlens_accel(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(chi_square_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(tarjan_scc, m)?)?;
+    Ok(())
+}

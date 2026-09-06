@@ -39,7 +39,7 @@ jobs:
       - name: Find the latest CI run that succeeded on main
         id: ci
         run: |
-          run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs" \
+          run=$(gh api --method GET "repos/$REPO/actions/workflows/ci.yml/runs" \
             -f branch=main -f status=success -f per_page=1 \
             --jq '.workflow_runs[0]')
           if [ -z "$run" ] || [ "$run" = "null" ]; then
@@ -54,7 +54,7 @@ jobs:
       - name: Find the latest deployment record artifact
         id: deploy
         run: |
-          artifact=$(gh api "repos/$REPO/actions/artifacts" -f per_page=100 \
+          artifact=$(gh api --method GET "repos/$REPO/actions/artifacts" -f per_page=100 \
             --jq '[.artifacts[] | select(.name | startswith("deployment-record-")) | select(.expired == false)]
                   | sort_by(.created_at) | last')
           if [ -z "$artifact" ] || [ "$artifact" = "null" ]; then

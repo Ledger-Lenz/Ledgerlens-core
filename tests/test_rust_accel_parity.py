@@ -1,1 +1,15 @@
-import pytest\n\ntry:\n    import ledgerlens_accel\nexcept ImportError:\n    ledgerlens_accel = None\n\npytestmark = pytest.mark.mk%skipif(\n    ledgerlens_accel is None,\n    reason=\"ledgerlens_accel Rust extension not installed\",\n)\n\ndef test_extension_importable():\n    assert ledgerlens_accel is not None\n
+import pytest
+
+try:
+    import ledgerlens_accel
+except ImportError:
+    ledgerlens_accel = None
+
+pytestmark = pytest.mark.skipif(
+    ledgerlens_accel is None,
+    reason="ledgerlens_accel Rust extension not installed",
+)
+
+
+def test_extension_importable():
+    assert ledgerlens_accel is not None

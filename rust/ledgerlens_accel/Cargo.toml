@@ -1,1 +1,10 @@
-[package]\nname = "ledgerlens-accel"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\n\n[dependencies]\npyo3 = { version = "0.22", features = ["extension-module"] }\n
+[package]
+name = "ledgerlens-accel"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }

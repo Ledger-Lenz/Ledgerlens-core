@@ -765,6 +765,7 @@ fn test_double_initialization_fails() {
 #[should_panic]
 fn unauthorized_caller_cannot_initialize() {
     use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::{IntoVal, Val};
 
     let env = Env::default();
     let contract_id = env.register_contract(None, OracleAggregator);
@@ -779,12 +780,19 @@ fn unauthorized_caller_cannot_initialize() {
     let score_contract = Address::generate(&env);
 
     // Only the legitimate deployer is authorised for an initialisation call.
+    let args: Vec<Val> = soroban_sdk::vec![
+        &env,
+        deployer.into_val(&env),
+        1u32.into_val(&env),
+        oracle_keys.into_val(&env),
+        score_contract.into_val(&env),
+    ];
     env.mock_auths(&[MockAuth {
         address: &deployer,
         invoke: &MockAuthInvoke {
             contract: &contract_id,
             fn_name: "initialize",
-            args: (&deployer, &1u32, &oracle_keys, &score_contract),
+            args,
             sub_invokes: &[],
         },
     }]);
