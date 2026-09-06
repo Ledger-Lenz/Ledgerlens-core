@@ -5,7 +5,6 @@ These tests verify that the :class:`RiskScore` model serializes exactly as the
 See `docs/contract_testing.md` for details.
 """
 import os
-from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient

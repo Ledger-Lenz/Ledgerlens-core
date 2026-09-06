@@ -20,8 +20,8 @@ use std::path::PathBuf;
 /// can resolve the fixture path relative to CARGO_MANIFEST_DIR's parent (the
 /// workspace root).
 fn fixture_path() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo test");
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo test");
     // crates/ledgerlens-sdk → go up two levels to workspace root
     let workspace_root = PathBuf::from(manifest_dir)
         .parent()
@@ -106,7 +106,10 @@ fn contract_vector_risk_score_minimal() {
     let score = parse_risk_score(&fixture, "minimal");
 
     // Optional fields must be None in the minimal vector
-    assert!(score.latency_ms.is_none(), "latency_ms should be None in minimal vector");
+    assert!(
+        score.latency_ms.is_none(),
+        "latency_ms should be None in minimal vector"
+    );
     assert!(score.score_lower.is_none());
     assert!(score.score_upper.is_none());
     assert!(score.prediction_set.is_none());
@@ -117,7 +120,10 @@ fn contract_vector_risk_score_minimal() {
 fn contract_vector_risk_score_disputed() {
     let fixture = load_fixture();
     let score = parse_risk_score(&fixture, "disputed");
-    assert!(score.disputed, "disputed must be true in the disputed vector");
+    assert!(
+        score.disputed,
+        "disputed must be true in the disputed vector"
+    );
 }
 
 #[test]
@@ -201,7 +207,13 @@ fn contract_vector_adversarial_wrong_field_name_rejected() {
 fn contract_vector_all_valid_vectors_deserialize() {
     // Meta-test: every non-adversarial RiskScore vector must deserialize without error.
     let fixture = load_fixture();
-    let valid_keys = ["complete", "minimal", "disputed", "score_boundary_zero", "score_boundary_hundred"];
+    let valid_keys = [
+        "complete",
+        "minimal",
+        "disputed",
+        "score_boundary_zero",
+        "score_boundary_hundred",
+    ];
 
     for key in &valid_keys {
         let raw = &fixture["risk_score"][key];
@@ -227,17 +239,26 @@ fn contract_vector_required_fields_declared_in_fixture() {
     // that is not in the fixture, this test prompts the developer to update the
     // fixture (and then all language implementations).
     let fixture = load_fixture();
-    let declared: Vec<String> = serde_json::from_value(
-        fixture["required_risk_score_fields"].clone()
-    )
-    .expect("required_risk_score_fields must be a JSON array of strings");
+    let declared: Vec<String> =
+        serde_json::from_value(fixture["required_risk_score_fields"].clone())
+            .expect("required_risk_score_fields must be a JSON array of strings");
 
     // These are the fields the Rust RiskScore struct knows about.
     // If a new field is added here that's not in the fixture, this test fails.
     let rust_fields = [
-        "wallet", "asset_pair", "score", "benford_flag", "ml_flag",
-        "confidence", "disputed", "timestamp", "latency_ms",
-        "score_lower", "score_upper", "prediction_set", "coverage_guarantee",
+        "wallet",
+        "asset_pair",
+        "score",
+        "benford_flag",
+        "ml_flag",
+        "confidence",
+        "disputed",
+        "timestamp",
+        "latency_ms",
+        "score_lower",
+        "score_upper",
+        "prediction_set",
+        "coverage_guarantee",
     ];
 
     for field in &rust_fields {
