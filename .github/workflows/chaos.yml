@@ -42,6 +42,13 @@ jobs:
           # sibling "redis" service. Override with the compose service name.
           echo "REDIS_URL=redis://redis:6379/0" >> .env
 
+      - name: Train models docker-compose bind-mounts into the container
+        # docker-compose.yml bind-mounts ./models into the container, and
+        # /health returns 503 (failing the compose healthcheck) if any
+        # expected model file is missing — the API's own doc for /health
+        # says as much: "Run model_training first."
+        run: python cli.py train --n-normal-accounts 200 --n-wash-rings 30
+
       - name: Create the SQLite database docker-compose bind-mounts
         # docker-compose.yml bind-mounts ./ledgerlens.db into the container;
         # if the host file doesn't already exist, Docker creates an empty
