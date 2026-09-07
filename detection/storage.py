@@ -616,7 +616,12 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
 
 @contextmanager
 def _connect(db_path: str | None = None):
-    conn = sqlite3.connect(db_path or settings.db_path)
+    # A short, explicit timeout so lock contention surfaces immediately as
+    # sqlite3.OperationalError (which api/main.py's exception handler turns
+    # into 503 + Retry-After) instead of blocking the request thread for
+    # sqlite3's default 5s busy-wait. Request-serving code should fail fast
+    # and let the client back off and retry, not silently stall.
+    conn = sqlite3.connect(db_path or settings.db_path, timeout=1.0)
     try:
         yield conn
     finally:
