@@ -41,6 +41,9 @@ jobs:
           # the api container refers to the container itself, not the
           # sibling "redis" service. Override with the compose service name.
           echo "REDIS_URL=redis://redis:6379/0" >> .env
+          # Must match the key the next step trains and signs models with,
+          # or the container fails to verify/load them at startup.
+          echo "LEDGERLENS_MODEL_SIGNING_KEY=chaos-ci-test-signing-key" >> .env
 
       - name: Train models docker-compose bind-mounts into the container
         # docker-compose.yml bind-mounts ./models into the container, and
@@ -52,6 +55,9 @@ jobs:
           # Newer mlflow refuses its legacy filesystem tracking backend
           # (the ./mlruns dir train_ensemble logs to) unless this is set.
           MLFLOW_ALLOW_FILE_STORE: "true"
+          # Saving a trained model HMAC-signs it; any non-empty secret works
+          # for this throwaway CI run.
+          LEDGERLENS_MODEL_SIGNING_KEY: "chaos-ci-test-signing-key"
 
       - name: Create the SQLite database docker-compose bind-mounts
         # docker-compose.yml bind-mounts ./ledgerlens.db into the container;
