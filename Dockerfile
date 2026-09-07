@@ -89,6 +89,15 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements/dev.txt
 # ─── Common runtime base ────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime-base
 
+# lightgbm's compiled extension dynamically links against libgomp (GNU
+# OpenMP) at import time; python:3.12-slim doesn't ship it, so loading any
+# saved model that pickles a lightgbm Booster fails with
+# "OSError: libgomp.so.1: cannot open shared object file" as soon as the
+# API tries to load models at startup.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG BUILD_VERSION="0.0.0"
 
 LABEL org.opencontainers.image.title="ledgerlens-core"
