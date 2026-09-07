@@ -25,6 +25,10 @@ jobs:
       - name: Train models (if not cached)
         run: python cli.py train --n-normal-accounts 200 --n-wash-rings 30
         continue-on-error: true
+        env:
+          # Newer mlflow refuses its legacy filesystem tracking backend
+          # (the ./mlruns dir train_ensemble logs to) unless this is set.
+          MLFLOW_ALLOW_FILE_STORE: "true"
 
       - name: Run red-team campaigns
         id: red_team
