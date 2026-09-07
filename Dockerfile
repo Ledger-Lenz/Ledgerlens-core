@@ -101,6 +101,14 @@ RUN groupadd --gid 1000 ledgerlens && \
 
 WORKDIR /app
 
+# WORKDIR creates /app as root before any COPY runs. `COPY --chown` below
+# only sets ownership on the files/dirs it creates *inside* /app, not on the
+# /app directory entry itself — so without this, ledgerlens (uid 1000) could
+# never create a new top-level file directly under /app (e.g. a SQLite
+# rollback journal next to a bind-mounted db file), even though it can
+# freely write into the subdirectories COPY populated.
+RUN chown ledgerlens:ledgerlens /app
+
 # Build/runtime hygiene only — application config comes from the environment at
 # runtime (see the "Runtime environment variables" note above), not from ENV here.
 ENV PYTHONUNBUFFERED=1 \
