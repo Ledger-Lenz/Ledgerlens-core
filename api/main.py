@@ -517,15 +517,25 @@ def health() -> JSONResponse:
             healthy = False
 
     # --- Model files check (existence + non-zero size only; no deserialization) ---
+    # temporal_lstm/gnn/sequence_model are trained only when torch (+
+    # torch_geometric for gnn) is installed — see the try/except around LSTM
+    # training in detection/model_training.py and use_gnn defaulting to
+    # False. They're absent by design on the base "runtime" image/a plain
+    # `cli.py train` run, so their absence is reported but doesn't fail the
+    # health check the way a missing core ensemble model does.
     with start_span("models.health_check"):
         missing = [
             name
             for name, filename in _MODEL_FILENAMES.items()
             if not _model_file_ok(os.path.join(settings.model_dir, filename))
         ]
-    if missing:
-        status["models"] = f"missing: {', '.join(sorted(missing))}"
+    missing_required = [name for name in missing if name not in _OPTIONAL_MODEL_NAMES]
+    if missing_required:
+        status["models"] = f"missing: {', '.join(sorted(missing_required))}"
         healthy = False
+    elif missing:
+        status["models"] = f"ok (optional missing: {', '.join(sorted(missing))})"
+        degraded = True
     else:
         status["models"] = "ok"
 
@@ -563,6 +573,12 @@ def health() -> JSONResponse:
         status["status"] = "degraded"
         http_status = 503
     return JSONResponse(content=status, status_code=http_status)
+
+
+# Trained only when torch (+ torch_geometric for "gnn") is installed —
+# absent by design on a base (non-ML-extras) deployment or a plain
+# `cli.py train` run. See the health() model-files check above.
+_OPTIONAL_MODEL_NAMES = frozenset({"temporal_lstm", "gnn", "sequence_model"})
 
 
 def _model_file_ok(path: str) -> bool:
