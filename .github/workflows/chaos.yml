@@ -37,6 +37,10 @@ jobs:
         run: |
           cp .env.example .env
           echo "LEDGERLENS_ADMIN_API_KEY=test-admin-key" >> .env
+          # .env.example defaults to redis://localhost:6379/0, which inside
+          # the api container refers to the container itself, not the
+          # sibling "redis" service. Override with the compose service name.
+          echo "REDIS_URL=redis://redis:6379/0" >> .env
 
       - name: Create the SQLite database docker-compose bind-mounts
         # docker-compose.yml bind-mounts ./ledgerlens.db into the container;
