@@ -123,7 +123,12 @@ jobs:
           mkdir -p reports
           lockfile_args=()
           for f in requirements/*.txt; do
-            lockfile_args+=(--lockfile "$f")
+            # osv-scanner's pip parser is selected by filename pattern
+            # (requirements*.txt) — none of base.txt/chain.txt/etc. match it,
+            # so auto-detection silently finds "no suitable extractor" and
+            # never writes a report at all. The "parseAs:path" form forces
+            # the pip parser regardless of the actual filename.
+            lockfile_args+=(--lockfile "requirements.txt:$f")
           done
           # osv-scanner exits non-zero when it finds anything — that exit
           # code is intentionally not authoritative here (see FAIL below):
