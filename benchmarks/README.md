@@ -1,7 +1,7 @@
 # Benchmarks
 
-This directory holds three standalone performance scripts. They are **not**
-correctness tests — they measure latency / throughput and, in two of the three
+This directory holds standalone performance scripts. They are **not**
+correctness tests — they measure latency / throughput and, in two
 cases, exit non-zero when a hard threshold is breached.
 
 | Script | What it measures | Run in CI? |
@@ -9,6 +9,7 @@ cases, exit non-zero when a hard threshold is breached.
 | `benchmark_scoring.py` | p50/p95/p99 latency of the scoring pipeline, with regression detection against a committed baseline | Helper functions only (see below) |
 | `benchmark_feature_engineering.py` | Numba JIT vs pure-Python speed of the `feature_engineering.py` hot loops | No — local only |
 | `horizon_checkpoint.py` | Cursor-checkpoint flush latency under a 10 000-event replay | No — local only |
+| `benchmark_vector_index.py` | ANN index build time, memory, query latency and recall from 1x to 10x+ wallet scale — results in `docs/vector_index_capacity.md` | No — local only |
 
 All three assume the project is installed (`pip install -e .` plus the test
 requirements) and are run from the repository root.

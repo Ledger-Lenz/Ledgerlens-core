@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import copy
 import logging
-import multiprocessing
 import os
 import statistics
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Optional
 
 import networkx as nx
@@ -491,6 +491,10 @@ class GraphTooLargeError(Exception):
     """Raised when a graph exceeds MAX_GRAPH_NODES nodes."""
 
 
+class ShardFailureError(RuntimeError):
+    """Raised when every shard fails, leaving no survivor to rebalance onto."""
+
+
 class NodeIndex:
     """Bijective str↔int mapping for Stellar account identifiers.
 
@@ -929,7 +933,12 @@ class ShardedTradeGraph(TradeGraph):
 
     Partitions the graph using community detection (:mod:`detection.graph_sharding`),
     runs :meth:`find_wash_rings` per shard in parallel via
-    :class:`multiprocessing.Pool`, and merges results with de-duplication.
+    :class:`concurrent.futures.ProcessPoolExecutor`, and merges results with
+    de-duplication.
+
+    If a shard's worker fails (exception or process death), its partition is
+    rebalanced onto the least-loaded surviving shard and re-run, so up to
+    ``shard_count - 1`` simultaneous shard failures lose no data.
 
     Activated automatically when ``GRAPH_SHARD_ENABLED=true`` (default) and the
     node count exceeds ``MAX_GRAPH_NODES``.
@@ -946,8 +955,12 @@ class ShardedTradeGraph(TradeGraph):
         self._overlap_hops = overlap_hops
         self._max_workers = max_workers
         self._shard_assignment: Optional[Any] = None
+        self._failed_shards: list[int] = []
         global _SHARDED_GRAPH_INSTANCE
         _SHARDED_GRAPH_INSTANCE = self
+
+    # Per-shard worker; overridable (module-level function) to inject faults.
+    _shard_worker = None
 
     def find_wash_rings(
         self,
@@ -992,12 +1005,36 @@ class ShardedTradeGraph(TradeGraph):
             for i, sed in enumerate(shard_edge_data)
         ]
 
+        worker = type(self)._shard_worker or _run_shard_find_rings
+        results: dict[int, list[dict]] = {}
+        failed: list[int] = []
         pool_size = min(self._max_workers, assignment.shard_count)
         if pool_size > 1:
-            with multiprocessing.Pool(pool_size) as pool:
-                shard_results = pool.map(_run_shard_find_rings, worker_inputs)
+            with ProcessPoolExecutor(pool_size) as pool:
+                futures = [(w[0], pool.submit(worker, w)) for w in worker_inputs]
+                for shard_id, future in futures:
+                    try:
+                        results[shard_id] = future.result()[1]
+                    except Exception as exc:  # noqa: BLE001 - any worker failure triggers rebalancing
+                        logger.warning("Shard %d failed: %s", shard_id, exc)
+                        failed.append(shard_id)
         else:
-            shard_results = [_run_shard_find_rings(w) for w in worker_inputs]
+            for w in worker_inputs:
+                try:
+                    results[w[0]] = worker(w)[1]
+                except Exception as exc:  # noqa: BLE001 - any worker failure triggers rebalancing
+                    logger.warning("Shard %d failed: %s", w[0], exc)
+                    failed.append(w[0])
+
+        self._failed_shards = failed
+        if failed:
+            self._rebalance_failed_shards(
+                failed,
+                results,
+                shard_edge_data,
+                (min_ring_size, max_ring_size, min_cycle_volume),
+            )
+        shard_results = sorted(results.items())
 
         all_rings: list[dict] = []
         seen_account_sets: list[frozenset[str]] = []
@@ -1031,6 +1068,36 @@ class ShardedTradeGraph(TradeGraph):
         )
         self._rings_cache = (cache_key, result)
         return result
+
+    def _rebalance_failed_shards(
+        self,
+        failed: list[int],
+        results: dict[int, list[dict]],
+        shard_edge_data: list[dict[tuple[str, str], list]],
+        ring_args: tuple,
+    ) -> None:
+        """Move each failed shard's partition onto the least-loaded survivor and re-run it."""
+        if not results:
+            raise ShardFailureError(
+                f"All {len(failed)} shards failed; no surviving shard to rebalance onto"
+            )
+        node_to_shard = self._shard_assignment.node_to_shard
+        for shard_id in failed:
+            target = min(results, key=lambda s: len(shard_edge_data[s]))
+            shard_edge_data[target].update(shard_edge_data[shard_id])
+            shard_edge_data[shard_id] = {}
+            for node, s in node_to_shard.items():
+                if s == shard_id:
+                    node_to_shard[node] = target
+            _, results[target] = _run_shard_find_rings(
+                (target, shard_edge_data[target], self._node_index, *ring_args)
+            )
+            logger.info("Rebalanced failed shard %d onto shard %d", shard_id, target)
+
+    @property
+    def failed_shards(self) -> list[int]:
+        """Shard ids whose workers failed during the last :meth:`find_wash_rings`."""
+        return list(self._failed_shards)
 
     @property
     def shard_topology(self) -> dict:

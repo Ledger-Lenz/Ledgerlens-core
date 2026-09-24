@@ -175,6 +175,44 @@ CREATE INDEX IF NOT EXISTS idx_bridge_stellar ON bridge_transfers(stellar_wallet
 CREATE INDEX IF NOT EXISTS idx_bridge_evm ON bridge_transfers(evm_wallet, timestamp);
 ```
 
+## Bridge-Spanning Path-Payment Cycles
+
+`detection/path_payment_engine.py` detects multi-hop round trips on Stellar.
+A wash or obfuscation route can instead leave Stellar through a bridge and come
+back — e.g. `A → B → C` via path payments, `C` bridges USDC out to EVM wallet
+`E`, and `E` bridges it back to `A`. Single-chain analysis sees no cycle.
+
+**How it is stitched together**
+
+1. `CrossChainCorrelator.match_round_trips(transfers)` pairs each
+   `stellar_to_evm` transfer (from `ingestion/bridge_loader.py`) with every
+   `evm_to_stellar` transfer from the **same EVM wallet** that arrives within
+   the correlator window (24 h) at a matching amount (±5%). The shared EVM
+   wallet resolves bridged identity: it ties the outbound `stellar_wallet` to
+   the inbound one, even when they differ.
+2. `bridge_hop_edges()` turns each pair into one synthetic `HopEdge`
+   `(out.stellar_wallet, out.token) → (in.stellar_wallet, in.token)` carrying
+   the inbound `amount_usd`, with `operation_id = "bridge:<out tx>:<in tx>"`.
+3. `PathCycleDetector.ingest_bridge_transfers(transfers)` adds those edges to
+   the hop graph and re-runs cycle detection for the affected wallets. Bridge
+   and Stellar hops can arrive in either order. Detected cycles expose
+   `PathPaymentCycle.crosses_bridge`.
+
+**Current limitations**
+
+- The EVM leg is collapsed into one hop; intermediate EVM hops, swaps, or
+  wallet-to-wallet transfers on the other chain are not traced (the round trip
+  must return from the same EVM wallet that received the funds).
+- Bridge hop amounts are `amount_usd`, while Stellar hops are in asset units.
+  Recovery ratios are only meaningful when the route's origin asset is a USD
+  stablecoin (e.g. USDC); for other assets, cycles may be missed or mis-scored.
+- Node continuity requires the bridged `token` code to equal the Stellar
+  asset code on both sides (e.g. `USDC`); issuer is not compared.
+- The whole route, bridge included, must fit within the detector's
+  `cycle_window_seconds` (max 24 h) and `max_depth` (7 hops, bridge hop counts
+  as one); the correlator's own window and amount tolerance also apply.
+- Transfers without `amount_usd` are skipped.
+
 ## Security Notes
 
 - **EIP-55 address validation**: all EVM addresses are validated at construction time. Malformed or non-checksummed addresses raise `ValueError` before any I/O occurs.
