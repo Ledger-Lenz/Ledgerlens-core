@@ -44,6 +44,35 @@ webhook_deliveries_total = Counter(
     ["result"],
 )
 
+benford_flags_total = Counter(
+    "ledgerlens_benford_flags_total",
+    "Total scored wallets whose Benford test flagged an anomaly",
+    ["asset_pair"],
+)
+
+model_lifecycle_events_total = Counter(
+    "ledgerlens_model_lifecycle_events_total",
+    "Total model promotion/rollback events (drives dashboard annotations)",
+    ["action"],  # "promote" or "rollback"
+)
+
+
+def _chain_submission_backlog() -> float:
+    try:
+        from detection.chain_submission_queue import queue_stats
+
+        stats = queue_stats()
+        return float(stats.get("pending", 0) + stats.get("in_flight", 0))
+    except Exception:
+        return 0.0
+
+
+chain_submission_backlog = Gauge(
+    "ledgerlens_chain_submission_backlog",
+    "On-chain submissions awaiting publication (pending + in_flight)",
+)
+chain_submission_backlog.set_function(_chain_submission_backlog)
+
 drift_detected_total = Counter(
     "ledgerlens_drift_detected_total",
     "Total feature-drift detection events",
@@ -107,6 +136,43 @@ ledgerlens_secret_rotation_overdue = Gauge(
     "Number of active API keys that have exceeded their maximum age without rotation",
 )
 ledgerlens_secret_rotation_overdue.set_function(get_overdue_count)
+
+
+# Internal event bus dead-letter queue (detection/event_bus.py)
+event_bus_dead_lettered_total = Counter(
+    "ledgerlens_event_bus_dead_lettered_total",
+    "Total risk-score events dead-lettered after exhausting the publish retry budget",
+    ["backend"],
+)
+
+event_bus_dead_letter_replays_total = Counter(
+    "ledgerlens_event_bus_dead_letter_replays_total",
+    "Total dead-lettered event replay attempts",
+    ["result"],  # "replayed" or "failed"
+)
+
+
+def _event_bus_dlq_stat(stat: str) -> float:
+    try:
+        from detection.event_bus import get_dead_letter_store
+
+        store = get_dead_letter_store()
+        return float(store.count() if stat == "count" else store.oldest_age_seconds())
+    except Exception:
+        return 0.0
+
+
+event_bus_dead_letter_events = Gauge(
+    "ledgerlens_event_bus_dead_letter_events",
+    "Current number of dead-lettered event bus events awaiting replay",
+)
+event_bus_dead_letter_events.set_function(lambda: _event_bus_dlq_stat("count"))
+
+event_bus_dead_letter_oldest_age_seconds = Gauge(
+    "ledgerlens_event_bus_dead_letter_oldest_age_seconds",
+    "Age of the oldest dead-lettered event bus event (0 when empty)",
+)
+event_bus_dead_letter_oldest_age_seconds.set_function(lambda: _event_bus_dlq_stat("age"))
 
 
 def metrics_response():

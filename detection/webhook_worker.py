@@ -19,6 +19,7 @@ from detection.webhook_queue import (
     mark_failed,
     init_db as init_queue_db,
 )
+from detection.tracing import TRACE_ID_HEADER, propagate_context_to_headers, use_trace_id
 from detection.webhook_registry import get_subscriber, init_db as init_registry_db
 
 logger = logging.getLogger("ledgerlens.webhook.worker")
@@ -28,11 +29,15 @@ REQUEST_TIMEOUT = 10.0
 
 
 def build_webhook_payload(score_data: dict) -> dict:
-    return {
+    payload = {
         "event": "risk_score_alert",
         "data": score_data,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    # Surface the pipeline trace ID for subscriber-side correlation.
+    if score_data.get("trace_id"):
+        payload["trace_id"] = score_data["trace_id"]
+    return payload
 
 
 def build_hmac_signature(body: bytes, secret: str) -> str:
@@ -62,9 +67,14 @@ async def _deliver(
         "X-LedgerLens-Timestamp": str(int(datetime.now(timezone.utc).timestamp())),
     }
 
-    with tracer.start_as_current_span("webhook.deliver") as span:
+    trace_id = payload.get("trace_id")
+    if trace_id:
+        headers[TRACE_ID_HEADER] = trace_id
+
+    with use_trace_id(trace_id), tracer.start_as_current_span("webhook.deliver") as span:
         span.set_attribute("webhook.subscriber_id", str(delivery.subscriber_id))
         span.set_attribute("webhook.attempt", delivery.attempt_count)
+        propagate_context_to_headers(headers)
 
         try:
             resp = await client.post(

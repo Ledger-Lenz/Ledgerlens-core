@@ -2,7 +2,8 @@
 
 LedgerLens exposes a Prometheus-compatible metrics endpoint at `GET /metrics`
 (configurable via `METRICS_ENDPOINT`, default `/metrics`). All metric names are
-prefixed with `ledgerlens_`.
+prefixed with `ledgerlens_`. New metrics must follow the
+[metric naming convention](metric_naming.md), which CI enforces.
 
 ## Quick Start
 

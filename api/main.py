@@ -44,8 +44,11 @@ from api.namespace import list_namespaces
 from api.gateway import GatewayMiddleware
 from config.settings import get_runtime_risk_score_threshold, settings
 from detection.tracing import (
+    TRACE_ID_HEADER,
     configure_tracing,
+    ensure_trace_id,
     start_span,
+    use_trace_id,
 )
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -361,6 +364,20 @@ async def _metrics_middleware(request: Request, call_next):
             ).observe(duration)
         except Exception:
             pass
+
+
+@app.middleware("http")
+async def _trace_id_middleware(request: Request, call_next):
+    """Echo the request's pipeline trace ID in ``X-Trace-ID`` for client correlation.
+
+    An inbound ``X-Trace-ID`` is honoured so callers can stitch their own
+    trace; otherwise the active OTel trace (or a fresh ID) is used.
+    """
+    trace_id = ensure_trace_id(request.headers.get(TRACE_ID_HEADER, "").lower() or None)
+    with use_trace_id(trace_id):
+        response = await call_next(request)
+    response.headers[TRACE_ID_HEADER] = trace_id
+    return response
 
 
 @app.middleware("http")

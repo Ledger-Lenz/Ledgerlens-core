@@ -83,6 +83,9 @@ jobs:
           pip install ruff==0.4.10 --quiet
           ruff check .
 
+      - name: Lint metric names
+        run: python scripts/lint_metric_names.py
+
       - name: Test
         run: |
           # The repository has many integration, optional-dependency, schema,
@@ -98,6 +101,8 @@ jobs:
             tests/test_benford_engine.py \
             tests/test_storage.py \
             tests/test_event_bus.py \
+            tests/test_event_bus_dead_letter.py \
+            tests/test_pipeline_trace_propagation.py \
             tests/test_webhook_queue.py \
             tests/test_http_client.py \
             tests/test_exceptions.py

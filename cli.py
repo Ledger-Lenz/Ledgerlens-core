@@ -2307,6 +2307,31 @@ def re_encrypt_webhook_secrets() -> None:
     typer.echo(f"Re-encryption complete. Successfully re-encrypted {reencrypted_count} webhook secrets under the current encryption key.")
 
 
+@app.command("event-bus-replay")
+def event_bus_replay(
+    limit: int = typer.Option(None, help="Maximum number of dead-lettered events to replay (default: all)"),
+    list_only: bool = typer.Option(False, "--list", help="List dead-lettered events without replaying them"),
+) -> None:
+    """Replay risk-score events dead-lettered by the internal event bus.
+
+    Run after the underlying Kafka/NATS fault is fixed. Successfully replayed
+    events are removed from the dead-letter store; failures stay for a retry.
+    """
+    from detection.event_bus import get_dead_letter_store, get_event_bus
+
+    store = get_dead_letter_store()
+    if list_only:
+        for entry in store.entries(limit=limit):
+            typer.echo(f"{entry.id}\t{entry.backend}\t{entry.created_at}\tattempts={entry.replay_attempts}\t{entry.error}")
+        typer.echo(f"{store.count()} dead-lettered event(s).")
+        return
+
+    result = get_event_bus().replay_dead_letters(store, limit=limit)
+    typer.echo(f"Replayed {result.replayed}, failed {result.failed}, remaining {result.remaining}.")
+    if result.failed:
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()
 

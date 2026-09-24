@@ -17,6 +17,26 @@ groups:
           description: "More than 10 webhook deliveries have permanently failed in the last hour."
           runbook: "Inspect GET /webhooks/dead-letters. Check subscriber URLs are reachable over HTTPS. Verify LEDGERLENS_WEBHOOK_ENCRYPTION_KEY is set. Dead letters require manual intervention or subscriber re-registration."
 
+      - alert: EventBusDeadLetters
+        expr: ledgerlens_event_bus_dead_letter_events > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Risk-score events are dead-lettered on the event bus"
+          description: "{{ $value }} risk-score event(s) exhausted the event bus retry budget and are waiting in the dead-letter store."
+          runbook: "Check Kafka/NATS connectivity (GET /health event_bus status). After the fault is fixed, run `ledgerlens event-bus-replay --list` then `ledgerlens event-bus-replay`. See docs/event_bus.md#dead-letter-queue-and-replay."
+
+      - alert: EventBusDeadLetterStale
+        expr: ledgerlens_event_bus_dead_letter_oldest_age_seconds > 3600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-lettered event bus events older than 1 hour"
+          description: "The oldest dead-lettered risk-score event has waited {{ $value | humanizeDuration }} for replay; downstream consumers are missing updates."
+          runbook: "Replay with `ledgerlens event-bus-replay`. If replays keep failing, inspect the stored error with `ledgerlens event-bus-replay --list`."
+
       - alert: FeatureDriftDetected
         expr: increase(ledgerlens_drift_detected_total[24h]) > 0
         for: 0m

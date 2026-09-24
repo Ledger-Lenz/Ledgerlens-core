@@ -73,6 +73,9 @@ def promote_model(version: str) -> dict:
         with open(latest_path, "w") as f:
             f.write(version)
 
+    from api.metrics import model_lifecycle_events_total
+
+    model_lifecycle_events_total.labels(action="promote").inc()
     return {"promoted": version, "models": _MODEL_NAMES}
 
 

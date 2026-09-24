@@ -133,6 +133,12 @@ def rollback_model(
     with open(latest_path, "w") as f:
         f.write(previous_version)
     logger.info("Rolled back %s to version %s", name, previous_version)
+    try:
+        from api.metrics import model_lifecycle_events_total
+
+        model_lifecycle_events_total.labels(action="rollback").inc()
+    except ImportError:
+        pass
 
 
 def list_model_versions(
