@@ -105,3 +105,23 @@ LEDGERLENS_COMPLIANCE_API_KEY=your-compliance-key
 - Stellar public keys are pseudonymous, but the audit log still stores only
   a SHA-256 hash, never the plaintext address, so the audit trail can't
   itself become a source of wallet-to-export linkage.
+
+## Pluggable export formats
+
+`detection/compliance_formats.py` exposes a format-plugin registry. Select a
+format at export time with
+`export_risk_assessment(wallet, fmt="ivms101" | "goaml", **options)`; every
+payload is validated against the plugin's JSON Schema before it is returned
+(`ExportValidationError` on failure).
+
+| Format    | Standard                                                        |
+|-----------|-----------------------------------------------------------------|
+| `ivms101` | FATF Travel Rule IVMS 101 LedgerLens risk block                 |
+| `goaml`   | UNODC goAML 4.x `report` (JSON projection), used by 60+ FIUs     |
+
+`goaml` options: `rentity_id` (FIU-assigned reporting entity id),
+`currency_code_local` (ISO 4217, default `USD`), `report_code` (default `STR`).
+
+To add a format, subclass `ExportFormat`, set `name` and `schema`, implement
+`build()`, and decorate the class with `@register_format` — no changes to the
+core exporter are required.

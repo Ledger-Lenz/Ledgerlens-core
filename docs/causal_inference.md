@@ -301,3 +301,26 @@ invalidate the cache and trigger a fresh ATE estimation.
 - Sharma, A., & Kiciman, E. (2020). [DoWhy: An End-to-End Library for Causal Inference](https://arxiv.org/abs/2011.04216).
 - Bang, H., & Robins, J. M. (2005). Doubly robust estimation in missing data and causal inference models. _Biometrics_, 61(4), 962–973.
 - Lundberg, S. M., & Lee, S.-I. (2017). [A unified approach to interpreting model predictions (SHAP)](https://arxiv.org/abs/1705.07874). NeurIPS.
+
+## PDC profiling and batched/async execution
+
+Profiled with `python -m tests.benchmark_causal_engine` (50 wallets, 5,000
+trades, 24h of 1-minute prices, one pair):
+
+- A single `estimate_pdc` call costs ~35–80 ms. ~60% is the DR-IPW fit
+  (`propensity_score` → `StandardScaler`/`LogisticRegression`, dominated by
+  sklearn input validation); the remainder is **wallet-independent** panel
+  preparation (price normalisation, resampling, trade timestamp parsing,
+  per-window volume) that the per-item path repeats for every wallet.
+- **Batched mode** — `estimate_pdc_batch(trades, prices, wallets, pair)`
+  prepares the pair context once and reuses it for every wallet. Results are
+  identical to per-item calls.
+- **Async mode** — `await estimate_pdc_batch_async(...)` runs the batch on a
+  dedicated 2-worker thread pool so the detection pipeline's event loop is
+  never blocked by causal computation.
+
+| Mode              | Wall time | Throughput      |
+|-------------------|-----------|-----------------|
+| Sync per-item     | 1.70 s    | 29 wallets/s    |
+| Batched           | 0.50 s    | 100 wallets/s (3.4x) |
+| Async batched     | 0.55 s    | max event-loop stall 4.9 ms (≈ timer resolution) |

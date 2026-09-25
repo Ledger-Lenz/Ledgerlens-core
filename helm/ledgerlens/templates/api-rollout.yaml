@@ -39,12 +39,12 @@ spec:
         - pause: {duration: {{ (index .Values.canary.steps 1).pauseSeconds }}s}
         - analysis:
             templates:
-              - name: ledgerlens-canary-analysis
+              - templateName: ledgerlens-canary-analysis
         - setWeight: {{ (index .Values.canary.steps 2).setWeight }}
         - pause: {duration: {{ (index .Values.canary.steps 3).pauseSeconds }}s}
         - analysis:
             templates:
-              - name: ledgerlens-canary-analysis
+              - templateName: ledgerlens-canary-analysis
         - setWeight: 100
   selector:
     matchLabels:

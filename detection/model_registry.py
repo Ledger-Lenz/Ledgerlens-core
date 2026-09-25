@@ -8,6 +8,12 @@ SHAP importance tracking: :func:`compute_shap_summary` computes mean absolute
 SHAP values per model after training. :func:`compare_importance_stability`
 checks Spearman rank correlation of top-10 features between model versions
 and blocks auto-promotion when correlation drops below the configured threshold.
+
+Robustness promotion gate: :func:`enforce_robustness_gate` is a hard gate that
+rejects candidates whose robustness score (``RobustnessReport.certified_radius``)
+is below :data:`MIN_ROBUSTNESS_SCORE`. A below-threshold candidate can only be
+promoted via an explicit :class:`RobustnessOverride` (approver + justification),
+which is appended to ``robustness_overrides.jsonl`` in the model directory.
 """
 
 import hashlib
@@ -26,6 +32,89 @@ from detection.model_signing import assert_within_model_dir, safe_joblib_load, s
 logger = logging.getLogger("ledgerlens.model_registry")
 
 SHAP_STABILITY_THRESHOLD: float = 0.70
+
+# Minimum certified robustness radius (L2, normalised feature space) a candidate
+# must reach to be promoted. Set from current baseline ensembles, which certify
+# at ~0.07-0.10 under the default randomized-smoothing settings.
+MIN_ROBUSTNESS_SCORE: float = 0.05
+ROBUSTNESS_OVERRIDE_LOG = "robustness_overrides.jsonl"
+
+
+class RobustnessGateError(RuntimeError):
+    """Raised when a candidate model fails the robustness promotion gate."""
+
+
+@dataclass(frozen=True)
+class RobustnessOverride:
+    """Explicit, audited sign-off to promote a below-threshold model."""
+
+    approved_by: str
+    justification: str
+
+    def __post_init__(self) -> None:
+        if not self.approved_by.strip() or not self.justification.strip():
+            raise ValueError("RobustnessOverride requires non-empty approved_by and justification")
+
+
+def enforce_robustness_gate(
+    report,
+    model_dir: str,
+    threshold: float = MIN_ROBUSTNESS_SCORE,
+    override: RobustnessOverride | None = None,
+) -> bool:
+    """Hard gate: refuse promotion when robustness is below ``threshold``.
+
+    Args:
+        report: ``RobustnessReport`` (or dict) with ``model_version`` and
+            ``certified_radius``.
+        model_dir: Model directory; overrides are audited to
+            ``robustness_overrides.jsonl`` here.
+        threshold: Minimum acceptable ``certified_radius``.
+        override: Explicit sign-off permitting a below-threshold promotion.
+
+    Returns:
+        True when the gate passes (score >= threshold, or audited override).
+
+    Raises:
+        RobustnessGateError: If the score is below threshold and no override is given.
+    """
+    data = report.model_dump() if hasattr(report, "model_dump") else dict(report)
+    version = data.get("model_version", "unknown")
+    score = float(data.get("certified_radius", 0.0))
+    if score >= threshold:
+        return True
+    if override is None:
+        raise RobustnessGateError(
+            f"Model {version} robustness score {score:.4f} is below minimum {threshold:.4f}; "
+            "promotion requires an explicit RobustnessOverride"
+        )
+
+    entry = {
+        "model_version": version,
+        "robustness_score": score,
+        "threshold": threshold,
+        "approved_by": override.approved_by,
+        "justification": override.justification,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
+    with open(os.path.join(model_dir, ROBUSTNESS_OVERRIDE_LOG), "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    logger.warning("Robustness gate overridden: %s", entry)
+    return True
+
+
+def promote_model(
+    model,
+    name: str,
+    version: str,
+    model_dir: str,
+    robustness_report,
+    override: RobustnessOverride | None = None,
+) -> None:
+    """Save and promote a model only if it passes the robustness gate."""
+    enforce_robustness_gate(robustness_report, model_dir, override=override)
+    save_versioned_model(model, name, version, model_dir)
 
 
 def _compute_version_hash(training_row_count: int, column_hash: str) -> str:

@@ -1,0 +1,22 @@
+# Non-default override profile validated in CI (see .github/workflows/helm-lint.yml).
+# Exercises the optional templates: canary Rollout + AnalysisTemplate, Ingress
+# with TLS, and the PVC; disables the bundled PostgreSQL subchart.
+canary:
+  enabled: true
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: ledgerlens.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: ledgerlens-tls
+      hosts:
+        - ledgerlens.example.com
+persistence:
+  enabled: true
+  storageClass: standard
+postgresql:
+  enabled: false
