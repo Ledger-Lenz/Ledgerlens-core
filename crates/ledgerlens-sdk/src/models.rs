@@ -1,3 +1,4 @@
+use alloc::{string::String, vec::Vec};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -160,7 +161,7 @@ pub struct HealthStatus {
     /// Model loading status.
     pub models: Option<String>,
     /// Circuit breaker statuses.
-    pub circuits: Option<std::collections::HashMap<String, String>>,
+    pub circuits: Option<CircuitMap>,
 }
 
 /// A ZK threshold proof for verifying that a committed score is >= a threshold
@@ -197,3 +198,10 @@ pub struct BitProof {
     /// Response for the "bit is 1" statement.
     pub s1: String,
 }
+
+/// Map type for [`HealthStatus::circuits`]: `HashMap` with `std`, `BTreeMap` under `no_std`.
+#[cfg(feature = "std")]
+pub type CircuitMap = std::collections::HashMap<String, String>;
+/// Map type for [`HealthStatus::circuits`]: `HashMap` with `std`, `BTreeMap` under `no_std`.
+#[cfg(not(feature = "std"))]
+pub type CircuitMap = alloc::collections::BTreeMap<String, String>;

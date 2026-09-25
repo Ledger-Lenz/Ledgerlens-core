@@ -76,8 +76,32 @@ assert!(valid, "ZK proof verification failed");
 
 | Feature     | Default | Description                                      |
 |-------------|---------|--------------------------------------------------|
-| `async`     | Yes     | Enable async/await support via `tokio`.          |
+| `std`       | Yes     | HTTP client (`reqwest`) and `std::error::Error` impls. |
+| `async`     | Yes     | Enable async/await support via `tokio` (implies `std`). |
 | `zk-verify` | No      | Enable ZK threshold proof verification.          |
+
+## no_std / WASM support
+
+With `default-features = false` the crate is `#![no_std]` (requires `alloc`) and
+builds for `wasm32-unknown-unknown`, e.g. for Soroban contract clients or other
+WASM tooling. CI checks this target with and without `zk-verify`.
+
+```toml
+ledgerlens-sdk = { version = "0.1", default-features = false, features = ["zk-verify"] }
+```
+
+| Functionality                                   | `std` | `no_std` |
+|-------------------------------------------------|:-----:|:--------:|
+| Response models (`RiskScore`, `Ring`, …) + serde | ✅ | ✅ |
+| `LedgerLensError` / `ZkVerifyError`             | ✅ | ✅ (no `std::error::Error` impl) |
+| `verify_threshold_proof` (`zk-verify`)          | ✅ | ✅ |
+| `LedgerLensClient` (HTTP)                       | ✅ | ❌ |
+| `HealthStatus::circuits` map type (`CircuitMap`) | `HashMap` | `BTreeMap` |
+
+Dependency audit: `reqwest`, `tokio` and `thiserror` require `std` and are only
+enabled by the `std`/`async` features; `serde`, `serde_json`, `chrono`, the
+arkworks crates, `sha2` and `num-bigint` are used with `default-features = false`
+and their `std` features are enabled only through this crate's `std` feature.
 
 ## API Coverage
 

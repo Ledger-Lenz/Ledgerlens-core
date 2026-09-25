@@ -56,9 +56,22 @@ class TemporalGraphBuilder:
     """Builds time-sliced trade graphs from a stream of Trade records."""
 
     def __init__(self, bucket_hours: int = DEFAULT_BUCKET_HOURS,
-                 max_node_degree: int = MAX_NODE_DEGREE) -> None:
+                 max_node_degree: int = MAX_NODE_DEGREE,
+                 retention_buckets: int | None = None) -> None:
+        """
+        Args:
+            retention_buckets: When set, wallets with no trade in the last
+                ``retention_buckets`` buckets are evicted from the node index,
+                bounding memory for long-running ingestion. ``None`` keeps
+                every wallet ever seen (legacy behaviour). See
+                docs/graph_retention.md for the accuracy trade-offs.
+        """
+        if retention_buckets is not None and retention_buckets < 1:
+            raise ValueError("retention_buckets must be >= 1")
         self.bucket_hours = bucket_hours
         self.max_node_degree = max_node_degree
+        self.retention_buckets = retention_buckets
+        self.stats = {"tracked_wallets": 0, "peak_tracked_wallets": 0, "evicted_wallets": 0}
 
     def build_snapshots(
         self,
@@ -75,11 +88,13 @@ class TemporalGraphBuilder:
 
         trades = sorted(trades, key=lambda t: t.ledger_close_time)
         wallet_index = {}
+        last_seen: dict[str, int] = {}
 
         snapshots = []
         slice_start = start_time
         trade_cursor = 0
         n_trades = len(trades)
+        bucket_no = 0
 
         while slice_start < end_time:
             slice_end = min(slice_start + bucket, end_time)
@@ -106,8 +121,13 @@ class TemporalGraphBuilder:
 
             for src, dst, _ in edges:
                 for addr in (src, dst):
+                    last_seen[addr] = bucket_no
                     if addr not in wallet_index:
                         wallet_index[addr] = len(wallet_index)
+
+            if self.retention_buckets is not None:
+                wallet_index = self._evict_expired(wallet_index, last_seen, bucket_no)
+            self._record_stats(len(wallet_index))
 
             capped_edges = self._cap_high_degree(edges)
             snapshot = self._materialize_snapshot(
@@ -115,13 +135,38 @@ class TemporalGraphBuilder:
             )
             snapshots.append(snapshot)
             slice_start = slice_end
+            bucket_no += 1
 
         logger.debug(
-            "Built %d graph snapshots covering %d wallets (hashed: %s)",
+            "Built %d graph snapshots covering %d wallets (peak %d, evicted %d; hashed: %s)",
             len(snapshots), len(wallet_index),
+            self.stats["peak_tracked_wallets"], self.stats["evicted_wallets"],
             [_hash_wallet(a) for a in list(wallet_index)[:3]],
         )
         return snapshots
+
+    def _evict_expired(self, wallet_index, last_seen, bucket_no):
+        """Drops wallets idle for longer than the retention window and compacts indices.
+
+        Eviction runs after the current bucket's wallets are marked as seen, so a
+        wallet referenced by any edge in the snapshot being built is never
+        evicted; in-flight rings spanning the window boundary keep every member
+        that traded within the window.
+        """
+        cutoff = bucket_no - self.retention_buckets
+        expired = [a for a in wallet_index if last_seen[a] <= cutoff]
+        if not expired:
+            return wallet_index
+        for addr in expired:
+            del last_seen[addr]
+        self.stats["evicted_wallets"] += len(expired)
+        survivors = sorted((i, a) for a, i in wallet_index.items() if a in last_seen)
+        return {addr: new_idx for new_idx, (_, addr) in enumerate(survivors)}
+
+    def _record_stats(self, tracked: int) -> None:
+        """Updates memory-usage metrics exposed via ``self.stats``."""
+        self.stats["tracked_wallets"] = tracked
+        self.stats["peak_tracked_wallets"] = max(self.stats["peak_tracked_wallets"], tracked)
 
     def _cap_high_degree(self, edges):
         """Caps per-wallet degree to max_node_degree, keeping highest-volume edges."""
