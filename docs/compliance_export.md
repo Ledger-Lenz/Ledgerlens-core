@@ -34,11 +34,24 @@ SHA-256 commitment over the scored fact, mirroring the on-chain ZK proof
 commitment so a Travel Rule recipient can cross-reference the two without
 either party revealing the underlying score history.
 
-### `POST /compliance/sar-package`
+### `POST /compliance/sar-narrative/draft` (v1)
 
 Body: `{"wallet": str, "start_date": ISO8601, "end_date": ISO8601}`.
 
-Generates a ZIP archive (`sar_narrative.txt`, `evidence/alerts.json`,
+Returns `{"draft": str, "draft_sha256": str}`: the auto-generated narrative
+for analyst review. A draft is **never exportable** on its own; see
+[SAR narrative review workflow](#sar-narrative-review-workflow).
+
+### `POST /compliance/sar-package`
+
+Body: `{"wallet": str, "start_date": ISO8601, "end_date": ISO8601,
+"reviewer": str, "draft_sha256": str, "approved_narrative": str | null,
+"review_notes": str}`.
+
+Returns `403` if `reviewer` or `draft_sha256` is missing, and `409` if the
+draft has changed since it was reviewed (for example, new alerts arrived).
+
+Generates a ZIP archive (`sar_narrative.txt`, `sar_review.json`, `evidence/alerts.json`,
 `evidence/score_history.csv`, `evidence/graph_export.gexf`,
 `evidence/shap_explanations.json`, `manifest.json` with a SHA-256 of every
 included file) and returns it as a download.
@@ -60,6 +73,35 @@ construction and is not cheap to run on demand:
 Returns the full chronological event log for a wallet (risk scores, alerts,
 on-chain submissions, disputes, score overrides) -- for a legal hold, not a
 record of exports themselves (see below).
+
+## SAR narrative review workflow
+
+SAR narratives are legally significant, so an auto-generated narrative can
+never be exported without a recorded human review. Every export path
+(`generate_sar_package`, `export_sar_package` and both `sar-package` endpoints)
+obtains the narrative through `detection.sar_narrative.require_approved_narrative`,
+which raises `SARNarrativeNotReviewed` unless it gets a `SARNarrativeReview`
+bound, by SHA-256, to the current draft.
+
+For compliance analysts:
+
+1. **Fetch the draft**: `POST /v1/compliance/sar-narrative/draft` (or
+   `draft_sar_narrative()` in Python). Keep the returned `draft_sha256`.
+2. **Review it** against the evidence (alerts, score history, graph, SHAP).
+   Correct anything the model got wrong.
+3. **Approve it**: `POST /compliance/sar-package` with your identity in
+   `reviewer`, the `draft_sha256` you reviewed, and your corrected text in
+   `approved_narrative` (omit it to approve the draft unchanged). In Python,
+   call `review_sar_narrative(draft, reviewer, edited_text=...)` and pass the
+   result as `review=` to `export_sar_package`.
+4. If the export returns `409`, the underlying data changed after your
+   review: fetch and review the new draft.
+
+The package's `sar_review.json` records the reviewer, review timestamp,
+draft and final SHA-256, whether it was edited, a unified diff of the
+analyst's edits, and any notes. The file is covered by the integrity
+`manifest.json`, so the review record is tamper-evident alongside the
+narrative it approves.
 
 ## Dry-run mode
 
