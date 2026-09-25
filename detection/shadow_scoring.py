@@ -20,8 +20,14 @@ from typing import Optional
 
 logger = logging.getLogger("ledgerlens.shadow_scoring")
 
-# Prometheus metric (lazy import to avoid hard dependency)
+# Normal range for mean absolute shadow-vs-production divergence; a sustained
+# mean above this fires the ShadowScoreDivergenceHigh alert
+# (monitoring/alerts.yml), which must be kept in sync with this default.
+SHADOW_DIVERGENCE_ALERT_MAX = float(os.environ.get("SHADOW_DIVERGENCE_ALERT_MAX", "0.10"))
+
+# Prometheus metrics (lazy import to avoid hard dependency)
 _shadow_histogram = None
+_shadow_delta_histogram = None
 
 
 def _get_histogram():
@@ -39,6 +45,64 @@ def _get_histogram():
     except ImportError:
         _shadow_histogram = None
     return _shadow_histogram
+
+
+def _get_delta_histogram():
+    global _shadow_delta_histogram
+    if _shadow_delta_histogram is not None:
+        return _shadow_delta_histogram
+    try:
+        from prometheus_client import Histogram
+
+        _shadow_delta_histogram = Histogram(
+            "ledgerlens_shadow_score_delta",
+            "Signed shadow minus production score delta (bias direction of the shadow model)",
+            buckets=[-0.5, -0.2, -0.1, -0.05, -0.01, 0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0],
+        )
+    except ImportError:
+        _shadow_delta_histogram = None
+    return _shadow_delta_histogram
+
+
+def compute_divergence_stats(
+    production_scores: Sequence[float], shadow_scores: Sequence[float]
+) -> dict:
+    """Return the divergence distribution between paired production/shadow scores.
+
+    ``mean_delta`` is signed (shadow - production); the other stats use the
+    absolute divergence, matching ``ledgerlens_shadow_score_divergence``.
+    """
+    if len(production_scores) != len(shadow_scores):
+        raise ValueError("production and shadow score sets must be the same length")
+    if not production_scores:
+        return {"count": 0, "mean_delta": 0.0, "mean_divergence": 0.0,
+                "p95_divergence": 0.0, "max_divergence": 0.0}
+    deltas = [s - p for p, s in zip(production_scores, shadow_scores)]
+    divergences = sorted(abs(d) for d in deltas)
+    return {
+        "count": len(deltas),
+        "mean_delta": sum(deltas) / len(deltas),
+        "mean_divergence": sum(divergences) / len(divergences),
+        "p95_divergence": _nearest_rank_percentile(divergences, 0.95),
+        "max_divergence": divergences[-1],
+    }
+
+
+def divergence_out_of_range(
+    window_means: Sequence[float],
+    normal_max: float = SHADOW_DIVERGENCE_ALERT_MAX,
+    sustained_windows: int = 3,
+) -> bool:
+    """Whether divergence has trended outside the normal range.
+
+    *window_means* are successive mean-divergence samples (oldest first). The
+    alert fires only when the last *sustained_windows* samples all exceed
+    *normal_max*, mirroring the ``for:`` clause of the Prometheus alert so a
+    single noisy window does not page.
+    """
+    if sustained_windows < 1 or len(window_means) < sustained_windows:
+        return False
+    return all(m > normal_max for m in window_means[-sustained_windows:])
 
 
 def get_shadow_model_version() -> Optional[str]:
@@ -92,6 +156,9 @@ def store_shadow_score(
     histogram = _get_histogram()
     if histogram is not None:
         histogram.observe(divergence)
+    delta_histogram = _get_delta_histogram()
+    if delta_histogram is not None:
+        delta_histogram.observe(shadow_score - production_score)
 
     logger.debug(
         "Shadow score: wallet=%s prod=%.3f shadow=%.3f divergence=%.3f",

@@ -25,6 +25,14 @@ groups:
           description: "At least one feature-drift event was recorded in the last 24 hours."
           runbook: "Run `python cli.py retrain-check` to review the drift report. Check /admin/drift-reports for PSI values. If PSI > 0.25 on key Benford features, consider running `cli.py retrain-check --force-retrain`."
 
+      - alert: ShadowScoreDivergenceHigh
+        expr: sum(rate(ledgerlens_shadow_score_divergence_sum[15m])) / sum(rate(ledgerlens_shadow_score_divergence_count[15m])) > 0.10
+        for: 30m
+        annotations:
+          summary: "Shadow vs production score divergence outside normal range"
+          description: "Mean absolute divergence between shadow and production scores has exceeded 0.10 (SHADOW_DIVERGENCE_ALERT_MAX) for 30 minutes."
+          runbook: "Check the 'Shadow vs Production Score Divergence' dashboard panel and GET the shadow report (detection.shadow_scoring.get_shadow_report) for high-divergence wallets. Use ledgerlens_shadow_score_delta to see whether the shadow model scores systematically higher or lower. Hold promotion of SHADOW_MODEL_VERSION until divergence returns to range."
+
       - alert: ScoringLatencyHigh
         expr: histogram_quantile(0.95, rate(ledgerlens_scoring_latency_seconds_bucket[10m])) > 2.0
         for: 5m

@@ -362,15 +362,30 @@ class FeatureStore:
         return f"ll:feature:{key_hash}"
 
     def get_state(self, wallet: str, asset_pair: str) -> Optional[WalletFeatureState]:
-        """Retrieve cached feature state from Redis (hot) or fallback dict (cold)."""
+        """Retrieve cached feature state from Redis (hot) or fallback dict (cold).
+
+        Degraded-mode contract (see ``chaos-mesh/README.md``): while Redis is
+        unreachable, reads and writes go to the in-process fallback dict.
+        Once Redis is reachable again, a fallback entry newer than the Redis
+        copy is written back to Redis (catch-up) and returned, so state
+        accumulated during the outage is never shadowed by the stale
+        pre-outage Redis value.
+        """
         key = self._hash_key(wallet, asset_pair)
 
         if self._redis_available():
             try:
                 data = self.redis_client.get(key)
                 self._circuit.record_success()
-                if data:
-                    return WalletFeatureState.model_validate_json(data)
+                redis_state = WalletFeatureState.model_validate_json(data) if data else None
+                local_state = self._fallback_dict.get(key)
+                if local_state is not None and (
+                    redis_state is None or local_state.last_updated > redis_state.last_updated
+                ):
+                    self.set_state(local_state)
+                    return local_state
+                if redis_state is not None:
+                    return redis_state
             except Exception as e:
                 self._circuit.record_failure()
                 logger.warning("FeatureStore.get_state: Redis error (%s), falling back", e)
@@ -389,6 +404,9 @@ class FeatureStore:
                 serialized = state.model_dump_json()
                 self.redis_client.setex(key, ttl_seconds, serialized)
                 self._circuit.record_success()
+                if key in self._fallback_dict:
+                    del self._fallback_dict[key]
+                    self._lru_order.remove(key)
                 return
             except Exception as e:
                 self._circuit.record_failure()
