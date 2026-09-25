@@ -1,0 +1,8 @@
+# buf configuration for LedgerLens protobuf definitions.
+# See proto/README.md for the compatibility policy enforced in CI.
+version: v2
+modules:
+  - path: .
+breaking:
+  use:
+    - WIRE_JSON

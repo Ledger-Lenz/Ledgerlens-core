@@ -6,6 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"time"
 
 	ledgerlens "github.com/Ledger-Lenz/Ledgerlens-core/go"
 )
@@ -88,4 +91,46 @@ func Example_withdrawalGating() {
 
 	fmt.Println("withdrawal allowed:", allowed)
 	// Output: withdrawal allowed: false
+}
+
+// ExampleVerifySignature shows verifying an inbound LedgerLens webhook inside
+// an http.Handler using the X-LedgerLens-Signature and X-LedgerLens-Timestamp
+// headers set by the API.
+func ExampleVerifySignature() {
+	const secret = "whsec_test_secret"
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if err := ledgerlens.VerifySignature(
+			body,
+			secret,
+			r.Header.Get("X-LedgerLens-Signature"),
+			r.Header.Get("X-LedgerLens-Timestamp"),
+			ledgerlens.DefaultWebhookMaxAge,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Simulate the API delivering a webhook (signature from api/webhook_sender.py).
+	body := `{"event":"risk_score_alert","wallet":"GABC","score":87}`
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+	req.Header.Set("X-LedgerLens-Signature", "sha256=2e1b1d2a6dbb4597dc74eab9b8ffbc8e1ab290fa529280569fa84789d53ef66c")
+	req.Header.Set("X-LedgerLens-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	fmt.Println(rec.Code)
+
+	req.Header.Set("X-LedgerLens-Signature", "sha256=deadbeef")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	fmt.Println(rec.Code)
+	// Output:
+	// 204
+	// 401
 }

@@ -197,6 +197,7 @@ export class LedgerLensClient {
    *
    * @param params Optional query parameters:
    *   - `wallet`  — restrict to a single wallet address;
+   *   - `asset_pair` — filter to a single asset pair (e.g. `"XLM/USDC"`);
    *   - `limit`   — maximum number of records to return;
    *   - `offset`  — number of records to skip (pagination);
    *   - `sort_by` — field name to sort by;
@@ -207,6 +208,7 @@ export class LedgerLensClient {
   async getScores(
     params?: {
       wallet?: string;
+      asset_pair?: string;
       limit?: number;
       offset?: number;
       sort_by?: string;

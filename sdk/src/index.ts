@@ -26,6 +26,20 @@ export { LedgerLensClient, LedgerLensError } from "./client";
 export type { LedgerLensClientOptions } from "./client";
 
 /**
+ * {@link LedgerLensAlertStream} consumes `/ws/alerts` with automatic
+ * reconnect (exponential backoff + jitter) and transparent resubscription.
+ */
+export { LedgerLensAlertStream } from "./stream";
+export type {
+  LedgerLensAlertStreamOptions,
+  ConnectionState,
+  ConnectionStateEvent,
+  RiskScoreAlert,
+  WebSocketLike,
+  WebSocketFactory,
+} from "./stream";
+
+/**
  * Zod schemas backing every API response. Exported so consumers can run their
  * own validation, derive partial schemas, or reuse them in tests. Each
  * `XxxSchema` parses the payload described by the matching `Xxx` type below.
