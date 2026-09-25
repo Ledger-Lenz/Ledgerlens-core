@@ -1,0 +1,72 @@
+# Metric label-cardinality budget, enforced by scripts/check_metric_cardinality.py.
+#
+# Every Prometheus label used by a metric defined in Python, or aggregated
+# with `by (...)` in monitoring/*.yml, must appear under `labels` with an
+# upper bound on its distinct values and a justification for that bound.
+# A metric's worst-case series count (product of its label bounds, times its
+# bucket count for histograms) must not exceed `max_series_per_metric`.
+# See "Cardinality Guidelines" in monitoring/README.md.
+
+max_series_per_metric: 5000
+
+# Explicitly justified exceptions to max_series_per_metric. Each entry needs a
+# justification; the worst-case product is still capped at max_series.
+metric_overrides:
+  ledgerlens_api_request_duration_seconds:
+    max_series: 150000
+    justification: >-
+      Worst case assumes every route returns every status code for every method.
+      All three labels are bounded (route templates, not raw paths), and in
+      practice each route emits a handful of (method, status) pairs, so live
+      series stay in the low thousands. status_code is kept (not bucketed to
+      2xx/5xx) because the score-availability SLO and dashboards key on it.
+  ledgerlens_http_requests_total:
+    max_series: 8000
+    justification: >-
+      Outbound Horizon/RPC calls: endpoint is normalised by
+      ingestion.http_client._normalise_endpoint and only GET/POST are used,
+      so real cardinality is far below the worst-case product.
+
+# Labels that must never be used: each value set is unbounded and grows with
+# on-chain activity or user traffic. Aggregate or bucket instead.
+forbidden_labels:
+  - wallet
+  - wallet_id
+  - wallet_address
+  - account
+  - account_id
+  - address
+  - counterparty
+  - tx_hash
+  - trade_id
+  - ledger
+  - user_id
+  - api_key
+  - key_id
+  - ip
+  - client_ip
+  - url
+  - path
+
+labels:
+  # Configured ASSET_PAIRS only (run_pipeline.py builds pair_key from settings).
+  asset_pair: 50
+  result: 5
+  status: 5
+  method: 8
+  # Route templates (api) / _normalise_endpoint() output (ingestion), never raw URLs.
+  endpoint: 50
+  status_code: 20
+  model_name: 10
+  rule: 10
+  # One value per tenant namespace; revisit if tenants exceed this bound.
+  namespace_id: 100
+  backend: 2
+  secret_type: 5
+  source: 5
+  reason: 10
+  error_class: 20
+  # Kubernetes aggregation labels used by recording_rules_cost.yml.
+  pod: 50
+  namespace: 5
+  persistentvolumeclaim: 10

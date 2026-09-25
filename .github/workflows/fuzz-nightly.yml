@@ -6,6 +6,10 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:  # Allow manual trigger
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   fuzz-deep:
     runs-on: ubuntu-latest
@@ -34,6 +38,14 @@ jobs:
           restore-keys: |
             fuzz-corpus-${{ matrix.contract }}-
       
+      - name: Replay fuzz regression inputs
+        run: |
+          cd contracts/${{ matrix.contract }}
+          for dir in fuzz/regressions/*/; do
+            [ -n "$(find "$dir" -type f ! -name .gitkeep)" ] || continue
+            cargo +nightly fuzz run "$(basename "$dir")" "$dir" -- -runs=0 || exit 1
+          done
+
       - name: Deep fuzz ${{ matrix.contract }} (30 min per target)
         run: |
           cd contracts/${{ matrix.contract }}
@@ -60,6 +72,19 @@ jobs:
             contracts/${{ matrix.contract }}/fuzz/artifacts
           retention-days: 90
       
+      - name: Report findings as an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "${{ github.repository }}" \
+            --title "Nightly deep-fuzz failure: ${{ matrix.contract }}" \
+            --label security \
+            --body "Deep fuzzing of \`${{ matrix.contract }}\` found a crash. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Download the crash artifact and commit it to \`contracts/${{ matrix.contract }}/fuzz/regressions/<target>/\`." \
+            || gh issue create --repo "${{ github.repository }}" \
+            --title "Nightly deep-fuzz failure: ${{ matrix.contract }}" \
+            --body "Deep fuzzing of \`${{ matrix.contract }}\` found a crash. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+
       - name: Report coverage statistics
         if: always()
         run: |

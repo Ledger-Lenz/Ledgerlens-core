@@ -83,6 +83,11 @@ jobs:
           pip install ruff==0.4.10 --quiet
           ruff check .
 
+      - name: Metric cardinality budget
+        run: |
+          pip install pyyaml==6.0.2 --quiet
+          python scripts/check_metric_cardinality.py
+
       - name: Test
         run: |
           # The repository has many integration, optional-dependency, schema,
@@ -260,10 +265,15 @@ jobs:
         run: cargo fmt -p oracle_aggregator -p ledgerlens-zk-verifier -- --check
 
   # ── Contract fuzz (PR smoke) ──────────────────────────────────────────────
+  # Required status check: "Contract fuzz (PR smoke)" must be marked required in
+  # the main branch protection rules. It runs on every PR (no path filter) so a
+  # required check is never left pending. Per-PR budget: 120s per target, after
+  # replaying every committed regression input in fuzz/regressions/<target>/.
   fuzz:
     name: Contract fuzz (PR smoke)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -284,6 +294,16 @@ jobs:
             contracts/zk_verifier/fuzz/corpus
           key: fuzz-corpus-${{ github.sha }}
           restore-keys: fuzz-corpus-
+
+      - name: Replay fuzz regression inputs
+        run: |
+          for dir in contracts/*/fuzz/regressions/*/; do
+            [ -n "$(find "$dir" -type f ! -name .gitkeep)" ] || continue
+            target=$(basename "$dir")
+            crate=$(dirname "$(dirname "$(dirname "$dir")")")
+            echo "Replaying regressions for $crate::$target"
+            (cd "$crate" && cargo +nightly fuzz run "$target" "fuzz/regressions/$target" -- -runs=0) || exit 1
+          done
 
       - name: Fuzz oracle_aggregator (120s each)
         run: |

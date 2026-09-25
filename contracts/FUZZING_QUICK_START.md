@@ -108,13 +108,34 @@ This keeps only the inputs that provide unique coverage.
 
 ## CI Behavior
 
-**On every PR:**
-- All 6 targets run for 120 seconds each (~12 min total)
+**On every PR** (`CI / Contract fuzz (PR smoke)` in `.github/workflows/ci.yml`):
+- This is a **required status check** on `main` — contract changes cannot merge
+  unless it passes. It runs on every PR (no path filter) so it is never left pending.
+- Every committed regression input is replayed first (see below)
+- All 6 targets then run for 120 seconds each (~12 min total)
 - Crash artifacts uploaded if any target fails
 
-**Nightly (2 AM UTC):**
-- All 6 targets run for 30 minutes each
+**Nightly (2 AM UTC)** (`.github/workflows/fuzz-nightly.yml`):
+- Regression inputs replayed, then all 6 targets run for 30 minutes each
 - Corpus cached and grows over time
+- Any crash uploads artifacts (90-day retention) and opens a GitHub issue
+
+## Regression Inputs
+
+Every crash found by CI or locally must be captured as a permanent regression test:
+
+```bash
+# Minimize, then commit under the target's regressions directory
+cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/crash-<hash>
+cp fuzz/artifacts/<target>/minimized-from-<hash> fuzz/regressions/<target>/
+```
+
+Files in `fuzz/regressions/<target>/` are replayed once each (`-runs=0`) on every
+PR and nightly run, so a fixed crash can never silently regress. Replay locally with:
+
+```bash
+cargo +nightly fuzz run <target> fuzz/regressions/<target> -- -runs=0
+```
 
 ## Expected Panics
 

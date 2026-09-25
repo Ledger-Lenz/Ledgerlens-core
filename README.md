@@ -1067,6 +1067,15 @@ Run as a long-lived foreground process (e.g., under systemd or supervisor).
 - The response body from the webhook receiver is discarded entirely to
   prevent log injection.
 
+### Model Loading (Fail-Closed)
+
+`detection/model_inference.py` treats signature verification as a hard
+precondition to loading **any** model artifact (base models, meta-learner,
+and GNN checkpoint). A missing `.sig` file, a tampered artifact, or an unset
+`LEDGERLENS_MODEL_SIGNING_KEY` raises `ModelIntegrityError` and is logged at
+`CRITICAL` level. There is no fallback to an unsigned or unverified model —
+the service refuses to start serving rather than degrade silently.
+
 ## Observability
 
 LedgerLens ships a production-grade observability stack. See [docs/observability.md](docs/observability.md) for full details and [docs/threat_model.md](docs/threat_model.md) for the STRIDE threat model.
