@@ -432,6 +432,27 @@ def is_chain_intact(db_path: Optional[str] = None) -> bool:
     return all(r["error"] is None for r in verify_chain(db_path))
 
 
+def verify_and_alert(db_path: Optional[str] = None) -> list[dict]:
+    """Verify the chain and raise an alert for every broken entry.
+
+    Used by the scheduled verification job and the admin API/CLI. Alerts are
+    emitted as CRITICAL log records (routed to the alerting pipeline) and as
+    the ``ledgerlens_audit_chain_broken_entries`` Prometheus gauge.
+
+    Returns the list of failing entries (empty when the chain is intact).
+    """
+    failures = [r for r in verify_chain(db_path) if r["error"] is not None]
+    for failure in failures:
+        logger.critical("[audit] Audit log chain break detected: %s", failure["error"])
+    try:
+        from api.metrics import audit_chain_broken_entries
+
+        audit_chain_broken_entries.set(len(failures))
+    except Exception:  # metrics are best-effort
+        pass
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Convenience event loggers
 # ---------------------------------------------------------------------------

@@ -1984,6 +1984,25 @@ app.add_typer(config_app, name="config")
 db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
 app.add_typer(db_app, name="db")
 
+audit_app = typer.Typer(help="Audit log commands")
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command("verify")
+def audit_verify(
+    db_path: str = typer.Option(None, "--db-path", help="Path to the audit log database"),
+) -> None:
+    """Verify the audit log hash chain; exit 1 if any entry was tampered with."""
+    from storage.audit_log import verify_and_alert
+
+    failures = verify_and_alert(db_path)
+    if failures:
+        for failure in failures:
+            typer.echo(failure["error"], err=True)
+        typer.echo(f"Chain broken: {len(failures)} entry(ies) failed verification")
+        raise typer.Exit(1)
+    typer.echo("Audit log chain intact")
+
 
 @db_app.command("retention")
 def db_retention(

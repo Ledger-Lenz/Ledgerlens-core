@@ -11,6 +11,16 @@ Archival (dual-tier storage):
   partition pruning.  :class:`DualTierFeatureStore` wraps both hot (SQLite) and
   cold (Parquet) tiers behind a single :meth:`~DualTierFeatureStore.query`
   interface used by ``drift_monitor.py``.
+
+Point-in-time semantics (preventing train/serve skew):
+  Every stored feature value carries the ``recorded_at`` time it became
+  known. Training code must read features with
+  :meth:`FeatureStore.get_features_as_of`, passing the label timestamp as
+  ``as_of``: it returns, per feature, the latest value recorded at or before
+  ``as_of`` and never a later update. Online inference uses the current time.
+  When adding a new feature, always write it with the time the value became
+  known (never backfill a past ``recorded_at`` with a value computed from later
+  data), and compute it only from inputs at or before that time.
 """
 
 import hashlib
@@ -497,6 +507,35 @@ class FeatureStore:
             return df
         except Exception:
             return pd.DataFrame()
+
+
+    def get_features_as_of(
+        self,
+        wallet: str,
+        as_of: datetime,
+        asset_pair: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> dict[str, float]:
+        """Return point-in-time correct feature values for ``wallet``.
+
+        For each feature, returns the latest value whose ``recorded_at`` is at
+        or before ``as_of``. Updates recorded after ``as_of`` are never visible,
+        so training on label-time features cannot leak future information.
+        """
+        clauses = ["wallet = ?", "recorded_at <= ?"]
+        params: list = [wallet, as_of.isoformat()]
+        if asset_pair:
+            clauses.append("asset_pair = ?")
+            params.append(asset_pair)
+        where = " AND ".join(clauses)
+        sql = (
+            "SELECT feature_name, feature_value FROM feature_distribution_snapshots "
+            f"WHERE {where} ORDER BY recorded_at ASC, rowid ASC"
+        )
+        with sqlite3.connect(db_path or settings.db_path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        # Later rows overwrite earlier ones, leaving the latest value per feature.
+        return {name: value for name, value in rows}
 
 
 class FeatureStoreArchiver:

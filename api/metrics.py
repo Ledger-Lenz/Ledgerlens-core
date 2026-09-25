@@ -113,3 +113,8 @@ def metrics_response():
     """Return (body_bytes, content_type) for the /metrics endpoint."""
     from prometheus_client import REGISTRY, generate_latest, CONTENT_TYPE_LATEST
     return generate_latest(REGISTRY), CONTENT_TYPE_LATEST
+
+audit_chain_broken_entries = Gauge(
+    "ledgerlens_audit_chain_broken_entries",
+    "Audit log entries failing hash-chain verification at the last scheduled check",
+)

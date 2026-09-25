@@ -203,6 +203,24 @@ async def _nightly_retention_task() -> None:
             logger.error("[retention] Nightly job failed: %s", exc)
 
 
+async def _audit_chain_verification_task() -> None:
+    """Async background task: verify the audit log hash chain once per hour.
+
+    Chain breaks are surfaced as CRITICAL logs and the
+    ``ledgerlens_audit_chain_broken_entries`` gauge by ``verify_and_alert``.
+    """
+    import asyncio
+
+    from storage.audit_log import verify_and_alert
+
+    while True:
+        try:
+            await asyncio.to_thread(verify_and_alert)
+        except Exception as exc:
+            logger.error("[audit] Scheduled chain verification failed: %s", exc)
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; drain requests and clean up on shutdown."""
@@ -249,12 +267,14 @@ async def _lifespan(application: FastAPI):
 
     import asyncio as _asyncio
     _retention_task = _asyncio.create_task(_nightly_retention_task())
+    _audit_verify_task = _asyncio.create_task(_audit_chain_verification_task())
     yield
 
     # ── Shutdown sequence ────────────────────────────────────────────────
     import asyncio
 
     _retention_task.cancel()
+    _audit_verify_task.cancel()
 
     _shutting_down = True
     logger.info("[shutdown] Stopping new requests (returning 503)")
