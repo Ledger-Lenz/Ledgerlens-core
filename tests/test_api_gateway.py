@@ -7,7 +7,6 @@ Covers:
 - Daily quota (429 with X-LedgerLens-Quota-Reset)
 - GATEWAY_LOG_BODY=false — access logs never contain wallet/score payloads
 - Quota backend unreachable — scoped routes return 503, public routes succeed
-- Legacy api/api_keys_router.py endpoints include Deprecation header
 - Regression: every route previously covered by Depends(require_scope) /
   Depends(require_admin_key) is still enforced after middleware migration
 """
@@ -426,23 +425,6 @@ def test_middleware_rejects_unauthenticated_scoped_route(app, db_path):
     client = TestClient(app)
     resp = client.get("/admin/test")
     assert resp.status_code == 401
-
-
-# ---------------------------------------------------------------------------
-# Test: legacy api_keys_router includes Deprecation header
-# ---------------------------------------------------------------------------
-
-
-def test_legacy_keys_router_deprecation_header():
-    """_add_deprecation_headers() returns an RFC 8594-compliant dict."""
-    from api.api_keys_router import _add_deprecation_headers
-
-    headers = _add_deprecation_headers()
-    assert "Deprecation" in headers
-    assert headers["Deprecation"] == "True"
-    assert "Sunset" in headers
-    assert "Link" in headers
-    assert "deprecation" in headers["Link"].lower()
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 Replaces the previous three-way duplication between:
 - ``api/auth.py`` (single admin key check)
 - ``api/api_key_router.py`` (scoped API key with ``detection/api_key_store.py``)
-- ``api/api_keys_router.py`` (independent duplicate scoped API key system)
+- ``api/api_keys_router.py`` (independent duplicate scoped API key system; removed in Issue #992)
 - ``api/namespace.py`` (namespace-level key handling)
 
 Every authenticated request flows through :class:`GatewayMiddleware` once,

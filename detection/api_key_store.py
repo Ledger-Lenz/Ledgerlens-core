@@ -76,6 +76,7 @@ def _init_table() -> None:
             # Table doesn't exist — create from scratch
             conn.executescript(_CREATE_TABLE)
             _ensure_gateway_log_table(conn)
+            _ensure_audit_table(conn)
             conn.commit()
             return
 
@@ -102,6 +103,7 @@ def _init_table() -> None:
 
         # Ensure gateway_request_log table exists
         _ensure_gateway_log_table(conn)
+        _ensure_audit_table(conn)
 
         conn.commit()
 
@@ -174,6 +176,50 @@ def create_api_key(
     }
 
 
+def _ensure_audit_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_key_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id TEXT NOT NULL,
+            event TEXT NOT NULL,
+            related_key_id TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _audit(
+    conn: sqlite3.Connection,
+    key_id: str,
+    event: str,
+    related_key_id: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Record a rotation/revocation event in the api_key_audit_log table."""
+    conn.execute(
+        "INSERT INTO api_key_audit_log (key_id, event, related_key_id, detail, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (key_id, event, related_key_id, detail, datetime.now(timezone.utc).isoformat()),
+    )
+    logger.info("api_key_audit event=%s key_id=%s related=%s", event, key_id, related_key_id)
+
+
+def list_api_key_audit_events(key_id: str | None = None) -> list[dict]:
+    """Return rotation/revocation audit events, oldest first, optionally for one key."""
+    _init_table()
+    with _connect() as conn:
+        if key_id is None:
+            rows = conn.execute("SELECT * FROM api_key_audit_log ORDER BY id").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM api_key_audit_log WHERE key_id = ? ORDER BY id", (key_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def revoke_api_key(key_id: str) -> bool:
     """Revoke a key by ID. Returns True if the key existed and was revoked."""
     _init_table()
@@ -181,6 +227,28 @@ def revoke_api_key(key_id: str) -> bool:
         cur = conn.execute(
             "UPDATE api_keys SET revoked=1, status='revoked' WHERE key_id=? AND revoked=0", (key_id,)
         )
+        if cur.rowcount > 0:
+            _audit(conn, key_id, "revoked")
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def force_revoke_api_key(key_id: str, reason: str = "suspected compromise") -> bool:
+    """Immediately invalidate a key for compromise response, ignoring any grace period.
+
+    Unlike :func:`revoke_api_key`, this also clears the rotation deadline so a
+    key that is mid-rotation stops authenticating at once. Returns True if the
+    key existed and was not already revoked.
+    """
+    _init_table()
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE api_keys SET revoked=1, status='revoked', rotation_deadline=NULL "
+            "WHERE key_id=? AND revoked=0",
+            (key_id,),
+        )
+        if cur.rowcount > 0:
+            _audit(conn, key_id, "force_revoked", detail=reason)
         conn.commit()
         return cur.rowcount > 0
 
@@ -232,6 +300,7 @@ def rotate_api_key(key_id: str, grace_period_seconds: int = 604800) -> dict:
             (new_key_id, new_key_hash, namespace_id, ",".join(scopes), rate_limit_per_minute,
              daily_quota, namespace_daily_quota, monthly_quota, namespace_monthly_quota, now, row["expires_at"], key_id),
         )
+        _audit(conn, key_id, "rotated", related_key_id=new_key_id, detail=f"grace_until={deadline}")
         conn.commit()
 
     try:
@@ -263,10 +332,18 @@ def sweep_expired_api_keys() -> int:
     _init_table()
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
+        expired = [
+            r["key_id"]
+            for r in conn.execute(
+                "SELECT key_id FROM api_keys WHERE status = 'rotating' AND rotation_deadline < ?", (now,)
+            ).fetchall()
+        ]
         cur = conn.execute(
             "UPDATE api_keys SET revoked = 1, status = 'revoked' WHERE status = 'rotating' AND rotation_deadline < ?",
             (now,)
         )
+        for expired_id in expired:
+            _audit(conn, expired_id, "grace_period_expired")
         conn.commit()
         return cur.rowcount
 

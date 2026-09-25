@@ -27,6 +27,16 @@ Usage:
     check_vuln_waivers.py --scanner cargo-audit --report /path/to/audit.json
     check_vuln_waivers.py --scanner govulncheck --report /path/to/govulncheck.ndjson
     check_vuln_waivers.py --scanner npm-audit --report /path/to/npm-audit.json
+    check_vuln_waivers.py --audit-waivers [--warn-days 14]
+
+``--audit-waivers`` (Issue #994) validates the waiver file on its own,
+independent of any scanner report: every entry must carry an ``expires``
+date, and any waiver whose expiry has passed fails the check even if the
+finding it covers is no longer reported — an expired entry must be renewed
+or deleted, never left to silently persist. Waivers expiring within
+``--warn-days`` are listed as ``UPCOMING`` so the scheduled reminder job
+can open a re-review issue ahead of time. See docs/dependency_policy.md
+("Vulnerability waiver review") for the renewal process.
 
 Exit code 0: no unwaived CRITICAL/HIGH finding. Exit code 1: at least one
 unwaived (or waived-but-expired) CRITICAL/HIGH finding — the calling CI
@@ -319,16 +329,61 @@ def evaluate(
     return ok, lines
 
 
+def audit_waivers(
+    waivers: dict[tuple[str, str], Waiver], today: datetime.date, warn_days: int
+) -> tuple[bool, list[str]]:
+    """Returns (ok, report_lines). ok is False iff any waiver has expired,
+    whether or not its finding is still reported by a scanner."""
+    ok = True
+    lines: list[str] = []
+    horizon = today + datetime.timedelta(days=warn_days)
+    for w in sorted(waivers.values(), key=lambda w: w.expires):
+        if w.expires < today:
+            ok = False
+            lines.append(
+                f"EXPIRED  {w.id} ({w.ecosystem}) — expired {w.expires.isoformat()}. "
+                f"Renew it with a fresh reason or remove it."
+            )
+        elif w.expires <= horizon:
+            lines.append(f"UPCOMING {w.id} ({w.ecosystem}) — expires {w.expires.isoformat()}. Re-review due.")
+    if not waivers:
+        lines.append("No waivers on file.")
+    return ok, lines
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scanner", required=True, choices=["osv", "cargo-audit", "govulncheck", "npm-audit"])
-    parser.add_argument("--report", required=True, type=Path, help="Path to the scanner's JSON/NDJSON output")
+    parser.add_argument("--scanner", choices=["osv", "cargo-audit", "govulncheck", "npm-audit"])
+    parser.add_argument("--report", type=Path, help="Path to the scanner's JSON/NDJSON output")
     parser.add_argument(
         "--waivers",
         type=Path,
         default=Path(__file__).resolve().parent.parent / "security" / "vulnerability-waivers.yml",
     )
+    parser.add_argument(
+        "--audit-waivers",
+        action="store_true",
+        help="Validate the waiver file alone: fail on any expired waiver, list upcoming expiries.",
+    )
+    parser.add_argument("--warn-days", type=int, default=14, help="Upcoming-expiry window for --audit-waivers")
     args = parser.parse_args()
+
+    if args.audit_waivers:
+        try:
+            waivers = load_waivers(args.waivers)
+        except ValueError as exc:
+            print(f"FAIL — {exc}")
+            return 1
+        ok, lines = audit_waivers(waivers, datetime.datetime.now(datetime.timezone.utc).date(), args.warn_days)
+        print("── vulnerability waiver expiry audit ──────────────────────────")
+        for line in lines:
+            print(line)
+        print()
+        print("PASS — no expired waivers." if ok else "FAIL — expired waiver(s) present (see EXPIRED lines above).")
+        return 0 if ok else 1
+
+    if not args.scanner or not args.report:
+        parser.error("--scanner and --report are required unless --audit-waivers is given")
 
     if not args.report.exists():
         print(f"FATAL: report file not found: {args.report}", file=sys.stderr)

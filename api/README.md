@@ -20,7 +20,6 @@ For deeper documentation see:
 | `admin_router.py` | `/admin/*` endpoints for model lifecycle management, drift reports, retrain run history, and runtime configuration. Admin-key gated. |
 | `analyst.py` | `/analyst/*` endpoints for the analyst review dashboard: wallet claim/release, feedback submission, case-management SLA stats, and review queue. |
 | `api_key_router.py` | Scoped API key auth and rate-limit enforcement (backed by `detection/api_key_store.py`). Kept for backward compatibility — new code should go through `gateway.py`. |
-| `api_keys_router.py` | Deprecated duplicate scoped API key management router. Endpoints delegate to `detection.api_key_store` and return a `Deprecation` header pointing to the migration guide. |
 | `allowlist_router.py` | `/allowlist` and `/denylist` wallet override management endpoints with audit trail (backed by `detection/wallet_override_store.py`). |
 | `audit_router.py` | `/audit/wallet/{wallet}` chronological scoring event history and Merkle-tree integrity verification. |
 | `batch_router.py` | `/batch/score` async job queue for bulk wallet scoring requests. |
