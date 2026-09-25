@@ -143,6 +143,8 @@ nav:
     - Upgrading Cost & Capacity: UPGRADE_COST_CAPACITY.md
   - Security & Compliance:
     - Threat Model: threat_model.md
+    - Threat Test Matrix: threat_test_matrix.md
+    - Red-Team Promotion Gate: red_team.md
     - Webhook Security Model: webhook_security_model.md
     - Secret Rotation: secret_rotation.md
     - Audit Log: audit_log.md

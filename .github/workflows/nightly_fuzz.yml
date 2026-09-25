@@ -5,10 +5,24 @@ on:
     - cron: "30 3 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   fuzz:
+    name: Fuzz ${{ matrix.harness }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        harness:
+          - fuzz_asset_parser
+          - fuzz_evm_rpc_parser
+          - fuzz_orderbook_event_parser
+          - fuzz_solana_vaa_parser
+          - fuzz_trade_parser
 
     steps:
       - uses: actions/checkout@v4
@@ -23,9 +37,9 @@ jobs:
       - name: Restore fuzz corpus cache
         uses: actions/cache@v4
         with:
-          path: fuzz/corpus/
-          key: fuzz-corpus-${{ github.run_id }}
-          restore-keys: fuzz-corpus-
+          path: fuzz/corpus/${{ matrix.harness }}
+          key: fuzz-corpus-${{ matrix.harness }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.harness }}-
 
       - name: Install from fuzz lockfile
         run: |
@@ -33,42 +47,143 @@ jobs:
           pip install -r requirements/fuzz.txt
           pip install -e . --no-deps
 
-      - name: Create corpus directories
+      - name: Fuzz ${{ matrix.harness }} (300s)
+        # The committed regression corpus is passed as a second (read-only)
+        # corpus dir so every known crash is replayed before new exploration.
+        # -fork/-ignore_crashes keep fuzzing after the first finding so a
+        # single run can surface several distinct bugs for triage.
         run: |
-          for harness in fuzz/fuzz_*.py; do
-            name=$(basename "$harness" .py)
-            mkdir -p "fuzz/corpus/$name"
-          done
+          name=${{ matrix.harness }}
+          mkdir -p "fuzz/corpus/$name" "fuzz/artifacts/$name"
+          timeout 360 python "fuzz/$name.py" \
+            "fuzz/corpus/$name" "fuzz/regression/$name" \
+            -artifact_prefix="fuzz/artifacts/$name/" \
+            -fork=1 -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1 \
+            -max_total_time=300 \
+            -print_final_stats=1 2>&1 | tee "fuzz/artifacts/$name.log" || true
 
-      - name: Run fuzz harnesses (300s each)
+      - name: Record run statistics
+        if: always()
         run: |
-          for harness in fuzz/fuzz_*.py; do
-            name=$(basename "$harness" .py)
-            echo "::group::Fuzzing $name"
-            timeout 300 python "$harness" \
-              "fuzz/corpus/$name" \
-              -max_total_time=300 \
-              -print_final_stats=1 \
-              || true
-            echo "::endgroup::"
-          done
+          mkdir -p fuzz/stats
+          python - <<'PY'
+          import json, os, pathlib, re
+          name = os.environ["HARNESS"]
+          log = pathlib.Path(f"fuzz/artifacts/{name}.log")
+          text = log.read_text(errors="replace") if log.exists() else ""
+          stats = dict(re.findall(r"^stat::(\w+):\s*(\d+)", text, re.M))
+          artifacts = pathlib.Path(f"fuzz/artifacts/{name}")
+          stats.update(
+              harness=name,
+              run_id=os.environ["GITHUB_RUN_ID"],
+              sha=os.environ["GITHUB_SHA"],
+              corpus_size=len(list(pathlib.Path(f"fuzz/corpus/{name}").glob("*"))),
+              crash_files=len(list(artifacts.glob("*-*"))) if artifacts.exists() else 0,
+          )
+          pathlib.Path(f"fuzz/stats/{name}.json").write_text(json.dumps(stats, indent=2))
+          print(json.dumps(stats, indent=2))
+          PY
+        env:
+          HARNESS: ${{ matrix.harness }}
 
-      - name: Upload crash artifacts
+      - name: Upload crash artifacts and stats
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-crashes
+          name: fuzz-results-${{ matrix.harness }}
           path: |
-            fuzz/corpus/**/crash-*
-            fuzz/corpus/**/timeout-*
-            fuzz/corpus/**/oom-*
+            fuzz/artifacts/
+            fuzz/stats/
           if-no-files-found: ignore
+          retention-days: 90
 
-      - name: Fail if crashes were found
+  triage:
+    name: Triage crashes into regression corpus
+    needs: fuzz
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements/fuzz.txt
+
+      - name: Install from fuzz lockfile
         run: |
-          crashes=$(find fuzz/corpus -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' 2>/dev/null | head -1)
-          if [ -n "$crashes" ]; then
-            echo "::error::Fuzz crash(es) detected. Download the 'fuzz-crashes' artifact and reproduce with:"
-            echo "::error::  python fuzz/fuzz_<harness>.py fuzz/corpus/crash-<hash>"
-            exit 1
-          fi
+          pip install --upgrade pip==24.0
+          pip install -r requirements/fuzz.txt
+          pip install -e . --no-deps
+
+      - name: Download fuzz results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fuzz-results-*
+          path: fuzz/
+          merge-multiple: true
+
+      - name: Deduplicate crashes by stack signature
+        id: triage
+        run: |
+          python scripts/fuzz_triage.py \
+            --artifacts-dir fuzz/artifacts \
+            --regression-dir fuzz/regression \
+            --report fuzz/triage_report.json \
+            || echo "new_crashes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish run summary
+        if: always()
+        run: |
+          {
+            echo "## Fuzz campaign summary"
+            echo
+            echo "| Harness | Execs | Corpus | Crash files |"
+            echo "|---|---|---|---|"
+            for f in fuzz/stats/*.json; do
+              [ -f "$f" ] || continue
+              python -c "import json,sys; s=json.load(open(sys.argv[1])); print(f\"| {s['harness']} | {s.get('number_of_executed_units','-')} | {s['corpus_size']} | {s['crash_files']} |\")" "$f"
+            done
+            echo
+            echo '### Triage'
+            echo '```json'
+            cat fuzz/triage_report.json 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload triage report and stats history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-triage-${{ github.run_id }}
+          path: |
+            fuzz/triage_report.json
+            fuzz/stats/
+          retention-days: 90
+
+      - name: Open PR adding new crash reproducers to regression corpus
+        if: steps.triage.outputs.new_crashes == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          add-paths: fuzz/regression/**
+          branch: fuzz/regression-corpus-${{ github.run_id }}
+          commit-message: "test(fuzz): add new crash reproducers to regression corpus"
+          title: "test(fuzz): new fuzz crash reproducers (run ${{ github.run_id }})"
+          body: |
+            The nightly fuzz campaign found new unique crash signatures.
+            Deduplicated reproducers were added under `fuzz/regression/` and are
+            replayed by `tests/test_fuzz_regression.py` on every CI run, so CI
+            stays red until the underlying bugs are fixed.
+
+            Triage report: see the `fuzz-triage-${{ github.run_id }}` artifact.
+          labels: fuzzing, bug
+
+      - name: Fail if new crashes were found
+        if: steps.triage.outputs.new_crashes == 'true'
+        run: |
+          echo "::error::New unique fuzz crash signature(s) found — see the triage report and the regression-corpus PR."
+          exit 1

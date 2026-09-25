@@ -346,3 +346,59 @@ def load_shap_importances(model_dir: str, version: str | None = None) -> dict | 
         return None
 
     return metadata.get("shap_importances")
+
+
+# ---------------------------------------------------------------------------
+# Red-team promotion gate & per-version result history
+# ---------------------------------------------------------------------------
+
+
+class RedTeamGateError(RuntimeError):
+    """Raised when a model version has no passing red-team result."""
+
+
+def _red_team_result_path(name: str, version: str, model_dir: str) -> str:
+    return os.path.join(model_dir, f"{name}_v{version}.redteam.json")
+
+
+def record_red_team_result(name: str, version: str, model_dir: str, summary: dict) -> str:
+    """Persist a red-team ``CampaignSummary.to_dict()`` for one model version.
+
+    Stored next to the model as ``{name}_v{version}.redteam.json`` so results
+    travel with the artifact and can be compared across versions.
+    """
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
+    path = _red_team_result_path(name, version, model_dir)
+    record = {"model": name, "version": version, **summary}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2)
+    logger.info("Recorded red-team result for %s v%s (passed=%s)", name, version, summary.get("passed"))
+    return path
+
+
+def load_red_team_history(name: str, model_dir: str) -> list[dict]:
+    """Return recorded red-team results for every version of *name*, newest first."""
+    history = []
+    for version in list_model_versions(name, model_dir):
+        path = _red_team_result_path(name, version, model_dir)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                history.append(json.load(f))
+    return history
+
+
+def assert_red_team_passed(name: str, version: str, model_dir: str) -> dict:
+    """Promotion gate: raise :class:`RedTeamGateError` unless *version* passed.
+
+    A version with no recorded result is treated as failing, so a model can
+    never be promoted without a documented adversarial evaluation pass.
+    """
+    path = _red_team_result_path(name, version, model_dir)
+    if not os.path.exists(path):
+        raise RedTeamGateError(f"{name} v{version}: no red-team result recorded")
+    with open(path, encoding="utf-8") as f:
+        result = json.load(f)
+    if not result.get("passed"):
+        failed = [c["attack_type"] for c in result.get("campaigns", []) if not c.get("passed")]
+        raise RedTeamGateError(f"{name} v{version}: red-team gate failed for {failed}")
+    return result

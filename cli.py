@@ -1948,6 +1948,9 @@ def red_team(
     evasion_threshold: float = typer.Option(0.05, help="Maximum allowed evasion rate (5%)"),
     report_dir: str = typer.Option("./red_team_reports", help="Directory to write campaign reports"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    record: bool = typer.Option(
+        True, help="Record the result against each model's current version (see model_registry)"
+    ),
 ) -> None:
     """Run automated red-team attack campaigns and exit 1 if any campaign fails (CI gate)."""
     from detection.model_inference import load_models
@@ -1973,6 +1976,16 @@ def red_team(
     typer.echo(f"Overall result: {'PASSED' if summary.passed else 'FAILED'}")
     for c in summary.campaigns:
         typer.echo(f"  {c.attack_type.value}: evasion_rate={c.evasion_rate:.3f} {'OK' if c.passed else 'FAIL'}")
+
+    if record:
+        from detection.model_registry import get_current_version, record_red_team_result
+
+        for pointer in sorted(Path(model_dir).glob("*_latest.txt")):
+            name = pointer.name[: -len("_latest.txt")]
+            version = get_current_version(name, model_dir)
+            if version:
+                record_red_team_result(name, version, model_dir, summary.to_dict())
+                typer.echo(f"Recorded red-team result for {name} v{version}")
 
     if not summary.passed:
         raise typer.Exit(1)

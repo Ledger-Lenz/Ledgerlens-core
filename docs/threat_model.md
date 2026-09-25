@@ -245,8 +245,15 @@ While Krum protects the server from individual rogue participants, the server re
 
 ---
 
+## Test Coverage Traceability
+
+Every STRIDE threat above is mapped to the automated regression test(s) that
+guard it, or to an explicitly tracked gap, in the
+[STRIDE threat → test matrix](threat_test_matrix.md).
+
 ## Maintenance & Review Process
 
 To prevent documentation decay and align the threat model with security updates:
+- **New Threats Require a Test Link**: Adding a STRIDE row to this document requires a matching row in [threat_test_matrix.md](threat_test_matrix.md) (a test reference, or a `gap` tracked in `TODO.md`). CI enforces this via `scripts/check_threat_matrix.py`.
 - **Trigger Check**: Re-evaluate this model on any modifications to trust boundary paths (e.g. changing contract interfaces, webhook schema adjustments, or registering new ingestion protocols).
 - **Scheduled Audit**: Conduct a formal team security review of this threat model **at least once every 6 months**.

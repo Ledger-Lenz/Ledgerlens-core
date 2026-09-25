@@ -10,6 +10,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Threat model traceability ─────────────────────────────────────────────
+  # Every STRIDE threat in docs/threat_model.md must map to a test (or a
+  # tracked gap) in docs/threat_test_matrix.md.
+  threat-matrix:
+    name: Threat matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_threat_matrix.py
+
   # ── Lock-file freshness ────────────────────────────────────────────────────
   # Fails the PR when any requirements/*.txt is stale relative to its *.in
   # source or pyproject.toml.
@@ -100,7 +113,8 @@ jobs:
             tests/test_event_bus.py \
             tests/test_webhook_queue.py \
             tests/test_http_client.py \
-            tests/test_exceptions.py
+            tests/test_exceptions.py \
+            tests/test_fuzz_regression.py
 
   # ── Go SDK ────────────────────────────────────────────────────────────────
   go-sdk:
