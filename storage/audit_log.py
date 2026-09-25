@@ -53,6 +53,8 @@ Event types logged:
     - ``suppression_rule_added``   — a suppression rule was added
     - ``suppression_rule_removed`` — a suppression rule was removed
     - ``audit_chain_verified`` — the full chain was verified (integrity self-check)
+    - ``break_glass_admin_action`` — a sensitive admin action, carrying a
+      mandatory ``justification`` that is covered by the entry HMAC
 
 Relationship to other audit modules: this module is the general-purpose,
 system-wide audit trail (API key usage, admin config changes, suppression
@@ -202,7 +204,13 @@ def _canonical_json(record: dict) -> bytes:
 
 def _compute_entry_hash(record: dict) -> str:
     """Compute ``entry_hash = HMAC-SHA256(key, canonical_json(record_without_hash))``."""
-    entry = {k: v for k, v in record.items() if k != "entry_hash"}
+    # ``justification`` is only part of the signed payload when present, so
+    # entries written before the column existed still verify unchanged.
+    entry = {
+        k: v
+        for k, v in record.items()
+        if k != "entry_hash" and not (k == "justification" and v is None)
+    }
     key = _get_audit_secret()
     return hmac.new(key, _canonical_json(entry), hashlib.sha256).hexdigest()
 
@@ -231,10 +239,14 @@ def init_db(db_path: Optional[str] = None) -> None:
                 wallet      TEXT,
                 score       INTEGER,
                 prev_hash   TEXT    NOT NULL,
-                entry_hash  TEXT    NOT NULL UNIQUE
+                entry_hash  TEXT    NOT NULL UNIQUE,
+                justification TEXT
             )
             """
         )
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(audit_log)")}
+        if "justification" not in columns:
+            conn.execute("ALTER TABLE audit_log ADD COLUMN justification TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log (event_type)"
         )
@@ -284,6 +296,7 @@ def append_entry(
     wallet: Optional[str] = None,
     score: Optional[int] = None,
     db_path: Optional[str] = None,
+    justification: str | None = None,
 ) -> dict:
     """Append a single entry to the audit log and return it as a dict.
 
@@ -308,13 +321,15 @@ def append_entry(
             "wallet": wallet,
             "score": score,
             "prev_hash": prev_hash,
+            "justification": justification,
         }
         entry["entry_hash"] = _compute_entry_hash(entry)
 
         conn.execute(
             """
-            INSERT INTO audit_log (timestamp, event_type, actor, wallet, score, prev_hash, entry_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audit_log
+                (timestamp, event_type, actor, wallet, score, prev_hash, entry_hash, justification)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry["timestamp"],
@@ -324,6 +339,7 @@ def append_entry(
                 entry["score"],
                 entry["prev_hash"],
                 entry["entry_hash"],
+                entry["justification"],
             ),
         )
         conn.commit()
@@ -356,8 +372,8 @@ def verify_chain(db_path: Optional[str] = None) -> list[dict]:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash "
-            "FROM audit_log ORDER BY id ASC"
+            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash, "
+            "justification FROM audit_log ORDER BY id ASC"
         ).fetchall()
     finally:
         conn.close()
@@ -375,6 +391,7 @@ def verify_chain(db_path: Optional[str] = None) -> list[dict]:
             score,
             prev_hash,
             entry_hash,
+            justification,
         ) = row
 
         record = {
@@ -384,6 +401,7 @@ def verify_chain(db_path: Optional[str] = None) -> list[dict]:
             "wallet": wallet,
             "score": score,
             "prev_hash": prev_hash,
+            "justification": justification,
         }
         computed_hash = _compute_entry_hash(record)
 
@@ -479,6 +497,17 @@ def log_suppression_rule_removed(
     return append_entry("suppression_rule_removed", actor, db_path=db_path)
 
 
+def log_break_glass_action(
+    actor: str,
+    justification: str,
+    db_path: str | None = None,
+) -> dict:
+    """Log a break-glass (sensitive) admin action with its justification."""
+    return append_entry(
+        "break_glass_admin_action", actor, justification=justification, db_path=db_path
+    )
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -491,8 +520,8 @@ def get_all_entries(db_path: Optional[str] = None) -> list[dict]:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash "
-            "FROM audit_log ORDER BY id ASC"
+            "SELECT id, timestamp, event_type, actor, wallet, score, prev_hash, entry_hash, "
+            "justification FROM audit_log ORDER BY id ASC"
         ).fetchall()
         return [
             {
@@ -504,6 +533,7 @@ def get_all_entries(db_path: Optional[str] = None) -> list[dict]:
                 "score": r[5],
                 "prev_hash": r[6],
                 "entry_hash": r[7],
+                "justification": r[8],
             }
             for r in rows
         ]

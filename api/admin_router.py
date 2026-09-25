@@ -1,24 +1,104 @@
 """Admin REST API for model lifecycle and system configuration (Issue #160)."""
 
+import hashlib
 import logging
 import os
+import secrets
 import sqlite3
+import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 from api.auth import require_admin_key
 from config.settings import settings, bump_config_version, invalidate_runtime_config_cache
 from detection.model_registry import get_current_version, list_model_versions
+from storage.audit_log import log_break_glass_action
 
 logger = logging.getLogger("ledgerlens.admin")
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 
 _MODEL_NAMES = ["random_forest", "xgboost", "lightgbm"]
+
+
+# ---------------------------------------------------------------------------
+# Break-glass elevation (Issue #974)
+#
+# Policy: sensitive admin actions (model promotion, runtime config changes,
+# retraining, suppression rule changes) require no standing privilege. An
+# admin first calls POST /admin/elevate with a justification and receives an
+# elevation token valid for ``settings.admin_elevation_ttl_seconds`` (default
+# 15 minutes). Each sensitive call must then send both
+# ``X-LedgerLens-Elevation-Token`` and ``X-LedgerLens-Justification``; the
+# elevation and every action are appended to the HMAC-chained audit log
+# (``storage.audit_log``) with actor, justification and timestamp.
+# ---------------------------------------------------------------------------
+
+_MIN_JUSTIFICATION_LEN = 10
+_elevations_lock = threading.Lock()
+_elevations: dict[str, datetime] = {}
+
+
+def _actor(admin_key: str) -> str:
+    """Stable, non-secret identifier for the admin key that made the call."""
+    return "admin:" + hashlib.sha256(admin_key.encode()).hexdigest()[:12]
+
+
+def _validate_justification(justification: str | None) -> str:
+    justification = (justification or "").strip()
+    if len(justification) < _MIN_JUSTIFICATION_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A justification of at least {_MIN_JUSTIFICATION_LEN} characters is required",
+        )
+    return justification
+
+
+def require_break_glass(
+    request: Request,
+    x_ledgerlens_justification: str | None = Header(default=None),
+    x_ledgerlens_elevation_token: str | None = Header(default=None),
+    x_ledgerlens_admin_key: str = Header(default=""),
+) -> None:
+    """Gate a sensitive admin action behind justification + unexpired elevation."""
+    justification = _validate_justification(x_ledgerlens_justification)
+
+    now = datetime.now(timezone.utc)
+    with _elevations_lock:
+        for token, expires in list(_elevations.items()):
+            if expires <= now:
+                del _elevations[token]
+        valid = bool(x_ledgerlens_elevation_token) and x_ledgerlens_elevation_token in _elevations
+    if not valid:
+        raise HTTPException(
+            status_code=403,
+            detail="Elevated access required: obtain a token from POST /admin/elevate",
+        )
+
+    log_break_glass_action(
+        _actor(x_ledgerlens_admin_key),
+        f"{request.method} {request.url.path}: {justification}",
+    )
+
+
+class ElevationRequest(BaseModel):
+    justification: str = Field(..., max_length=1000)
+
+
+@router.post("/elevate", include_in_schema=False)
+def elevate(body: ElevationRequest, x_ledgerlens_admin_key: str = Header(default="")) -> dict:
+    """Issue a short-lived elevation token for sensitive admin actions."""
+    justification = _validate_justification(body.justification)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=settings.admin_elevation_ttl_seconds)
+    token = secrets.token_urlsafe(32)
+    with _elevations_lock:
+        _elevations[token] = expires_at
+    log_break_glass_action(_actor(x_ledgerlens_admin_key), f"elevate: {justification}")
+    return {"elevation_token": token, "expires_at": expires_at.isoformat()}
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +133,7 @@ def list_models() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/models/{version}/promote", include_in_schema=False)
+@router.post("/models/{version}/promote", include_in_schema=False, dependencies=[Depends(require_break_glass)])
 def promote_model(version: str) -> dict:
     """Promote ``version`` to active for all three model types."""
     model_dir = settings.model_dir
@@ -104,7 +184,7 @@ class RuntimeConfigPatch(BaseModel):
     updates: dict[str, str]
 
 
-@router.patch("/config", include_in_schema=False)
+@router.patch("/config", include_in_schema=False, dependencies=[Depends(require_break_glass)])
 def patch_config(body: RuntimeConfigPatch) -> dict:
     """Persist config key/value updates to SQLite and propagate to every process.
 
@@ -229,7 +309,7 @@ def shadow_report() -> dict:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/retrain", include_in_schema=False)
+@router.post("/retrain", include_in_schema=False, dependencies=[Depends(require_break_glass)])
 def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     """Enqueue an async retraining job and return its job ID."""
     job_id = str(uuid.uuid4())
@@ -359,7 +439,7 @@ class SuppressionCreate(BaseModel):
     expires_at: Optional[str] = None
 
 
-@router.post("/suppressions", status_code=201, include_in_schema=False)
+@router.post("/suppressions", status_code=201, include_in_schema=False, dependencies=[Depends(require_break_glass)])
 def add_suppression(body: SuppressionCreate) -> dict:
     """Add an alert suppression rule for a wallet.
 
@@ -379,7 +459,7 @@ def list_suppressions() -> list[dict]:
     return get_store().list_active()
 
 
-@router.delete("/suppressions/{rule_id}", include_in_schema=False)
+@router.delete("/suppressions/{rule_id}", include_in_schema=False, dependencies=[Depends(require_break_glass)])
 def delete_suppression(rule_id: int) -> dict:
     """Remove a suppression rule by ID."""
     from detection.suppressions import get_store

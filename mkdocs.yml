@@ -146,6 +146,8 @@ nav:
     - Webhook Security Model: webhook_security_model.md
     - Secret Rotation: secret_rotation.md
     - Audit Log: audit_log.md
+    - Break-Glass Admin Access: admin_break_glass.md
+    - Batch, Export & Retention: data_lifecycle_api.md
     - Compliance Export: compliance_export.md
     - Case Management: case_management.md
     - Model Signing: model_signing.md

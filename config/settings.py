@@ -229,6 +229,14 @@ class Settings(BaseSettings):
     compliance_sar_min_score: int = 70
     # Hourly cap on regulatory exports (SAR + Travel Rule) per `detection.compliance_exporter`.
     compliance_export_rate_limit_per_hour: int = 10
+    # Dedup window for `Idempotency-Key` on POST /scores/batch (Issue #976).
+    batch_idempotency_window_hours: int = 24
+    # Rows fetched per DB round-trip while streaming exports (Issue #975).
+    export_chunk_size: int = 1000
+    # Hard cap on rows a single export may return (memory guardrail, Issue #975).
+    export_max_rows: int = 1_000_000
+    # Lifetime of a break-glass elevated admin session (Issue #974).
+    admin_elevation_ttl_seconds: int = 900
 
     # ── ED25519 model signing ────────────────────────────────────────────────
     # Base64-encoded 32-byte ED25519 public key for model artifact signing.
