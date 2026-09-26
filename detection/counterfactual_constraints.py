@@ -18,6 +18,8 @@ fully supported for the one feature where the opposite holds
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from numbers import Real
 
 
 @dataclass(frozen=True)
@@ -37,10 +39,18 @@ class FeatureConstraint:
     direction: str
     min_val: float | None
     max_val: float | None
+    actionable: bool = True
 
 
 def _immutable(name: str) -> FeatureConstraint:
-    return FeatureConstraint(feature_name=name, mutable=False, direction="any", min_val=None, max_val=None)
+    return FeatureConstraint(
+        feature_name=name,
+        mutable=False,
+        direction="any",
+        min_val=None,
+        max_val=None,
+        actionable=False,
+    )
 
 
 def _decreasable(name: str, min_val: float = 0.0) -> FeatureConstraint:
@@ -291,6 +301,39 @@ def _validate_constraints() -> None:
         raise RuntimeError(
             f"FEATURE_CONSTRAINTS is missing entries for: {sorted(missing)}"
         )
+
+
+def validate_counterfactual(candidate: dict, original: dict) -> bool:
+    """Return whether a generated counterfactual is finite, actionable, and feasible.
+
+    A candidate must contain exactly the observed feature set. This prevents
+    explanations from silently inventing values for missing features or
+    changing historical/immutable observations.
+    """
+    if set(candidate) != set(original):
+        return False
+    constraints = {c.feature_name: c for c in FEATURE_CONSTRAINTS}
+    for name, original_value in original.items():
+        value = candidate[name]
+        if not isinstance(value, Real) or not isinstance(original_value, Real):
+            return False
+        if not math.isfinite(float(value)) or not math.isfinite(float(original_value)):
+            return False
+        constraint = constraints.get(name)
+        if constraint is None:
+            return False
+        changed = abs(float(value) - float(original_value)) > 1e-9
+        if changed and (not constraint.mutable or not constraint.actionable):
+            return False
+        if constraint.direction == "decrease" and value > original_value + 1e-9:
+            return False
+        if constraint.direction == "increase" and value < original_value - 1e-9:
+            return False
+        if constraint.min_val is not None and value < constraint.min_val - 1e-9:
+            return False
+        if constraint.max_val is not None and value > constraint.max_val + 1e-9:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
