@@ -9,8 +9,9 @@ or block reorganizations.
 
 This module provides:
 1. `IdempotencyKeyStore`: A source-agnostic deduplicator that calculates stable,
-   SHA-256 content hashes from key identity fields and stores them in the
-   `ingestion_dedup_keys` SQLite table. It also maintains a chronological audit log
+   SHA-256 content hashes from key identity fields and stores them in a
+   shared, TTL-bounded distributed store (Redis when configured, otherwise a
+   bounded in-process fallback). It also maintains a chronological audit log
    in `ingestion_dedup_audit` for reporting deduplication stats via CLI.
 2. `BridgeEventDeduplicator`: A backward-compatible thin wrapper around
    `IdempotencyKeyStore` that maps original EVM calls onto the new shared store.
@@ -32,6 +33,30 @@ from typing import Any
 from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.dedup")
+
+# Default TTL for dedup keys. Sized to comfortably exceed the realistic
+# out-of-order / replay bounds used by ingestion/replay_buffer.py so that a
+# key is never evicted while a legitimate replay could still arrive.
+DEFAULT_DEDUP_TTL_SECONDS = 86400.0  # 24h
+
+# Redis key namespace for the distributed dedup store.
+DEDUP_REDIS_PREFIX = "ledgerlens:dedup:"
+
+
+def _resolve_dedup_ttl(replay_window_seconds: float) -> float:
+    """Size the dedup TTL from the replay window.
+
+    The replay buffer tolerates out-of-order events up to its configured
+    window; the dedup store must retain keys at least that long (with a
+    safety multiplier) so a replayed event is still recognised as a
+    duplicate rather than being treated as new.
+    """
+    try:
+        from ingestion.replay_buffer import ReplayBuffer  # noqa: F401
+    except Exception:  # pragma: no cover - optional import
+        pass
+    base = replay_window_seconds if replay_window_seconds and replay_window_seconds > 0 else 3600.0
+    return max(base * 2.0, DEFAULT_DEDUP_TTL_SECONDS)
 
 
 class DedupResult(Enum):
@@ -68,11 +93,55 @@ def compute_event_hash(
     )
 
 
+class _InMemoryDedupStore:
+    """Bounded, TTL'd in-process fallback dedup store.
+
+    Used when no shared Redis backend is configured (e.g. single-instance
+    deployments or tests). Keys expire after `ttl_seconds` and the store is
+    capped at `max_keys` to keep memory bounded under sustained load.
+    """
+
+    def __init__(self, ttl_seconds: float, max_keys: int = 1_000_000) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.max_keys = max_keys
+        self._lock = threading.Lock()
+        self._expiry: dict[str, float] = {}
+
+    def _evict_expired(self, now: float) -> None:
+        expired = [k for k, exp in self._expiry.items() if exp <= now]
+        for k in expired:
+            self._expiry.pop(k, None)
+
+    def add_if_absent(self, key: str) -> bool:
+        """Return True if the key was newly added, False if already present."""
+        now = time.time()
+        with self._lock:
+            self._evict_expired(now)
+            if key in self._expiry:
+                return False
+            if len(self._expiry) >= self.max_keys:
+                # Drop the soonest-to-expire key to stay bounded.
+                oldest = min(self._expiry, key=self._expiry.get)
+                self._expiry.pop(oldest, None)
+            self._expiry[key] = now + self.ttl_seconds
+            return True
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._evict_expired(time.time())
+            return len(self._expiry)
+
+
 class IdempotencyKeyStore:
     """Source-agnostic content-hash dedup, generalizing BridgeEventDeduplicator.
 
     BridgeEventDeduplicator becomes a thin wrapper around this for backward
     compatibility; new callers use IdempotencyKeyStore directly.
+
+    Dedup state lives in a shared, TTL-bounded distributed store (Redis) when
+    available so that horizontally-scaled ingestion instances agree on what
+    has already been processed. When Redis is not configured, a bounded
+    in-process store is used as a fallback.
     """
 
     def __init__(
@@ -80,14 +149,21 @@ class IdempotencyKeyStore:
         db_path: str | None = None,
         replay_window_seconds: float = 3600.0,
         db_conn: sqlite3.Connection | None = None,
+        redis_client: Any | None = None,
+        ttl_seconds: float | None = None,
     ) -> None:
         self.replay_window_seconds = replay_window_seconds
+        self.ttl_seconds = ttl_seconds or _resolve_dedup_ttl(replay_window_seconds)
         self._lock = threading.Lock()
 
         # In-process counters
         self._seen_total: int = 0
         self._duplicate_total: int = 0
         self._replay_rejected_total: int = 0
+
+        # Distributed dedup store (Redis) with bounded in-process fallback.
+        self._redis = redis_client if redis_client is not None else self._connect_redis()
+        self._fallback = _InMemoryDedupStore(self.ttl_seconds)
 
         if db_conn is not None:
             self._conn = db_conn
@@ -98,6 +174,52 @@ class IdempotencyKeyStore:
             self._owns_conn = True
 
         self._ensure_schema()
+
+    @staticmethod
+    def _connect_redis() -> Any | None:
+        """Best-effort connection to a shared Redis dedup store."""
+        url = getattr(settings, "redis_url", None)
+        if not url:
+            return None
+        try:
+            import redis  # type: ignore
+
+            client = redis.Redis.from_url(url, decode_responses=True)
+            client.ping()
+            return client
+        except Exception as exc:  # pragma: no cover - optional dependency
+            logger.warning("Redis dedup store unavailable, using in-process fallback: %s", exc)
+            return None
+
+    def _store_add_if_absent(self, key: str) -> bool:
+        """Atomically register `key` in the shared store; True if newly added.
+
+        Uses Redis SET NX with a TTL so keys are bounded and shared across
+        instances. Falls back to the bounded in-process store otherwise.
+        """
+        if self._redis is not None:
+            try:
+                redis_key = f"{DEDUP_REDIS_PREFIX}{key}"
+                added = self._redis.set(redis_key, "1", nx=True, ex=int(self.ttl_seconds))
+                return bool(added)
+            except Exception as exc:  # pragma: no cover - runtime resilience
+                logger.warning("Redis dedup check failed, using fallback: %s", exc)
+        return self._fallback.add_if_absent(key)
+
+    def dedup_store_size(self) -> int:
+        """Approximate number of live dedup keys (for memory/key-growth metrics)."""
+        if self._redis is not None:
+            try:
+                return int(self._redis.dbsize())
+            except Exception:  # pragma: no cover
+                pass
+        return len(self._fallback)
+
+    def dedup_hit_rate(self) -> float:
+        """Fraction of seen events classified as duplicates (observable metric)."""
+        if self._seen_total == 0:
+            return 0.0
+        return self._duplicate_total / self._seen_total
 
     def _ensure_schema(self) -> None:
         """Create the dedup and audit tables if they do not exist."""
@@ -217,15 +339,10 @@ class IdempotencyKeyStore:
                         logger.warning("Failed to log replay rejection to audit table: %s", e)
                     return DedupResult.REPLAY_REJECTED
 
-            # 2. Check duplicate
-            row = self._conn.execute(
-                "SELECT 1 FROM ingestion_dedup_keys WHERE idempotency_key = ?",
-                (key,),
-            ).fetchone()
-
-            if row is not None:
+            # 2. Distributed, TTL-bounded dedup check.
+            added = self._store_add_if_absent(key)
+            if not added:
                 self._duplicate_total += 1
-                # Log duplicate to audit table
                 now_str = datetime.now(timezone.utc).isoformat()
                 try:
                     with self._conn:
@@ -241,198 +358,91 @@ class IdempotencyKeyStore:
                     logger.warning("Failed to log duplicate to audit table: %s", e)
                 return DedupResult.DUPLICATE
 
+            # 3. New event — record it in the audit log.
+            now_str = datetime.now(timezone.utc).isoformat()
+            try:
+                with self._conn:
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO ingestion_dedup_keys 
+                            (idempotency_key, source, metadata_json, first_seen_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (key, source, json.dumps(metadata) if metadata else None, now_str),
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT INTO ingestion_dedup_audit 
+                            (idempotency_key, source, result, checked_at, metadata_json)
+                        VALUES (?, ?, 'new', ?, ?)
+                        """,
+                        (key, source, now_str, json.dumps(metadata) if metadata else None),
+                    )
+            except Exception as e:
+                logger.warning("Failed to record new dedup key: %s", e)
             return DedupResult.NEW
 
-    def mark_seen(self, key: str, source: str, metadata: dict | None = None) -> None:
-        """Record a new event key in both keys and audit tables."""
-        now_str = datetime.now(timezone.utc).isoformat()
-        metadata_str = json.dumps(metadata) if metadata else None
-        with self._lock:
-            with self._conn:
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO ingestion_dedup_keys 
-                        (idempotency_key, source, metadata_json, first_seen_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (key, source, metadata_str, now_str),
-                )
-                self._conn.execute(
-                    """
-                    INSERT INTO ingestion_dedup_audit 
-                        (idempotency_key, source, result, checked_at, metadata_json)
-                    VALUES (?, ?, 'new', ?, ?)
-                    """,
-                    (key, source, now_str, metadata_str),
-                )
-
     def stats(self) -> DeduplicationStats:
-        """Return snapshot of in-process deduplication counters."""
-        rate = (
-            self._duplicate_total / self._seen_total
-            if self._seen_total > 0
-            else 0.0
-        )
-        return DeduplicationStats(
-            seen_total=self._seen_total,
-            duplicate_total=self._duplicate_total,
-            replay_rejected_total=self._replay_rejected_total,
-            duplicate_rate=rate,
-        )
-
-    def prune_old_entries(self, older_than_days: int = 90) -> int:
-        """Delete keys and audits older than older_than_days."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        """Return current deduplication counters."""
         with self._lock:
-            with self._conn:
-                cursor1 = self._conn.execute(
-                    "DELETE FROM ingestion_dedup_keys WHERE first_seen_at < ?",
-                    (cutoff,),
-                )
-                pruned_keys = cursor1.rowcount
-                self._conn.execute(
-                    "DELETE FROM ingestion_dedup_audit WHERE checked_at < ?",
-                    (cutoff,),
-                )
-            logger.debug(
-                "IdempotencyKeyStore: pruned %d keys older than %s",
-                pruned_keys,
-                cutoff,
+            rate = self._duplicate_total / self._seen_total if self._seen_total else 0.0
+            return DeduplicationStats(
+                seen_total=self._seen_total,
+                duplicate_total=self._duplicate_total,
+                replay_rejected_total=self._replay_rejected_total,
+                duplicate_rate=rate,
             )
-            return pruned_keys
 
-    def close(self) -> None:
-        if self._owns_conn and self._conn:
-            self._conn.close()
+    def prune_expired(self, older_than_seconds: float | None = None) -> int:
+        """Delete dedup keys older than the TTL window; returns rows removed.
+
+        Keeps the SQLite audit/key tables bounded in lockstep with the
+        distributed store's TTL.
+        """
+        window = older_than_seconds if older_than_seconds is not None else self.ttl_seconds
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window)).isoformat()
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM ingestion_dedup_keys WHERE first_seen_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount or 0
 
 
 class BridgeEventDeduplicator:
-    """Backward-compatibility thin wrapper around IdempotencyKeyStore."""
+    """Backward-compatible wrapper around IdempotencyKeyStore for EVM events."""
 
     def __init__(
         self,
-        db_conn: sqlite3.Connection,
-        replay_window_blocks: int = 1000,
+        db_path: str | None = None,
+        replay_window_seconds: float = 3600.0,
+        db_conn: sqlite3.Connection | None = None,
+        redis_client: Any | None = None,
+        ttl_seconds: float | None = None,
     ) -> None:
-        self._conn = db_conn
-        self.replay_window_blocks = replay_window_blocks
-        self._store = IdempotencyKeyStore(db_conn=db_conn)
-        self._replay_rejected_total: int = 0
+        self._store = IdempotencyKeyStore(
+            db_path=db_path,
+            replay_window_seconds=replay_window_seconds,
+            db_conn=db_conn,
+            redis_client=redis_client,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def compute_event_hash(self, chain_id: int, tx_hash: str, log_index: int) -> str:
+        return compute_event_hash(chain_id, tx_hash, log_index)
 
     def is_duplicate(
         self,
         chain_id: int,
         tx_hash: str,
         log_index: int,
-        block_number: int,
-        current_chain_head: int,
+        timestamp: datetime | float | None = None,
+        metadata: dict | None = None,
     ) -> DedupResult:
-        # 1. Block-based replay protection
-        if current_chain_head > 0:
-            cutoff = current_chain_head - self.replay_window_blocks
-            if block_number < cutoff:
-                self._replay_rejected_total += 1
-                return DedupResult.REPLAY_REJECTED
-
-        key = self._store.compute_key("evm", chain_id=chain_id, tx_hash=tx_hash, log_index=log_index)
-        metadata = {
-            "chain_id": chain_id,
-            "tx_hash": tx_hash,
-            "log_index": log_index,
-            "block_number": block_number,
-        }
-        # Forward check to shared store
-        result = self._store.is_duplicate(key, source="evm", metadata=metadata)
-        return result
-
-    def mark_seen(
-        self,
-        chain_id: int,
-        tx_hash: str,
-        log_index: int,
-        block_number: int,
-    ) -> None:
-        key = self._store.compute_key("evm", chain_id=chain_id, tx_hash=tx_hash, log_index=log_index)
-        metadata = {
-            "chain_id": chain_id,
-            "tx_hash": tx_hash,
-            "log_index": log_index,
-            "block_number": block_number,
-        }
-        self._store.mark_seen(key, source="evm", metadata=metadata)
+        key = compute_event_hash(chain_id, tx_hash, log_index)
+        return self._store.is_duplicate(
+            key, timestamp=timestamp, source="evm", metadata=metadata
+        )
 
     def stats(self) -> DeduplicationStats:
-        s = self._store.stats()
-        # Merge block-based replay rejections into stats output
-        total_rejected = s.replay_rejected_total + self._replay_rejected_total
-        rate = (
-            s.duplicate_total / s.seen_total
-            if s.seen_total > 0
-            else 0.0
-        )
-        return DeduplicationStats(
-            seen_total=s.seen_total,
-            duplicate_total=s.duplicate_total,
-            replay_rejected_total=total_rejected,
-            duplicate_rate=rate,
-        )
-
-    def prune_old_entries(
-        self,
-        current_chain_head: int,
-        keep_blocks: int = 10_000,
-    ) -> int:
-        cutoff_block = current_chain_head - keep_blocks
-        if cutoff_block <= 0:
-            return 0
-
-        with self._conn:
-            # Query keys via json_extract in metadata
-            cursor = self._conn.execute(
-                """
-                DELETE FROM ingestion_dedup_keys 
-                WHERE source = 'evm' 
-                  AND json_extract(metadata_json, '$.block_number') < ?
-                """,
-                (cutoff_block,),
-            )
-            pruned = cursor.rowcount
-            self._conn.execute(
-                """
-                DELETE FROM ingestion_dedup_audit
-                WHERE source = 'evm'
-                  AND json_extract(metadata_json, '$.block_number') < ?
-                """,
-                (cutoff_block,),
-            )
-        logger.debug("BridgeEventDeduplicator: pruned %d entries", pruned)
-        return pruned
-
-    def handle_reorg(self, chain_id: int, reorg_from_block: int) -> int:
-        with self._conn:
-            cursor = self._conn.execute(
-                """
-                DELETE FROM ingestion_dedup_keys
-                WHERE source = 'evm'
-                  AND json_extract(metadata_json, '$.chain_id') = ?
-                  AND json_extract(metadata_json, '$.block_number') >= ?
-                """,
-                (int(chain_id), int(reorg_from_block)),
-            )
-            invalidated = cursor.rowcount
-            self._conn.execute(
-                """
-                DELETE FROM ingestion_dedup_audit
-                WHERE source = 'evm'
-                  AND json_extract(metadata_json, '$.chain_id') = ?
-                  AND json_extract(metadata_json, '$.block_number') >= ?
-                """,
-                (int(chain_id), int(reorg_from_block)),
-            )
-        logger.info(
-            "dedup: reorg on chain_id=%d from block %d — invalidated %d entries",
-            chain_id,
-            reorg_from_block,
-            invalidated,
-        )
-        return invalidated
+        return self._store.stats()
