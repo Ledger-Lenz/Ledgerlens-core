@@ -3,8 +3,10 @@ package ledgerlens
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,6 +29,7 @@ type Client struct {
 	baseURL    string
 	apiKey     string // never exposed through String/GoString/log
 	httpClient *http.Client
+	retry      RetryPolicy
 }
 
 // String returns a non-sensitive representation of the client.
@@ -159,16 +162,7 @@ func (c *Client) DeleteWebhook(ctx context.Context, subscriberID string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close() //nolint:errcheck
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newAPIError(resp, string(body))
-	}
-	return nil
+	return c.do(req, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -221,24 +215,72 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	return req, nil
 }
 
-// do executes the request, checks the status, and decodes the JSON body.
+// retryableStatus reports whether an HTTP status is safe to retry.
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// backoff returns the full-jitter delay before retry number attempt (1-based).
+func (c *Client) backoff(attempt int, lastErr error) time.Duration {
+	var apiErr *LedgerLensAPIError
+	if errors.As(lastErr, &apiErr) && apiErr.RetryAfter > 0 {
+		return min(apiErr.RetryAfter, c.retry.MaxBackoff)
+	}
+	ceiling := c.retry.MaxBackoff
+	if shift := attempt - 1; shift < 32 {
+		ceiling = min(c.retry.InitialBackoff<<shift, c.retry.MaxBackoff)
+	}
+	return time.Duration(rand.Int63n(int64(ceiling) + 1)) //nolint:gosec // jitter, not security
+}
+
+// do executes the request, retrying idempotent methods per the client's
+// RetryPolicy, checks the status, and decodes the JSON body.
 func (c *Client) do(req *http.Request, out interface{}) error {
+	attempts := 1
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodDelete:
+		attempts = max(1, c.retry.MaxAttempts)
+	}
+	var err error
+	for attempt := 1; ; attempt++ {
+		var retryable bool
+		retryable, err = c.doOnce(req, out)
+		if err == nil || !retryable || attempt >= attempts {
+			return err
+		}
+		timer := time.NewTimer(c.backoff(attempt, err))
+		select {
+		case <-req.Context().Done():
+			timer.Stop()
+			return req.Context().Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// doOnce performs a single attempt and reports whether a failure is retryable.
+func (c *Client) doOnce(req *http.Request, out interface{}) (bool, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return req.Context().Err() == nil, err
 	}
 	defer resp.Body.Close() //nolint:errcheck
 	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("ledgerlens: read response body: %w", err)
+		return false, fmt.Errorf("ledgerlens: read response body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newAPIError(resp, string(rawBody))
+		return retryableStatus(resp.StatusCode), newAPIError(resp, string(rawBody))
 	}
 	if out != nil {
 		if err := json.Unmarshal(rawBody, out); err != nil {
-			return fmt.Errorf("ledgerlens: decode response: %w", err)
+			return false, fmt.Errorf("ledgerlens: decode response: %w", err)
 		}
 	}
-	return nil
+	return false, nil
 }

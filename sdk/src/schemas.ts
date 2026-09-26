@@ -177,13 +177,6 @@ export const HealthSchema = z.object({
 
 export type Health = z.infer<typeof HealthSchema>;
 
-export const PaginatedScoresSchema = z.object({
-  scores: z.array(RiskScoreSchema),
-  total: z.number().int().optional(),
-});
-
-export type PaginatedScores = z.infer<typeof PaginatedScoresSchema>;
-
 export const ApiErrorSchema = z.object({
   detail: z.string(),
 });

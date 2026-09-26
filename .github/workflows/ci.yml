@@ -185,6 +185,29 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      # tests/api_contract_test.rs checks the SDK models against
+      # docs/openapi.json, which schema.yml keeps in sync with api/.
+      - name: API contract tests
+        run: cargo test --test api_contract_test
+
+      # Semver policy (see README "Semver Policy"): changes to the public API
+      # in src/ need a CHANGELOG entry, and the Cargo.toml version must have a
+      # matching CHANGELOG release heading.
+      - name: Semver / CHANGELOG gate
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::Cargo.toml version $version has no '## [$version]' heading in CHANGELOG.md"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --depth=1 origin "${{ github.base_ref }}"
+            if ! git diff --quiet FETCH_HEAD -- src/ && git diff --quiet FETCH_HEAD -- CHANGELOG.md; then
+              echo "::error::crates/ledgerlens-sdk/src changed without a CHANGELOG.md entry"
+              exit 1
+            fi
+          fi
+
       - name: cargo clippy
         run: cargo clippy -- -D warnings
 

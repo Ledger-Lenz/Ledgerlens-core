@@ -115,6 +115,57 @@ cargo test -p ledgerlens-sdk contract_vectors
 
 See [ADR-005](../../docs/adr/ADR-005-schema-contract-enforcement.md) for the full design rationale.
 
+## Semver Policy
+
+The crate follows [Semantic Versioning](https://semver.org/). While the version
+is `0.x`, the minor number plays the role of the major number (Cargo treats
+`0.1` → `0.2` as incompatible).
+
+**Breaking** (major bump; minor bump while `0.x`):
+
+- Removing or renaming a public type, function, method, field or feature flag.
+- Changing a function/method signature or a public field's type.
+- Making an `Option<T>` model field required, or adding a required field to a
+  response model (older API responses would stop deserializing).
+- Adding a variant to a public enum that is not `#[non_exhaustive]`.
+- Raising the minimum supported Rust version.
+- Dropping support for an API response shape published in `docs/openapi.json`.
+
+**Additive** (minor bump; patch bump while `0.x`):
+
+- New public types, functions, methods, `Option<T>` / `#[serde(default)]`
+  fields or feature flags.
+- Accepting new optional fields from the API.
+
+**Patch**: bug fixes, documentation, and internal changes with no public API
+or wire-format effect.
+
+### API contract tests
+
+`tests/api_contract_test.rs` builds minimal, full, and null-optional responses
+from the `RiskScore` schema in `docs/openapi.json` and asserts that the SDK
+models deserialize them. It also asserts that every SDK field still exists in
+the API. `docs/openapi.json` is exported from `api/`, and the `schema.yml` CI
+workflow fails if it drifts. An undocumented breaking API change therefore
+fails either the drift check or these contract tests.
+
+```bash
+cargo test -p ledgerlens-sdk --test api_contract_test
+```
+
+### Release process
+
+1. Record every change under `## [Unreleased]` in `CHANGELOG.md`, grouped as
+   `Added` / `Changed` / `Removed` / `Fixed`. CI fails a PR that touches `src/`
+   without a CHANGELOG entry.
+2. To release, pick the bump from the policy above: any `Changed`/`Removed`
+   entry that is breaking requires a major (0.x: minor) bump.
+3. Bump `version` in `Cargo.toml`, and rename `[Unreleased]` to
+   `## [x.y.z] - YYYY-MM-DD` (then add a new empty `[Unreleased]`). CI fails if
+   the `Cargo.toml` version has no matching CHANGELOG heading.
+4. The `rust-sdk` CI job, including the API contract tests, must pass before
+   the release is tagged.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for a version history.

@@ -135,6 +135,25 @@ jobs:
         run: npx vitest run tests/contract_vectors.test.ts --reporter=verbose
 
   # ---------------------------------------------------------------------------
+  # TypeScript pagination types generated from proto/ledgerlens (issue #984)
+  # ---------------------------------------------------------------------------
+  ts-generated-types:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check generated types match proto definitions
+        run: npm run generate:check
+
+  # ---------------------------------------------------------------------------
   # Job 4: Rust contract vector tests (new — ADR-005)
   # ---------------------------------------------------------------------------
   contract-vectors-rust:

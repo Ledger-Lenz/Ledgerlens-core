@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Documented semver policy and release process in the README.
+- API contract tests (`tests/api_contract_test.rs`) validating `RiskScore`
+  against `docs/openapi.json`, run in CI.
+
 ## [0.1.0] - 2024-01-01
 
 ### Added

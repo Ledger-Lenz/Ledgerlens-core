@@ -95,6 +95,7 @@ func checkWithdrawalAllowed(ctx context.Context, client *ledgerlens.Client, wall
 | `WithHTTPClient(hc)` | Replaces the default `*http.Client` |
 | `WithTimeout(d)` | Sets the per-request timeout (default: 30 s) |
 | `WithInsecureSkipVerify()` | Disables TLS verification — **test servers only** |
+| `WithRetryPolicy(p)` | Enables retry with exponential backoff for idempotent requests (see below) |
 
 ## Methods
 
@@ -137,6 +138,32 @@ if err != nil {
     return err
 }
 ```
+
+## Cancellation and Retries
+
+Every method takes a `context.Context`. Cancelling it (or letting its deadline
+pass) aborts the in-flight request and any pending retry backoff immediately,
+returning `context.Canceled` / `context.DeadlineExceeded`.
+
+Retries are disabled by default and enabled with `WithRetryPolicy`:
+
+```go
+client := ledgerlens.NewClient(baseURL, ledgerlens.WithRetryPolicy(ledgerlens.RetryPolicy{
+    MaxAttempts:    3,                      // total attempts, including the first
+    InitialBackoff: 500 * time.Millisecond, // default
+    MaxBackoff:     30 * time.Second,       // default
+}))
+```
+
+The semantics are consistent with the shared LedgerLens Python HTTP client
+(`ingestion/http_client.py`):
+
+- Only idempotent methods (`GET`, `HEAD`, `DELETE`) are retried; `POST`
+  (e.g. `RegisterWebhook`) is never retried.
+- Only transport errors and HTTP 429, 500, 502, 503 and 504 are retried; other
+  4xx responses fail immediately.
+- Delays use exponential backoff with full jitter, capped at `MaxBackoff`.
+  A `Retry-After` header on a 429 response takes precedence (also capped).
 
 ## Webhook Verification
 

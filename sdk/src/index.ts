@@ -43,9 +43,12 @@ export {
   CounterfactualSchema,
   WebhookSubscriberSchema,
   HealthSchema,
-  PaginatedScoresSchema,
   ApiErrorSchema,
 } from "./schemas";
+export {
+  PageCursorSchema,
+  PaginatedScoresSchema,
+} from "./generated/pagination";
 
 /**
  * Static types inferred from the Zod schemas above, describing the shape of
@@ -62,6 +65,6 @@ export type {
   Counterfactual,
   WebhookSubscriber,
   Health,
-  PaginatedScores,
   ApiError,
 } from "./schemas";
+export type { PageCursor, PaginatedScores } from "./generated/pagination";
