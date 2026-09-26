@@ -13,6 +13,7 @@ from detection.graph_engine import (
     build_ring_membership_index,
     build_transaction_graph,
     find_wash_rings,
+    invalidate_ring_cache,
 )
 
 
@@ -49,6 +50,30 @@ def test_three_account_ring_detected_with_cycle_volume():
     assert ring["avg_trade_count"] == 1.0
     assert ring["timing_tightness"] == 0.0
     assert ring["truncated"] is False
+
+
+def test_module_level_ring_results_are_cached_until_graph_changes(monkeypatch):
+    graph = build_transaction_graph(
+        _ring_trades(["A", "B", "C"], [pd.Timestamp("2026-06-12T00:00:00Z")] * 3)
+    )
+    calls = 0
+    original = nx.strongly_connected_components
+
+    def counted(value):
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(nx, "strongly_connected_components", counted)
+    find_wash_rings(graph)
+    find_wash_rings(graph)
+    assert calls == 1
+    graph.add_edge("A", "D", total_volume=1.0, trade_count=1)
+    find_wash_rings(graph)
+    assert calls == 2
+    invalidate_ring_cache(graph)
+    find_wash_rings(graph)
+    assert calls == 3
 
 
 def test_five_account_ring_timing_tightness():

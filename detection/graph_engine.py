@@ -17,6 +17,34 @@ from scipy.sparse import csr_matrix, lil_matrix
 logger = logging.getLogger(__name__)
 
 
+def _ring_cache_key(
+    graph: nx.DiGraph,
+    min_ring_size: int,
+    max_ring_size: int,
+    min_cycle_volume: float,
+) -> tuple:
+    """Build a cheap mutation-sensitive key for module-level ring detection."""
+    volume_total = 0.0
+    trade_total = 0
+    for _, _, attrs in graph.edges(data=True):
+        volume_total += float(attrs.get("total_volume", 0.0))
+        trade_total += int(attrs.get("trade_count", attrs.get("payment_count", 0)))
+    return (
+        min_ring_size,
+        max_ring_size,
+        min_cycle_volume,
+        graph.number_of_nodes(),
+        graph.number_of_edges(),
+        round(volume_total, 9),
+        trade_total,
+    )
+
+
+def invalidate_ring_cache(graph: nx.DiGraph) -> None:
+    """Invalidate cached module-level ring results after external mutation."""
+    graph.graph.pop("_wash_ring_cache", None)
+
+
 def build_transaction_graph(trades: pd.DataFrame) -> nx.DiGraph:
     """Build a directed graph from a trades DataFrame.
 
@@ -150,6 +178,11 @@ def find_wash_rings(
     if max_ring_size < min_ring_size:
         raise ValueError("max_ring_size must be greater than or equal to min_ring_size")
 
+    cache_key = _ring_cache_key(graph, min_ring_size, max_ring_size, min_cycle_volume)
+    cached = graph.graph.get("_wash_ring_cache")
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
     rings: list[dict[str, Any]] = []
     for component in nx.strongly_connected_components(graph):
         if len(component) < min_ring_size:
@@ -196,7 +229,9 @@ def find_wash_rings(
             }
         )
 
-    return sorted(rings, key=lambda ring: (ring["total_volume"], ring["cycle_volume"]), reverse=True)
+    result = sorted(rings, key=lambda ring: (ring["total_volume"], ring["cycle_volume"]), reverse=True)
+    graph.graph["_wash_ring_cache"] = (cache_key, result)
+    return result
 
 
 def build_ring_membership_index(
