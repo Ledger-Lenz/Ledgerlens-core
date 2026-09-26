@@ -191,6 +191,49 @@ def first_digit(value: float) -> int | None:
     return int(value)
 
 
+def significant_digit(value: float, position: int) -> int | None:
+    """Return a significant decimal digit, where position 1 is the first."""
+    if position < 1 or value is None or not math.isfinite(value) or value <= 0:
+        return None
+    magnitude = math.floor(math.log10(value))
+    mantissa = value / (10 ** magnitude)
+    return int(mantissa * (10 ** position) + 1e-9) % 10
+
+
+def digit_distribution_at_position(amounts: list[float], position: int) -> dict[int, float]:
+    """Return observed frequencies for a significant digit position."""
+    digits = [d for d in (significant_digit(a, position) for a in amounts) if d is not None]
+    classes = range(1, 10) if position == 1 else range(10)
+    if not digits:
+        return {d: 0.0 for d in classes}
+    return {d: digits.count(d) / len(digits) for d in classes}
+
+
+def _benford_position_probabilities(position: int) -> dict[int, float]:
+    classes = range(1, 10) if position == 1 else range(10)
+    probabilities = {}
+    for digit in classes:
+        total = 0.0
+        for leading in range(1, 10):
+            prefix = leading * (10 ** (position - 1)) + digit
+            total += math.log10(1 + 1 / prefix)
+        probabilities[digit] = total
+    normalizer = sum(probabilities.values())
+    return {digit: probability / normalizer for digit, probability in probabilities.items()}
+
+
+BENFORD_SECOND_DIGIT = _benford_position_probabilities(2)
+BENFORD_THIRD_DIGIT = _benford_position_probabilities(3)
+
+
+def _position_mad(amounts: list[float], position: int) -> float:
+    observed = digit_distribution_at_position(amounts, position)
+    expected = _benford_position_probabilities(position)
+    if not any(observed.values()):
+        return 0.0
+    return float(np.mean([abs(observed[d] - expected[d]) for d in expected]))
+
+
 def digit_distribution(amounts: list[float]) -> dict[int, float]:
     """Return the observed proportion of each leading digit 1-9 in `amounts`."""
     digits = [d for d in (first_digit(a) for a in amounts) if d is not None]
@@ -366,6 +409,8 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
       - ``z_scores``: per-digit Z-scores (dict[int, float])
       - ``observed_distribution``: digit -> proportion mapping
       - ``sample_size``: number of valid (positive, finite) amounts
+      - ``second_digit_mad`` / ``third_digit_mad``: higher-order digit MADs
+      - ``higher_order_mad``: conservative maximum of second/third MAD
     """
     observed = digit_distribution(amounts)
     n = sum(1 for a in amounts if first_digit(a) is not None)
@@ -383,11 +428,16 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
             "z_scores": {d: 0.0 for d in DIGITS},
             "observed_distribution": observed,
             "sample_size": 0,
+            "second_digit_mad": 0.0,
+            "third_digit_mad": 0.0,
+            "higher_order_mad": 0.0,
         }
 
     counts = np.array([observed.get(d, 0.0) * n for d in DIGITS])
     p_value, p_method = compute_chi_square_pvalue(counts, n)
 
+    second_mad = _position_mad(amounts, 2)
+    third_mad = _position_mad(amounts, 3)
     return {
         "chi_square": chi_square_statistic(observed, n),
         "chi_square_pvalue": p_value,
@@ -396,12 +446,20 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
         "z_scores": z_scores(observed, n),
         "observed_distribution": observed,
         "sample_size": n,
+        "second_digit_distribution": digit_distribution_at_position(amounts, 2),
+        "third_digit_distribution": digit_distribution_at_position(amounts, 3),
+        "second_digit_mad": second_mad,
+        "third_digit_mad": third_mad,
+        "higher_order_mad": max(second_mad, third_mad),
     }
 
 
 def is_anomalous(metrics: dict[str, object], mad_threshold: float = 0.015) -> bool:
-    """Whether a `compute_benford_metrics` result exceeds the MAD threshold."""
-    return metrics["mad"] > mad_threshold
+    """Whether first or higher-order digit distributions exceed the threshold."""
+    return any(
+        float(metrics.get(key, 0.0)) > mad_threshold
+        for key in ("mad", "second_digit_mad", "third_digit_mad")
+    )
 
 
 # ---------------------------------------------------------------------------
