@@ -924,6 +924,68 @@ class GNNRingDetector:
             logger.error("top_neighbours error: %s", exc)
             return []
 
+    def explain(self, wallet: str, graph: Any, k: int = 5) -> dict[str, Any]:
+        """Return review-safe node and edge evidence for a wallet score.
+
+        The explanation deliberately contains identifiers and aggregate edge
+        attributes only; raw embeddings are never exposed.  Edge evidence is
+        ranked by the amount of information available in the graph (volume,
+        trade count, and the neighbouring node score), so analysts can
+        reproduce why a flagged neighbourhood was surfaced.
+        """
+        evidence: dict[str, Any] = {
+            "wallet": wallet,
+            "score": float(self.predict(wallet, graph)),
+            "nodes": [],
+            "edges": [],
+            "fallback_used": not self._fitted,
+        }
+        if graph is None or not _HAS_PYG:
+            return evidence
+        try:
+            wallet_list = list(graph["wallet"].wallet_list)
+            if wallet not in wallet_list:
+                return evidence
+            scores = self.predict_batch(graph).detach().cpu().tolist() if self._fitted else [
+                float(self._scc_membership(node, graph)) for node in wallet_list
+            ]
+            target_idx = wallet_list.index(wallet)
+            ranked_nodes = sorted(
+                (
+                    {"wallet": node, "score": round(float(score), 6)}
+                    for node, score in zip(wallet_list, scores)
+                    if node != wallet
+                ),
+                key=lambda item: item["score"],
+                reverse=True,
+            )[: max(0, k)]
+            evidence["nodes"] = [{"wallet": wallet, "score": round(float(scores[target_idx]), 6)}] + ranked_nodes
+
+            edge_store = graph["wallet", "trades", "wallet"]
+            edge_index = edge_store.edge_index.detach().cpu().tolist()
+            edge_attr = getattr(edge_store, "edge_attr", None)
+            attrs = edge_attr.detach().cpu().tolist() if edge_attr is not None else []
+            edges = []
+            for edge_pos, (src, dst) in enumerate(zip(*edge_index)):
+                if target_idx not in (src, dst):
+                    continue
+                values = attrs[edge_pos] if edge_pos < len(attrs) else [0.0, 0.0, 0.0]
+                edges.append({
+                    "source": wallet_list[src],
+                    "target": wallet_list[dst],
+                    "total_volume": float(values[0]) if values else 0.0,
+                    "trade_count": int(values[1]) if len(values) > 1 else 0,
+                    "neighbour_score": round(float(scores[dst if src == target_idx else src]), 6),
+                })
+            evidence["edges"] = sorted(
+                edges,
+                key=lambda item: (item["neighbour_score"], item["total_volume"]),
+                reverse=True,
+            )[: max(0, k)]
+        except Exception as exc:
+            logger.error("GNN explanation error for wallet %s: %s", wallet[:8], exc)
+        return evidence
+
     # ------------------------------------------------------------------
     # Batch predict (for training / eval)
     # ------------------------------------------------------------------

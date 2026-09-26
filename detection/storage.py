@@ -440,6 +440,11 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         15,
+        "add structured ring evidence for analyst review",
+        "ALTER TABLE wash_rings ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}';",
+    ),
+    (
+        15,
         "add benford_baselines table for market-wide calibration",
         """
         CREATE TABLE IF NOT EXISTS benford_baselines (
@@ -1653,8 +1658,8 @@ def save_rings(rings: list[dict], db_path: str | None = None) -> None:
             """
             INSERT INTO wash_rings
                 (accounts_json, total_volume, cycle_volume, avg_trade_count,
-                 timing_tightness, truncated, detected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 timing_tightness, truncated, evidence_json, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1664,6 +1669,7 @@ def save_rings(rings: list[dict], db_path: str | None = None) -> None:
                     float(r.get("avg_trade_count", 0.0)),
                     float(r.get("timing_tightness", 0.0)),
                     int(bool(r.get("truncated", False))),
+                    json.dumps(r.get("evidence", {})),
                     ts,
                 )
                 for r in rings
@@ -1681,7 +1687,7 @@ def get_rings(
     init_db(db_path)
     query = (
         "SELECT accounts_json, total_volume, cycle_volume, avg_trade_count, "
-        "timing_tightness, truncated, detected_at FROM wash_rings ORDER BY detected_at DESC"
+        "timing_tightness, truncated, evidence_json, detected_at FROM wash_rings ORDER BY detected_at DESC"
     )
     params: list = []
     if limit is not None:
@@ -1699,7 +1705,8 @@ def get_rings(
             "avg_trade_count": row[3],
             "timing_tightness": row[4],
             "truncated": bool(row[5]),
-            "detected_at": row[6],
+            "evidence": json.loads(row[6] or "{}"),
+            "detected_at": row[7],
         }
         for row in rows
     ]
