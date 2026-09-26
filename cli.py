@@ -178,7 +178,12 @@ def train(
     logger.info("Saved training reference to %s", training_dataset_path)
 
     logger.info("Training RF/XGBoost/LightGBM ensemble on %d rows...", len(df))
-    results = train_ensemble(df, calibrate=calibrate, experiment_name=experiment_name)
+    results = train_ensemble(
+        df,
+        calibrate=calibrate,
+        experiment_name=experiment_name,
+        random_state=seed,
+    )
     for name, result in results.items():
         if name.startswith("_") or not isinstance(result, dict) or "auc_roc" not in result:
             continue
@@ -1608,6 +1613,18 @@ def compute_embeddings(
     typer.echo(f"Stored embeddings for {len(wallet_ids)} wallets with version {model_version}")
 
 
+@app.command("lineage-model")
+def lineage_model(
+    model: str = typer.Argument(..., help="Model name, version, or versioned model dataset name"),
+) -> None:
+    """Query the training data and feature versions that produced a model."""
+    import json
+
+    from detection.lineage import get_model_lineage
+
+    typer.echo(json.dumps(get_model_lineage(model), indent=2, sort_keys=True))
+
+
 @app.command("webhook-worker")
 def webhook_worker(
     interval: float = typer.Option(5.0, "--interval", help="Poll interval in seconds"),
@@ -2309,4 +2326,3 @@ def re_encrypt_webhook_secrets() -> None:
 
 if __name__ == "__main__":
     app()
-

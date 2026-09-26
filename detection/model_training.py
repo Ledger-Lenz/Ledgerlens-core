@@ -22,7 +22,12 @@ Stacking ensemble (Issue-111):
 """
 
 import logging
+import hashlib
 import joblib
+import os
+import random
+import sys
+from importlib import metadata as package_metadata
 
 # ---------------------------------------------------------------------------
 # Optional dependency: mlflow  (pip install 'ledgerlens-core[ml]')
@@ -50,6 +55,49 @@ from config.settings import settings
 from detection.feature_engineering import FEATURE_NAMES
 
 logger = logging.getLogger("ledgerlens.model_training")
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+def _training_package_versions() -> dict[str, str]:
+    versions = {}
+    for package in ("scikit-learn", "xgboost", "lightgbm", "imbalanced-learn", "torch"):
+        try:
+            versions[package] = package_metadata.version(package)
+        except package_metadata.PackageNotFoundError:
+            continue
+    return versions
+
+
+def _seed_training(random_state: int) -> None:
+    """Seed supported training RNGs and require deterministic Torch kernels."""
+    random.seed(random_state)
+    np.random.seed(random_state)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    try:
+        import torch
+    except ImportError:
+        return
+    torch.manual_seed(random_state)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(random_state)
+    torch.use_deterministic_algorithms(True)
+
+
+def _dataframe_sha256(df: pd.DataFrame) -> str:
+    """Fingerprint ordered columns, index, and values of the training snapshot."""
+    digest = hashlib.sha256()
+    digest.update(pd.util.hash_pandas_object(df, index=True).values.tobytes())
+    digest.update("\0".join(map(str, df.columns)).encode())
+    digest.update("\0".join(map(str, df.dtypes)).encode())
+    return digest.hexdigest()
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +335,7 @@ def _train_ensemble_base(
     ``ConformalCalibrator`` instances are returned under the ``"calib"`` key
     and used by ``save_models`` to persist the artifacts.
     """
+    _seed_training(random_state)
     if adversarial_augment:
         from detection.dataset import build_training_dataset
         from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
@@ -417,9 +466,9 @@ def _train_ensemble_base(
         mlflow.log_param("has_sample_weights", sample_weights is not None)
 
     models = {
-        "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
-        "xgboost": XGBClassifier(eval_metric="logloss", random_state=random_state),
-        "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1),
+        "random_forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=1),
+        "xgboost": XGBClassifier(eval_metric="logloss", random_state=random_state, n_jobs=1),
+        "lightgbm": LGBMClassifier(random_state=random_state, verbose=-1, n_jobs=1),
     }
 
     # Per-model hyperparameters/metrics/artifacts are only worth logging when
@@ -708,6 +757,9 @@ def save_models(
 
     model_dir = model_dir or settings.model_dir
     os.makedirs(model_dir, exist_ok=True)
+    model_artifact_hashes: dict[str, str] = dict(
+        results.get("_reproducibility", {}).get("model_artifact_sha256", {})
+    )
 
     # Compute version first
     if training_dataset_path:
@@ -743,11 +795,13 @@ def save_models(
             path = os.path.join(model_dir, f"{name}.joblib")
             joblib.dump(result["model"], path)
             sign_model_file(path, signing_key)
+            model_artifact_hashes[os.path.basename(path)] = _file_sha256(path)
             
             # Save versioned model file
             version_path = os.path.join(model_dir, f"{name}_v{version}.joblib")
             joblib.dump(result["model"], version_path)
             sign_model_file(version_path, signing_key)
+            model_artifact_hashes[os.path.basename(version_path)] = _file_sha256(version_path)
             
             # Save latest.txt pointer
             latest_path = os.path.join(model_dir, f"{name}_latest.txt")
@@ -774,6 +828,15 @@ def save_models(
             }
             for name, result in results.items()
             if not name.startswith("_") and isinstance(result, dict) and "model" in result
+        },
+        "reproducibility": {
+            **results.get("_reproducibility", {}),
+            "training_reference_sha256": (
+                _file_sha256(training_dataset_path)
+                if training_dataset_path and os.path.isfile(training_dataset_path)
+                else None
+            ),
+            "model_artifact_sha256": model_artifact_hashes,
         },
     }
 
@@ -831,6 +894,24 @@ def save_models(
         meta_path = os.path.join(model_dir, "meta_learner.joblib")
         joblib.dump(stacking_info["meta_learner"], meta_path)
         sign_model_file(meta_path, signing_key)
+        model_artifact_hashes[os.path.basename(meta_path)] = _file_sha256(meta_path)
+        with lineage.run("model_training.save_meta_learner", inputs=inputs) as meta_run:
+            meta_run.add_output(
+                Dataset(
+                    namespace="ledgerlens-core.models",
+                    name=os.path.basename(meta_path),
+                    facets={
+                        "model_name": "meta_learner",
+                        "model_version": version,
+                        "training_data_sha256": training_data_sha256,
+                        "feature_version": feature_version,
+                        "config_sha256": config_sha256,
+                        "artifact_sha256": model_artifact_hashes[
+                            os.path.basename(meta_path)
+                        ],
+                    },
+                )
+            )
         logger.info("Saved meta-learner to %s", meta_path)
 
         # Persist meta-learner metrics into training_metadata.json
@@ -885,6 +966,12 @@ def train_ensemble(
         tracking_uri: MLflow tracking URI.  Falls back to
             ``MLFLOW_TRACKING_URI`` env var, then ``settings.mlflow_tracking_uri``.
     """
+    random_state = kwargs.get("random_state", 42)
+    if not isinstance(random_state, (int, np.integer)) or isinstance(random_state, bool):
+        raise TypeError("random_state must be a fixed integer for reproducible training")
+    random_state = int(random_state)
+    kwargs["random_state"] = random_state
+    _seed_training(random_state)
     gnn_features_by_wallet = {}
 
     if use_gnn:
@@ -913,6 +1000,26 @@ def train_ensemble(
             df, *args, use_gnn=use_gnn, gnn_features=gnn_features_by_wallet,
             model_dir=model_dir, imbalance_strategy=imbalance_strategy, **kwargs
         )
+        model_artifact_hashes = {}
+        gnn_checkpoint = os.path.join(model_dir, "gnn_model.pt")
+        if use_gnn and os.path.isfile(gnn_checkpoint):
+            model_artifact_hashes[os.path.basename(gnn_checkpoint)] = _file_sha256(
+                gnn_checkpoint
+            )
+        results["_reproducibility"] = {
+            "seed": random_state,
+            "data_sha256": _dataframe_sha256(df),
+            "config": {
+                "use_gnn": use_gnn,
+                "imbalance_strategy": imbalance_strategy,
+                **kwargs,
+            },
+            "python_version": sys.version.split()[0],
+            "numpy_version": np.__version__,
+            "pandas_version": pd.__version__,
+            "package_versions": _training_package_versions(),
+            "model_artifact_sha256": model_artifact_hashes,
+        }
 
         if run_id:
             log_metrics(_collect_aggregate_metrics(results))

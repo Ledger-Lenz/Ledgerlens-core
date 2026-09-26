@@ -50,6 +50,8 @@ from typing import Optional
 
 import numpy as np
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 logger = logging.getLogger("ledgerlens.train_lstm")
 logging.basicConfig(
     level=logging.INFO,
@@ -170,7 +172,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def load_clean_wallet_series(db_path: str, sequence_length: int) -> list[np.ndarray]:
+def load_clean_wallet_series(
+    db_path: str,
+    sequence_length: int,
+    seed: int = 42,
+) -> list[np.ndarray]:
+    """Load training sequences while preserving the original list-returning API."""
+    sequences, _ = _load_clean_wallet_series_with_source(db_path, sequence_length, seed)
+    return sequences
+
+
+def _load_clean_wallet_series_with_source(
+    db_path: str,
+    sequence_length: int,
+    seed: int,
+) -> tuple[list[np.ndarray], str]:
     """Load 5-min binned trade sequences for clean wallets.
 
     Returns a list of numpy arrays of shape ``(sequence_length, 2)``
@@ -179,31 +195,28 @@ def load_clean_wallet_series(db_path: str, sequence_length: int) -> list[np.ndar
     Falls back to synthetic data when the DB is unavailable.
     """
     try:
-        conn = sqlite3.connect(db_path)
-        # Try to get feature distribution snapshots (binned amounts available)
-        cur = conn.execute(
-            """
-            SELECT wallet, feature_name, feature_value, recorded_at
-            FROM feature_distribution_snapshots
-            WHERE feature_name IN ('log_amount_bin', 'trade_count_bin')
-            ORDER BY wallet, recorded_at
-            LIMIT 50000
-            """
-        )
-        rows = cur.fetchall()
-        conn.close()
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT wallet, feature_name, feature_value, recorded_at
+                FROM feature_distribution_snapshots
+                WHERE feature_name IN ('log_amount_bin', 'trade_count_bin')
+                ORDER BY wallet, recorded_at, feature_name, rowid
+                LIMIT 50000
+                """
+            ).fetchall()
         if rows:
             logger.info("Loaded %d feature snapshot rows from DB.", len(rows))
             # Simple approach: group by wallet and build sequences
             sequences = _build_sequences_from_snapshots(rows, sequence_length)
             if sequences:
-                return sequences
+                return sequences, "feature_distribution_snapshots"
     except Exception as exc:
         logger.warning("Could not load feature snapshots: %s", exc)
 
     # Synthetic data fallback
     logger.info("Generating synthetic training sequences …")
-    return _generate_synthetic_sequences(n=500, sequence_length=sequence_length)
+    return _generate_synthetic_sequences(n=500, sequence_length=sequence_length, seed=seed), "synthetic"
 
 
 def _build_sequences_from_snapshots(
@@ -217,7 +230,8 @@ def _build_sequences_from_snapshots(
         wallet_data[wallet].append((recorded_at, feat_name, float(feat_value or 0)))
 
     sequences = []
-    for wallet, records in wallet_data.items():
+    for wallet in sorted(wallet_data):
+        records = wallet_data[wallet]
         records.sort(key=lambda x: x[0])
         # Interleave log_amount and trade_count into pairs
         log_amounts = [v for _, fn, v in records if fn == "log_amount_bin"]
@@ -235,10 +249,14 @@ def _build_sequences_from_snapshots(
     return sequences
 
 
-def _generate_synthetic_sequences(n: int, sequence_length: int) -> list[np.ndarray]:
+def _generate_synthetic_sequences(
+    n: int,
+    sequence_length: int,
+    seed: int = 42,
+) -> list[np.ndarray]:
     """Generate synthetic clean-wallet sequences (Gaussian noise + trend)."""
     seqs = []
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
     for _ in range(n):
         log_amounts = rng.normal(loc=1.5, scale=0.8, size=sequence_length).astype(
             np.float32
@@ -263,14 +281,27 @@ def train(args: argparse.Namespace) -> None:
 
     from detection.temporal_patterns import LSTMAutoencoder
 
-    torch.manual_seed(args.seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.use_deterministic_algorithms(True)
 
     # --- Load data ------------------------------------------------------------
-    sequences = load_clean_wallet_series(args.db_path, args.sequence_length)
+    sequences, data_source = _load_clean_wallet_series_with_source(
+        args.db_path, args.sequence_length, args.seed
+    )
     if not sequences:
         logger.error("No training sequences available. Exiting.")
         sys.exit(1)
+    data_digest = hashlib.sha256()
+    for sequence in sequences:
+        contiguous = np.ascontiguousarray(sequence, dtype=np.float32)
+        data_digest.update(str(contiguous.shape).encode())
+        data_digest.update(contiguous.tobytes())
+    dataset_sha256 = data_digest.hexdigest()
 
     logger.info("Training on %d sequences of length %d.", len(sequences), args.sequence_length)
 
@@ -362,7 +393,6 @@ def train(args: argparse.Namespace) -> None:
             "sequence_length": args.sequence_length,
             "dropout": args.dropout,
             "val_loss": best_val_loss,
-            "trained_at": datetime.now(timezone.utc).isoformat(),
         },
         save_path,
     )
@@ -371,10 +401,16 @@ def train(args: argparse.Namespace) -> None:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
     checksum_path = save_path.replace(".pt", ".sha256")
-    Path(checksum_path).write_text(h.hexdigest())
+    Path(checksum_path).write_text(h.hexdigest() + "\n")
     logger.info("LSTM autoencoder saved to %s.", save_path)
     logger.info("Checksum written to %s.", checksum_path)
 
+    state_digest = hashlib.sha256()
+    for name, tensor in sorted(best_state.items()):
+        state_digest.update(name.encode())
+        state_digest.update(str(tensor.dtype).encode())
+        state_digest.update(str(tuple(tensor.shape)).encode())
+        state_digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     meta_path = os.path.join(args.model_dir, "lstm_training_metadata.json")
     with open(meta_path, "w") as mf:
         json.dump(
@@ -383,6 +419,14 @@ def train(args: argparse.Namespace) -> None:
                 "val_loss": best_val_loss,
                 "n_sequences": len(sequences),
                 "epochs_run": epoch,
+                "data_source": data_source,
+                "dataset_sha256": dataset_sha256,
+                "model_state_sha256": state_digest.hexdigest(),
+                "artifact_sha256": h.hexdigest(),
+                "seed": args.seed,
+                "python_version": sys.version.split()[0],
+                "numpy_version": np.__version__,
+                "torch_version": torch.__version__,
                 "args": vars(args),
                 "trained_at": datetime.now(timezone.utc).isoformat(),
             },
