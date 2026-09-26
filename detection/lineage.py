@@ -10,6 +10,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 import uuid
 
@@ -18,6 +19,41 @@ import httpx
 from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.lineage")
+
+_LINEAGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS lineage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    parent_run_id TEXT,
+    job_namespace TEXT NOT NULL,
+    job_name TEXT NOT NULL,
+    inputs_json TEXT NOT NULL,
+    outputs_json TEXT NOT NULL,
+    producer TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_events_run ON lineage_events(run_id, event_type);
+CREATE TABLE IF NOT EXISTS lineage_model_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_time TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    job_namespace TEXT NOT NULL,
+    job_name TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    model_dataset_name TEXT NOT NULL,
+    training_data_sha256 TEXT NOT NULL,
+    feature_version TEXT NOT NULL,
+    config_sha256 TEXT NOT NULL,
+    inputs_json TEXT NOT NULL,
+    model_dataset_json TEXT NOT NULL,
+    UNIQUE (run_id, model_dataset_name)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_model_name_version
+    ON lineage_model_runs(model_name, model_version, event_time);
+"""
 
 
 @dataclass
@@ -129,6 +165,9 @@ class LineageEmitter:
                 }
             }
 
+        if self.backend == "console":
+            logger.info("OpenLineage event: %s", json.dumps(event))
+
         try:
             self._queue.put_nowait(event)
         except queue.Full:
@@ -172,9 +211,10 @@ class LineageEmitter:
 
     def _store_locally(self, event: dict) -> None:
         import sqlite3
-        conn = None
-        try:
-            conn = sqlite3.connect(settings.db_path)
+        db_path = settings.db_path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(_LINEAGE_SCHEMA)
             conn.execute(
                 """
                 INSERT INTO lineage_events (
@@ -194,12 +234,37 @@ class LineageEmitter:
                     event["producer"],
                 )
             )
-            conn.commit()
-        except sqlite3.OperationalError as op_err:
-            logger.debug("lineage_events table operational error: %s", op_err)
-        finally:
-            if conn:
-                conn.close()
+            if event["eventType"] == "COMPLETE":
+                for dataset in event["outputs"]:
+                    facets = dataset.get("facets", {})
+                    model_name = facets.get("model_name")
+                    model_version = facets.get("model_version")
+                    if not model_name or not model_version:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO lineage_model_runs (
+                            event_time, run_id, job_namespace, job_name,
+                            model_name, model_version, model_dataset_name,
+                            training_data_sha256, feature_version, config_sha256,
+                            inputs_json, model_dataset_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event["eventTime"],
+                            event["run"]["runId"],
+                            event["job"]["namespace"],
+                            event["job"]["name"],
+                            model_name,
+                            model_version,
+                            dataset["name"],
+                            facets.get("training_data_sha256", ""),
+                            facets.get("feature_version", ""),
+                            facets.get("config_sha256", ""),
+                            json.dumps(event["inputs"]),
+                            json.dumps(dataset),
+                        ),
+                    )
 
     def stop(self) -> None:
         self._queue.put(None)
@@ -314,3 +379,43 @@ def get_lineage_graph(dataset_name: str, db_path: str | None = None) -> dict:
         "nodes": filtered_nodes,
         "edges": filtered_edges,
     }
+
+
+def get_model_lineage(model: str, db_path: str | None = None) -> list[dict]:
+    """Query completed training runs by model name, version, or output dataset."""
+    import sqlite3
+
+    if not model:
+        raise ValueError("model identifier must not be empty")
+    database = db_path or settings.db_path
+    Path(database).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database) as conn:
+        conn.executescript(_LINEAGE_SCHEMA)
+        rows = conn.execute(
+            """
+            SELECT event_time, run_id, job_namespace, job_name, model_name,
+                   model_version, model_dataset_name, training_data_sha256,
+                   feature_version, config_sha256, inputs_json, model_dataset_json
+            FROM lineage_model_runs
+            WHERE model_name = ? OR model_version = ? OR model_dataset_name = ?
+            ORDER BY event_time DESC, id DESC
+            """,
+            (model, model, model),
+        ).fetchall()
+
+    return [
+        {
+            "event_time": row[0],
+            "run_id": row[1],
+            "job": {"namespace": row[2], "name": row[3]},
+            "model_name": row[4],
+            "model_version": row[5],
+            "model_dataset_name": row[6],
+            "training_data_sha256": row[7],
+            "feature_version": row[8],
+            "config_sha256": row[9],
+            "inputs": json.loads(row[10]),
+            "model_dataset": json.loads(row[11]),
+        }
+        for row in rows
+    ]

@@ -1709,6 +1709,20 @@ def get_lineage(dataset: str) -> dict:
     return get_lineage_graph(dataset)
 
 
+@v1_router.get(
+    "/admin/lineage/models/{model}",
+    tags=["Admin"],
+    summary="Query model training lineage",
+    description="Return data snapshots, feature schema versions, and artifacts used to produce a model.",
+    dependencies=[Depends(require_admin_key)],
+)
+def get_model_training_lineage(model: str) -> list[dict]:
+    """Query completed training lineage by model name, version, or dataset name."""
+    from detection.lineage import get_model_lineage
+
+    return get_model_lineage(model)
+
+
 @v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),

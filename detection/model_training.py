@@ -779,11 +779,48 @@ def save_models(
     version = _compute_version_hash(training_row_count, column_hash)
 
     from detection.lineage import lineage, Dataset
-    
+
+    reproducibility = results.get("_reproducibility", {})
+    training_data_sha256 = (
+        reproducibility.get("data_sha256")
+        or reproducibility.get("training_reference_sha256")
+        or "unknown"
+    )
+    feature_version = hashlib.sha256(
+        json.dumps(FEATURE_NAMES, separators=(",", ":")).encode()
+    ).hexdigest()
+    config_sha256 = hashlib.sha256(
+        json.dumps(reproducibility.get("config", {}), sort_keys=True, default=str).encode()
+    ).hexdigest()
     inputs = [
-        Dataset(namespace="ledgerlens-core.csv", name="training_reference.csv"),
-        Dataset(namespace="ledgerlens-core.models", name=f"labelled_dataset_v{version}")
+        Dataset(
+            namespace="ledgerlens-core.training-data",
+            name="training_dataframe",
+            facets={"sha256": training_data_sha256},
+        ),
+        Dataset(
+            namespace="ledgerlens-core.feature-set",
+            name=f"feature_schema_v{feature_version[:16]}",
+            facets={
+                "feature_version": feature_version,
+                "feature_count": len(FEATURE_NAMES),
+            },
+        ),
     ]
+    if training_dataset_path:
+        inputs.append(
+            Dataset(
+                namespace="ledgerlens-core.csv",
+                name=os.path.basename(training_dataset_path),
+                facets={
+                    "sha256": (
+                        _file_sha256(training_dataset_path)
+                        if os.path.isfile(training_dataset_path)
+                        else "unknown"
+                    )
+                },
+            )
+        )
 
     with lineage.run("model_training.train_ensemble", inputs=inputs) as r:
         signing_key = settings.model_signing_key.encode()
@@ -808,7 +845,38 @@ def save_models(
             with open(latest_path, "w") as f:
                 f.write(version)
                 
-            r.add_output(Dataset(namespace="ledgerlens-core.models", name=f"{name}_v{version}.joblib"))
+            model_dataset = f"{name}_v{version}.joblib"
+            r.add_output(
+                Dataset(
+                    namespace="ledgerlens-core.models",
+                    name=model_dataset,
+                    facets={
+                        "model_name": name,
+                        "model_version": version,
+                        "training_data_sha256": training_data_sha256,
+                        "feature_version": feature_version,
+                        "config_sha256": config_sha256,
+                        "artifact_sha256": model_artifact_hashes[
+                            os.path.basename(version_path)
+                        ],
+                    },
+                )
+            )
+        if "gnn_model.pt" in model_artifact_hashes:
+            r.add_output(
+                Dataset(
+                    namespace="ledgerlens-core.models",
+                    name="gnn_model.pt",
+                    facets={
+                        "model_name": "gnn_model",
+                        "model_version": version,
+                        "training_data_sha256": training_data_sha256,
+                        "feature_version": feature_version,
+                        "config_sha256": config_sha256,
+                        "artifact_sha256": model_artifact_hashes["gnn_model.pt"],
+                    },
+                )
+            )
 
     _causal_selected = results.get("_causal_selected_features")
     metadata = {
@@ -921,6 +989,7 @@ def save_models(
             meta_md["meta_learner_auc_pr"] = stacking_info.get("meta_learner_auc_pr", 0.0)
             meta_md["meta_learner_auc_roc"] = stacking_info.get("meta_learner_auc_roc", 0.0)
             meta_md["meta_learner_coef"] = stacking_info.get("meta_learner_coef", [])
+            meta_md["reproducibility"]["model_artifact_sha256"] = model_artifact_hashes
             with open(metadata_path, "w") as f:
                 json.dump(meta_md, f, indent=2)
         except Exception as exc:
@@ -934,7 +1003,6 @@ from detection.mlflow_tracker import (  # noqa: E402
     mlflow_run,
 )
 from ingestion.graph_builder import TemporalGraphBuilder  # noqa: E402
-import os  # noqa: E402
 
 
 def train_ensemble(

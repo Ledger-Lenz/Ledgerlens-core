@@ -81,3 +81,21 @@ This returns a JSON representation of the DAG:
   ]
 }
 ```
+
+### Query model provenance
+
+New completed model-training runs persist searchable model records in SQLite,
+including the training snapshot SHA-256, feature-schema version, training
+configuration hash, and versioned artifact metadata. Query by model name,
+model version, or output dataset:
+
+```bash
+curl -H "X-LedgerLens-Admin-Key: <your_admin_key>" \
+  http://localhost:8000/v1/admin/lineage/models/random_forest
+
+python cli.py lineage-model random_forest_v<version>.joblib
+```
+
+The API route is `GET /v1/admin/lineage/models/{model}`. Both the API and CLI
+use `detection.lineage.get_model_lineage()` and return the completed training
+run, input datasets/facets, and matching versioned model artifact.
