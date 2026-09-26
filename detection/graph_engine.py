@@ -210,6 +210,11 @@ def find_wash_rings(
                     "avg_trade_count": avg_trade_count,
                     "timing_tightness": timing_tightness,
                     "truncated": True,
+                    "evidence": {
+                        "nodes": [{"account": account} for account in accounts],
+                        "edges": [],
+                    },
+                    "evidence": _ring_evidence(subgraph),
                 }
             )
             continue
@@ -226,6 +231,8 @@ def find_wash_rings(
                 "avg_trade_count": avg_trade_count,
                 "timing_tightness": timing_tightness,
                 "truncated": False,
+                "evidence": _ring_evidence(subgraph),
+                "evidence": _ring_evidence(subgraph),
             }
         )
 
@@ -279,6 +286,22 @@ def _component_total_volume(subgraph: nx.DiGraph) -> float:
             for _, _, data in subgraph.edges(data=True)
         )
     )
+
+
+def _ring_evidence(subgraph: nx.DiGraph) -> dict[str, list[dict]]:
+    """Return compact node and edge evidence suitable for analyst review."""
+    nodes = [{"account": account} for account in sorted(subgraph.nodes())]
+    edges = [
+        {
+            "source": source,
+            "target": target,
+            "total_volume": float(data.get("total_volume", 0.0)),
+            "trade_count": int(data.get("trade_count", data.get("payment_count", 0))),
+        }
+        for source, target, data in subgraph.edges(data=True)
+    ]
+    edges.sort(key=lambda edge: edge["total_volume"], reverse=True)
+    return {"nodes": nodes, "edges": edges}
 
 
 def _avg_trade_count(subgraph: nx.DiGraph) -> float:
