@@ -42,6 +42,8 @@ from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 
+from detection.drift_detectors import BatchDriftTest, DriftTestResult, PerFeatureDriftConfig
+
 logger = logging.getLogger("ledgerlens.drift_monitor")
 
 PSI_THRESHOLD: float = 0.20
@@ -338,22 +340,38 @@ def compute_psi_for_feature(
     epsilon: float = 1e-6,
 ) -> float:
     """Compute PSI between reference and current distributions for a single feature."""
-    reference = reference[~np.isnan(reference)]
-    current = current[~np.isnan(current)]
+    reference = np.asarray(reference, dtype=float)
+    current = np.asarray(current, dtype=float)
+    reference = reference[np.isfinite(reference)]
+    current = current[np.isfinite(current)]
 
     if len(reference) == 0 or len(current) == 0:
         return 0.0
 
     percentile_bins = np.percentile(reference, np.linspace(0, 100, n_bins + 1))
     percentile_bins = np.unique(percentile_bins)
-    if len(percentile_bins) < 3:
-        return 0.0
+    if len(percentile_bins) == 1:
+        margin = max(abs(percentile_bins[0]) * 1e-6, 1e-6)
+        percentile_bins = np.array(
+            [percentile_bins[0] - margin, percentile_bins[0] + margin]
+        )
+    elif len(percentile_bins) == 2:
+        percentile_bins = np.insert(
+            percentile_bins, 1, percentile_bins[0] + (percentile_bins[1] - percentile_bins[0]) / 2
+        )
 
     ref_counts, _ = np.histogram(reference, bins=percentile_bins)
     cur_counts, _ = np.histogram(current, bins=percentile_bins)
-
-    ref_pct = ref_counts / (len(reference) + epsilon)
-    cur_pct = cur_counts / (len(current) + epsilon)
+    ref_counts = np.concatenate(([0], ref_counts, [0]))
+    cur_counts = np.concatenate(
+        (
+            [np.count_nonzero(current < percentile_bins[0])],
+            cur_counts,
+            [np.count_nonzero(current > percentile_bins[-1])],
+        )
+    )
+    ref_pct = (ref_counts + epsilon) / (len(reference) + epsilon * len(ref_counts))
+    cur_pct = (cur_counts + epsilon) / (len(current) + epsilon * len(cur_counts))
 
     ref_pct = np.clip(ref_pct, epsilon, None)
     cur_pct = np.clip(cur_pct, epsilon, None)
@@ -953,6 +971,61 @@ class TrendDirection(str, Enum):
         return TrendDirection.STABLE
 
 
+class PopulationStabilityIndexTest:
+    """Batch PSI test implementing the shared distribution-test interface."""
+
+    name = "psi"
+    default_threshold = 0.20
+
+    def evaluate(
+        self,
+        reference: np.ndarray,
+        current: np.ndarray,
+        threshold: float,
+    ) -> DriftTestResult:
+        statistic = compute_psi_for_feature(reference, current)
+        return DriftTestResult(
+            test=self.name,
+            statistic=statistic,
+            threshold=threshold,
+            detected=statistic > threshold,
+        )
+
+
+class KolmogorovSmirnovTest:
+    """Two-sample Kolmogorov-Smirnov test with configurable alpha threshold."""
+
+    name = "kolmogorov_smirnov"
+    default_threshold = 0.05
+
+    def evaluate(
+        self,
+        reference: np.ndarray,
+        current: np.ndarray,
+        threshold: float,
+    ) -> DriftTestResult:
+        from scipy.stats import ks_2samp
+
+        reference = np.asarray(reference, dtype=float)
+        current = np.asarray(current, dtype=float)
+        reference = reference[np.isfinite(reference)]
+        current = current[np.isfinite(current)]
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("KS test threshold (alpha) must be in [0, 1]")
+        if len(reference) == 0 or len(current) == 0:
+            statistic, p_value = 0.0, 1.0
+        else:
+            test = ks_2samp(reference, current)
+            statistic, p_value = float(test.statistic), float(test.pvalue)
+        return DriftTestResult(
+            test=self.name,
+            statistic=statistic,
+            threshold=threshold,
+            detected=p_value < threshold,
+            p_value=p_value,
+        )
+
+
 @dataclass
 class FeaturePSIRecord:
     feature: str
@@ -1002,24 +1075,30 @@ CREATE INDEX IF NOT EXISTS idx_psi_trend_feature_time
 """
 
 
-class PerFeaturePSIConfig:
-    """Per-feature PSI alert thresholds; defaults apply when no override is set."""
+class PerFeaturePSIConfig(PerFeatureDriftConfig):
+    """Per-feature test parameters and PSI escalation thresholds.
+
+    Test-specific overrides use ``{feature: {test_name: {parameter: value}}}``;
+    legacy flat PSI warning/error/critical overrides remain supported.
+    """
 
     DEFAULT_WARNING = 0.10
     DEFAULT_ERROR = 0.20
     DEFAULT_CRITICAL = 0.25
 
     def __init__(self, overrides: Optional[dict] = None) -> None:
-        self._overrides: dict[str, dict] = overrides or {}
+        super().__init__(overrides)
 
     def thresholds(self, feature: str) -> tuple[float, float, float]:
         """Return (warning, error, critical) thresholds for ``feature``."""
-        cfg = self._overrides.get(feature, {})
         return (
-            cfg.get("warning", self.DEFAULT_WARNING),
-            cfg.get("error", self.DEFAULT_ERROR),
-            cfg.get("critical", self.DEFAULT_CRITICAL),
+            self.value(feature, "psi", "warning", self.DEFAULT_WARNING),
+            self.value(feature, "psi", "error", self.DEFAULT_ERROR),
+            self.value(feature, "psi", "critical", self.DEFAULT_CRITICAL),
         )
+
+    def test_threshold(self, feature: str, test: BatchDriftTest) -> float:
+        return self.value(feature, test.name, "threshold", test.default_threshold)
 
 
 class DriftMonitor:
@@ -1051,6 +1130,33 @@ class DriftMonitor:
             logger.warning("WARNING drift on feature '%s': PSI=%.4f", feature, psi)
             return EscalationLevel.WARNING
         return EscalationLevel.OK
+
+    def evaluate_distributions(
+        self,
+        references: dict[str, np.ndarray],
+        current: dict[str, np.ndarray],
+        tests: dict[str, BatchDriftTest] | None = None,
+    ) -> dict[str, dict[str, DriftTestResult]]:
+        """Run registered batch tests with per-feature, per-test thresholds."""
+        selected_tests = tests if tests is not None else {
+            "psi": PopulationStabilityIndexTest(),
+            "kolmogorov_smirnov": KolmogorovSmirnovTest(),
+        }
+        results: dict[str, dict[str, DriftTestResult]] = {}
+        for feature in sorted(references.keys() & current.keys()):
+            for registered_name, test in selected_tests.items():
+                if registered_name != test.name:
+                    raise ValueError(
+                        f"Test registry key {registered_name!r} does not match test name {test.name!r}"
+                    )
+                threshold = self.psi_config.test_threshold(feature, test)
+                result = test.evaluate(
+                    np.asarray(references[feature]),
+                    np.asarray(current[feature]),
+                    threshold,
+                )
+                results.setdefault(feature, {})[test.name] = result
+        return results
 
     def _record_psi(self, feature: str, psi: float, level: EscalationLevel) -> None:
         now = datetime.now(timezone.utc).isoformat()

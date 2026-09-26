@@ -105,3 +105,31 @@ per-feature PSI tracking, three-tier escalation, and webhook alerting. It
 remains the tool for thorough, retrospective characterisation of gradual
 distribution drift and for deciding when a full model retrain
 (`cli.py retrain-check`) is warranted.
+
+### Extensible tests and per-feature configuration
+
+Batch distribution tests implement the `BatchDriftTest` protocol: each exposes
+a `name`, `default_threshold`, and `evaluate(reference, current, threshold)`
+method returning a common `DriftTestResult` (`test`, `statistic`, `threshold`,
+`detected`, and optional `p_value`). `DriftMonitor.evaluate_distributions()`
+runs PSI and Kolmogorov-Smirnov by default; pass a `{name: test}` mapping to
+add or select tests.
+
+Threshold overrides are shared with the streaming registry through
+`PerFeatureDriftConfig`:
+
+```python
+overrides = {
+    "trade_volume": {
+        "psi": {"threshold": 0.15, "warning": 0.08},
+        "kolmogorov_smirnov": {"threshold": 0.01},
+        "adwin": {"delta": 0.001},
+        "page_hinkley": {"threshold": 25.0, "delta": 0.002},
+    }
+}
+```
+
+Pass these overrides to `PerFeaturePSIConfig` for batch tests and to
+`DriftDetectorRegistry(feature_config=PerFeatureDriftConfig(overrides))` for
+streaming detectors. The streaming registry accepts additional named detector
+factories implementing `update(value)`, `magnitude`, and `state()`.

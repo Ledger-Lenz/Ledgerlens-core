@@ -45,8 +45,8 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 | `ensemble_reweighter.py` | Adjusts per-model ensemble weights at inference time |
 | `adaptive_reweighter.py` | Dynamically reweights ensemble models based on analyst feedback signals |
 | `shadow_scoring.py` | Shadow-mode scoring — runs a candidate model alongside the live model to compare outputs safely before promotion |
-| `drift_monitor.py` | PSI-based feature drift detection; triggers continuous retraining when drift exceeds the configured threshold |
-| `drift_detectors.py` | Pluggable drift detector implementations (PSI, Kolmogorov-Smirnov, and others) |
+| `drift_monitor.py` | Pluggable batch distribution tests (PSI, Kolmogorov-Smirnov, and extensions) with per-feature thresholds and drift alerting |
+| `drift_detectors.py` | Common streaming detector interface and registry for per-feature ADWIN, Page-Hinkley, and custom tests |
 | `shap_drift_monitor.py` | Monitors SHAP value distributions for explanation drift, independent of raw feature drift |
 | `mlflow_tracker.py` | MLflow experiment tracking integration — logs parameters, metrics, and artefacts for every training run |
 

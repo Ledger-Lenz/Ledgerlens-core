@@ -10,6 +10,7 @@ from detection.drift_detectors import (
     DRIFT_ACTIVE_COOLDOWN_OBSERVATIONS,
     ADWINDriftDetector,
     DriftDetectorRegistry,
+    PerFeatureDriftConfig,
     PageHinkleyDetector,
     _combine_stats,
 )
@@ -243,6 +244,46 @@ class TestDriftDetectorRegistry:
             assert fname in state["features"]
             assert "adwin" in state["features"][fname]
             assert "page_hinkley" in state["features"][fname]
+
+    def test_per_feature_parameters_and_extension_factory(self):
+        class OneShotDetector:
+            name = "one_shot"
+            magnitude = 1.0
+
+            def __init__(self, feature):
+                self.feature = feature
+                self.fired = False
+
+            def update(self, value):
+                if self.fired:
+                    return False
+                self.fired = True
+                return True
+
+            def state(self):
+                return {"fired": self.fired}
+
+        config = PerFeatureDriftConfig(
+            {
+                "f1": {
+                    "adwin": {"delta": 0.01},
+                    "page_hinkley": {"delta": 0.02, "threshold": 3.0},
+                }
+            }
+        )
+        registry = DriftDetectorRegistry(
+            ["f1"],
+            feature_config=config,
+            detector_factories={"one_shot": OneShotDetector},
+        )
+
+        assert registry._adwin["f1"].delta == 0.01
+        assert registry._ph["f1"].delta == 0.02
+        assert registry._ph["f1"].threshold == 3.0
+        assert registry.observe({"f1": 1.0}) == [
+            {"feature": "f1", "detector": "one_shot", "magnitude": 1.0}
+        ]
+        assert registry.state()["features"]["f1"]["one_shot"] == {"fired": True}
 
     def test_is_active_without_detection(self, registry):
         assert not registry.is_active()
