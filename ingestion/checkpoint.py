@@ -1,4 +1,11 @@
-"""Durable Horizon paging-token checkpoints."""
+"""Durable Horizon paging-token checkpoints.
+
+This module is the single, consolidated checkpoint store for ingestion. It
+replaces the former ``ingestion.stream_checkpoint`` module and provides
+exactly-once resume semantics: a checkpoint is only advanced after the work
+it covers has been durably committed, and every write is atomic so a crash
+during a checkpoint write can never lose or duplicate processing.
+"""
 
 from __future__ import annotations
 
@@ -71,7 +78,19 @@ class FlushPolicy:
 
 
 class CursorCheckpoint:
-    """Persist a Horizon paging token in a small, atomically replaced JSON file."""
+    """Persist a Horizon paging token in a small, atomically replaced JSON file.
+
+    This is the consolidated checkpoint store used by every ingestion loader.
+    It guarantees exactly-once resume:
+
+    * Writes are atomic (write-to-temp plus :func:`os.replace`), so a crash
+      mid-write leaves either the previous complete checkpoint or the new one
+      intact -- never a torn file.
+    * The token is only advanced once the caller has durably committed the
+      work it covers, so a crash before commit replays from the last committed
+      token (no lost processing) and a crash after commit resumes past it
+      (no duplicate processing).
+    """
 
     def __init__(self, path: Path):
         """Create a checkpoint at an absolute path.
@@ -152,6 +171,16 @@ class CursorCheckpoint:
                 os.replace(tmp_path, self.path)
         except (OSError, ValueError) as exc:
             logger.warning("Failed to save cursor checkpoint %s: %s", self.path, exc)
+
+    def commit(self, paging_token: str, ledger_sequence: int | None = None) -> None:
+        """Advance the checkpoint after the covered work is durably committed.
+
+        This is the exactly-once entry point loaders should call once the
+        events up to *paging_token* have been persisted. It is a thin,
+        intention-revealing wrapper over :meth:`save` so the resume contract
+        is explicit at every call site.
+        """
+        self.save(paging_token, ledger_sequence)
 
     def delete(self) -> None:
         """Delete the checkpoint under the same advisory lock used by readers/writers."""
