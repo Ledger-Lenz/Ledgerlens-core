@@ -54,6 +54,7 @@ def db_path(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _fix_settings(monkeypatch, db_path):
+    monkeypatch.setattr("detection.webhook_queue._jitter", lambda: 0.0)
     monkeypatch.setenv("LEDGERLENS_DB_PATH", db_path)
     import config.settings as s
     object.__setattr__(s.settings, "ledgerlens_db_path", db_path)

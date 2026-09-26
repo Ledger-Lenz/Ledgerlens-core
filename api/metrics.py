@@ -38,6 +38,17 @@ circuit_breaker_open_total = Counter(
     "Total times the Soroban circuit breaker opened",
 )
 
+grpc_stream_buffer_occupancy = Histogram(
+    "ledgerlens_grpc_stream_buffer_occupancy",
+    "Per-client gRPC stream send-buffer depth, observed on every enqueue",
+    buckets=(0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512),
+)
+
+grpc_backpressure_disconnects_total = Counter(
+    "ledgerlens_grpc_backpressure_disconnects_total",
+    "Streaming gRPC clients disconnected because they consumed too slowly",
+)
+
 webhook_deliveries_total = Counter(
     "ledgerlens_webhook_deliveries_total",
     "Total webhook delivery attempts",

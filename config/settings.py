@@ -224,6 +224,9 @@ class Settings(BaseSettings):
     ledgerlens_webhook_encryption_key_previous: str = ""
     api_key_rotation_grace_seconds: int = 604800
     ws_max_connections: int = 100
+    # How often (seconds) long-lived WS/SSE sessions re-validate their credentials.
+    # Lower = faster revocation, higher = less auth-lookup overhead. 0 disables.
+    stream_auth_recheck_interval_seconds: float = 30.0
     api_key_max_age_days: int = 90
     # Minimum LedgerLens risk score (0-100) required to export a SAR package.
     compliance_sar_min_score: int = 70
@@ -443,6 +446,10 @@ class Settings(BaseSettings):
     grpc_allow_insecure: bool = False
     grpc_max_message_size_bytes: int = 4194304
     grpc_max_batch_wallets: int = 1000
+    # Per-client bounded send buffer for streaming RPCs (messages).
+    grpc_stream_buffer_size: int = 64
+    # Disconnect a streaming client whose buffer stays full this long (seconds).
+    grpc_slow_client_timeout_seconds: float = 10.0
 
     # ── ZK-SNARK Configuration ────────────────────────────────────────────────
     zk_proof_system: str = "sigma"                      # "sigma" | "snark"
@@ -474,6 +481,7 @@ class Settings(BaseSettings):
                      "historical_loader_concurrency", "historical_max_lookback_days",
                      "analyst_lock_timeout_seconds", "analyst_claim_max_active_per_analyst",
                      "grpc_max_workers", "grpc_max_message_size_bytes", "grpc_max_batch_wallets",
+                     "grpc_stream_buffer_size",
                      mode="before", check_fields=False)
     @classmethod
     def must_be_positive(cls, v: object) -> object:

@@ -79,20 +79,20 @@ async def _deliver(
             return True
         except httpx.HTTPStatusError as exc:
             error = f"HTTP {exc.response.status_code}"
-            mark_failed(delivery.id, error, db_path=db_path)
-            result_metric = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            status = mark_failed(delivery.id, error, db_path=db_path)
+            result_metric = "dead_lettered" if status == "dead" else "failed"
             webhook_deliveries_total.labels(result=result_metric).inc()
             return False
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             error = f"{type(exc).__name__}"
-            mark_failed(delivery.id, error, db_path=db_path)
-            result_metric = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            status = mark_failed(delivery.id, error, db_path=db_path)
+            result_metric = "dead_lettered" if status == "dead" else "failed"
             webhook_deliveries_total.labels(result=result_metric).inc()
             return False
         except Exception as exc:
             error = str(exc)[:200]
-            mark_failed(delivery.id, error, db_path=db_path)
-            result_metric = "dead_lettered" if delivery.attempt_count >= 7 else "failed"
+            status = mark_failed(delivery.id, error, db_path=db_path)
+            result_metric = "dead_lettered" if status == "dead" else "failed"
             webhook_deliveries_total.labels(result=result_metric).inc()
             return False
 
