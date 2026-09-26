@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS ensemble_weights_history (
 _MODEL_NAMES_ORDER = ("random_forest", "xgboost", "lightgbm")
 _MAX_DELTA_PER_DAY = 0.1
 _MIN_WEIGHT = 0.1
+_MAX_WEIGHT = 0.6
 _WINDOW_DAYS = 7
 
 
@@ -279,6 +280,7 @@ class AdaptiveReweighter:
         window_days: int = _WINDOW_DAYS,
         max_delta_per_day: float = _MAX_DELTA_PER_DAY,
         min_weight: float = _MIN_WEIGHT,
+        max_weight: float = _MAX_WEIGHT,
         ema_alpha: float = 0.3,
     ) -> None:
         from config.settings import settings as _s
@@ -286,6 +288,11 @@ class AdaptiveReweighter:
         self.window_days = window_days
         self.max_delta = max_delta_per_day
         self.min_weight = min_weight
+        self.max_weight = max_weight
+        if not 0.0 <= min_weight <= max_weight or max_weight > 1.0:
+            raise ValueError("weight bounds must satisfy 0 <= min_weight <= max_weight <= 1")
+        if len(_MODEL_NAMES_ORDER) * min_weight > 1.0:
+            raise ValueError("min_weight is too high for the number of models")
         self.ema_alpha = ema_alpha
         self._tracker = ModelPerformanceTracker(window_days)
         self._weights: dict[str, float] = {m: 1.0 / 3 for m in _MODEL_NAMES_ORDER}
@@ -307,9 +314,14 @@ class AdaptiveReweighter:
         ).fetchone()
         conn.close()
         if row:
-            loaded = json.loads(row[0])
-            if set(loaded) == set(_MODEL_NAMES_ORDER):
-                self._weights = loaded
+            try:
+                loaded = json.loads(row[0])
+                if set(loaded) == set(_MODEL_NAMES_ORDER):
+                    self._weights = self._project_weights(
+                        {m: float(loaded[m]) for m in _MODEL_NAMES_ORDER}
+                    )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("Ignoring invalid persisted ensemble weights")
 
     def current_weights(self) -> dict[str, float]:
         return dict(self._weights)
@@ -351,9 +363,39 @@ class AdaptiveReweighter:
             new = new_weights[model]
             delta = max(-self.max_delta, min(self.max_delta, new - old))
             clamped[model] = max(self.min_weight, old + delta)
-        # Renormalise to sum=1
-        total = sum(clamped.values())
-        return {m: w / total for m, w in clamped.items()}
+        return self._project_weights(clamped)
+
+    def _project_weights(self, weights: dict[str, float]) -> dict[str, float]:
+        """Project weights onto a bounded simplex.
+
+        Normalising alone can violate a floor or ceiling.  This water-filling
+        projection keeps every model inside the configured hard bounds even
+        when feedback is adversarial or persisted state is malformed.
+        """
+        projected = {
+            model: min(self.max_weight, max(self.min_weight, float(weights[model]))
+                       if np.isfinite(float(weights[model])) else self.min_weight)
+            for model in _MODEL_NAMES_ORDER
+        }
+        for _ in range(len(_MODEL_NAMES_ORDER) + 1):
+            deficit = 1.0 - sum(projected.values())
+            if abs(deficit) < 1e-12:
+                break
+            adjustable = [
+                model for model in _MODEL_NAMES_ORDER
+                if (deficit > 0 and projected[model] < self.max_weight)
+                or (deficit < 0 and projected[model] > self.min_weight)
+            ]
+            if not adjustable:
+                break
+            share = deficit / len(adjustable)
+            for model in adjustable:
+                projected[model] = min(
+                    self.max_weight,
+                    max(self.min_weight, projected[model] + share),
+                )
+        total = sum(projected.values())
+        return {model: projected[model] / total for model in _MODEL_NAMES_ORDER}
 
     def update_weights(self) -> dict[str, float]:
         """Recompute weights from recent feedback and persist to SQLite."""

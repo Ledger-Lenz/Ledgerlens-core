@@ -13,6 +13,7 @@ from detection.adaptive_reweighter import (
     save_state,
 )
 from detection.feedback_store import ScoringFeedback, record_feedback
+from detection.adaptive_reweighter import AdaptiveReweighter
 
 
 def _fb(model_name: str, prob: float, label: int, db_path: str) -> None:
@@ -148,3 +149,18 @@ def test_integration_weights_shift_toward_better_classifier(tmp_path):
         f"xgb weight {weights['xgboost']:.3f} after 2 update cycles"
     )
     assert weights["random_forest"] > weights["lightgbm"]
+
+
+def test_adaptive_weights_remain_inside_hard_bounds(tmp_path):
+    rw = AdaptiveReweighter(db_path=str(tmp_path / "weights.db"), ema_alpha=1.0)
+    rw._weights = {"random_forest": 0.6, "xgboost": 0.2, "lightgbm": 0.2}
+    projected = rw._project_weights(
+        {"random_forest": 10.0, "xgboost": -4.0, "lightgbm": float("nan")}
+    )
+    assert sum(projected.values()) == pytest.approx(1.0)
+    assert all(0.1 <= weight <= 0.6 for weight in projected.values())
+
+
+def test_invalid_weight_bounds_are_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        AdaptiveReweighter(db_path=str(tmp_path / "weights.db"), min_weight=0.4)
