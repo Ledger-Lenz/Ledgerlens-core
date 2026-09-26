@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
@@ -273,13 +274,18 @@ class DriftDetectorRegistry:
     """
 
     def __init__(self, feature_names, adwin_delta: float = ADWIN_DELTA,
-                 ph_threshold: float = PAGE_HINKLEY_THRESHOLD, ph_delta: float = PAGE_HINKLEY_DELTA):
+                 ph_threshold: float = PAGE_HINKLEY_THRESHOLD, ph_delta: float = PAGE_HINKLEY_DELTA,
+                 retrain_callback=None):
         self._feature_names = list(feature_names)
         self._adwin = {f: ADWINDriftDetector(delta=adwin_delta) for f in self._feature_names}
         self._ph = {f: PageHinkleyDetector(delta=ph_delta, threshold=ph_threshold) for f in self._feature_names}
         self.last_drifted_features: list[str] = []
         self.last_event_at: Optional[str] = None
         self._last_detection_width: Optional[int] = None
+        self._retrain_callback = retrain_callback
+        self._retrain_lock = threading.Lock()
+        self._retraining_in_flight = False
+        self.last_retraining_requested_at: Optional[str] = None
 
     def observe(self, feature_vector: dict) -> list[dict]:
         """Update every known feature's detectors with one observation.
@@ -308,6 +314,7 @@ class DriftDetectorRegistry:
             self.last_event_at = datetime.now(timezone.utc).isoformat()
             self._last_detection_width = max(self._adwin[f].width for f in self.last_drifted_features)
             self._emit_drift_event(fired)
+            self._request_retraining(fired)
         return fired
 
     def is_active(self, cooldown_observations: int = DRIFT_ACTIVE_COOLDOWN_OBSERVATIONS) -> bool:
@@ -341,6 +348,34 @@ class DriftDetectorRegistry:
         except Exception:
             logger.exception("Failed to enqueue drift.detected webhook")
 
+    def _request_retraining(self, fired: list[dict]) -> None:
+        """Start one asynchronous retraining pipeline run for this drift event."""
+        if self._retrain_callback is None:
+            return
+        with self._retrain_lock:
+            if self._retraining_in_flight:
+                logger.info("Retraining already in flight; coalescing drift event")
+                return
+            self._retraining_in_flight = True
+            self.last_retraining_requested_at = datetime.now(timezone.utc).isoformat()
+
+        def run() -> None:
+            try:
+                self._retrain_callback(
+                    {
+                        "event": "drift.detected",
+                        "features": fired,
+                        "timestamp": self.last_retraining_requested_at,
+                    }
+                )
+            except Exception:
+                logger.exception("Drift-triggered retraining pipeline failed")
+            finally:
+                with self._retrain_lock:
+                    self._retraining_in_flight = False
+
+        threading.Thread(target=run, name="drift-retraining", daemon=True).start()
+
     def state(self) -> dict:
         """JSON-serialisable snapshot of every detector's state, for `/health/drift`."""
         features = {}
@@ -365,6 +400,8 @@ class DriftDetectorRegistry:
             "drift_active": self.is_active(),
             "last_drifted_features": self.last_drifted_features,
             "last_event_at": self.last_event_at,
+            "retraining_in_flight": self._retraining_in_flight,
+            "last_retraining_requested_at": self.last_retraining_requested_at,
             "config": {
                 "adwin_delta": ADWIN_DELTA,
                 "page_hinkley_threshold": PAGE_HINKLEY_THRESHOLD,
@@ -384,5 +421,16 @@ def get_drift_registry() -> DriftDetectorRegistry:
     if _registry is None:
         from detection.feature_engineering import FEATURE_NAMES
 
-        _registry = DriftDetectorRegistry(FEATURE_NAMES)
+        def request_retraining(_event: dict) -> None:
+            # Keep scoring latency independent from the training pipeline.
+            from cli import retrain_check
+
+            retrain_check(
+                psi_threshold=0.20,
+                min_drifted_features=3,
+                force_retrain=False,
+                force_promote=False,
+            )
+
+        _registry = DriftDetectorRegistry(FEATURE_NAMES, retrain_callback=request_retraining)
     return _registry
