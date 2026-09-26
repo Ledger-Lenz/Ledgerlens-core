@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import random
@@ -34,7 +35,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -73,6 +74,107 @@ def _write_checksum(model_path: str) -> None:
     with open(checksum_path, "w") as f:
         f.write(checksum + "\n")
     logger.info("Checksum written to %s", checksum_path)
+
+
+def _save_gnn_training_checkpoint(
+    checkpoint_dir: str | os.PathLike[str],
+    *,
+    epoch: int,
+    global_step: int,
+    encoder,
+    classifier,
+    optimizer,
+    best_val_auc: float,
+    best_state: dict | None,
+    patience_counter: int,
+    dataset_fingerprint: str,
+    training_config: dict,
+    current_mlflow_run_id: str | None,
+    original_mlflow_run_id: str | None,
+    resumed: bool,
+) -> Path:
+    import torch
+
+    checkpoint_path = Path(checkpoint_dir) / f"gnn_ring_detector_epoch_{epoch:04d}.pt"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "model_type": "gnn_ring_detector",
+        "checkpoint_identifier": checkpoint_path.name,
+        "checkpoint_path": str(checkpoint_path),
+        "epoch": epoch,
+        "global_step": global_step,
+        "encoder_state_dict": encoder.state_dict(),
+        "classifier_state_dict": classifier.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_auc": best_val_auc,
+        "best_state": best_state,
+        "patience_counter": patience_counter,
+        "dataset_fingerprint": dataset_fingerprint,
+        "training_config": training_config,
+        "python_rng_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "current_mlflow_run_id": current_mlflow_run_id,
+        "original_mlflow_run_id": original_mlflow_run_id,
+        "resumed": resumed,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temporary_path = checkpoint_path.with_suffix(".tmp")
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+
+    if current_mlflow_run_id:
+        from detection.mlflow_tracker import log_checkpoint_metadata
+
+        log_checkpoint_metadata(
+            {
+                "model": "gnn_ring_detector",
+                "current_mlflow_run_id": current_mlflow_run_id,
+                "original_mlflow_run_id": original_mlflow_run_id,
+                "resumed": resumed,
+                "best_val_auc": best_val_auc,
+                "dataset_fingerprint": dataset_fingerprint,
+            },
+            checkpoint_path=str(checkpoint_path),
+            epoch=epoch,
+            step=global_step,
+        )
+    logger.info("Saved resumable GNN checkpoint to %s", checkpoint_path)
+    return checkpoint_path
+
+
+def _read_gnn_training_checkpoint(checkpoint_path: str | os.PathLike[str]) -> dict:
+    import torch
+
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError(f"Could not load GNN training checkpoint {checkpoint_path}: {exc}") from exc
+
+    required = {
+        "epoch",
+        "global_step",
+        "encoder_state_dict",
+        "classifier_state_dict",
+        "optimizer_state_dict",
+        "best_val_auc",
+        "best_state",
+        "patience_counter",
+        "dataset_fingerprint",
+        "training_config",
+        "python_rng_state",
+        "torch_rng_state",
+    }
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Invalid GNN training checkpoint {checkpoint_path}: expected a mapping")
+    if checkpoint.get("format_version") != 1 or checkpoint.get("model_type") != "gnn_ring_detector":
+        raise ValueError(f"Invalid GNN training checkpoint {checkpoint_path}: unsupported format or model")
+    missing = required.difference(checkpoint)
+    if missing:
+        raise ValueError(
+            f"Invalid GNN training checkpoint {checkpoint_path}: missing {', '.join(sorted(missing))}"
+        )
+    return checkpoint
 
 
 def _load_labels(db_path: str, neg_sample_ratio: int) -> tuple[list[str], list[str]]:
@@ -126,6 +228,7 @@ def _load_labels(db_path: str, neg_sample_ratio: int) -> tuple[list[str], list[s
             negatives = []
 
         # Downsample negatives
+        negatives.sort()
         n_neg = len(positives) * neg_sample_ratio
         if len(negatives) > n_neg:
             negatives = random.sample(negatives, n_neg)
@@ -141,7 +244,7 @@ def _make_dummy_trades(wallets: list[str], n_trades: int = 50) -> list:
     from types import SimpleNamespace
 
     trades = []
-    now_ts = datetime.now(timezone.utc).timestamp()
+    now_ts = 1_700_000_000.0
     for i in range(n_trades):
         src = random.choice(wallets)
         dst = random.choice(wallets)
@@ -163,14 +266,25 @@ def _default_node_feature_fn(wallet: str):
     """Simple hash-based node feature vector (4-dim)."""
     import torch
 
-    h = abs(hash(wallet)) % 10000
+    h = int.from_bytes(hashlib.sha256(wallet.encode()).digest()[:4], "big") % 10000
     return torch.tensor(
         [h / 10000.0, len(wallet) / 60.0, float(wallet.startswith("G")), 0.0],
         dtype=torch.float,
     )
 
 
-def train(
+def _default_asset_feature_fn(asset_pair: str):
+    """Return stable asset features for reproducible heterogeneous resumes."""
+    import torch
+
+    h = int.from_bytes(hashlib.sha256(asset_pair.encode()).digest()[:4], "big") % 10000
+    return torch.tensor(
+        [h / 10000.0, len(asset_pair) / 40.0, 0.0, 0.0],
+        dtype=torch.float,
+    )
+
+
+def _train(
     db_path: str,
     model_path: str,
     epochs: int = 50,
@@ -184,6 +298,13 @@ def train(
     dropout: float = 0.3,
     graph_mode: str = "homogeneous",
     conv_type: str = "sage",
+    checkpoint_dir: str = "checkpoints",
+    checkpoint_every: int = 1,
+    seed: int = 42,
+    checkpoint: dict | None = None,
+    current_mlflow_run_id: str | None = None,
+    original_mlflow_run_id: str | None = None,
+    resumed: bool = False,
 ):
     """Full training loop for GNNRingDetector.
 
@@ -227,8 +348,16 @@ def train(
         HeteroGraphSAGEEncoder,
         build_heterogeneous_graph,
     )
+    from detection.mlflow_tracker import log_artifact, log_metrics
+
+    if checkpoint_every < 1:
+        raise ValueError("checkpoint_every must be a positive integer")
+    random.seed(seed)
+    torch.manual_seed(seed)
 
     positives, negatives = _load_labels(db_path, neg_sample_ratio)
+    positives = sorted(positives)
+    negatives = sorted(negatives)
     all_wallets = positives + negatives
 
     if len(all_wallets) < 4:
@@ -238,6 +367,26 @@ def train(
             len(all_wallets),
         )
         sys.exit(1)
+
+    dataset_fingerprint = hashlib.sha256(
+        json.dumps(
+            {"positives": sorted(positives), "negatives": sorted(negatives)},
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    training_config = {
+        "lr": lr,
+        "neg_sample_ratio": neg_sample_ratio,
+        "patience": patience,
+        "val_fraction": val_fraction,
+        "hidden_channels": hidden_channels,
+        "out_channels": out_channels,
+        "num_layers": num_layers,
+        "dropout": dropout,
+        "graph_mode": graph_mode,
+        "conv_type": conv_type,
+        "seed": seed,
+    }
 
     # Shuffle and split
     combined = [(w, 1) for w in positives] + [(w, 0) for w in negatives]
@@ -252,12 +401,16 @@ def train(
     logger.info("Train: %d wallets | Val: %d wallets", len(train_wallets), len(val_wallets))
 
     # Build graphs
-    all_trades = _make_dummy_trades(list(set(train_wallets + val_wallets)), n_trades=500)
+    all_trades = _make_dummy_trades(
+        sorted(set(train_wallets + val_wallets)), n_trades=500
+    )
 
+    encoder: Any
     if graph_mode == "heterogeneous":
         full_graph = build_heterogeneous_graph(
             trades=all_trades,
             node_feature_fn=_default_node_feature_fn,
+            asset_feature_fn=_default_asset_feature_fn,
         )
     else:
         full_graph = build_transaction_graph(all_trades, _default_node_feature_fn)
@@ -316,8 +469,33 @@ def train(
     best_val_auc = -1.0
     patience_counter = 0
     best_state: Optional[dict] = None
+    start_epoch = 1
+    global_step = 0
 
-    for epoch in range(1, epochs + 1):
+    if checkpoint is not None:
+        if checkpoint["dataset_fingerprint"] != dataset_fingerprint:
+            raise ValueError("Resume checkpoint was created from different GNN training labels")
+        if checkpoint["training_config"] != training_config:
+            raise ValueError("Resume checkpoint does not match the current GNN training configuration")
+        start_epoch = int(checkpoint["epoch"]) + 1
+        global_step = int(checkpoint["global_step"])
+        best_val_auc = float(checkpoint["best_val_auc"])
+        best_state = checkpoint["best_state"]
+        patience_counter = int(checkpoint["patience_counter"])
+        encoder.load_state_dict(checkpoint["encoder_state_dict"])
+        classifier.load_state_dict(checkpoint["classifier_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        random.setstate(checkpoint["python_rng_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        logger.info("Resuming GNN training from epoch %d", start_epoch)
+
+    if epochs < start_epoch:
+        raise ValueError(
+            f"--epochs ({epochs}) must be greater than the saved epoch ({start_epoch - 1})"
+        )
+
+    epoch = start_epoch - 1
+    for epoch in range(start_epoch, epochs + 1):
         encoder.train()
         classifier.train()
         optimizer.zero_grad()
@@ -344,6 +522,7 @@ def train(
 
         loss.backward()
         optimizer.step()
+        global_step += 1
 
         # Validation
         encoder.eval()
@@ -362,6 +541,9 @@ def train(
         else:
             val_auc = 0.5
 
+        if current_mlflow_run_id:
+            log_metrics({"train_loss": loss.item(), "validation_auc": val_auc}, step=epoch)
+
         if epoch % 10 == 0 or epoch == 1:
             logger.info(
                 "Epoch %3d/%d — loss=%.4f, val_auc=%.4f",
@@ -371,6 +553,7 @@ def train(
                 val_auc,
             )
 
+        should_stop = False
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             patience_counter = 0
@@ -380,9 +563,29 @@ def train(
             }
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                logger.info("Early stopping at epoch %d (patience=%d).", epoch, patience)
-                break
+            should_stop = patience_counter >= patience
+
+        if epoch % checkpoint_every == 0 or epoch == epochs or should_stop:
+            _save_gnn_training_checkpoint(
+                checkpoint_dir,
+                epoch=epoch,
+                global_step=global_step,
+                encoder=encoder,
+                classifier=classifier,
+                optimizer=optimizer,
+                best_val_auc=best_val_auc,
+                best_state=best_state,
+                patience_counter=patience_counter,
+                dataset_fingerprint=dataset_fingerprint,
+                training_config=training_config,
+                current_mlflow_run_id=current_mlflow_run_id,
+                original_mlflow_run_id=original_mlflow_run_id,
+                resumed=resumed,
+            )
+
+        if should_stop:
+            logger.info("Early stopping at epoch %d (patience=%d).", epoch, patience)
+            break
 
     if best_state is None:
         logger.error("Training produced no valid model state.")
@@ -440,6 +643,93 @@ def train(
     torch.save(checkpoint, model_path)
     _write_checksum(model_path)
     logger.info("Model saved to %s (val_auc=%.4f, mode=%s)", model_path, best_val_auc, graph_mode)
+
+    if current_mlflow_run_id:
+        log_artifact(model_path)
+        log_artifact(model_path.replace(".pt", ".sha256"))
+
+
+def train(
+    db_path: str,
+    model_path: str,
+    epochs: int = 50,
+    lr: float = 0.001,
+    neg_sample_ratio: int = 3,
+    patience: int = 5,
+    val_fraction: float = 0.2,
+    hidden_channels: int = 128,
+    out_channels: int = 64,
+    num_layers: int = 3,
+    dropout: float = 0.3,
+    graph_mode: str = "homogeneous",
+    conv_type: str = "sage",
+    checkpoint_dir: str = "checkpoints",
+    checkpoint_every: int = 1,
+    resume_from_checkpoint: str | None = None,
+    seed: int = 42,
+):
+    from detection.mlflow_tracker import _HAS_MLFLOW, log_hyperparameters, mlflow_run
+
+    checkpoint = (
+        _read_gnn_training_checkpoint(resume_from_checkpoint)
+        if resume_from_checkpoint
+        else None
+    )
+    original_run_id = None
+    if checkpoint is not None:
+        original_run_id = (
+            checkpoint.get("original_mlflow_run_id")
+            or checkpoint.get("current_mlflow_run_id")
+        )
+
+    training_args: dict[str, Any] = {
+        "db_path": db_path,
+        "model_path": model_path,
+        "epochs": epochs,
+        "lr": lr,
+        "neg_sample_ratio": neg_sample_ratio,
+        "patience": patience,
+        "val_fraction": val_fraction,
+        "hidden_channels": hidden_channels,
+        "out_channels": out_channels,
+        "num_layers": num_layers,
+        "dropout": dropout,
+        "graph_mode": graph_mode,
+        "conv_type": conv_type,
+        "checkpoint_dir": checkpoint_dir,
+        "checkpoint_every": checkpoint_every,
+        "seed": seed,
+        "checkpoint": checkpoint,
+        "resumed": checkpoint is not None,
+    }
+
+    if not _HAS_MLFLOW:
+        return _train(
+            **training_args,
+            original_mlflow_run_id=original_run_id,
+        )
+
+    with mlflow_run(
+        experiment_name="gnn-ring-detector-training",
+        parent_run_id=original_run_id,
+    ) as current_run_id:
+        log_hyperparameters(
+            {
+                "model": "gnn_ring_detector",
+                "epochs": epochs,
+                "learning_rate": lr,
+                "graph_mode": graph_mode,
+                "conv_type": conv_type,
+                "seed": seed,
+                "resumed": checkpoint is not None,
+                "original_mlflow_run_id": original_run_id or "",
+            }
+        )
+        return _train(
+            **training_args,
+            current_mlflow_run_id=current_run_id or None,
+            original_mlflow_run_id=original_run_id or current_run_id or None,
+        )
 
 
 class _HelpFormatter(
@@ -572,6 +862,28 @@ def main():
             "(HGTConv with multi-head attention, more expressive)."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="checkpoints",
+        help="Directory for periodic GNN training checkpoints.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help="Save a checkpoint every N completed training epochs.",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default=None,
+        help="Path to a GNN training checkpoint to resume.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for deterministic splits, graph construction, and training.",
+    )
     args = parser.parse_args()
 
     _check_pyg()
@@ -589,6 +901,10 @@ def main():
         dropout=args.dropout,
         graph_mode=args.graph_mode,
         conv_type=args.conv_type,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every=args.checkpoint_every,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        seed=args.seed,
     )
 
 
