@@ -32,6 +32,49 @@ The circuits are used in two proof systems:
 
 For details on comparing the two approaches, see the table in [docs/zk_snark_range_proof.md](../docs/zk_snark_range_proof.md#comparison-sigma-protocol-vs-zk-snark).
 
+## Trusted Setup Ceremony
+
+The Groth16 backend requires a circuit-specific trusted setup. Because the setup's toxic waste would let anyone forge proofs, the ceremony is run as a **multi-party computation (MPC)** where the setup is only trustworthy if at least one participant honestly discarded their contribution randomness. To make that trust auditable, the ceremony is automated and every contribution is verified and published.
+
+### Running the ceremony
+
+`scripts/setup_trusted_ceremony.sh` drives the ceremony. For each participant it:
+
+1. Generates the participant's contribution from the **prior** ceremony state.
+2. **Verifies the contribution against the prior state before accepting it** — a contribution that fails verification is rejected and the ceremony aborts, so a malformed or malicious contribution can never become part of the final parameters.
+3. Appends the contribution to the transcript and records its checksum.
+
+### Published artifacts
+
+On completion the ceremony publishes versioned, checksummed artifacts under `circuits/artifacts/<version>/`:
+
+| Artifact | Description |
+| --- | --- |
+| `transcript.json` | Ordered list of contributions with per-contribution checksums |
+| `final.zkey` | Final proving key (the ceremony output) |
+| `verification_key.json` | Verification key derived from the final parameters |
+| `attestation.json` | Signed attestation binding the artifact checksums to the ceremony version |
+| `SHA256SUMS` | Checksums of every published artifact |
+
+Each artifact is checksummed and the attestation is signed, so downstream users can confirm the parameters they consume are exactly the ones the ceremony produced.
+
+### Auditing the ceremony (third-party verification)
+
+External parties do **not** need to trust this repository. They can independently re-verify the published artifacts:
+
+```sh
+# Verify the published transcript, final parameters, and signatures/checksums
+scripts/verify_trusted_ceremony.sh circuits/artifacts/<version>/
+```
+
+The verification script:
+
+1. Re-checks every contribution in `transcript.json` against the prior state (the same per-contribution check the ceremony enforces).
+2. Verifies the final parameters against the transcript.
+3. Verifies the artifact checksums in `SHA256SUMS` and the signature on `attestation.json`.
+
+It exits non-zero on any mismatch, so it can be wired into a downstream CI job to gate on a specific ceremony version.
+
 ## Negative Test Vectors
 
 The circuit test suite (`circuits/test/score_range_proof.test.js`) includes negative test vectors that **must fail** proof generation or verification. These guard against under-constrained signals that would otherwise let an invalid witness produce a valid proof.
