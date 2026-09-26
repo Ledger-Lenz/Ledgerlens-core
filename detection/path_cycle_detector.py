@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import heapq
 import logging
+import time
 
 import networkx as nx
 import pandas as pd
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_CYCLE_LENGTH = 6
 DEFAULT_MAX_TIME_WINDOW = pd.Timedelta(hours=24)
 DEFAULT_MAX_COMPONENT_SIZE = 12
+DEFAULT_MAX_CYCLE_SEARCH_SECONDS = 5.0
+DEFAULT_MAX_CYCLES = 10_000
 
 
 def path_payments_to_frame(payments: list[PathPayment]) -> pd.DataFrame:
@@ -145,6 +148,8 @@ def detect_path_payment_cycles(
     max_time_window: pd.Timedelta = DEFAULT_MAX_TIME_WINDOW,
     min_cycle_xlm: float = 0.0,
     max_component_size: int = DEFAULT_MAX_COMPONENT_SIZE,
+    max_cycle_search_seconds: float | None = DEFAULT_MAX_CYCLE_SEARCH_SECONDS,
+    max_cycles: int | None = DEFAULT_MAX_CYCLES,
 ) -> list[dict]:
     """Return closed path-payment cycles over the expanded account graph.
 
@@ -168,14 +173,29 @@ def detect_path_payment_cycles(
     unbounded enumeration. Real wash rings are small by construction (compare
     `graph_engine.find_wash_rings`'s `max_ring_size`, default 10), so this
     bound is not expected to affect realistic detections.
+    The search is also bounded by both a wall-clock budget and a maximum
+    number of enumerated cycles, so dense components cannot starve callers.
     """
     if max_cycle_length < 2:
         raise ValueError("max_cycle_length must be at least 2")
+    if max_cycle_search_seconds is not None and max_cycle_search_seconds < 0:
+        raise ValueError("max_cycle_search_seconds must be non-negative")
+    if max_cycles is not None and max_cycles < 1:
+        raise ValueError("max_cycles must be at least 1")
 
     cycles: list[dict] = []
     seen: set[frozenset[str]] = set()
+    started_at = time.monotonic()
+    enumerated_cycles = 0
+    budget_exhausted = False
 
     for component in nx.strongly_connected_components(graph):
+        if (
+            max_cycle_search_seconds is not None
+            and time.monotonic() - started_at >= max_cycle_search_seconds
+        ) or (max_cycles is not None and enumerated_cycles >= max_cycles):
+            budget_exhausted = True
+            break
         if len(component) < 2:
             continue
         if root_accounts is not None and not (component & root_accounts):
@@ -193,6 +213,13 @@ def detect_path_payment_cycles(
 
         subgraph = graph.subgraph(component)
         for node_cycle in nx.simple_cycles(subgraph, length_bound=max_cycle_length):
+            if (
+                max_cycle_search_seconds is not None
+                and time.monotonic() - started_at > max_cycle_search_seconds
+            ) or (max_cycles is not None and enumerated_cycles >= max_cycles):
+                budget_exhausted = True
+                break
+            enumerated_cycles += 1
             if len(node_cycle) < 2:
                 continue
             if root_accounts is not None and not (set(node_cycle) & root_accounts):
@@ -239,6 +266,17 @@ def detect_path_payment_cycles(
                     ],
                 }
             )
+        if budget_exhausted:
+            break
+
+    if budget_exhausted:
+        logger.warning(
+            "Stopped path-payment cycle search at budget (%s seconds, %s cycles); "
+            "returning %d detected cycles",
+            max_cycle_search_seconds if max_cycle_search_seconds is not None else "unlimited",
+            max_cycles if max_cycles is not None else "unlimited",
+            len(cycles),
+        )
 
     return sorted(cycles, key=lambda c: c["cycle_value_xlm"], reverse=True)
 
@@ -250,6 +288,8 @@ def detect_cycles_from_payments(
     max_time_window: pd.Timedelta = DEFAULT_MAX_TIME_WINDOW,
     min_cycle_xlm: float = 0.0,
     max_component_size: int = DEFAULT_MAX_COMPONENT_SIZE,
+    max_cycle_search_seconds: float | None = DEFAULT_MAX_CYCLE_SEARCH_SECONDS,
+    max_cycles: int | None = DEFAULT_MAX_CYCLES,
 ) -> list[dict]:
     """Convenience wrapper: build the graph and detect cycles in one call."""
     graph = build_path_payment_graph(payments)
@@ -260,6 +300,8 @@ def detect_cycles_from_payments(
         max_time_window=max_time_window,
         min_cycle_xlm=min_cycle_xlm,
         max_component_size=max_component_size,
+        max_cycle_search_seconds=max_cycle_search_seconds,
+        max_cycles=max_cycles,
     )
 
 

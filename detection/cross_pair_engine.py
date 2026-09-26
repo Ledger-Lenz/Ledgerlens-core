@@ -11,6 +11,24 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
+from scipy.stats import t as student_t
+
+
+def _benjamini_hochberg(p_values: np.ndarray, alpha: float) -> np.ndarray:
+    """Return which hypotheses survive the Benjamini-Hochberg FDR procedure."""
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError("fdr_alpha must be in (0, 1]")
+    if p_values.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    order = np.argsort(p_values)
+    thresholds = alpha * (np.arange(1, len(p_values) + 1) / len(p_values))
+    passing = p_values[order] <= thresholds
+    if not passing.any():
+        return np.zeros(len(p_values), dtype=bool)
+    largest_passing_rank = np.flatnonzero(passing)[-1]
+    cutoff = p_values[order[largest_passing_rank]]
+    return p_values <= cutoff
 
 
 def build_volume_time_series(
@@ -85,6 +103,7 @@ def find_correlated_pairs(
     correlation_threshold: float = 0.75,
     min_active_buckets: int = 10,
     method: str = "spearman",
+    fdr_alpha: float = 0.05,
 ) -> list[tuple[str, str, float]]:
     """Return (pair_A, pair_B, correlation_r) for pairs whose volume time
     series are correlated above `correlation_threshold`.
@@ -93,10 +112,14 @@ def find_correlated_pairs(
     considered. Uses Spearman rank correlation by default to avoid false
     positives from heavy-tailed outlier trades.
 
-    `method` must be "spearman" (default) or "pearson_winsorized".
+    `method` must be "spearman" (default) or "pearson_winsorized". Pairwise
+    significance tests are corrected with Benjamini-Hochberg at `fdr_alpha`
+    before a pair is returned.
     """
     if volume_matrix.empty or volume_matrix.shape[1] < 2:
         return []
+    if not 0.0 < fdr_alpha <= 1.0:
+        raise ValueError("fdr_alpha must be in (0, 1]")
 
     active_pairs = [
         col for col in volume_matrix.columns
@@ -127,13 +150,30 @@ def find_correlated_pairs(
     X /= norms
     C = X.T @ X  # shape (P, P)
 
-    results: list[tuple[str, str, float]] = []
+    pair_indices: list[tuple[int, int]] = []
+    correlations: list[float] = []
     n = len(active_pairs)
     for i in range(n):
         for j in range(i + 1, n):
             r = float(C[i, j])
-            if r >= correlation_threshold:
-                results.append((active_pairs[i], active_pairs[j], r))
+            pair_indices.append((i, j))
+            correlations.append(r)
+
+    # Test every pair before correction so adding unrelated pairs cannot
+    # silently inflate the number of uncorrected discoveries.
+    n_observations = X.shape[0]
+    correlations_array = np.asarray(correlations)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_statistics = correlations_array * np.sqrt(
+            (n_observations - 2) / np.maximum(1.0 - correlations_array**2, np.finfo(float).eps)
+        )
+    p_values = 2.0 * student_t.sf(np.abs(t_statistics), max(n_observations - 2, 1))
+    significant = _benjamini_hochberg(p_values, fdr_alpha)
+
+    results: list[tuple[str, str, float]] = []
+    for (i, j), r, is_significant in zip(pair_indices, correlations, significant):
+        if r >= correlation_threshold and is_significant:
+            results.append((active_pairs[i], active_pairs[j], r))
 
     return results
 
