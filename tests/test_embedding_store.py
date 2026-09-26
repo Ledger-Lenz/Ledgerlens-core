@@ -82,3 +82,22 @@ def test_get_latest_model_version(store):
         datetime(2025, 1, 2, tzinfo=timezone.utc)
     )
     assert store.get_latest_model_version() == "gnn_v2"
+
+
+def test_index_snapshot_tracks_revision_and_active_model_version(store):
+    assert store.get_index_snapshot() == (None, 0, [])
+
+    store.upsert_embedding("GABC", "gnn_v1", np.array([1.0, 2.0]))
+    version, revision, embeddings = store.get_index_snapshot()
+    assert version == "gnn_v1"
+    assert revision == 1
+    assert [wallet for wallet, _ in embeddings] == ["GABC"]
+
+    store.upsert_embedding("GABC", "gnn_v2", np.array([3.0, 4.0]))
+    version, revision, embeddings = store.get_index_snapshot()
+    assert version == "gnn_v2"
+    assert revision == 2
+    assert [wallet for wallet, _ in embeddings] == ["GABC"]
+
+    store.delete_embedding("GABC", "gnn_v1")
+    assert store.get_revision() == 3

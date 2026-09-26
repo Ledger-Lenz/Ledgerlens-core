@@ -43,6 +43,15 @@ class EmbeddingStore:
                 CREATE INDEX IF NOT EXISTS idx_wallet_embeddings_version
                 ON wallet_embeddings (model_version)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS embedding_store_metadata (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )
+            """)
+            conn.execute(
+                "INSERT OR IGNORE INTO embedding_store_metadata (key, value) VALUES ('revision', 0)"
+            )
 
     def upsert_embedding(
         self,
@@ -69,6 +78,9 @@ class EmbeddingStore:
                 INSERT OR REPLACE INTO wallet_embeddings (wallet, model_version, embedding, computed_at)
                 VALUES (?, ?, ?, ?)
             """, (wallet, model_version, embedding_bytes, computed_at_str))
+            conn.execute(
+                "UPDATE embedding_store_metadata SET value = value + 1 WHERE key = 'revision'"
+            )
 
     def get_embedding(self, wallet: str, model_version: str) -> tuple[np.ndarray, datetime] | None:
         """Retrieve a wallet's embedding and its computed timestamp, or None if not found."""
@@ -112,10 +124,14 @@ class EmbeddingStore:
     def delete_embedding(self, wallet: str, model_version: str) -> None:
         """Delete an embedding."""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "DELETE FROM wallet_embeddings WHERE wallet = ? AND model_version = ?",
                 (wallet, model_version),
             )
+            if cursor.rowcount:
+                conn.execute(
+                    "UPDATE embedding_store_metadata SET value = value + 1 WHERE key = 'revision'"
+                )
 
     def get_latest_model_version(self) -> str | None:
         """Get the latest model version (most recent computed_at timestamp)."""
@@ -125,3 +141,36 @@ class EmbeddingStore:
             )
             row = cursor.fetchone()
             return row[0] if row else None
+
+    def get_index_snapshot(self) -> tuple[str | None, int, list[tuple[str, np.ndarray]]]:
+        """Return a consistent model-versioned snapshot for building an ANN index."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN")
+            revision = conn.execute(
+                "SELECT value FROM embedding_store_metadata WHERE key = 'revision'"
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT model_version FROM wallet_embeddings ORDER BY computed_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None, revision, []
+
+            model_version = row[0]
+            embeddings = [
+                (wallet, np.frombuffer(blob, dtype=np.float32))
+                for wallet, blob in conn.execute(
+                    """
+                    SELECT wallet, embedding FROM wallet_embeddings
+                    WHERE model_version = ? ORDER BY wallet
+                    """,
+                    (model_version,),
+                )
+            ]
+            return model_version, revision, embeddings
+
+    def get_revision(self) -> int:
+        """Return the monotonically increasing embedding-store revision."""
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                "SELECT value FROM embedding_store_metadata WHERE key = 'revision'"
+            ).fetchone()[0]

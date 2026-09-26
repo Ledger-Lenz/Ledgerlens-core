@@ -56,7 +56,9 @@ class FaissVectorIndex:
             raise RuntimeError("FAISS is not installed. Install with: pip install faiss-cpu")
 
         self.dim = dim or settings.vector_index_dim
-        self.backend = backend or settings.vector_index_backend
+        backend = backend or settings.vector_index_backend
+        aliases = {"faiss_flat": "flat", "faiss_ivf": "ivf"}
+        self.backend = aliases.get(backend, backend)
         self.ivf_threshold = ivf_threshold or settings.vector_index_ivf_threshold
 
         self._index: Optional[faiss.Index] = None
@@ -66,13 +68,12 @@ class FaissVectorIndex:
         self._initialize_index()
 
     def _initialize_index(self) -> None:
-        if self.backend == "faiss_flat":
+        if self.backend == "flat":
             self._index = faiss.IndexFlatIP(self.dim)
-        elif self.backend == "faiss_ivf":
-            # Use IVF with nlist=100 (a reasonable default)
+        elif self.backend == "ivf":
             quantizer = faiss.IndexFlatIP(self.dim)
-            self._index = faiss.IndexIVFFlat(quantizer, self.dim, 100)
-            self._index.nprobe = 10  # Search 10 out of 100 clusters
+            self._index = faiss.IndexIVFFlat(quantizer, self.dim, 1)
+            self._index.nprobe = 1
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
 
@@ -84,29 +85,28 @@ class FaissVectorIndex:
             raise ValueError("Vectors must be a 2D array")
         if vectors.shape[1] != self.dim:
             raise ValueError(f"Vector dimension mismatch: expected {self.dim}, got {vectors.shape[1]}")
+        if len(wallets) != len(vectors):
+            raise ValueError("Wallet count must match vector count")
 
         # Normalize vectors for inner product (which then equals cosine similarity)
-        vectors = vectors.astype(np.float32)
+        vectors = vectors.astype(np.float32, copy=True)
         faiss.normalize_L2(vectors)
 
         # Check if we need to switch to IVF
         if (
-            self.backend == "faiss_flat"
+            self.backend == "flat"
             and len(self._wallet_list) + len(wallets) > self.ivf_threshold
         ):
             logger.info(f"Switching from flat to IVF index (threshold: {self.ivf_threshold})")
-            self.backend = "faiss_ivf"
-            # Rebuild the index
+            self.backend = "ivf"
             all_wallets = self._wallet_list + wallets
             all_vectors = (
                 np.vstack([self._get_all_vectors(), vectors]) if self._wallet_list else vectors
             )
-            self.clear()
-            self._initialize_index()
+            self._initialize_ivf(len(all_vectors))
             self._wallet_list = all_wallets
             self._wallet_to_idx = {w: i for i, w in enumerate(all_wallets)}
-            if not self._index.is_trained:
-                self._index.train(all_vectors)
+            self._index.train(all_vectors)
             self._index.add(all_vectors)
             return
 
@@ -117,15 +117,22 @@ class FaissVectorIndex:
             self._wallet_to_idx[wallet] = start_idx + i
 
         if not self._index.is_trained and isinstance(self._index, faiss.IndexIVFFlat):
+            self._initialize_ivf(len(vectors))
             self._index.train(vectors)
         self._index.add(vectors)
 
+    def _initialize_ivf(self, sample_count: int) -> None:
+        if sample_count < 39:
+            self._index = faiss.IndexFlatIP(self.dim)
+            return
+        nlist = min(100, max(1, sample_count // 39))
+        quantizer = faiss.IndexFlatIP(self.dim)
+        self._index = faiss.IndexIVFFlat(quantizer, self.dim, nlist)
+        self._index.nprobe = min(10, nlist)
+
     def _get_all_vectors(self) -> np.ndarray:
-        if self.backend == "faiss_flat" and hasattr(self._index, "xb"):
-            return faiss.vector_to_array(self._index.xb).reshape(-1, self.dim)
-        # For IVF, we can't easily get all vectors, so we just return an empty array
-        # (this method is only used when switching from flat to IVF, which only happens
-        # when the index was originally flat)
+        if isinstance(self._index, faiss.IndexFlat):
+            return self._index.reconstruct_n(0, self._index.ntotal)
         return np.empty((0, self.dim), dtype=np.float32)
 
     def search(self, vector: np.ndarray, k: int) -> List[Tuple[str, float]]:
@@ -167,7 +174,7 @@ def create_vector_index(
     """Create a vector index based on settings."""
     backend = backend or settings.vector_index_backend
 
-    if backend in ("faiss_flat", "faiss_ivf"):
+    if backend in ("faiss_flat", "faiss_ivf", "flat", "ivf"):
         return FaissVectorIndex(dim=dim, backend=backend, ivf_threshold=ivf_threshold)
     elif backend == "pgvector":
         raise NotImplementedError("pgvector backend is not yet implemented")

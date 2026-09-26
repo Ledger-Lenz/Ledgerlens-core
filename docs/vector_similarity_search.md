@@ -90,6 +90,14 @@ GNN_SIMILARITY_RATE_LIMIT_PER_MINUTE=10
 | `EMBEDDING_STORE_PATH` | Path to SQLite database for embeddings. |
 | `GNN_SIMILARITY_RATE_LIMIT_PER_MINUTE` | Rate limit for similarity queries (lower than general API limit for security). |
 
+The API indexes embeddings for one model version at a time. A model-version
+change or any embedding insert, update, or delete triggers an index rebuild
+before the next similarity query. `VECTOR_INDEX_REFRESH_SECONDS` is a fallback
+refresh interval (also covering changes made outside `EmbeddingStore`); set it
+to a positive number to bound how long such external changes can remain stale.
+Each SQLite snapshot records a monotonically increasing revision so index
+rebuilds use a consistent model version and embedding set.
+
 ## Security Considerations
 
 1. **No raw embeddings exposed**: The API only returns wallet addresses and similarity scores, never raw embedding vectors.

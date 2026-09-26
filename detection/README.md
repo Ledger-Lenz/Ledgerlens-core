@@ -58,8 +58,8 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 |------|-------------|
 | `gnn_ring_detector.py` | Graph neural network classifier that scores wash-trading ring membership directly from the trade graph |
 | `gnn_model.py` | GNN model architecture (message-passing layers and readout head) |
-| `embedding_store.py` | SQLite-backed store for GNN wallet embeddings with model version and timestamp metadata |
-| `vector_index.py` | FAISS approximate nearest-neighbour index for global similarity search across all stored wallet embeddings |
+| `embedding_store.py` | SQLite-backed store for GNN wallet embeddings with model version, timestamp, and change revision metadata |
+| `vector_index.py` | FAISS approximate nearest-neighbour index for global similarity search; rebuilt immediately when the embedding store revision or model version changes, and periodically as a fallback |
 
 → See [`../docs/gnn_ring_detection.md`](../docs/gnn_ring_detection.md)
 

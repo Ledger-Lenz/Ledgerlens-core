@@ -66,6 +66,32 @@ def _make_robustness_df() -> pd.DataFrame:
     return df
 
 
+def test_similarity_index_rebuilds_on_model_version_change(tmp_path, monkeypatch):
+    from api import main as api_main
+    from config.settings import settings
+    from detection.embedding_store import EmbeddingStore
+
+    monkeypatch.setattr(settings, "embedding_store_path", str(tmp_path / "embeddings.db"))
+    monkeypatch.setattr(api_main, "_embedding_store", None)
+    monkeypatch.setattr(api_main, "_vector_index", None)
+    monkeypatch.setattr(api_main, "_model_version", None)
+    monkeypatch.setattr(api_main, "_indexed_embedding_revision", None)
+    monkeypatch.setattr(api_main, "_vector_index_refreshed_at", None)
+
+    store = EmbeddingStore()
+    store.upsert_embedding("GABC", "gnn_v1", np.ones(64, dtype=np.float32))
+    api_main._initialize_vector_resources()
+    first_index = api_main._vector_index
+    assert api_main._model_version == "gnn_v1"
+    assert first_index.size() == 1
+
+    store.upsert_embedding("GDEF", "gnn_v2", np.zeros(64, dtype=np.float32))
+    api_main._initialize_vector_resources()
+    assert api_main._model_version == "gnn_v2"
+    assert api_main._vector_index is not first_index
+    assert api_main._vector_index.size() == 1
+
+
 # ---------------------------------------------------------------------------
 # Robustness endpoint tests (admin-key gated, dependency-override pattern)
 # ---------------------------------------------------------------------------
