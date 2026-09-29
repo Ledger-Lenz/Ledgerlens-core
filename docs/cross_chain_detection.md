@@ -193,6 +193,25 @@ See `.env.example` for the full list of EVM settings. Required variables:
 | `EVM_RPC_POLYGON` | JSON-RPC endpoint for Polygon (legacy single-provider) |
 | `EVM_LOOKBACK_BLOCKS` | Number of blocks to look back when fetching events (default: 7200 ≈ 24h) |
 | `EVM_POOL_ADDRESSES` | Comma-separated list of EIP-55 checksummed pool addresses to monitor |
+| `EVM_CONFIRMATION_DEPTH` | Blocks below the head before EVM data is treated as final (default: 12) |
+| `EVM_REORG_CHECK_BLOCKS` | Blocks below the finalized head re-checked for deep reorgs (default: 128) |
+
+### Finality and Reorg Handling
+
+Cross-chain correlation (`detection/cross_chain_correlator.py`) consumes **only
+finalized EVM data**:
+
+1. `EVMTradeLoader.load_trades()` and `BridgeTransferLoader.load_transfers()`
+   only fetch events up to `latest - EVM_CONFIRMATION_DEPTH`; unconfirmed blocks
+   and logs flagged `removed` are never ingested.
+2. Each ingested block hash is tracked by `ingestion/evm_finality.FinalityTracker`.
+   On every run the loaders compare tracked hashes (up to `EVM_REORG_CHECK_BLOCKS`
+   below the finalized head) with the canonical chain.
+3. Blocks whose hash changed were orphaned by a reorg — even one deeper than the
+   confirmation depth. Bridge transfers from those blocks are deleted from
+   `bridge_transfers` (`detection.storage.retract_bridge_transfers`); retracted tx
+   hashes are exposed as `retracted_tx_hashes` (and via the `on_retract` callback
+   on `EVMTradeLoader`) for other downstream stores.
 
 ### Multi-Provider Failover (EVMProviderPool)
 

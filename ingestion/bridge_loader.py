@@ -45,6 +45,7 @@ def _require_web3(location: str = "ingestion/bridge_loader.py") -> None:
 
 from config.settings import settings
 from ingestion.data_models import BridgeTransfer
+from ingestion.evm_finality import FinalityTracker
 
 logger = logging.getLogger("ledgerlens.bridge_loader")
 
@@ -242,12 +243,18 @@ class BridgeTransferLoader:
         rpc_url: str,
         contract_address: str,
         chain_id: int = 1,
+        finality: FinalityTracker | None = None,
     ) -> None:
         self.chain = chain
         self._rpc_url = rpc_url
         self.contract_address = _validate_evm_address(contract_address)
         self.chain_id = chain_id
         self._verifier = BridgeEventVerifier(rpc_call_fn=self._rpc_call)
+        self._finality = finality or FinalityTracker(
+            settings.evm_confirmation_depth, settings.evm_reorg_check_blocks
+        )
+        # EVM tx hashes retracted by the most recent load_transfers() reorg check.
+        self.retracted_tx_hashes: set[str] = set()
 
     def _rpc_call(self, method: str, params: list, max_retries: int = 3) -> dict:
         payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
@@ -301,6 +308,10 @@ class BridgeTransferLoader:
 
     def _get_latest_block(self) -> int:
         return int(self._rpc_call("eth_blockNumber", [])["result"], 16)
+
+    def _get_block_hash(self, block_number: int) -> str | None:
+        block = self._rpc_call("eth_getBlockByNumber", [hex(block_number), False]).get("result")
+        return block.get("hash") if block else None
 
     def _get_block_timestamp(self, block_number: int) -> datetime:
         result = self._rpc_call("eth_getBlockByNumber", [hex(block_number), False])
@@ -383,6 +394,12 @@ class BridgeTransferLoader:
     ) -> list[BridgeTransfer]:
         """Fetch TokensSent events and optionally persist them to storage.
 
+        Only events at or below the finalized head
+        (``latest - EVM_CONFIRMATION_DEPTH``) are ingested.  Previously
+        ingested blocks are first re-checked against the canonical chain;
+        transfers from orphaned (reorged) blocks are deleted from the
+        ``bridge_transfers`` store and exposed as :attr:`retracted_tx_hashes`.
+
         Events are verified against on-chain receipts according to
         ``BRIDGE_VERIFY_SAMPLE_RATE``.  Tampered events are routed to the
         dead-letter queue and excluded from the returned list.
@@ -394,7 +411,14 @@ class BridgeTransferLoader:
         sample_rate = settings.bridge_verify_sample_rate
 
         lookback_blocks = lookback_blocks if lookback_blocks is not None else settings.evm_lookback_blocks
-        latest = self._get_latest_block()
+        latest_head = self._get_latest_block()
+        orphaned = self._finality.check_reorgs(latest_head, self._get_block_hash)
+        self.retracted_tx_hashes = set().union(*orphaned.values()) if orphaned else set()
+        if self.retracted_tx_hashes and (db_path is not None or settings.db_path):
+            from detection.storage import retract_bridge_transfers
+            retract_bridge_transfers(self.chain, self.retracted_tx_hashes, db_path=db_path)
+
+        latest = self._finality.finalized_head(latest_head)
         from_block = max(0, latest - lookback_blocks)
 
         logs = self._get_logs(from_block, latest)
@@ -402,6 +426,8 @@ class BridgeTransferLoader:
         tampered_count = 0
 
         for log in logs:
+            if log.get("removed"):
+                continue
             try:
                 transfer = self._parse_tokens_sent(log)
             except ValueError as exc:
@@ -437,6 +463,12 @@ class BridgeTransferLoader:
                 )
 
             accepted.append(transfer)
+            block_num = log.get("blockNumber", 0)
+            self._finality.record(
+                int(block_num, 16) if isinstance(block_num, str) else block_num,
+                transfer._block_hash,
+                transfer.tx_hash_evm,
+            )
 
         if tampered_count:
             logger.warning(

@@ -3,6 +3,14 @@
 Identifies round-trip bridge patterns where a wallet bridges assets from
 Stellar to EVM and back within a configurable time window, computing a
 correlation score that feeds into the risk model as an additional feature.
+
+Finality: the correlator consumes only *finalized* EVM data.  The EVM-side
+loaders (``ingestion/evm_loader.py``, ``ingestion/bridge_loader.py``) only
+ingest events at least ``EVM_CONFIRMATION_DEPTH`` blocks below the chain head,
+and re-check ingested block hashes against the canonical chain on every run;
+transfers from reorged (orphaned) blocks are retracted from the
+``bridge_transfers`` store before they can be correlated (see
+``ingestion/evm_finality.py``).
 """
 
 from __future__ import annotations

@@ -8,6 +8,9 @@ Provides three cooperating components:
   pauses SSE consumption when the queue exceeds a high-watermark threshold.
 - :class:`AdaptiveRateController` — halves the token-bucket rate on HTTP 429
   responses and restores it linearly over a configurable window.
+- :class:`HorizonAdaptiveRateLimiter` — async token bucket whose refill rate
+  is continuously re-derived from Horizon's ``X-Ratelimit-*`` response headers,
+  with 429-driven backoff-and-resume as a safety net.
 """
 
 from __future__ import annotations
@@ -15,6 +18,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from threading import Lock
 from typing import Optional
 
@@ -24,6 +30,9 @@ __all__ = [
     "TokenBucket",
     "BackpressureController",
     "AdaptiveRateController",
+    "HorizonQuota",
+    "HorizonAdaptiveRateLimiter",
+    "parse_horizon_rate_limit_headers",
 ]
 
 # Minimum allowed refill rate — prevents the bucket from being silenced to zero.
@@ -241,3 +250,192 @@ class AdaptiveRateController:
                 1.0 / self._restore_seconds
             )
             self._bucket.set_rate(self._bucket.current_rate + step)
+
+
+@dataclass(frozen=True)
+class HorizonQuota:
+    """Rate-limit state reported by Horizon on a single response."""
+
+    limit: int            # requests allowed per window (X-Ratelimit-Limit)
+    remaining: int        # requests left in the window (X-Ratelimit-Remaining)
+    reset_seconds: float  # seconds until the window resets (X-Ratelimit-Reset)
+
+    @property
+    def utilization(self) -> float:
+        """Fraction of the window quota already consumed (0.0-1.0)."""
+        return (self.limit - self.remaining) / self.limit if self.limit > 0 else 0.0
+
+
+def _header(headers: Mapping[str, str], name: str) -> str | None:
+    value = headers.get(name)
+    if value is None:
+        lowered = name.lower()
+        for key, val in headers.items():
+            if key.lower() == lowered:
+                return val
+    return value
+
+
+def parse_horizon_rate_limit_headers(headers: Mapping[str, str]) -> HorizonQuota | None:
+    """Parse Horizon's ``X-Ratelimit-Limit/Remaining/Reset`` headers.
+
+    Returns ``None`` when any header is missing or malformed.
+    """
+    try:
+        limit = int(_header(headers, "X-Ratelimit-Limit"))  # type: ignore[arg-type]
+        remaining = int(_header(headers, "X-Ratelimit-Remaining"))  # type: ignore[arg-type]
+        reset = float(_header(headers, "X-Ratelimit-Reset"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0 or remaining < 0 or reset < 0:
+        return None
+    return HorizonQuota(limit=limit, remaining=min(remaining, limit), reset_seconds=reset)
+
+
+class HorizonAdaptiveRateLimiter:
+    """Async token bucket tuned by Horizon's reported rate-limit headers.
+
+    After every response, :meth:`observe_response` re-derives the refill rate
+    as ``safety_factor * remaining / reset_seconds`` so the remaining quota is
+    spread evenly across the rest of the window — spending spare quota when
+    Horizon allows more and slowing down when it is nearly exhausted, without
+    manual tuning.  When ``remaining`` hits zero, requests pause until the
+    window resets.
+
+    As a safety net, :meth:`on_429` halves the rate and pauses all callers for
+    ``Retry-After`` seconds (or an exponential backoff when absent); the pause
+    lifts automatically and header-driven tuning resumes.
+
+    Parameters
+    ----------
+    rate:
+        Initial refill rate (req/s) used until the first headers are seen.
+    burst:
+        Bucket capacity (default ``rate * 2``).
+    max_rate:
+        Optional hard ceiling on the header-derived rate.
+    safety_factor:
+        Fraction of the header-derived sustainable rate actually used.
+    clock, sleep:
+        Injectable time source and sleep coroutine (for tests / simulation).
+    """
+
+    def __init__(
+        self,
+        rate: float,
+        burst: float | None = None,
+        max_rate: float | None = None,
+        safety_factor: float = 0.9,
+        max_backoff: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        if rate <= 0:
+            raise ValueError(f"rate must be positive, got {rate!r}")
+        self._rate = rate
+        self._capacity = burst if burst is not None else rate * 2
+        self._max_rate = max_rate
+        self._safety = safety_factor
+        self._max_backoff = max_backoff
+        self._clock = clock
+        self._sleep = sleep
+        self._tokens = self._capacity
+        self._last_refill = clock()
+        self._paused_until = 0.0
+        self._consecutive_429 = 0
+        self._lock = asyncio.Lock()
+        self._sent: deque[float] = deque()
+        self.quota: HorizonQuota | None = None
+
+    @property
+    def current_rate(self) -> float:
+        return self._rate
+
+    @property
+    def paused_until(self) -> float:
+        return self._paused_until
+
+    def effective_throughput(self, window: float = 60.0) -> float:
+        """Requests per second actually dispatched over the trailing *window*."""
+        cutoff = self._clock() - window
+        while self._sent and self._sent[0] < cutoff:
+            self._sent.popleft()
+        return len(self._sent) / window
+
+    def _refill(self) -> None:
+        now = self._clock()
+        self._tokens = min(self._capacity, self._tokens + (now - self._last_refill) * self._rate)
+        self._last_refill = now
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            pause = self._paused_until - self._clock()
+            if pause > 0:
+                await self._sleep(pause)
+                self._last_refill = max(self._last_refill, self._clock())
+            self._refill()
+            if self._tokens < 1.0:
+                await self._sleep((1.0 - self._tokens) / self._rate)
+                self._refill()
+            self._tokens = max(0.0, self._tokens - 1.0)
+            self._sent.append(self._clock())
+        self._publish_metrics()
+
+    def observe_response(self, status_code: int, headers: Mapping[str, str]) -> None:
+        """Feed a Horizon response into the limiter (call for every response)."""
+        if status_code == 429:
+            self.on_429(_retry_after(headers))
+            return
+        self._consecutive_429 = 0
+        quota = parse_horizon_rate_limit_headers(headers)
+        if quota is None:
+            return
+        self.quota = quota
+        now = self._clock()
+        if quota.remaining == 0:
+            self._paused_until = max(self._paused_until, now + quota.reset_seconds)
+            logger.warning("Horizon quota exhausted; pausing %.1fs until window reset", quota.reset_seconds)
+        target = self._safety * quota.remaining / max(quota.reset_seconds, 1.0)
+        if self._max_rate is not None:
+            target = min(target, self._max_rate)
+        self._refill()
+        self._rate = max(target, _MIN_RATE)
+        # Never hold more burst tokens than the window has left.
+        self._tokens = min(self._tokens, float(quota.remaining))
+        self._publish_metrics()
+
+    def on_429(self, retry_after: float | None = None) -> None:
+        """Back off on HTTP 429: halve the rate and pause all callers."""
+        self._consecutive_429 += 1
+        delay = retry_after if retry_after is not None else min(
+            self._max_backoff, 2.0 ** (self._consecutive_429 - 1)
+        )
+        delay = min(delay, self._max_backoff)
+        self._refill()
+        self._rate = max(self._rate / 2.0, _MIN_RATE)
+        self._tokens = 0.0
+        self._paused_until = max(self._paused_until, self._clock() + delay)
+        logger.warning(
+            "Horizon HTTP 429: pausing %.1fs and reducing rate to %.2f req/s", delay, self._rate
+        )
+        from ingestion.metrics import get_metrics
+
+        get_metrics().http_rate_limit_backoffs_total.inc()
+        self._publish_metrics()
+
+    def _publish_metrics(self) -> None:
+        from ingestion.metrics import get_metrics
+
+        metrics = get_metrics()
+        metrics.http_rate_limit_allowed_rps.set(self._rate)
+        metrics.http_effective_throughput_rps.set(self.effective_throughput())
+        if self.quota is not None:
+            metrics.http_quota_utilization_ratio.set(self.quota.utilization)
+
+
+def _retry_after(headers: Mapping[str, str]) -> float | None:
+    value = _header(headers, "Retry-After")
+    try:
+        return max(0.0, float(value)) if value is not None else None
+    except ValueError:
+        return None

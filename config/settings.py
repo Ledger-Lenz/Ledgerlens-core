@@ -309,6 +309,21 @@ class Settings(BaseSettings):
     # Consecutive failures before a provider's circuit breaker opens.
     evm_circuit_breaker_threshold: int = 5
 
+    # Blocks below the chain head before EVM data is treated as final
+    # (ingestion/evm_finality.py).  Only finalized data reaches detection.
+    evm_confirmation_depth: int = 12
+
+    # Blocks below the finalized head whose ingested hashes are re-checked
+    # against the canonical chain to detect (and retract) deep reorgs.
+    evm_reorg_check_blocks: int = 128
+
+    # Current Wormhole guardian set used to verify bridge VAAs
+    # (ingestion/wormhole_vaa.py).  Comma-separated 20-byte hex guardian
+    # addresses in guardian-index order.  When empty, every VAA fails
+    # verification and is quarantined (fail closed).
+    wormhole_guardian_set_index: int = 0
+    wormhole_guardian_addresses: str = ""
+
     # ── Runtime config cache TTL ──────────────────────────────────────────────
     runtime_config_ttl_seconds: int = 60
 

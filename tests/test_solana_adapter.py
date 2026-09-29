@@ -724,24 +724,37 @@ def _wormhole_tx(data_b64: str, program: str = WORMHOLE_CORE) -> dict:
     }
 
 
-def test_extract_stellar_address_from_vaa_happy_path():
+def test_extract_stellar_address_from_vaa_rejects_unsigned_vaa():
+    """Unsigned VAAs are never trusted (signed paths: tests/test_wormhole_vaa.py)."""
     raw_key = bytes.fromhex(
         "3f0c34bf93ad0d9971d04ccc90f705511c838aad9734a4a2fb0d7a03fc7fe89a"
     )
     tx = _wormhole_tx(_vaa_instruction_data(emitter_chain=6, emitter_address=raw_key))
+    rejected = []
 
-    assert _extract_stellar_address_from_vaa(tx) == _stellar_pubkey_to_address(raw_key)
+    assert _extract_stellar_address_from_vaa(
+        tx, on_reject=lambda raw, reason: rejected.append(reason)
+    ) is None
+    assert rejected and rejected[0].startswith("unverified")
 
 
 @pytest.mark.parametrize("num_signatures", [0, 1, 3, 13])
 def test_extract_stellar_address_from_vaa_varying_guardian_signatures(num_signatures):
-    """Body offset must track the variable-length guardian signature block."""
+    """Body offset must track the variable-length guardian signature block.
+
+    The Stellar emitter is located (so the VAA reaches signature verification)
+    but zeroed signatures never verify, so nothing is trusted.
+    """
     raw_key = bytes(range(32))
     tx = _wormhole_tx(
         _vaa_instruction_data(6, raw_key, num_signatures=num_signatures)
     )
+    rejected = []
 
-    assert _extract_stellar_address_from_vaa(tx) == _stellar_pubkey_to_address(raw_key)
+    assert _extract_stellar_address_from_vaa(
+        tx, on_reject=lambda raw, reason: rejected.append(reason)
+    ) is None
+    assert rejected and rejected[0].startswith("unverified")
 
 
 def test_extract_stellar_address_from_vaa_ignores_other_chains():

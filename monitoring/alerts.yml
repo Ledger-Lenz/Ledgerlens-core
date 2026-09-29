@@ -17,6 +17,22 @@ groups:
           description: "More than 10 webhook deliveries have permanently failed in the last hour."
           runbook: "Inspect GET /webhooks/dead-letters. Check subscriber URLs are reachable over HTTPS. Verify LEDGERLENS_WEBHOOK_ENCRYPTION_KEY is set. Dead letters require manual intervention or subscriber re-registration."
 
+      - alert: TradeDLQPoisonMessageQuarantined
+        expr: increase(ledgerlens_dlq_quarantined_total[15m]) > 0
+        for: 0m
+        annotations:
+          summary: "Trade DLQ entry quarantined as a poison message"
+          description: "A trade DLQ entry failed replay repeatedly and was quarantined; it will not be retried automatically."
+          runbook: "See docs/runbooks/dlq.md. Run `python cli.py trade-dlq list --status quarantined` and `python cli.py trade-dlq inspect <id>`."
+
+      - alert: TradeDLQBacklogAging
+        expr: ledgerlens_dlq_oldest_entry_age_seconds > 3600
+        for: 15m
+        annotations:
+          summary: "Trade DLQ has pending entries older than 1 hour"
+          description: "The oldest pending trade DLQ entry is {{ $value | humanizeDuration }} old."
+          runbook: "See docs/runbooks/dlq.md. Inspect and replay pending entries with `python cli.py trade-dlq`."
+
       - alert: FeatureDriftDetected
         expr: increase(ledgerlens_drift_detected_total[24h]) > 0
         for: 0m

@@ -1342,6 +1342,75 @@ def dlq_replay(
     typer.echo(f"DLQ replay complete: {replayed} replayed, {failed} failed out of {len(items)} items.")
 
 
+trade_dlq_app = typer.Typer(help="Trade ingestion dead-letter queue: list, inspect, replay")
+app.add_typer(trade_dlq_app, name="trade-dlq")
+
+
+@trade_dlq_app.command("list")
+def trade_dlq_list(
+    status: str | None = typer.Option(None, help="pending | replayed | dead | quarantined"),
+    source: str | None = typer.Option(None, help="Filter by ingestion source"),
+    limit: int = typer.Option(50, help="Max entries to show"),
+) -> None:
+    """List trade DLQ entries and print depth / oldest-entry age."""
+    from ingestion.dlq import TradeDLQ
+
+    dlq = TradeDLQ()
+    for e in dlq.list_entries(status=status, source=source, limit=limit):
+        typer.echo(
+            f"{e.id}\t{e.status}\t{e.error_class.value}\t{e.source}\t"
+            f"failures={e.replay_failures}\t{e.created_at.isoformat()}\t{e.error_message}"
+        )
+    stats = dlq.refresh_metrics()
+    typer.echo(
+        f"depth={stats['depth']} quarantined={stats['quarantined']} "
+        f"oldest_age_seconds={stats['oldest_age_seconds']:.0f}"
+    )
+
+
+@trade_dlq_app.command("inspect")
+def trade_dlq_inspect(entry_id: int = typer.Argument(..., help="DLQ entry id")) -> None:
+    """Show a single trade DLQ entry including its raw record."""
+    import dataclasses
+    import json
+
+    from ingestion.dlq import TradeDLQ
+
+    entry = TradeDLQ().get(entry_id)
+    if entry is None:
+        typer.echo(f"DLQ entry {entry_id} not found.", err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(dataclasses.asdict(entry), default=str, indent=2))
+
+
+@trade_dlq_app.command("replay")
+def trade_dlq_replay(
+    entry_ids: list[int] = typer.Argument(..., help="DLQ entry ids to replay"),
+    handler: str = typer.Option(
+        ..., help="Replay handler as 'module:function', called with the decoded record"
+    ),
+) -> None:
+    """Replay selected trade DLQ entries; repeated failures are quarantined with an alert."""
+    import importlib
+
+    from ingestion.dlq import TradeDLQ
+
+    module_name, _, func_name = handler.partition(":")
+    if not func_name:
+        typer.echo("--handler must be in 'module:function' form.", err=True)
+        raise typer.Exit(2)
+    fn = getattr(importlib.import_module(module_name), func_name)
+    dlq = TradeDLQ()
+    failed = 0
+    for entry_id in entry_ids:
+        outcome = dlq.replay(entry_id, fn)
+        failed += outcome.status != "replayed"
+        typer.echo(f"{entry_id}\t{outcome.status}" + (f"\t{outcome.error}" if outcome.error else ""))
+    dlq.refresh_metrics()
+    if failed:
+        raise typer.Exit(1)
+
+
 @app.command("governance-close-expired")
 def governance_close_expired() -> None:
     """Close all active governance proposals whose voting period has expired.

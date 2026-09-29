@@ -1839,6 +1839,27 @@ def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None =
         conn.commit()
 
 
+def retract_bridge_transfers(
+    chain: str, tx_hashes: set[str] | list[str], db_path: str | None = None
+) -> int:
+    """Delete bridge transfers ingested from reorged (orphaned) EVM blocks.
+
+    Returns the number of rows removed.
+    """
+    hashes = list(tx_hashes)
+    if not hashes:
+        return 0
+    init_db(db_path)
+    placeholders = ",".join("?" for _ in hashes)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            f"DELETE FROM bridge_transfers WHERE chain = ? AND tx_hash_evm IN ({placeholders})",
+            (chain, *hashes),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
 def get_bridge_transfers(
     stellar_wallet: str | None = None,
     evm_wallet: str | None = None,
