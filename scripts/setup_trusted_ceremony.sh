@@ -44,16 +44,48 @@ set -euo pipefail
 #   `powersoftau new bn128 12` builds an SRS supporting 2^12 constraints. If the
 #   circuit grows beyond that, bump the power (e.g. 13/14/15) here AND everywhere
 #   the `pot12_*` filenames appear, otherwise `groth16 setup` will fail.
+#
+# VERIFICATION & ATTESTATION (issue #946)
+#   Every contribution is verified against the prior state before it is
+#   accepted, and the final artifacts are published as versioned, checksummed
+#   files with a signed transcript. Third parties can re-run the checks with
+#   `scripts/verify_trusted_ceremony.sh` against the published artifacts.
 # =============================================================================
 
 CIRCUIT="score_range_proof"
 CIRCUITS_DIR="circuits"
 KEYS_DIR="circuits/keys"
 
-# Output directory for the proving/verification keys produced by Phase 2.
-mkdir -p "$KEYS_DIR"
+# Versioned artifact directory for the published ceremony outputs.
+CEREMONY_VERSION="${CEREMONY_VERSION:-v1}"
+ARTIFACTS_DIR="circuits/ceremony/$CEREMONY_VERSION"
+TRANSCRIPT="$ARTIFACTS_DIR/transcript.json"
 
-echo "=== Starting Trusted Setup Ceremony ==="
+# Output directory for the proving/verification keys produced by Phase 2.
+mkdir -p "$KEYS_DIR" "$ARTIFACTS_DIR"
+
+# -----------------------------------------------------------------------------
+# 0. Attestation helpers.
+#    `sha256sum` produces the checksums published alongside each artifact, and
+#    `record_contribution` appends a verifiable entry to the ceremony transcript
+#    (name, input hash, output hash) so the contribution chain can be audited.
+# -----------------------------------------------------------------------------
+sha256_of() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+record_contribution() {
+  local phase="$1" name="$2" input="$3" output="$4"
+  local input_hash output_hash
+  input_hash="$(sha256_of "$input")"
+  output_hash="$(sha256_of "$output")"
+  printf '{"phase":"%s","name":"%s","input_sha256":"%s","output_sha256":"%s"}\n' \
+    "$phase" "$name" "$input_hash" "$output_hash" >> "$TRANSCRIPT"
+  echo "  recorded $phase contribution '$name' ($output_hash)"
+}
+
+echo "=== Starting Trusted Setup Ceremony ($CEREMONY_VERSION) ==="
+: > "$TRANSCRIPT"
 
 # -----------------------------------------------------------------------------
 # 1. Phase 1 — start a new Powers of Tau ceremony.
@@ -72,6 +104,10 @@ snarkjs powersoftau new bn128 12 pot12_0000.ptau -v
 #    guarantee: the setup stays secure as long as at least one of these
 #    contributors was honest and actually destroyed their secret afterwards.
 #
+#    Each contribution is verified against the prior state with
+#    `powersoftau verify` before it is accepted; a failed check aborts the
+#    ceremony (set -e) so a bad contribution never enters the chain.
+#
 #    SECURITY: `-e=` supplies the entropy inline. The values here are dummy
 #    strings for local/dev runs ONLY. For a real ceremony, drop `-e=` (snarkjs
 #    will prompt), run each contribution as a separate operator on a separate
@@ -80,12 +116,21 @@ snarkjs powersoftau new bn128 12 pot12_0000.ptau -v
 # -----------------------------------------------------------------------------
 echo "Adding first contribution..."
 snarkjs powersoftau contribute pot12_0000.ptau pot12_0001.ptau --name="Contributor 1" -v -e="random_entropy_source_1"
+echo "Verifying first contribution..."
+snarkjs powersoftau verify pot12_0001.ptau
+record_contribution "phase1" "Contributor 1" pot12_0000.ptau pot12_0001.ptau
 
 echo "Adding second contribution..."
 snarkjs powersoftau contribute pot12_0001.ptau pot12_0002.ptau --name="Contributor 2" -v -e="random_entropy_source_2"
+echo "Verifying second contribution..."
+snarkjs powersoftau verify pot12_0002.ptau
+record_contribution "phase1" "Contributor 2" pot12_0001.ptau pot12_0002.ptau
 
 echo "Adding third contribution..."
 snarkjs powersoftau contribute pot12_0002.ptau pot12_0003.ptau --name="Contributor 3" -v -e="random_entropy_source_3"
+echo "Verifying third contribution..."
+snarkjs powersoftau verify pot12_0003.ptau
+record_contribution "phase1" "Contributor 3" pot12_0002.ptau pot12_0003.ptau
 
 # -----------------------------------------------------------------------------
 # 3. Phase 1 — finalize / "prepare phase 2".
@@ -126,36 +171,60 @@ snarkjs groth16 setup "$CIRCUITS_DIR/$CIRCUIT.r1cs" pot12_final.ptau "$KEYS_DIR/
 #    `<circuit>.zkey`. As with Phase 1, security rests on at least one Phase-2
 #    contributor being honest and destroying their secret.
 #
+#    The contribution is verified against the R1CS and the finalized Phase-1
+#    SRS with `zkey verify` before it is accepted; a failed check aborts the
+#    ceremony so an invalid proving key is never published.
+#
 #    SECURITY: `-e="final_circuit_entropy"` is a placeholder. Use real,
 #    interactively supplied entropy and, ideally, multiple independent Phase-2
 #    contributors (repeat `zkey contribute` chaining the output files) for a
-#    production ceremony. `snarkjs zkey verify` can be used afterwards to check
-#    the .zkey against the .r1cs and .ptau.
+#    production ceremony.
 # -----------------------------------------------------------------------------
 echo "Contributing to Phase 2..."
 snarkjs zkey contribute "$KEYS_DIR/${CIRCUIT}_0000.zkey" "$KEYS_DIR/$CIRCUIT.zkey" --name="Final Setup Contributor" -v -e="final_circuit_entropy"
+echo "Verifying Phase 2 contribution..."
+snarkjs zkey verify "$CIRCUITS_DIR/$CIRCUIT.r1cs" pot12_final.ptau "$KEYS_DIR/$CIRCUIT.zkey"
+record_contribution "phase2" "Final Setup Contributor" "$KEYS_DIR/${CIRCUIT}_0000.zkey" "$KEYS_DIR/$CIRCUIT.zkey"
 
 # -----------------------------------------------------------------------------
 # 7. Export the verification key.
 #    Extracts the public `verification_key.json` from the final proving key.
-#    This is the only artifact the verifier (on-chain contract / verifier lib)
-#    needs; it contains no secret material and is safe to distribute publicly.
 # -----------------------------------------------------------------------------
 echo "Exporting verification key..."
 snarkjs zkey export verificationkey "$KEYS_DIR/$CIRCUIT.zkey" "$KEYS_DIR/verification_key.json"
 
 # -----------------------------------------------------------------------------
-# 8. Clean up intermediate ceremony files.
-#    Removes the Powers of Tau transcripts and the pre-contribution `_0000.zkey`.
-#    SECURITY: for a real ceremony this deletion is not sufficient — securely
-#    wipe these files (and any entropy material / shell history) so the toxic
-#    waste cannot be recovered from disk. Keep only `<circuit>.zkey` and
-#    `verification_key.json`.
+# 8. Publish versioned, checksummed attestation artifacts.
+#    Copies the final proving key, verification key, and transcript into the
+#    versioned artifact directory and writes a SHA-256 manifest. The manifest is
+#    signed when a signing key is available (GPG or cosign), so downstream users
+#    can confirm the artifacts were produced by this ceremony.
 # -----------------------------------------------------------------------------
-echo "Cleaning up temporary files..."
-rm pot12_*.ptau "$KEYS_DIR/${CIRCUIT}_0000.zkey"
+echo "Publishing attestation artifacts to $ARTIFACTS_DIR..."
+cp "$KEYS_DIR/$CIRCUIT.zkey" "$ARTIFACTS_DIR/$CIRCUIT.zkey"
+cp "$KEYS_DIR/verification_key.json" "$ARTIFACTS_DIR/verification_key.json"
+cp "$CIRCUITS_DIR/$CIRCUIT.r1cs" "$ARTIFACTS_DIR/$CIRCUIT.r1cs"
 
-echo "=== Trusted Setup Ceremony Completed ==="
-echo "Keys generated at:"
-echo " - $KEYS_DIR/$CIRCUIT.zkey"
-echo " - $KEYS_DIR/verification_key.json"
+(
+  cd "$ARTIFACTS_DIR"
+  sha256sum "$CIRCUIT.zkey" verification_key.json "$CIRCUIT.r1cs" transcript.json > SHA256SUMS
+)
+
+if [[ -n "${CEREMONY_SIGNING_KEY:-}" ]]; then
+  if command -v gpg >/dev/null 2>&1; then
+    echo "Signing SHA256SUMS with GPG key $CEREMONY_SIGNING_KEY..."
+    gpg --batch --yes --local-user "$CEREMONY_SIGNING_KEY" --armor \
+      --detach-sign --output "$ARTIFACTS_DIR/SHA256SUMS.asc" "$ARTIFACTS_DIR/SHA256SUMS"
+  elif command -v cosign >/dev/null 2>&1; then
+    echo "Signing SHA256SUMS with cosign..."
+    cosign sign-blob --yes --key "$CEREMONY_SIGNING_KEY" \
+      --output-signature "$ARTIFACTS_DIR/SHA256SUMS.sig" "$ARTIFACTS_DIR/SHA256SUMS"
+  else
+    echo "WARNING: CEREMONY_SIGNING_KEY set but neither gpg nor cosign is available; skipping signature." >&2
+  fi
+else
+  echo "NOTE: set CEREMONY_SIGNING_KEY to sign the published SHA256SUMS manifest."
+fi
+
+echo "=== Ceremony complete. Artifacts: $ARTIFACTS_DIR ==="
+echo "Third parties can audit with: scripts/verify_trusted_ceremony.sh $ARTIFACTS_DIR"

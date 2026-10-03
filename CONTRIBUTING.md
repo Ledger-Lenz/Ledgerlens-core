@@ -27,6 +27,7 @@ feature changes.
 17. [Definition of Done checklist](#definition-of-done-checklist)
 18. [Cross-repo changes](#cross-repo-changes)
 19. [Protobuf style conventions](#protobuf-style-conventions)
+20. [Metric naming conventions](#metric-naming-conventions)
 
 
 ---
@@ -730,3 +731,10 @@ conventions already established there:
   be called out explicitly in the PR description per the
   [Cross-repo changes](#cross-repo-changes) policy above, since `RiskScore` is
   a shared contract.
+
+## Metric naming conventions
+
+New Prometheus metrics must follow [docs/metric_naming.md](docs/metric_naming.md):
+use the `ledgerlens_<subsystem>_<what>_<unit>` shape, end counters with `_total`,
+use base units, and use `snake_case` labels. CI runs
+`python scripts/lint_metric_names.py` and fails on non-conforming names.

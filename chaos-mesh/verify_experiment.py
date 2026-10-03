@@ -22,9 +22,19 @@ Workflow
     are logged at DEBUG (use ``-v`` to see them); only a failure to recover
     before the timeout is treated as an error.
 
+Degraded-mode assertions
+    With ``--expect-degraded CIRCUIT`` (e.g. ``feature_store_redis`` for
+    ``network-partition-redis.yaml``) the script first asserts, *while the
+    fault is active*, that ``/health`` reports the specific degraded mode
+    rather than mere liveness: HTTP 200 (never 503), ``status == "degraded"``
+    and ``circuits[CIRCUIT]`` open or half-open.  It then asserts the
+    recovery-to-healthy transition: ``status == "ok"`` with
+    ``circuits[CIRCUIT] == "closed"``.
+
 Exit codes
     0  the health endpoint recovered within the timeout
-    1  the health endpoint did not recover in time
+    1  the health endpoint did not recover in time, or the expected
+       degraded mode was not observed
 """
 import argparse
 import logging
@@ -44,16 +54,59 @@ HEALTH_URL = os.environ.get("HEALTH_URL", DEFAULT_HEALTH_URL)
 METRICS_URL = os.environ.get("METRICS_URL", DEFAULT_METRICS_URL)
 
 
-def assert_recovery(health_url: str, timeout_s: int = 60) -> None:
-    """Poll GET /health until status == 'ok' or timeout_s elapses; raise on timeout."""
-    deadline = time.time() + timeout_s
+def assert_degraded(health_url: str, circuit: str, timeout_s: int = 60) -> float:
+    """Poll GET /health until it reports the graceful degraded mode for *circuit*.
+
+    Passes on HTTP 200 with ``status == "degraded"`` and ``circuits[circuit]``
+    open/half-open. An HTTP 503 means the fault escalated to a hard failure
+    instead of degrading gracefully and fails immediately. Returns the seconds
+    taken to enter degraded mode.
+    """
+    start = time.time()
+    deadline = start + timeout_s
+    last = None
+    while time.time() < deadline:
+        try:
+            resp = requests.get(health_url, timeout=5)
+            if resp.status_code == 503:
+                raise AssertionError(
+                    f"{circuit} fault escalated to a hard failure (HTTP 503): {resp.text[:200]}"
+                )
+            body = resp.json()
+            last = body
+            state = (body.get("circuits") or {}).get(circuit)
+            if (
+                resp.status_code == 200
+                and body.get("status") == "degraded"
+                and state in ("open", "half_open")
+            ):
+                return time.time() - start
+        except (requests.RequestException, ValueError) as exc:
+            logger.debug("degraded check against %s raised %s: %s", health_url, type(exc).__name__, exc)
+        time.sleep(2)
+    raise AssertionError(
+        f"Expected degraded mode for {circuit} within {timeout_s}s; last health body: {last!r}"
+    )
+
+
+def assert_recovery(health_url: str, timeout_s: int = 60, circuit: str | None = None) -> float:
+    """Poll GET /health until status == 'ok' or timeout_s elapses; raise on timeout.
+
+    When *circuit* is given, also require ``circuits[circuit] == "closed"``.
+    Returns the seconds taken to recover.
+    """
+    start = time.time()
+    deadline = start + timeout_s
     attempt = 0
     while time.time() < deadline:
         attempt += 1
         try:
             resp = requests.get(health_url, timeout=5)
-            if resp.status_code == 200 and resp.json().get("status") == "ok":
-                return
+            body = resp.json() if resp.status_code == 200 else {}
+            if body.get("status") == "ok" and (
+                circuit is None or (body.get("circuits") or {}).get(circuit) == "closed"
+            ):
+                return time.time() - start
             logger.debug(
                 "health check attempt %d: not ready yet (status_code=%s, body=%.200r)",
                 attempt,
@@ -97,6 +150,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Seconds to keep polling before declaring the recovery failed (default: 60).",
     )
     parser.add_argument(
+        "--expect-degraded",
+        metavar="CIRCUIT",
+        default=None,
+        help=(
+            "Assert graceful degraded mode for this /health circuit while the fault "
+            "is active (e.g. feature_store_redis), then assert it closes on recovery."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -110,8 +172,13 @@ def main(argv=None) -> int:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     try:
-        assert_recovery(args.health_url, timeout_s=args.timeout)
-        print(f"✅ Health recovered ({args.health_url})")
+        if args.expect_degraded:
+            entered = assert_degraded(args.health_url, args.expect_degraded, timeout_s=args.timeout)
+            print(f"✅ Degraded mode observed for {args.expect_degraded} after {entered:.1f}s")
+        recovered = assert_recovery(
+            args.health_url, timeout_s=args.timeout, circuit=args.expect_degraded
+        )
+        print(f"✅ Health recovered in {recovered:.1f}s ({args.health_url})")
         return 0
     except Exception as e:
         print(f"❌ Recovery failed: {e}")

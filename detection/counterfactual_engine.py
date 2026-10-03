@@ -38,7 +38,11 @@ but not necessarily the minimum-distance one. See the docs for more detail.
 
 from __future__ import annotations
 
-from detection.counterfactual_constraints import FEATURE_CONSTRAINTS, get_mutable_features
+from detection.counterfactual_constraints import (
+    FEATURE_CONSTRAINTS,
+    get_mutable_features,
+    validate_counterfactual,
+)
 from detection.model_inference import score_feature_vector
 
 # ---------------------------------------------------------------------------
@@ -151,7 +155,9 @@ def _build_candidate_result(
 ) -> dict | None:
     """Build the result dict for one candidate, or `None` if it is infeasible or empty."""
     candidate = _candidate_for_subset(feature_vector, subset, t)
-    if _violates_constraints(candidate, feature_vector):
+    if _violates_constraints(candidate, feature_vector) or not validate_counterfactual(
+        candidate, feature_vector
+    ):
         return None
 
     feature_deltas = {

@@ -17,6 +17,7 @@ from storage.audit_log import (
     log_suppression_rule_added,
     log_suppression_rule_removed,
     is_chain_intact,
+    verify_and_alert,
     verify_chain,
 )
 
@@ -236,3 +237,18 @@ def test_init_db_is_idempotent(audit_db):
     init_db(audit_db)
     entries = get_all_entries(audit_db)
     assert len(entries) == 1
+
+
+def test_verify_and_alert_flags_tampered_entry(populated_db, caplog):
+    log_score_computed("alice", "GABCDEF123", 85, db_path=populated_db)
+    assert verify_and_alert(populated_db) == []
+
+    conn = sqlite3.connect(populated_db)
+    conn.execute("UPDATE audit_log SET score = 1 WHERE id = 2")
+    conn.commit()
+    conn.close()
+
+    with caplog.at_level("CRITICAL", logger="ledgerlens.audit_log"):
+        failures = verify_and_alert(populated_db)
+    assert [f["id"] for f in failures] == [2]
+    assert "chain break detected" in caplog.text

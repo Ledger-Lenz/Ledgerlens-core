@@ -12,7 +12,7 @@ The governance engine (`detection/governance.py`) implements a full proposal lif
 submit_proposal()  →  status: active
       ↓  (72 h voting window)
 close_proposal()   →  status: passed | rejected
-      ↓  (admin executes)
+      ↓  (required role sign-offs + evidence; see "Change approval workflow")
 execute_proposal() →  status: executed | failed
 ```
 
@@ -24,6 +24,51 @@ Expired proposals are closed automatically by `cli.py governance-close-expired` 
 |---|---|---|
 | `config_change` | `{"key": "RISK_SCORE_THRESHOLD", "new_value": "75"}` | Live settings update via `SettingsReloader` + atomic `.env` write + propagation to every process (see below) |
 | `committee_update` | `{"action": "add"\|"remove", "member": "alice@example.com"}` | Insert/soft-delete row in `governance_committee` |
+| `model_promotion` | `{"model_name": "xgboost", "version": "202606010000"}` | Points `{model_name}_latest.txt` in `MODEL_DIR` at the registered version |
+
+## Change approval workflow
+
+A passed committee vote is necessary but **not sufficient** to execute a
+significant change. `execute_proposal()` enforces the approval policy in
+`detection.governance.APPROVAL_POLICIES` and raises `GovernanceApprovalError`
+(HTTP `422`, proposal stays `passed`) until every required role has signed off
+and every required piece of evidence is attached:
+
+| Proposal type | Required sign-off roles | Required evidence (attached to sign-offs) |
+|---|---|---|
+| `config_change` (detection policy) | `risk_owner`, `compliance_officer` | `impact_analysis` (e.g. a backtest of the new value) |
+| `model_promotion` | `model_owner`, `independent_validator`, `compliance_officer` | `backtest_report`, `robustness_report`, `red_team_report` |
+| `committee_update` | — (committee vote only) | — |
+
+Rules enforced on every sign-off (`GovernanceEngine.record_signoff`, or
+`POST /v1/governance/proposals/{id}/signoffs`):
+
+- The signer must be an **active committee member**.
+- The **proposer cannot sign off** their own change (segregation of duties).
+- Each role is signed **once**, and one person cannot fill **two roles** on the same proposal.
+- Sign-offs are accepted only while the proposal is `active` or `passed`.
+- Evidence is a map of evidence kind → reference (report path, URL or artifact hash).
+
+### Traceability
+
+When a proposal executes, its complete approval chain — proposer, votes,
+sign-offs with evidence, timestamps — is written to
+`governance_approval_records` together with its SHA-256, in the same
+`BEGIN EXCLUSIVE` transaction as the `executed` transition. So every live
+change has a recorded, complete approval chain:
+
+- `GovernanceEngine.approval_chain(id)` — current votes, sign-offs and any `missing_roles` / `missing_evidence`.
+- `GovernanceEngine.recorded_approval(id)` — the immutable chain recorded at execution.
+- `GovernanceEngine.live_change_approval("config_change", "RISK_SCORE_THRESHOLD")` or
+  `("model_promotion", "xgboost")` — the chain behind the value that is live now.
+- `GET /v1/governance/proposals/{id}/approval-chain` — both of the first two, over REST.
+
+### Checklist for governance participants
+
+1. Proposer submits the proposal and links the evidence it relies on.
+2. Committee votes during the 72 h window; the proposal closes as `passed`.
+3. Each required role holder reviews the evidence and records a sign-off, attaching the evidence references.
+4. An admin checks `approval-chain` shows no missing roles or evidence, then executes.
 
 ## Configuration propagation
 
@@ -80,7 +125,9 @@ A proposal passes when the number of `for` votes reaches `quorum_required` (stri
 | `GET`  | `/governance/proposals` | none | List proposals (filterable by `?status=`) |
 | `GET`  | `/governance/proposals/{id}` | none | Get proposal + tally |
 | `POST` | `/governance/proposals/{id}/vote` | none | Cast a vote |
-| `POST` | `/governance/proposals/{id}/execute` | admin key | Execute a passed proposal |
+| `POST` | `/governance/proposals/{id}/signoffs` | admin key | Record a role sign-off with evidence |
+| `GET`  | `/governance/proposals/{id}/approval-chain` | admin key | Current and recorded approval chain |
+| `POST` | `/governance/proposals/{id}/execute` | admin key | Execute a passed, fully signed-off proposal |
 
 ## CLI
 

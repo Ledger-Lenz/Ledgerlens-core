@@ -14,7 +14,30 @@ from ingestion.data_models import OrderBookEvent
 
 logger = logging.getLogger("ledgerlens.replay_buffer")
 
-__all__ = ["OrderBookReplayBuffer"]
+__all__ = ["OrderBookReplayBuffer", "replay_window_seconds"]
+
+# Default gap timeout used when sizing the distributed dedup TTL.  This is the
+# realistic upper bound on how long an out-of-order event may be held back
+# before it is force-emitted, and therefore the window over which a replay of
+# the same event can still occur.
+DEFAULT_GAP_TIMEOUT_SECONDS = 30.0
+
+# Safety multiplier applied to the gap timeout when deriving the dedup TTL so
+# that a replayed event arriving just after a forced flush is still deduped.
+DEDUP_TTL_SAFETY_FACTOR = 2.0
+
+
+def replay_window_seconds(gap_timeout_seconds: float = DEFAULT_GAP_TIMEOUT_SECONDS) -> float:
+    """Return the dedup TTL/window implied by the replay buffer's gap timeout.
+
+    The replay buffer holds out-of-order events for at most
+    ``gap_timeout_seconds`` before force-emitting them.  Any replay of an
+    already-processed event must therefore arrive within that window (plus a
+    safety margin) for the buffer to have observed it.  Distributed dedup
+    stores should size their TTL from this value so the dedup window is
+    bounded and consistent with the replay bounds.
+    """
+    return gap_timeout_seconds * DEDUP_TTL_SAFETY_FACTOR
 
 
 def _sort_key(token: str) -> tuple[int, int, str]:
@@ -55,9 +78,12 @@ class OrderBookReplayBuffer:
         Gap detection is only enforced for numeric tokens in strict consecutive
         order.  Non-numeric tokens are emitted in heap-min order without gap
         checking, since there is no natural predecessor relationship.
+
+        The ``gap_timeout_seconds`` value also bounds the replay window used to
+        size the distributed dedup TTL (see :func:`replay_window_seconds`).
     """
 
-    def __init__(self, max_size: int = 1000, gap_timeout_seconds: float = 30.0) -> None:
+    def __init__(self, max_size: int = 1000, gap_timeout_seconds: float = DEFAULT_GAP_TIMEOUT_SECONDS) -> None:
         self._max_size = max_size
         self._gap_timeout = gap_timeout_seconds
         # Min-heap entries: (_sort_key(token), token)
@@ -67,6 +93,20 @@ class OrderBookReplayBuffer:
         # Tracks the last token *emitted* so we can detect gaps against it.
         # None means nothing has been emitted yet.
         self._last_emitted_key: tuple[int, int, str] | None = None
+
+    @property
+    def gap_timeout_seconds(self) -> float:
+        """Seconds an out-of-order event may be held before a forced flush."""
+        return self._gap_timeout
+
+    @property
+    def dedup_ttl_seconds(self) -> float:
+        """TTL/window a distributed dedup store should use for this buffer.
+
+        Derived from the gap timeout so the dedup window is bounded and
+        consistent with the replay bounds enforced here.
+        """
+        return replay_window_seconds(self._gap_timeout)
 
     def ingest(self, event: OrderBookEvent) -> None:
         """Add an event to the buffer."""

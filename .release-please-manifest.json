@@ -1,3 +1,11 @@
 {
-  ".": "0.1.0"
+  ".": "0.1.0",
+  "go": "0.1.0",
+  "sdk": "0.1.0",
+  "packages/ledgerlens-sdk": "0.1.0",
+  "packages/ledgerlens-fl-client": "0.1.0",
+  "packages/ledgerlens-fl-server": "0.1.0",
+  "crates/ledgerlens-sdk": "0.1.0",
+  "contracts/oracle_aggregator": "0.1.0",
+  "contracts/zk_verifier": "0.1.0"
 }

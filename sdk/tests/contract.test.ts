@@ -23,3 +23,17 @@ describe("Cross-repo schema contracts", () => {
     }
   });
 });
+
+describe("Generated pagination types", () => {
+  it("PaginatedScores envelope parses with the generated schema", async () => {
+    const { PaginatedScoresSchema, PageCursorSchema } = await import("../src/index");
+    const fixturePath = resolve(__dirname, "../../tests/fixtures/schemas/risk_score_v1.json");
+    const score = JSON.parse(readFileSync(fixturePath, "utf-8"));
+
+    const page = PaginatedScoresSchema.parse({ scores: [score], total: 1 });
+    expect(page.scores).toHaveLength(1);
+    expect(page.total).toBe(1);
+    expect(PageCursorSchema.parse({ limit: 50, offset: 100 })).toEqual({ limit: 50, offset: 100 });
+    expect(() => PageCursorSchema.parse({ limit: 1.5 })).toThrow();
+  });
+});

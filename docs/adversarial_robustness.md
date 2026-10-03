@@ -32,3 +32,20 @@ Disclaimer
 ----------
 Certificates are probabilistic (Monte Carlo) estimates, not hard guarantees.
 Results depend on sampling parameters and random seed.
+
+## Robustness promotion gate
+
+Model promotion (`detection.model_registry.promote_model`) enforces a hard
+robustness gate via `enforce_robustness_gate`:
+
+- **Threshold:** `MIN_ROBUSTNESS_SCORE = 0.05`, compared against
+  `RobustnessReport.certified_radius`. Current baseline ensembles certify at
+  ~0.07–0.10, so the threshold rejects clear regressions without blocking
+  healthy retrains.
+- **Enforcement:** a candidate below the threshold raises
+  `RobustnessGateError` and is not saved or promoted.
+- **Override policy:** exceptional promotions require an explicit
+  `RobustnessOverride(approved_by=..., justification=...)` (both non-empty).
+  Every override is appended to `robustness_overrides.jsonl` in the model
+  directory (version, score, threshold, approver, justification, timestamp)
+  and logged at WARNING level for audit.

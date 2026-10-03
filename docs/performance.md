@@ -130,10 +130,27 @@ adaptive sharded graph engine can be activated instead of raising
    detected in at least one shard.
 
 3. **Parallel per-shard SCC**: Each shard runs `TradeGraph.find_wash_rings`
-   independently via a `multiprocessing.Pool` (size = `GRAPH_SHARD_MAX_WORKERS`).
+   independently via a `ProcessPoolExecutor` (size = `GRAPH_SHARD_MAX_WORKERS`).
    Results are merged with de-duplication — rings whose account set is a subset
    of an already-seen ring from another shard (via a replicated boundary node)
    keep only the larger/higher-volume ring.
+
+4. **Shard-failure rebalancing**: If a shard's worker fails (exception or the
+   worker process dying mid-operation), its partition — edges and account
+   assignments — is moved onto the least-loaded surviving shard and re-run, so
+   no ring is lost. Failed shard ids are exposed via
+   `ShardedTradeGraph.failed_shards`.
+
+### Fault-tolerance limit
+
+Up to **`shard_count - 1` simultaneous shard failures** are tolerated: at least
+one shard must complete to absorb the failed partitions. If every shard fails,
+`find_wash_rings` raises `ShardFailureError`. Recovery re-runs the failed
+partitions serially on the coordinator, so worst-case recovery time is roughly
+the unsharded `find_wash_rings` time for the failed share of the graph.
+Covered by the chaos scenario `tests/chaos/test_graph_shard_failure.py`
+(recovery-time SLO: 30 s; data-integrity SLO: identical ring set to the
+unsharded engine).
 
 ### Accuracy tradeoff at boundaries
 
@@ -161,7 +178,7 @@ community-detection partitioning keeps most rings intact within a single shard.
 | `GRAPH_SHARD_ENABLED`        | true     | Auto-route to sharding when `MAX_GRAPH_NODES` would be exceeded    |
 | `GRAPH_SHARD_COUNT`          | 8        | Number of partitions; each targets `MAX_GRAPH_NODES // count`      |
 | `GRAPH_SHARD_OVERLAP_HOPS`   | 1        | Hop-distance boundary replication buffer (0-3)                     |
-| `GRAPH_SHARD_MAX_WORKERS`    | 8        | `multiprocessing.Pool` size for per-shard SCC computation          |
+| `GRAPH_SHARD_MAX_WORKERS`    | 8        | `ProcessPoolExecutor` size for per-shard SCC computation           |
 
 
 ## Numba JIT for feature engineering

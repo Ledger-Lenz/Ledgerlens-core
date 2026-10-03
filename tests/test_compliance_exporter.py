@@ -15,6 +15,7 @@ from detection.compliance_exporter import (
     ComplianceScoreTooLow,
     augment_ivms_payload,
     build_ivms_risk_field,
+    draft_sar_narrative,
     export_sar_package,
     export_travel_rule,
     generate_sar_package,
@@ -22,7 +23,11 @@ from detection.compliance_exporter import (
     hash_wallet,
 )
 from detection.risk_score import RiskScore
-from detection.sar_narrative import generate_sar_narrative
+from detection.sar_narrative import (
+    SARNarrativeNotReviewed,
+    generate_sar_narrative,
+    review_sar_narrative,
+)
 from detection.storage import _connect as _connect_for_test
 from detection.storage import save_alerts, save_scores, save_submission
 
@@ -41,6 +46,21 @@ def _score(score, *, wallet=WALLET, asset_pair="XLM/USDC", ts=None):
         confidence=90,
         timestamp=ts or datetime(2026, 6, 1, tzinfo=timezone.utc),
     )
+
+
+START = "2026-06-01T00:00:00+00:00"
+END = "2026-06-30T00:00:00+00:00"
+
+
+def _review(wallet, db_path, **kwargs):
+    draft = draft_sar_narrative(wallet, START, END, db_path=db_path)
+    return review_sar_narrative(draft, "analyst@example.com", **kwargs)
+
+
+def _reviewed_body(client, body):
+    headers = {"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY}
+    draft = client.post("/v1/compliance/sar-narrative/draft", json=body, headers=headers).json()
+    return {**body, "reviewer": "analyst@example.com", "draft_sha256": draft["draft_sha256"]}
 
 
 def _seed(db_path):
@@ -119,7 +139,12 @@ def test_generate_sar_package_produces_valid_zip(db_path, tmp_path):
     _seed(db_path)
     out_dir = str(tmp_path / "out")
     zip_path = generate_sar_package(
-        WALLET, "2026-06-01T00:00:00+00:00", "2026-06-30T00:00:00+00:00", out_dir, db_path=db_path
+        WALLET,
+        "2026-06-01T00:00:00+00:00",
+        "2026-06-30T00:00:00+00:00",
+        out_dir,
+        db_path=db_path,
+        review=_review(WALLET, db_path),
     )
 
     assert os.path.isfile(zip_path)
@@ -127,6 +152,7 @@ def test_generate_sar_package_produces_valid_zip(db_path, tmp_path):
         names = set(archive.namelist())
         expected = {
             "sar_narrative.txt",
+            "sar_review.json",
             "evidence/alerts.json",
             "evidence/score_history.csv",
             "evidence/graph_export.gexf",
@@ -217,7 +243,9 @@ def test_sar_package_endpoint_requires_scope(client):
 
     # With the scope -> 200 + a ZIP body.
     resp = client.post(
-        "/compliance/sar-package", json=body, headers={"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY}
+        "/compliance/sar-package",
+        json=_reviewed_body(client, body),
+        headers={"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY},
     )
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/zip"
@@ -267,6 +295,7 @@ def test_export_sar_package_rejects_low_risk_score(db_path, tmp_path):
             "2026-06-30T00:00:00+00:00",
             str(tmp_path / "out"),
             db_path=db_path,
+            review=_review(LOW_SCORE_WALLET, db_path),
         )
 
 
@@ -278,6 +307,7 @@ def test_export_sar_package_logs_audit_entry_with_wallet_hash(db_path, tmp_path)
         "2026-06-30T00:00:00+00:00",
         str(tmp_path / "out"),
         db_path=db_path,
+        review=_review(WALLET, db_path),
     )
 
     with _connect_for_test(db_path) as conn:
@@ -303,6 +333,7 @@ def test_export_sar_package_dry_run_skips_audit_log(db_path, tmp_path):
         str(tmp_path / "out"),
         dry_run=True,
         db_path=db_path,
+        review=_review(WALLET, db_path),
     )
 
     with _connect_for_test(db_path) as conn:
@@ -323,6 +354,7 @@ def test_export_sar_package_rate_limit_exceeded(db_path, tmp_path):
             "2026-06-30T00:00:00+00:00",
             str(tmp_path / "out1"),
             db_path=db_path,
+            review=_review(WALLET, db_path),
         )
         with pytest.raises(ComplianceRateLimitExceeded):
             export_sar_package(
@@ -331,6 +363,7 @@ def test_export_sar_package_rate_limit_exceeded(db_path, tmp_path):
                 "2026-06-30T00:00:00+00:00",
                 str(tmp_path / "out2"),
                 db_path=db_path,
+                review=_review(WALLET, db_path),
             )
     finally:
         object.__setattr__(settings_module.settings, "compliance_export_rate_limit_per_hour", original)
@@ -371,7 +404,9 @@ def test_sar_package_endpoint_rejects_low_score(client, db_path):
         "end_date": "2026-06-30T00:00:00+00:00",
     }
     resp = client.post(
-        "/compliance/sar-package", json=body, headers={"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY}
+        "/compliance/sar-package",
+        json=_reviewed_body(client, body),
+        headers={"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY},
     )
     assert resp.status_code == 400
 
@@ -384,7 +419,7 @@ def test_sar_package_endpoint_dry_run_skips_audit_log(client, db_path):
     }
     resp = client.post(
         "/compliance/sar-package?dry_run=true",
-        json=body,
+        json=_reviewed_body(client, body),
         headers={"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY},
     )
     assert resp.status_code == 200
@@ -406,6 +441,7 @@ def test_sar_package_endpoint_rate_limited(client, db_path):
             "end_date": "2026-06-30T00:00:00+00:00",
         }
         headers = {"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY}
+        body = _reviewed_body(client, body)
         resp1 = client.post("/compliance/sar-package", json=body, headers=headers)
         assert resp1.status_code == 200
 
@@ -413,3 +449,65 @@ def test_sar_package_endpoint_rate_limited(client, db_path):
         assert resp2.status_code == 429
     finally:
         object.__setattr__(settings_module.settings, "compliance_export_rate_limit_per_hour", original)
+
+
+# ---------------------------------------------------------------------------
+# Mandatory human review of the SAR narrative
+# ---------------------------------------------------------------------------
+
+
+def test_generate_sar_package_blocks_unreviewed_narrative(db_path, tmp_path):
+    _seed(db_path)
+    out_dir = tmp_path / "out"
+    with pytest.raises(SARNarrativeNotReviewed):
+        generate_sar_package(WALLET, START, END, str(out_dir), db_path=db_path)
+    assert not out_dir.exists()
+
+
+def test_export_sar_package_blocks_unreviewed_narrative(db_path, tmp_path):
+    _seed(db_path)
+    with pytest.raises(SARNarrativeNotReviewed):
+        export_sar_package(WALLET, START, END, str(tmp_path / "out"), db_path=db_path)
+    with _connect_for_test(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM compliance_exports").fetchone()[0] == 0
+
+
+def test_sar_review_of_a_different_draft_is_rejected(db_path, tmp_path):
+    _seed(db_path)
+    stale = review_sar_narrative("an earlier draft", "analyst@example.com")
+    with pytest.raises(SARNarrativeNotReviewed):
+        generate_sar_package(WALLET, START, END, str(tmp_path / "out"), db_path=db_path, review=stale)
+
+
+def test_sar_review_requires_named_reviewer():
+    with pytest.raises(SARNarrativeNotReviewed):
+        review_sar_narrative("draft", "  ")
+
+
+def test_sar_package_records_reviewer_and_edits(db_path, tmp_path):
+    _seed(db_path)
+    draft = draft_sar_narrative(WALLET, START, END, db_path=db_path)
+    edited = draft + "\nAnalyst note: counterparties confirmed as related entities.\n"
+    review = review_sar_narrative(draft, "analyst@example.com", edited_text=edited)
+    zip_path = generate_sar_package(WALLET, START, END, str(tmp_path / "out"), db_path=db_path, review=review)
+
+    with zipfile.ZipFile(zip_path) as archive:
+        assert archive.read("sar_narrative.txt").decode("utf-8") == edited
+        record = json.loads(archive.read("sar_review.json"))
+        manifest = json.loads(archive.read("manifest.json"))
+    assert record["reviewer"] == "analyst@example.com"
+    assert record["reviewed_at"]
+    assert record["edited"] is True
+    assert "+Analyst note" in record["diff"]
+    assert record["draft_sha256"] == hashlib.sha256(draft.encode("utf-8")).hexdigest()
+    assert "sar_review.json" in manifest["files"]
+
+
+def test_sar_package_endpoint_blocks_unreviewed_narrative(client):
+    body = {"wallet": WALLET, "start_date": START, "end_date": END}
+    headers = {"X-LedgerLens-Compliance-Key": COMPLIANCE_KEY}
+    assert client.post("/compliance/sar-package", json=body, headers=headers).status_code == 403
+    assert client.post("/v1/compliance/sar-package", json=body, headers=headers).status_code == 403
+
+    stale = {**body, "reviewer": "analyst@example.com", "draft_sha256": "0" * 64}
+    assert client.post("/v1/compliance/sar-package", json=stale, headers=headers).status_code == 409

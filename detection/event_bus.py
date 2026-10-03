@@ -2,15 +2,19 @@ import asyncio
 import importlib.util
 import json
 import logging
+import sqlite3
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from config.settings import settings
 from detection.risk_score import RiskScore
+from detection.tracing import current_trace_id
 
 logger = logging.getLogger("ledgerlens.event_bus")
 
@@ -22,9 +26,149 @@ class PublishResult:
     errors: list[str]
 
 
+@dataclass
+class DeadLetter:
+    id: int
+    backend: str
+    key: bytes | None
+    value: bytes
+    error: str
+    replay_attempts: int
+    created_at: str
+
+
+@dataclass
+class ReplayResult:
+    replayed: int
+    failed: int
+    remaining: int
+
+
+_DLQ_SCHEMA = """
+CREATE TABLE IF NOT EXISTS event_bus_dead_letters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backend TEXT NOT NULL,
+    key BLOB,
+    value BLOB NOT NULL,
+    error TEXT NOT NULL,
+    replay_attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+class EventBusDeadLetterStore:
+    """SQLite-backed dead-letter store for events that exhausted their retry budget.
+
+    Persisted (rather than in-memory) so events survive restarts and can be
+    replayed from a separate process via ``ledgerlens event-bus-replay``.
+    """
+
+    def __init__(self, db_path: str | None = None):
+        self.db_path = db_path
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path or settings.db_path)
+        try:
+            conn.executescript(_DLQ_SCHEMA)
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def add(self, backend: str, key: bytes | None, value: bytes, error: str) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO event_bus_dead_letters (backend, key, value, error, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (backend, key, value, error[:500], datetime.now(timezone.utc).isoformat()),
+                )
+        except sqlite3.Error:
+            # Never let the dead-letter path break publishing; the counter
+            # below still fires so the loss is alertable.
+            logger.critical("Failed to persist dead-lettered event (backend=%s)", backend, exc_info=True)
+        try:
+            from api.metrics import event_bus_dead_lettered_total
+
+            event_bus_dead_lettered_total.labels(backend=backend).inc()
+        except Exception:
+            pass
+        logger.error("Event dead-lettered after exhausting retries (backend=%s): %s", backend, error)
+
+    def entries(self, limit: int | None = None) -> list[DeadLetter]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, backend, key, value, error, replay_attempts, created_at "
+                "FROM event_bus_dead_letters ORDER BY id LIMIT ?",
+                (-1 if limit is None else limit,),
+            ).fetchall()
+        return [DeadLetter(*row) for row in rows]
+
+    def count(self) -> int:
+        with self._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM event_bus_dead_letters").fetchone()[0]
+
+    def oldest_age_seconds(self) -> float:
+        with self._connect() as conn:
+            row = conn.execute("SELECT MIN(created_at) FROM event_bus_dead_letters").fetchone()
+        if not row or row[0] is None:
+            return 0.0
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(row[0])).total_seconds()
+
+    def remove(self, entry_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM event_bus_dead_letters WHERE id = ?", (entry_id,))
+
+    def record_failed_replay(self, entry_id: int, error: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE event_bus_dead_letters SET replay_attempts = replay_attempts + 1, error = ? WHERE id = ?",
+                (error[:500], entry_id),
+            )
+
+
+_dead_letter_store = EventBusDeadLetterStore()
+
+
+def get_dead_letter_store() -> EventBusDeadLetterStore:
+    return _dead_letter_store
+
+
 class RiskScoreEventBus(ABC):
+    backend = "none"
+
     @abstractmethod
     def publish(self, scores: list[RiskScore]) -> PublishResult: ...
+
+    def send_raw(self, key: bytes | None, value: bytes) -> None:
+        """Deliver one pre-serialised event, raising on failure (used by replay)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot replay events")
+
+    def replay_dead_letters(
+        self, store: EventBusDeadLetterStore | None = None, limit: int | None = None
+    ) -> ReplayResult:
+        """Re-send dead-lettered events; successes are removed, failures stay queued."""
+        store = store or get_dead_letter_store()
+        replayed = failed = 0
+        for entry in store.entries(limit=limit):
+            try:
+                self.send_raw(entry.key, entry.value)
+            except Exception as e:
+                failed += 1
+                store.record_failed_replay(entry.id, str(e))
+                result = "failed"
+            else:
+                replayed += 1
+                store.remove(entry.id)
+                result = "replayed"
+            try:
+                from api.metrics import event_bus_dead_letter_replays_total
+
+                event_bus_dead_letter_replays_total.labels(result=result).inc()
+            except Exception:
+                pass
+        return ReplayResult(replayed=replayed, failed=failed, remaining=store.count())
 
     @abstractmethod
     def close(self) -> None: ...
@@ -60,6 +204,9 @@ def _serialize_event(score: RiskScore) -> bytes:
         "producer": "ledgerlens-core",
         "data": payload,
     }
+    trace_id = current_trace_id()
+    if trace_id:
+        envelope["trace_id"] = trace_id
     return json.dumps(envelope).encode("utf-8")
 
 
@@ -79,6 +226,8 @@ class NullEventBus(RiskScoreEventBus):
 
 
 class KafkaRiskScoreBus(RiskScoreEventBus):
+    backend = "kafka"
+
     def __init__(self, bootstrap_servers: str, topic: str, sasl_password: str = "", client_id: str = "ledgerlens-core"):
         self.topic = topic
         self._last_publish = None
@@ -128,6 +277,7 @@ class KafkaRiskScoreBus(RiskScoreEventBus):
                         self._failures += 1
                         errors.append(str(e))
                         logger.error("Failed to publish to Kafka after %d retries: %s", settings.event_bus_max_retries, str(e))
+                        get_dead_letter_store().add(self.backend, key, value, str(e))
                     else:
                         time.sleep(settings.event_bus_retry_backoff_seconds)
                         
@@ -138,6 +288,13 @@ class KafkaRiskScoreBus(RiskScoreEventBus):
             self._last_publish = datetime.now(timezone.utc).isoformat()
 
         return PublishResult(published=published, failed=failed, errors=errors)
+
+    def send_raw(self, key: bytes | None, value: bytes) -> None:
+        if not self._producer:
+            raise RuntimeError("confluent-kafka missing")
+        self._producer.produce(self.topic, key=key, value=value)
+        if self._producer.flush(timeout=settings.event_bus_publish_timeout_seconds):
+            raise RuntimeError("Kafka flush timed out")
 
     def close(self) -> None:
         if self._producer:
@@ -150,6 +307,8 @@ class KafkaRiskScoreBus(RiskScoreEventBus):
 
 
 class NATSRiskScoreBus(RiskScoreEventBus):
+    backend = "nats"
+
     def __init__(self, servers: str, subject: str, token: str = "", stream: str = "LEDGERLENS_RISKSCORES"):
         self.servers = servers
         self.subject = subject
@@ -200,6 +359,7 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         async def _publish_all():
             nonlocal published, failed, errors
             for score in scores:
+                key = f"{score.wallet}:{score.asset_pair}".encode("utf-8")
                 value = _serialize_event(score)
                 for attempt in range(settings.event_bus_max_retries):
                     try:
@@ -213,6 +373,7 @@ class NATSRiskScoreBus(RiskScoreEventBus):
                             self._failures += 1
                             errors.append(str(e))
                             logger.error("Failed to publish to NATS after %d retries: %s", settings.event_bus_max_retries, str(e))
+                            get_dead_letter_store().add(self.backend, key, value, str(e))
                         else:
                             await asyncio.sleep(settings.event_bus_retry_backoff_seconds)
                             
@@ -220,6 +381,13 @@ class NATSRiskScoreBus(RiskScoreEventBus):
         if published > 0:
             self._last_publish = datetime.now(timezone.utc).isoformat()
         return PublishResult(published=published, failed=failed, errors=errors)
+
+    def send_raw(self, key: bytes | None, value: bytes) -> None:
+        if not self._nc or not self._js:
+            raise RuntimeError("NATS not connected")
+        self._loop.run_until_complete(
+            self._js.publish(self.subject, value, timeout=settings.event_bus_publish_timeout_seconds)
+        )
 
     def close(self) -> None:
         if self._nc:

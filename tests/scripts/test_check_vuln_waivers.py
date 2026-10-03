@@ -337,3 +337,38 @@ def test_evaluate_waiver_expired_yesterday_blocks():
     }
     ok, _ = cvw.evaluate(findings, waivers, TODAY)
     assert ok is False
+
+
+# ── stale waivers (#1016) ────────────────────────────────────────────────────
+
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "vuln_waivers"
+
+
+def _fixture_osv(vuln_id):
+    return json.loads((FIXTURES / f"{vuln_id}.json").read_text())
+
+
+def test_stale_check_flags_waiver_for_since_patched_cve():
+    waivers = cvw.load_waivers(FIXTURES / "waivers.yml")
+    stale = cvw.find_stale_waivers(waivers, _fixture_osv)
+    assert [(w.id, fixes) for w, fixes in stale] == [("GHSA-patched-0001", ["2.4.1"])]
+
+
+def test_stale_check_ignores_waiver_without_upstream_fix():
+    waivers = {
+        k: w for k, w in cvw.load_waivers(FIXTURES / "waivers.yml").items() if w.id == "GHSA-unfixed-0002"
+    }
+    assert cvw.find_stale_waivers(waivers, _fixture_osv) == []
+
+
+def test_stale_check_ignores_fix_for_other_package():
+    waiver = cvw.Waiver(
+        id="GHSA-patched-0001", ecosystem="python", reason="r", expires=TODAY, package="unrelated"
+    )
+    assert cvw.fixed_versions(_fixture_osv("GHSA-patched-0001"), waiver) == []
+
+
+def test_stale_check_cli_fails_on_stale_waiver(capsys):
+    rc = cvw.main(["--check-stale", "--waivers", str(FIXTURES / "waivers.yml"), "--osv-dir", str(FIXTURES)])
+    assert rc == 1
+    assert "STALE  GHSA-patched-0001" in capsys.readouterr().out

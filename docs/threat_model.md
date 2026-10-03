@@ -243,10 +243,46 @@ While Krum protects the server from individual rogue participants, the server re
 - Coordinate the transition to Secure Multi-Party Computation (SMPC) to ensure the server never receives unaggregated, readable soft labels.
 - Verify server audit logs offline regularly using the server's public key.
 
+### 3. Cross-Chain Bridge Data Trust Model
+
+Bridge messages feed cross-chain fraud features, so a forged message could
+falsely link (or unlink) wallets across chains. Trust rules:
+
+- **Solana / Wormhole VAAs** (`ingestion/solana_adapter.py`, `ingestion/wormhole_vaa.py`):
+  the Solana RPC node is *untrusted*. A VAA is trusted only if it parses
+  strictly as VAA v1 and carries signatures from at least `⌊2n/3⌋ + 1` of the
+  `n` guardians in the **current** guardian set (`WORMHOLE_GUARDIAN_SET_INDEX`,
+  `WORMHOLE_GUARDIAN_ADDRESSES`). Signatures must be over
+  `keccak256(keccak256(body))`, use strictly ascending guardian indices, and
+  recover to the configured guardian address. VAAs from other guardian sets
+  are rejected.
+- **Fail closed**: with no guardian set configured, every VAA is rejected.
+- **Reject and quarantine, never drop silently**: malformed or unverified VAAs
+  are written to the trade DLQ with status `quarantined` (source
+  `solana_wormhole_vaa`), logged as `wormhole.vaa_rejected`, and raise the
+  `TradeDLQPoisonMessageQuarantined` alert (see `docs/runbooks/dlq.md`).
+- **Guardian set rotation** is an operator action: update the settings when
+  Wormhole governance rotates the set. The configured addresses are the root
+  of trust and must come from an authenticated source.
+- **EVM bridge events** (`ingestion/bridge_loader.py`): only finalized blocks
+  (`EVM_CONFIRMATION_DEPTH`) are ingested, reorged data is retracted, and a
+  sample of events is re-verified against transaction receipts
+  (`BRIDGE_VERIFY_SAMPLE_RATE`); see `docs/cross_chain_detection.md`.
+- Parser robustness is covered by `fuzz/fuzz_solana_vaa_parser.py`; malformed
+  inputs it surfaces are kept as permanent regression tests in
+  `tests/test_wormhole_vaa.py`.
+
 ---
+
+## Test Coverage Traceability
+
+Every STRIDE threat above is mapped to the automated regression test(s) that
+guard it, or to an explicitly tracked gap, in the
+[STRIDE threat → test matrix](threat_test_matrix.md).
 
 ## Maintenance & Review Process
 
 To prevent documentation decay and align the threat model with security updates:
+- **New Threats Require a Test Link**: Adding a STRIDE row to this document requires a matching row in [threat_test_matrix.md](threat_test_matrix.md) (a test reference, or a `gap` tracked in `TODO.md`). CI enforces this via `scripts/check_threat_matrix.py`.
 - **Trigger Check**: Re-evaluate this model on any modifications to trust boundary paths (e.g. changing contract interfaces, webhook schema adjustments, or registering new ingestion protocols).
 - **Scheduled Audit**: Conduct a formal team security review of this threat model **at least once every 6 months**.

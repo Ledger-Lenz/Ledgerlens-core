@@ -1347,6 +1347,75 @@ def dlq_replay(
     typer.echo(f"DLQ replay complete: {replayed} replayed, {failed} failed out of {len(items)} items.")
 
 
+trade_dlq_app = typer.Typer(help="Trade ingestion dead-letter queue: list, inspect, replay")
+app.add_typer(trade_dlq_app, name="trade-dlq")
+
+
+@trade_dlq_app.command("list")
+def trade_dlq_list(
+    status: str | None = typer.Option(None, help="pending | replayed | dead | quarantined"),
+    source: str | None = typer.Option(None, help="Filter by ingestion source"),
+    limit: int = typer.Option(50, help="Max entries to show"),
+) -> None:
+    """List trade DLQ entries and print depth / oldest-entry age."""
+    from ingestion.dlq import TradeDLQ
+
+    dlq = TradeDLQ()
+    for e in dlq.list_entries(status=status, source=source, limit=limit):
+        typer.echo(
+            f"{e.id}\t{e.status}\t{e.error_class.value}\t{e.source}\t"
+            f"failures={e.replay_failures}\t{e.created_at.isoformat()}\t{e.error_message}"
+        )
+    stats = dlq.refresh_metrics()
+    typer.echo(
+        f"depth={stats['depth']} quarantined={stats['quarantined']} "
+        f"oldest_age_seconds={stats['oldest_age_seconds']:.0f}"
+    )
+
+
+@trade_dlq_app.command("inspect")
+def trade_dlq_inspect(entry_id: int = typer.Argument(..., help="DLQ entry id")) -> None:
+    """Show a single trade DLQ entry including its raw record."""
+    import dataclasses
+    import json
+
+    from ingestion.dlq import TradeDLQ
+
+    entry = TradeDLQ().get(entry_id)
+    if entry is None:
+        typer.echo(f"DLQ entry {entry_id} not found.", err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(dataclasses.asdict(entry), default=str, indent=2))
+
+
+@trade_dlq_app.command("replay")
+def trade_dlq_replay(
+    entry_ids: list[int] = typer.Argument(..., help="DLQ entry ids to replay"),
+    handler: str = typer.Option(
+        ..., help="Replay handler as 'module:function', called with the decoded record"
+    ),
+) -> None:
+    """Replay selected trade DLQ entries; repeated failures are quarantined with an alert."""
+    import importlib
+
+    from ingestion.dlq import TradeDLQ
+
+    module_name, _, func_name = handler.partition(":")
+    if not func_name:
+        typer.echo("--handler must be in 'module:function' form.", err=True)
+        raise typer.Exit(2)
+    fn = getattr(importlib.import_module(module_name), func_name)
+    dlq = TradeDLQ()
+    failed = 0
+    for entry_id in entry_ids:
+        outcome = dlq.replay(entry_id, fn)
+        failed += outcome.status != "replayed"
+        typer.echo(f"{entry_id}\t{outcome.status}" + (f"\t{outcome.error}" if outcome.error else ""))
+    dlq.refresh_metrics()
+    if failed:
+        raise typer.Exit(1)
+
+
 @app.command("governance-close-expired")
 def governance_close_expired() -> None:
     """Close all active governance proposals whose voting period has expired.
@@ -1965,6 +2034,9 @@ def red_team(
     evasion_threshold: float = typer.Option(0.05, help="Maximum allowed evasion rate (5%)"),
     report_dir: str = typer.Option("./red_team_reports", help="Directory to write campaign reports"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    record: bool = typer.Option(
+        True, help="Record the result against each model's current version (see model_registry)"
+    ),
 ) -> None:
     """Run automated red-team attack campaigns and exit 1 if any campaign fails (CI gate)."""
     from detection.model_inference import load_models
@@ -1991,6 +2063,16 @@ def red_team(
     for c in summary.campaigns:
         typer.echo(f"  {c.attack_type.value}: evasion_rate={c.evasion_rate:.3f} {'OK' if c.passed else 'FAIL'}")
 
+    if record:
+        from detection.model_registry import get_current_version, record_red_team_result
+
+        for pointer in sorted(Path(model_dir).glob("*_latest.txt")):
+            name = pointer.name[: -len("_latest.txt")]
+            version = get_current_version(name, model_dir)
+            if version:
+                record_red_team_result(name, version, model_dir, summary.to_dict())
+                typer.echo(f"Recorded red-team result for {name} v{version}")
+
     if not summary.passed:
         raise typer.Exit(1)
 
@@ -2000,6 +2082,25 @@ app.add_typer(config_app, name="config")
 
 db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
 app.add_typer(db_app, name="db")
+
+audit_app = typer.Typer(help="Audit log commands")
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command("verify")
+def audit_verify(
+    db_path: str = typer.Option(None, "--db-path", help="Path to the audit log database"),
+) -> None:
+    """Verify the audit log hash chain; exit 1 if any entry was tampered with."""
+    from storage.audit_log import verify_and_alert
+
+    failures = verify_and_alert(db_path)
+    if failures:
+        for failure in failures:
+            typer.echo(failure["error"], err=True)
+        typer.echo(f"Chain broken: {len(failures)} entry(ies) failed verification")
+        raise typer.Exit(1)
+    typer.echo("Audit log chain intact")
 
 
 @db_app.command("retention")
@@ -2322,6 +2423,31 @@ def re_encrypt_webhook_secrets() -> None:
                 
         conn.commit()
     typer.echo(f"Re-encryption complete. Successfully re-encrypted {reencrypted_count} webhook secrets under the current encryption key.")
+
+
+@app.command("event-bus-replay")
+def event_bus_replay(
+    limit: int = typer.Option(None, help="Maximum number of dead-lettered events to replay (default: all)"),
+    list_only: bool = typer.Option(False, "--list", help="List dead-lettered events without replaying them"),
+) -> None:
+    """Replay risk-score events dead-lettered by the internal event bus.
+
+    Run after the underlying Kafka/NATS fault is fixed. Successfully replayed
+    events are removed from the dead-letter store; failures stay for a retry.
+    """
+    from detection.event_bus import get_dead_letter_store, get_event_bus
+
+    store = get_dead_letter_store()
+    if list_only:
+        for entry in store.entries(limit=limit):
+            typer.echo(f"{entry.id}\t{entry.backend}\t{entry.created_at}\tattempts={entry.replay_attempts}\t{entry.error}")
+        typer.echo(f"{store.count()} dead-lettered event(s).")
+        return
+
+    result = get_event_bus().replay_dead_letters(store, limit=limit)
+    typer.echo(f"Replayed {result.replayed}, failed {result.failed}, remaining {result.remaining}.")
+    if result.failed:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

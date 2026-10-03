@@ -10,6 +10,13 @@ that pattern directly from `ingestion.data_models.PathPayment` records.
 PathPaymentGraph / PathCycleDetector implement the multi-hop engine described
 in GitHub issue #121: a directed (wallet, asset) hop graph with iterative DFS
 cycle detection bounded to 7 hops.
+
+Bridge-spanning routes: :func:`bridge_hop_edges` stitches a matched Stellar →
+EVM → Stellar bridge round trip (``ingestion.bridge_loader`` transfers,
+paired by ``detection.cross_chain_correlator``) into the hop graph as one
+synthetic hop, so a cycle that leaves Stellar through a bridge and comes back
+is detected like any other path-payment cycle. See
+``docs/cross_chain_detection.md``.
 """
 
 from __future__ import annotations
@@ -24,7 +31,8 @@ from typing import Optional
 
 import pandas as pd
 
-from ingestion.data_models import PathPayment
+from detection.cross_chain_correlator import CrossChainCorrelator, _parse_timestamp
+from ingestion.data_models import BridgeTransfer, PathPayment
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +44,9 @@ _STELLAR_KEY_RE = re.compile(r"^G[A-Z2-7]{55}$")
 MAX_NODES_PER_WALLET = 500
 MAX_EDGES_PER_WALLET = 2000
 MAX_GRAPH_EDGES = 500_000
+
+# operation_id prefix marking a synthetic bridge hop (see bridge_hop_edges).
+BRIDGE_HOP_PREFIX = "bridge:"
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 
@@ -69,6 +80,11 @@ class PathPaymentCycle:
     @property
     def path_length(self) -> int:
         return len(self.hops)
+
+    @property
+    def crosses_bridge(self) -> bool:
+        """True when the cycle leaves Stellar through a bridge and comes back."""
+        return any(h.operation_id.startswith(BRIDGE_HOP_PREFIX) for h in self.hops)
 
 
 # ── Scoring ──────────────────────────────────────────────────────────────────
@@ -318,7 +334,6 @@ class PathCycleDetector:
 
     def ingest(self, hop_records: list[dict]) -> list[PathPaymentCycle]:
         """Process raw Horizon path_payment records and return newly detected cycles."""
-        newly_detected: list[PathPaymentCycle] = []
         wallets_to_check: set[str] = set()
 
         for rec in hop_records:
@@ -328,6 +343,23 @@ class PathCycleDetector:
             self._graph.add_hop(edge)
             wallets_to_check.add(edge.src_wallet)
 
+        return self._detect(wallets_to_check)
+
+    def ingest_bridge_transfers(
+        self,
+        transfers: list[BridgeTransfer],
+        correlator: CrossChainCorrelator | None = None,
+    ) -> list[PathPaymentCycle]:
+        """Stitch matched bridge round trips into the hop graph and return newly
+        detected cycles, including routes that span the bridge."""
+        wallets_to_check: set[str] = set()
+        for edge in bridge_hop_edges(transfers, correlator):
+            self._graph.add_hop(edge)
+            wallets_to_check.update((edge.src_wallet, edge.dst_wallet))
+        return self._detect(wallets_to_check)
+
+    def _detect(self, wallets_to_check: set[str]) -> list[PathPaymentCycle]:
+        newly_detected: list[PathPaymentCycle] = []
         for wallet in wallets_to_check:
             for cycle in self._graph.find_cycles(wallet):
                 if cycle.recovery_ratio < self.min_recovery_ratio:
@@ -358,6 +390,38 @@ def _validate_window(seconds: float) -> None:
         raise ValueError(
             f"cycle_window_seconds must be between 300 and 86400, got {seconds}"
         )
+
+
+def bridge_hop_edges(
+    transfers: list[BridgeTransfer],
+    correlator: CrossChainCorrelator | None = None,
+) -> list[HopEdge]:
+    """Convert matched bridge round trips into synthetic Stellar hop edges.
+
+    Each ``(outbound, inbound)`` pair matched by
+    :meth:`CrossChainCorrelator.match_round_trips` (same EVM wallet, within
+    the window, matching amount) becomes one hop from
+    ``(outbound.stellar_wallet, outbound.token)`` to
+    ``(inbound.stellar_wallet, inbound.token)`` carrying the inbound USD
+    amount, stamped at the inbound time. The EVM leg itself is collapsed.
+    """
+    correlator = correlator or CrossChainCorrelator()
+    edges: list[HopEdge] = []
+    for out, inp, _ in correlator.match_round_trips(transfers):
+        if not inp.amount_usd:
+            continue
+        edges.append(
+            HopEdge(
+                src_wallet=out.stellar_wallet,
+                src_asset=out.token,
+                dst_wallet=inp.stellar_wallet,
+                dst_asset=inp.token,
+                amount=inp.amount_usd,
+                ledger_timestamp=_parse_timestamp(inp.timestamp),
+                operation_id=f"{BRIDGE_HOP_PREFIX}{out.tx_hash_evm}:{inp.tx_hash_evm}",
+            )
+        )
+    return edges
 
 
 def _record_to_hop_edge(rec: dict) -> HopEdge | None:

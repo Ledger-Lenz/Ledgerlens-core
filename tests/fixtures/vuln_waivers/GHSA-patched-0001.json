@@ -1,0 +1,1 @@
+{"id": "GHSA-patched-0001", "aliases": ["CVE-2099-0001"], "affected": [{"package": {"name": "examplelib", "ecosystem": "PyPI"}, "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "2.4.1"}]}]}]}

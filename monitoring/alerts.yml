@@ -17,6 +17,26 @@ groups:
           description: "More than 10 webhook deliveries have permanently failed in the last hour."
           runbook: "Inspect GET /webhooks/dead-letters. Check subscriber URLs are reachable over HTTPS. Verify LEDGERLENS_WEBHOOK_ENCRYPTION_KEY is set. Dead letters require manual intervention or subscriber re-registration."
 
+      - alert: EventBusDeadLetters
+        expr: ledgerlens_event_bus_dead_letter_events > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Risk-score events are dead-lettered on the event bus"
+          description: "{{ $value }} risk-score event(s) exhausted the event bus retry budget and are waiting in the dead-letter store."
+          runbook: "Check Kafka/NATS connectivity (GET /health event_bus status). After the fault is fixed, run `ledgerlens event-bus-replay --list` then `ledgerlens event-bus-replay`. See docs/event_bus.md#dead-letter-queue-and-replay."
+
+      - alert: EventBusDeadLetterStale
+        expr: ledgerlens_event_bus_dead_letter_oldest_age_seconds > 3600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-lettered event bus events older than 1 hour"
+          description: "The oldest dead-lettered risk-score event has waited {{ $value | humanizeDuration }} for replay; downstream consumers are missing updates."
+          runbook: "Replay with `ledgerlens event-bus-replay`. If replays keep failing, inspect the stored error with `ledgerlens event-bus-replay --list`."
+
       - alert: FeatureDriftDetected
         expr: increase(ledgerlens_drift_detected_total[24h]) > 0
         for: 0m
@@ -24,6 +44,14 @@ groups:
           summary: "Feature distribution drift detected"
           description: "At least one feature-drift event was recorded in the last 24 hours."
           runbook: "Run `python cli.py retrain-check` to review the drift report. Check /admin/drift-reports for PSI values. If PSI > 0.25 on key Benford features, consider running `cli.py retrain-check --force-retrain`."
+
+      - alert: ShadowScoreDivergenceHigh
+        expr: sum(rate(ledgerlens_shadow_score_divergence_sum[15m])) / sum(rate(ledgerlens_shadow_score_divergence_count[15m])) > 0.10
+        for: 30m
+        annotations:
+          summary: "Shadow vs production score divergence outside normal range"
+          description: "Mean absolute divergence between shadow and production scores has exceeded 0.10 (SHADOW_DIVERGENCE_ALERT_MAX) for 30 minutes."
+          runbook: "Check the 'Shadow vs Production Score Divergence' dashboard panel and GET the shadow report (detection.shadow_scoring.get_shadow_report) for high-divergence wallets. Use ledgerlens_shadow_score_delta to see whether the shadow model scores systematically higher or lower. Hold promotion of SHADOW_MODEL_VERSION until divergence returns to range."
 
       - alert: ScoringLatencyHigh
         expr: histogram_quantile(0.95, rate(ledgerlens_scoring_latency_seconds_bucket[10m])) > 2.0
@@ -56,3 +84,115 @@ groups:
           summary: "Secret rotation is overdue"
           description: "One or more active API keys have exceeded the maximum age without rotation."
           runbook: "Identify the overdue key using the API key metadata or database. Rotate the key immediately via the POST /admin/api-keys/{key_id}/rotate endpoint or namespace rotation."
+
+      - alert: ScoringLatencySLOFastBurn
+        expr: >-
+          ledgerlens:scoring_latency_slo:error_ratio_rate1h > (14.4 * 0.01)
+          and
+          ledgerlens:scoring_latency_slo:error_ratio_rate5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+          slo: scoring_latency
+        annotations:
+          summary: "Scoring latency (<2s) SLO fast-burning error budget (14.4x)"
+          description: "Scoring latency (<2s) error ratio exceeds 14.4x the 1% budget (14.4%) over both the 1h and 5m windows; at this rate it will consume the 30-day error budget in ~2 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the scoring_latency dashboard panel and ledgerlens:scoring_latency_slo:error_budget_remaining."
+
+      - alert: ScoringLatencySLOSlowBurn
+        expr: >-
+          ledgerlens:scoring_latency_slo:error_ratio_rate6h > (6 * 0.01)
+          and
+          ledgerlens:scoring_latency_slo:error_ratio_rate30m > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: warning
+          slo: scoring_latency
+        annotations:
+          summary: "Scoring latency (<2s) SLO slow-burning error budget (6x)"
+          description: "Scoring latency (<2s) error ratio exceeds 6x the 1% budget (6%) over both the 6h and 30m windows; at this rate it will consume the 30-day error budget in ~5 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the scoring_latency dashboard panel and ledgerlens:scoring_latency_slo:error_budget_remaining."
+
+      - alert: WebhookDeliverySLOFastBurn
+        expr: >-
+          ledgerlens:webhook_delivery_slo:error_ratio_rate1h > (14.4 * 0.01)
+          and
+          ledgerlens:webhook_delivery_slo:error_ratio_rate5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+          slo: webhook_delivery
+        annotations:
+          summary: "Webhook delivery SLO fast-burning error budget (14.4x)"
+          description: "Webhook delivery error ratio exceeds 14.4x the 1% budget (14.4%) over both the 1h and 5m windows; at this rate it will consume the 30-day error budget in ~2 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the webhook_delivery dashboard panel and ledgerlens:webhook_delivery_slo:error_budget_remaining."
+
+      - alert: WebhookDeliverySLOSlowBurn
+        expr: >-
+          ledgerlens:webhook_delivery_slo:error_ratio_rate6h > (6 * 0.01)
+          and
+          ledgerlens:webhook_delivery_slo:error_ratio_rate30m > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: warning
+          slo: webhook_delivery
+        annotations:
+          summary: "Webhook delivery SLO slow-burning error budget (6x)"
+          description: "Webhook delivery error ratio exceeds 6x the 1% budget (6%) over both the 6h and 30m windows; at this rate it will consume the 30-day error budget in ~5 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the webhook_delivery dashboard panel and ledgerlens:webhook_delivery_slo:error_budget_remaining."
+
+      - alert: SorobanSubmissionSLOFastBurn
+        expr: >-
+          ledgerlens:soroban_submission_slo:error_ratio_rate1h > (14.4 * 0.01)
+          and
+          ledgerlens:soroban_submission_slo:error_ratio_rate5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+          slo: soroban_submission
+        annotations:
+          summary: "Soroban submission SLO fast-burning error budget (14.4x)"
+          description: "Soroban submission error ratio exceeds 14.4x the 1% budget (14.4%) over both the 1h and 5m windows; at this rate it will consume the 30-day error budget in ~2 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the soroban_submission dashboard panel and ledgerlens:soroban_submission_slo:error_budget_remaining."
+
+      - alert: SorobanSubmissionSLOSlowBurn
+        expr: >-
+          ledgerlens:soroban_submission_slo:error_ratio_rate6h > (6 * 0.01)
+          and
+          ledgerlens:soroban_submission_slo:error_ratio_rate30m > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: warning
+          slo: soroban_submission
+        annotations:
+          summary: "Soroban submission SLO slow-burning error budget (6x)"
+          description: "Soroban submission error ratio exceeds 6x the 1% budget (6%) over both the 6h and 30m windows; at this rate it will consume the 30-day error budget in ~5 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the soroban_submission dashboard panel and ledgerlens:soroban_submission_slo:error_budget_remaining."
+
+      - alert: ScoreAvailabilitySLOFastBurn
+        expr: >-
+          ledgerlens:score_availability_slo:error_ratio_rate1h > (14.4 * 0.005)
+          and
+          ledgerlens:score_availability_slo:error_ratio_rate5m > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: critical
+          slo: score_availability
+        annotations:
+          summary: "Score availability SLO fast-burning error budget (14.4x)"
+          description: "Score availability error ratio exceeds 14.4x the 0.5% budget (7.2%) over both the 1h and 5m windows; at this rate it will consume the 30-day error budget in ~2 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the score_availability dashboard panel and ledgerlens:score_availability_slo:error_budget_remaining."
+
+      - alert: ScoreAvailabilitySLOSlowBurn
+        expr: >-
+          ledgerlens:score_availability_slo:error_ratio_rate6h > (6 * 0.005)
+          and
+          ledgerlens:score_availability_slo:error_ratio_rate30m > (6 * 0.005)
+        for: 15m
+        labels:
+          severity: warning
+          slo: score_availability
+        annotations:
+          summary: "Score availability SLO slow-burning error budget (6x)"
+          description: "Score availability error ratio exceeds 6x the 0.5% budget (3%) over both the 6h and 30m windows; at this rate it will consume the 30-day error budget in ~5 days."
+          runbook: "See docs/slo.md (Alerting Design). Check the score_availability dashboard panel and ledgerlens:score_availability_slo:error_budget_remaining."

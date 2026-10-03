@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from threading import Event
 
 from detection.drift_detectors import (
     ADWIN_DELTA,
@@ -287,6 +288,24 @@ class TestDriftDetectorRegistry:
 
     def test_is_active_without_detection(self, registry):
         assert not registry.is_active()
+
+    def test_drift_requests_retraining_once(self):
+        requests = []
+        requested = Event()
+
+        def callback(event):
+            requests.append(event)
+            requested.set()
+
+        registry = DriftDetectorRegistry(["f1"], retrain_callback=callback)
+        for _ in range(200):
+            registry._adwin["f1"].update(0.0)
+        for _ in range(500):
+            if registry.observe({"f1": 5.0}):
+                break
+        requested.wait(timeout=1.0)
+        assert requests
+        assert requests[0]["event"] == "drift.detected"
 
     def test_is_active_immediately_after_detection(self, registry):
         # Force detection by inducing a shift on one feature

@@ -224,11 +224,22 @@ class Settings(BaseSettings):
     ledgerlens_webhook_encryption_key_previous: str = ""
     api_key_rotation_grace_seconds: int = 604800
     ws_max_connections: int = 100
+    # How often (seconds) long-lived WS/SSE sessions re-validate their credentials.
+    # Lower = faster revocation, higher = less auth-lookup overhead. 0 disables.
+    stream_auth_recheck_interval_seconds: float = 30.0
     api_key_max_age_days: int = 90
     # Minimum LedgerLens risk score (0-100) required to export a SAR package.
     compliance_sar_min_score: int = 70
     # Hourly cap on regulatory exports (SAR + Travel Rule) per `detection.compliance_exporter`.
     compliance_export_rate_limit_per_hour: int = 10
+    # Dedup window for `Idempotency-Key` on POST /scores/batch (Issue #976).
+    batch_idempotency_window_hours: int = 24
+    # Rows fetched per DB round-trip while streaming exports (Issue #975).
+    export_chunk_size: int = 1000
+    # Hard cap on rows a single export may return (memory guardrail, Issue #975).
+    export_max_rows: int = 1_000_000
+    # Lifetime of a break-glass elevated admin session (Issue #974).
+    admin_elevation_ttl_seconds: int = 900
 
     # ── ED25519 model signing ────────────────────────────────────────────────
     # Base64-encoded 32-byte ED25519 public key for model artifact signing.
@@ -308,6 +319,21 @@ class Settings(BaseSettings):
 
     # Consecutive failures before a provider's circuit breaker opens.
     evm_circuit_breaker_threshold: int = 5
+
+    # Blocks below the chain head before EVM data is treated as final
+    # (ingestion/evm_finality.py).  Only finalized data reaches detection.
+    evm_confirmation_depth: int = 12
+
+    # Blocks below the finalized head whose ingested hashes are re-checked
+    # against the canonical chain to detect (and retract) deep reorgs.
+    evm_reorg_check_blocks: int = 128
+
+    # Current Wormhole guardian set used to verify bridge VAAs
+    # (ingestion/wormhole_vaa.py).  Comma-separated 20-byte hex guardian
+    # addresses in guardian-index order.  When empty, every VAA fails
+    # verification and is quarantined (fail closed).
+    wormhole_guardian_set_index: int = 0
+    wormhole_guardian_addresses: str = ""
 
     # ── Runtime config cache TTL ──────────────────────────────────────────────
     runtime_config_ttl_seconds: int = 60
@@ -443,6 +469,10 @@ class Settings(BaseSettings):
     grpc_allow_insecure: bool = False
     grpc_max_message_size_bytes: int = 4194304
     grpc_max_batch_wallets: int = 1000
+    # Per-client bounded send buffer for streaming RPCs (messages).
+    grpc_stream_buffer_size: int = 64
+    # Disconnect a streaming client whose buffer stays full this long (seconds).
+    grpc_slow_client_timeout_seconds: float = 10.0
 
     # ── ZK-SNARK Configuration ────────────────────────────────────────────────
     zk_proof_system: str = "sigma"                      # "sigma" | "snark"
@@ -474,6 +504,7 @@ class Settings(BaseSettings):
                      "historical_loader_concurrency", "historical_max_lookback_days",
                      "analyst_lock_timeout_seconds", "analyst_claim_max_active_per_analyst",
                      "grpc_max_workers", "grpc_max_message_size_bytes", "grpc_max_batch_wallets",
+                     "grpc_stream_buffer_size",
                      mode="before", check_fields=False)
     @classmethod
     def must_be_positive(cls, v: object) -> object:

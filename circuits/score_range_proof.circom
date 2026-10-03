@@ -16,6 +16,11 @@ template Bn254CondAdd() {
     signal output x3;
     signal output y3;
 
+    // Constrain bit to be boolean so the conditional select below is
+    // well-defined; without this the witness could pick an arbitrary field
+    // element and the accumulator would be under-constrained.
+    bit * (bit - 1) === 0;
+
     signal lambda;
     lambda <-- (y2 - y1) / (x2 - x1);
     lambda * (x2 - x1) === y2 - y1;
@@ -28,8 +33,12 @@ template Bn254CondAdd() {
     y3_add <-- lambda * (x1 - x3_add) - y1;
     y3_add === lambda * (x1 - x3_add) - y1;
 
+    // Constrain the conditional selection so x3/y3 are fully determined by
+    // the inputs (previously only assigned via <--, leaving them free).
     x3 <-- x1 + bit * (x3_add - x1);
+    x3 === x1 + bit * (x3_add - x1);
     y3 <-- y1 + bit * (y3_add - y1);
+    y3 === y1 + bit * (y3_add - y1);
 }
 
 // Add two points on BN254 G1 natively

@@ -21,6 +21,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock
@@ -50,6 +51,7 @@ def _require_web3(location: str = "ingestion/evm_loader.py") -> None:
         )
 
 from config.settings import settings
+from ingestion.evm_finality import FinalityTracker
 
 logger = logging.getLogger("ledgerlens.evm_loader")
 
@@ -822,6 +824,8 @@ class EVMTradeLoader:
         pool_addresses: list[str] | None = None,
         _rate_limiter: _TokenBucket | None = None,
         _circuit_breaker: _CircuitBreaker | None = None,
+        finality: FinalityTracker | None = None,
+        on_retract: Callable[[set[str]], None] | None = None,
     ) -> None:
         if chain not in SUPPORTED_CHAINS:
             raise ValueError(
@@ -833,6 +837,12 @@ class EVMTradeLoader:
         rate = _NETWORK_RATE_LIMITS.get(chain, 10.0)
         self._rate_limiter = _rate_limiter or _TokenBucket(rate=rate)
         self._circuit_breaker = _circuit_breaker or _CircuitBreaker()
+        self._finality = finality or FinalityTracker(
+            settings.evm_confirmation_depth, settings.evm_reorg_check_blocks
+        )
+        self._on_retract = on_retract
+        # tx hashes retracted by the most recent load_trades() reorg check.
+        self.retracted_tx_hashes: set[str] = set()
 
     def _rpc_call(self, method: str, params: list, max_retries: int = 3) -> dict:
         """Issue a JSON-RPC call with exponential backoff on 429 / transport errors."""
@@ -888,6 +898,10 @@ class EVMTradeLoader:
         result = self._rpc_call("eth_getBlockByNumber", [hex(block_number), False])
         ts = int(result["result"]["timestamp"], 16)
         return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+    def _get_block_hash(self, block_number: int) -> str | None:
+        block = self._rpc_call("eth_getBlockByNumber", [hex(block_number), False]).get("result")
+        return block.get("hash") if block else None
 
     def _get_logs(
         self, from_block: int, to_block: int, address: str, topics: list[str]
@@ -950,6 +964,7 @@ class EVMTradeLoader:
             token_out=token_out,
             amount_in=amount_in,
             amount_out=amount_out,
+            block_hash=log.get("blockHash", ""),
         )
 
     def _parse_v2_swap(
@@ -999,17 +1014,28 @@ class EVMTradeLoader:
             token_out=token_out,
             amount_in=amount_in,
             amount_out=amount_out,
+            block_hash=log.get("blockHash", ""),
         )
 
     def load_trades(self, lookback_blocks: int | None = None) -> list[CrossChainTrade]:
         """Fetch Swap events from all configured pool addresses.
 
-        Paginates over the last `lookback_blocks` blocks (default from settings).
+        Paginates over the `lookback_blocks` blocks (default from settings)
+        ending at the finalized head (``latest - evm_confirmation_depth``);
+        unconfirmed blocks are never returned.  Before fetching, previously
+        ingested blocks are re-checked against the canonical chain; trades
+        from orphaned blocks are retracted via ``on_retract`` and exposed as
+        :attr:`retracted_tx_hashes`.
         ABI mismatches between networks are handled gracefully: a warning is
         logged, the event is skipped, and ingestion continues.
         """
         lookback_blocks = lookback_blocks if lookback_blocks is not None else settings.evm_lookback_blocks
-        latest = self._get_latest_block()
+        latest_head = self._get_latest_block()
+        orphaned = self._finality.check_reorgs(latest_head, self._get_block_hash)
+        self.retracted_tx_hashes = set().union(*orphaned.values()) if orphaned else set()
+        if self.retracted_tx_hashes and self._on_retract is not None:
+            self._on_retract(self.retracted_tx_hashes)
+        latest = self._finality.finalized_head(latest_head)
         from_block = max(0, latest - lookback_blocks)
 
         trades: list[CrossChainTrade] = []
@@ -1024,11 +1050,14 @@ class EVMTradeLoader:
                     block_ts_cache: dict[int, datetime] = {}
                     for log in logs:
                         block_num = int(log["blockNumber"], 16)
+                        if log.get("removed") or block_num > latest:
+                            continue
                         if block_num not in block_ts_cache:
                             block_ts_cache[block_num] = self._get_block_timestamp(block_num)
                         try:
                             trade = parser(log, pool_address, block_ts_cache[block_num])
                             trades.append(trade)
+                            self._finality.record(block_num, trade.block_hash, trade.tx_hash)
                         except ValueError as exc:
                             # ABI mismatch or malformed event — log and skip, do not crash
                             logger.warning(

@@ -41,10 +41,19 @@ Security notes
   modification invalidates the chain.
 * Retention enforcement only runs when explicitly configured; default is 7
   years and never auto-deletes without operator opt-in.
+
+Chain of custody (Issue #1032)
+------------------------------
+``make_scoring_event`` signs each event with HMAC-SHA256 (the audit-chain key
+from ``storage.audit_log``) at the point of generation, before it enters any
+queue or store. The signature travels with the event (``to_dict``) and is
+verified by ``storage.audit_log.ingest_scoring_event``, which rejects unsigned
+or tampered events at the audit-log boundary. See ``docs/audit_log.md``.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import uuid
@@ -120,6 +129,53 @@ class ScoringEvent:
     actor_id: Optional[str]
     chain_hash: str = field(default="")
     occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    signature: str = field(default="")
+
+    # ------------------------------------------------------------------
+    # Chain-of-custody signature
+    # ------------------------------------------------------------------
+
+    def signing_payload(self) -> bytes:
+        """Canonical bytes covered by the custody signature.
+
+        Excludes ``chain_hash`` (assigned later by the store) and
+        ``signature`` itself.
+        """
+        return json.dumps(
+            {
+                "event_id": self.event_id,
+                "wallet": self.wallet,
+                "namespace_id": self.namespace_id,
+                "score": self.score,
+                "previous_score": self.previous_score,
+                "features": dict(sorted(self.feature_snapshot.items())),
+                "model_version": self.model_version,
+                "triggered_by": self.triggered_by,
+                "actor_id": self.actor_id,
+                "occurred_at": self.occurred_at.isoformat(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def compute_signature(self) -> str:
+        """HMAC-SHA256 of ``signing_payload`` under the audit-chain key."""
+        from storage.audit_log import _get_audit_secret
+
+        return hmac.new(
+            _get_audit_secret(), self.signing_payload(), hashlib.sha256
+        ).hexdigest()
+
+    def sign(self) -> ScoringEvent:
+        """Sign the event in place and return it."""
+        self.signature = self.compute_signature()
+        return self
+
+    def verify_signature(self) -> bool:
+        """Return True only if the event carries a valid custody signature."""
+        if not self.signature:
+            return False
+        return hmac.compare_digest(self.signature, self.compute_signature())
 
     # ------------------------------------------------------------------
     # Chain hash computation
@@ -182,6 +238,7 @@ class ScoringEvent:
             "actor_id": self.actor_id,
             "chain_hash": self.chain_hash,
             "occurred_at": self.occurred_at.isoformat(),
+            "signature": self.signature,
         }
 
     @classmethod
@@ -213,6 +270,7 @@ class ScoringEvent:
             actor_id=row["actor_id"],
             chain_hash=row["chain_hash"],
             occurred_at=occurred,
+            signature=row.get("signature") or "",
         )
 
 
@@ -583,7 +641,7 @@ def make_scoring_event(
     triggered_by: str,
     actor_id: Optional[str] = None,
 ) -> ScoringEvent:
-    """Create a ScoringEvent with a freshly generated UUID v4 event_id."""
+    """Create a signed ScoringEvent with a freshly generated UUID v4 event_id."""
     return ScoringEvent(
         event_id=str(uuid.uuid4()),
         wallet=wallet,
@@ -594,4 +652,4 @@ def make_scoring_event(
         model_version=model_version,
         triggered_by=triggered_by,
         actor_id=actor_id,
-    )
+    ).sign()

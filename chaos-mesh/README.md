@@ -60,11 +60,77 @@ Polls `GET /health` every 2 seconds until it returns HTTP 200 with
 | --- | --- | --- | --- |
 | `--health-url` | `HEALTH_URL` | `http://localhost:8000/health` | Health endpoint to poll. |
 | `--timeout` | `HEALTH_TIMEOUT_S` | `60` | Seconds to keep polling before failing. |
+| `--expect-degraded CIRCUIT` | — | off | While the fault is active, assert `/health` reports graceful degraded mode for `CIRCUIT` (see below), then assert it closes again on recovery. |
 | `-v` / `--verbose` | — | off | Log every failed poll attempt at DEBUG. |
 
 Exit code `0` means the endpoint recovered within the timeout; `1` means it did
 not. Connection errors during polling are expected while a fault is active and
 are logged at DEBUG rather than aborting the run.
+
+## Feature-store degraded-mode contract
+
+`network-partition-redis.yaml` asserts specific degraded behavior of
+`detection/feature_store.py`, not just liveness. Run it with:
+
+```bash
+kubectl apply -f chaos-mesh/network-partition-redis.yaml
+python chaos-mesh/verify_experiment.py --expect-degraded feature_store_redis \
+  --health-url https://ledgerlens.staging.example/health
+```
+
+**During the partition** (checked by `assert_degraded`):
+
+- `GET /health` keeps returning **HTTP 200** — a Redis partition must never
+  escalate to a 503 hard failure. Any 503 fails the experiment immediately.
+- `status` is `"degraded"` and `circuits.feature_store_redis` is `"open"` or
+  `"half_open"` (the breaker trips after 3 consecutive Redis failures).
+- Reads and writes go to the in-process fallback dict (LRU-bounded at
+  `max_fallback_entries`). Feature state is still derived from live trades;
+  Redis values are never read while the circuit is open.
+
+**After the partition heals** (checked by `assert_recovery`):
+
+- After the breaker's 30s recovery timeout, a successful Redis call closes the
+  circuit: `status` returns to `"ok"` with `circuits.feature_store_redis ==
+  "closed"`.
+- Catch-up / cache warm: on the first read of a key, a fallback entry whose
+  `last_updated` is newer than the Redis copy (or with no Redis copy) is
+  written back to Redis and returned, so state accumulated during the outage
+  is never shadowed by the stale pre-partition Redis value (no
+  stale-as-fresh). Keys written back to Redis are dropped from the fallback
+  dict.
+
+## Chaos day and the resilience scorecard
+
+`.github/workflows/chaos-day.yml` runs the full suite against staging every
+Monday at 04:00 UTC (or on demand via *Run workflow*). It calls
+`run_chaos_day.py`, which for each experiment applies it, runs the degraded
+assertion (where one is defined) and the recovery check, then always deletes
+the experiment.
+
+Each run publishes a **resilience scorecard**:
+
+- `scorecard.json` — pass/fail, time to enter degraded mode, and recovery
+  time per experiment, plus the overall score and commit SHA. Uploaded as the
+  `resilience-scorecard` artifact (kept 400 days), so runs are historically
+  comparable.
+- `scorecard.md` — the same data as a table, posted to the workflow's job
+  summary.
+
+The previous run's scorecard is downloaded and compared. A regression (an
+experiment that passed before and now fails, or recovery time up by more than
+50%) fails the run and is listed in the summary.
+
+### Adding a new experiment
+
+1. Add the Chaos Mesh YAML to this directory, targeting the
+   `ledgerlens-staging` namespace, and add a row to the table above.
+2. Register it in `EXPERIMENTS` in `run_chaos_day.py` with an `inject_wait_s`
+   (how long to wait after `kubectl apply` before verifying), plus
+   `expect_degraded` if it trips a `/health` circuit that should be asserted.
+3. If it adds a new degraded mode, document the contract in this README.
+4. Trigger `chaos-day.yml` manually once to confirm it passes and appears in
+   the scorecard.
 
 ## Related
 

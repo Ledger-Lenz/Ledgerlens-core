@@ -3,6 +3,14 @@
 Identifies round-trip bridge patterns where a wallet bridges assets from
 Stellar to EVM and back within a configurable time window, computing a
 correlation score that feeds into the risk model as an additional feature.
+
+Finality: the correlator consumes only *finalized* EVM data.  The EVM-side
+loaders (``ingestion/evm_loader.py``, ``ingestion/bridge_loader.py``) only
+ingest events at least ``EVM_CONFIRMATION_DEPTH`` blocks below the chain head,
+and re-check ingested block hashes against the canonical chain on every run;
+transfers from reorged (orphaned) blocks are retracted from the
+``bridge_transfers`` store before they can be correlated (see
+``ingestion/evm_finality.py``).
 """
 
 from __future__ import annotations
@@ -97,6 +105,30 @@ class CrossChainCorrelator:
             logger.debug("Wallet %s has <2 transfers; round-trip score = 0.0", wallet)
             return 0.0
 
+        matched_pairs = [score for _, _, score in self.match_round_trips(transfers)]
+        if not matched_pairs:
+            return 0.0
+
+        # Aggregate: best single pair + diminishing returns from additional pairs
+        best = max(matched_pairs)
+        bonus = min(0.3, 0.05 * (len(matched_pairs) - 1))
+        return min(1.0, best + bonus)
+
+    def match_round_trips(
+        self,
+        transfers: list[BridgeTransfer],
+    ) -> list[tuple[BridgeTransfer, BridgeTransfer, float]]:
+        """Pair each Stellar → EVM bridge-out with every EVM → Stellar bridge-in
+        from the same EVM wallet that lands within the window at a matching
+        amount.
+
+        The shared EVM wallet is what resolves bridged identity: it ties the
+        outbound ``stellar_wallet`` to the inbound ``stellar_wallet`` across the
+        hop, even when they differ.
+
+        Returns ``(outbound, inbound, pair_score)`` tuples, ``pair_score`` in
+        [0, 1].
+        """
         # Separate outbound (Stellar→EVM) and inbound (EVM→Stellar)
         outbound = [
             t for t in transfers if t.direction == "stellar_to_evm"
@@ -106,13 +138,12 @@ class CrossChainCorrelator:
         ]
 
         if not outbound or not inbound:
-            logger.debug("Wallet %s missing outbound or inbound transfers; score = 0.0", wallet)
-            return 0.0
+            return []
 
         # Find matching pairs: for each outbound, look for an inbound
         # from the same EVM wallet within the time window with a similar
         # amount.
-        matched_pairs: list[tuple[float, float, int]] = []
+        matched_pairs: list[tuple[BridgeTransfer, BridgeTransfer, float]] = []
         for out in outbound:
             out_ts = _parse_timestamp(out.timestamp)
             for inp in inbound:
@@ -146,12 +177,6 @@ class CrossChainCorrelator:
                 hop_score = 1.0 / max(hop_count, 1)
 
                 pair_score = (amount_score * 0.5 + timing_score * 0.3 + hop_score * 0.2)
-                matched_pairs.append((pair_score, delta.total_seconds(), hop_count))
+                matched_pairs.append((out, inp, pair_score))
 
-        if not matched_pairs:
-            return 0.0
-
-        # Aggregate: best single pair + diminishing returns from additional pairs
-        best = max(pair[0] for pair in matched_pairs)
-        bonus = min(0.3, 0.05 * (len(matched_pairs) - 1))
-        return min(1.0, best + bonus)
+        return matched_pairs

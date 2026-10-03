@@ -8,6 +8,7 @@ from detection.counterfactual_constraints import (
     _decreasable,
     _increasable,
     get_mutable_features,
+    validate_counterfactual,
 )
 
 
@@ -149,3 +150,26 @@ def test_immutable_features_are_not_mutable():
     by_name = {c.feature_name: c for c in FEATURE_CONSTRAINTS}
     for name in ("account_age_days", "has_evm_link"):
         assert by_name[name].mutable is False
+
+
+def test_validate_counterfactual_rejects_historical_changes():
+    original = {"account_age_days": 100.0}
+    candidate = {"account_age_days": 99.0}
+    assert validate_counterfactual(candidate, original) is False
+
+
+def test_validate_counterfactual_accepts_actionable_change():
+    original = {"self_matching_rate": 0.8}
+    candidate = {"self_matching_rate": 0.2}
+    assert validate_counterfactual(candidate, original) is True
+
+
+def test_validate_counterfactual_rejects_non_finite_and_missing_features():
+    assert not validate_counterfactual(
+        {"self_matching_rate": float("nan")},
+        {"self_matching_rate": 0.8},
+    )
+    assert not validate_counterfactual(
+        {"self_matching_rate": 0.2},
+        {"self_matching_rate": 0.8, "round_trip_trade_frequency": 0.1},
+    )

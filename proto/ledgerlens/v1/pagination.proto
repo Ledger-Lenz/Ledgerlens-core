@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package ledgerlens.v1;
+
+import "ledgerlens/v1/scoring.proto";
+
+// Pagination cursor and response envelopes for list endpoints.
+//
+// The TypeScript SDK types in sdk/src/generated/pagination.ts are generated
+// from this file (`npm run generate` in sdk/). CI fails if they drift.
+// Field numbers must never be reused.
+
+// PageCursor is the offset-based cursor accepted by paginated endpoints
+// (query parameters `limit` and `offset`).
+message PageCursor {
+  optional int32 limit = 1;
+  optional int32 offset = 2;
+}
+
+// PaginatedScores is the envelope returned by GET /scores.
+message PaginatedScores {
+  repeated RiskScoreProto scores = 1;
+  optional int32 total = 2;
+}

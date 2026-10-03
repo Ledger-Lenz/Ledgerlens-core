@@ -4,6 +4,7 @@ import time
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from detection.cross_pair_engine import (
     build_volume_time_series,
@@ -148,6 +149,28 @@ def test_find_correlated_pairs_outlier_does_not_create_false_positive():
 def test_find_correlated_pairs_empty_matrix():
     result = find_correlated_pairs(pd.DataFrame())
     assert result == []
+
+
+def test_find_correlated_pairs_applies_fdr_correction():
+    """A correlation must remain significant after correcting all pair tests."""
+    rng = np.random.default_rng(123)
+    matrix = pd.DataFrame(rng.normal(size=(30, 8)), columns=[f"p{i}" for i in range(8)])
+    matrix["p1"] = matrix["p0"]
+
+    result = find_correlated_pairs(
+        matrix,
+        correlation_threshold=0.75,
+        min_active_buckets=1,
+        fdr_alpha=0.05,
+    )
+
+    assert [(a, b) for a, b, _ in result] == [("p0", "p1")]
+
+
+def test_find_correlated_pairs_validates_fdr_alpha():
+    matrix = pd.DataFrame(np.ones((10, 2)), columns=["a", "b"])
+    with pytest.raises(ValueError, match="fdr_alpha"):
+        find_correlated_pairs(matrix, fdr_alpha=0.0)
 
 
 def test_find_correlated_pairs_performance_200_pairs():

@@ -193,6 +193,17 @@ class TestIsDriftDetected:
         report = {}
         assert is_drift_detected(report) is False
 
+    def test_drift_detection_can_request_retraining(self):
+        requests = []
+        report = {"feature_a": 0.25, "feature_b": 0.22}
+        assert is_drift_detected(
+            report,
+            min_drifted_features=2,
+            retrain_callback=requests.append,
+        )
+        assert requests[0]["event"] == "drift.detected"
+        assert set(requests[0]["drifted_features"]) == {"feature_a", "feature_b"}
+
 
 class TestRunDriftReport:
     """Tests for drift report generation."""

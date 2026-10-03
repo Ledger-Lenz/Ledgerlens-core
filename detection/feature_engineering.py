@@ -898,6 +898,10 @@ def build_cross_chain_features(
     transfers = get_bridge_transfers(stellar_wallet=wallet, since_days=90)
     correlator = CrossChainCorrelator()
     round_trip_score = correlator.compute_round_trip_score(wallet, transfers)
+    # Weight by how certain the Stellar<->EVM linkage is, so weak links
+    # contribute proportionally less than confirmed ones (Issue #1035).
+    link_confidence = max(linker.link_confidences(wallet).values(), default=0.0)
+    round_trip_score *= link_confidence
 
     return {
         "has_evm_link": 1.0,

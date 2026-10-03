@@ -1,6 +1,7 @@
 """WebhookRetryQueue — asyncio-based retry scheduler with dead-letter storage.
 
-Retry schedule: 30 s → 5 min → 30 min (3 attempts total).
+Retry schedule: 30 s → 5 min → 30 min (3 attempts total), each delay reduced
+by up to 20% random jitter.
 After all retries are exhausted the delivery is written to the
 ``webhook_dlq`` SQLite table and a ``webhook.dead_lettered`` log event
 is emitted.  HMAC-SHA256 signatures are re-computed on every attempt
@@ -15,6 +16,7 @@ import hashlib
 import hmac
 import json
 import logging
+import random
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ from config.settings import settings
 logger = logging.getLogger("ledgerlens.webhook.sender")
 
 RETRY_DELAYS = [30, 300, 1800]  # 30 s, 5 min, 30 min
+JITTER_RATIO = 0.2
 REQUEST_TIMEOUT = 10.0
 
 _DLQ_SCHEMA = """
@@ -203,7 +206,7 @@ class WebhookRetryQueue:
 
         async with httpx.AsyncClient() as client:
             for delay in RETRY_DELAYS:
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay * (1 - JITTER_RATIO * random.random()))
                 attempt += 1
                 try:
                     await _attempt_delivery(client, url, payload, secret)

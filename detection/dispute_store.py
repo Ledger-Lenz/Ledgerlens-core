@@ -11,7 +11,13 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from detection.chain_submission_queue import enqueue_override_submission
+from detection.feedback_store import AnalystFeedbackStore
 from detection.storage import init_db, _connect
+
+
+# Resolution recorded when the committee confirms a score was a false positive.
+# Reaching it generates a clean (label 0) training correction.
+CONFIRMED_FALSE_POSITIVE = "score_removed"
 
 
 class ScoreDispute(BaseModel):
@@ -206,7 +212,7 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
             if approves * 3 >= 2 * total:
                 # Approve: remove score, record override, publish zero score
                 resolved_at = datetime.now(timezone.utc)
-                _write_dispute_row(conn, row_id, "approved", votes, resolved_at, "score_removed")
+                _write_dispute_row(conn, row_id, "approved", votes, resolved_at, CONFIRMED_FALSE_POSITIVE)
                 wallet = row[2]
                 asset_pair = row[3]
 
@@ -237,6 +243,18 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
                 )
                 conn.commit()
 
+                # Feed the confirmed false positive into retraining data,
+                # tagged with the dispute for provenance. Full confidence:
+                # the label was confirmed by a committee supermajority.
+                AnalystFeedbackStore(db_path=settings.db_path).add_correction(
+                    wallet=wallet,
+                    asset_pair=asset_pair,
+                    analyst_label=0,
+                    original_score=max(0, min(100, int(row[4]))),
+                    confidence=1.0,
+                    source_dispute_id=dispute_id,
+                )
+
                 return ScoreDispute(
                     dispute_id=row[1],
                     wallet=row[2],
@@ -248,7 +266,7 @@ def cast_vote(dispute_id: str, voter_key_hash: str, vote: str) -> ScoreDispute:
                     status="approved",
                     committee_votes=votes,
                     resolved_at=resolved_at,
-                    resolution="score_removed",
+                    resolution=CONFIRMED_FALSE_POSITIVE,
                 )
             if rejects * 3 >= 2 * total:
                 resolved_at = datetime.now(timezone.utc)

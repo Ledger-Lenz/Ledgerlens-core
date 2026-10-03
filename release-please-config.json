@@ -1,22 +1,118 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "python",
+  "separate-pull-requests": true,
+  "include-component-in-tag": true,
+  "draft": true,
+  "force-tag-creation": true,
+  "changelog-sections": [
+    {
+      "type": "feat",
+      "section": "Features",
+      "hidden": false
+    },
+    {
+      "type": "fix",
+      "section": "Bug Fixes",
+      "hidden": false
+    },
+    {
+      "type": "chore",
+      "section": "Miscellaneous",
+      "hidden": false
+    },
+    {
+      "type": "docs",
+      "section": "Documentation",
+      "hidden": false
+    },
+    {
+      "type": "style",
+      "section": "Styling",
+      "hidden": false
+    },
+    {
+      "type": "refactor",
+      "section": "Code Refactoring",
+      "hidden": false
+    },
+    {
+      "type": "perf",
+      "section": "Performance Improvements",
+      "hidden": false
+    },
+    {
+      "type": "test",
+      "section": "Tests",
+      "hidden": false
+    },
+    {
+      "type": "build",
+      "section": "Build System",
+      "hidden": false
+    },
+    {
+      "type": "ci",
+      "section": "CI",
+      "hidden": false
+    }
+  ],
   "packages": {
     ".": {
-      "package-name": "ledgerlens-core",
+      "component": "core",
+      "release-type": "python",
       "changelog-path": "CHANGELOG.md",
-      "changelog-sections": [
-        { "type": "feat", "section": "Features", "hidden": false },
-        { "type": "fix", "section": "Bug Fixes", "hidden": false },
-        { "type": "chore", "section": "Miscellaneous", "hidden": false },
-        { "type": "docs", "section": "Documentation", "hidden": false },
-        { "type": "style", "section": "Styling", "hidden": false },
-        { "type": "refactor", "section": "Code Refactoring", "hidden": false },
-        { "type": "perf", "section": "Performance Improvements", "hidden": false },
-        { "type": "test", "section": "Tests", "hidden": false },
-        { "type": "build", "section": "Build System", "hidden": false },
-        { "type": "ci", "section": "CI", "hidden": false }
+      "package-name": "ledgerlens-core",
+      "exclude-paths": [
+        "go",
+        "sdk",
+        "crates",
+        "contracts",
+        "packages"
       ]
+    },
+    "go": {
+      "component": "go",
+      "release-type": "go",
+      "changelog-path": "CHANGELOG.md",
+      "tag-separator": "/"
+    },
+    "sdk": {
+      "component": "ts-sdk",
+      "release-type": "node",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "packages/ledgerlens-sdk": {
+      "component": "python-sdk",
+      "release-type": "python",
+      "changelog-path": "CHANGELOG.md",
+      "package-name": "ledgerlens-sdk"
+    },
+    "packages/ledgerlens-fl-client": {
+      "component": "fl-client",
+      "release-type": "python",
+      "changelog-path": "CHANGELOG.md",
+      "package-name": "ledgerlens-fl-client"
+    },
+    "packages/ledgerlens-fl-server": {
+      "component": "fl-server",
+      "release-type": "python",
+      "changelog-path": "CHANGELOG.md",
+      "package-name": "ledgerlens-fl-server"
+    },
+    "crates/ledgerlens-sdk": {
+      "component": "rust-sdk",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "contracts/oracle_aggregator": {
+      "component": "oracle-aggregator",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "contracts/zk_verifier": {
+      "component": "zk-verifier",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md"
     }
   }
 }

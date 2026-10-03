@@ -7,27 +7,42 @@ license = "MIT"
 repository = "https://github.com/Derry255/Ledgerlens-core"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+reqwest = { version = "0.12", features = ["json"], optional = true }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
-chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1"
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+thiserror = { version = "1", optional = true }
 # ZK verification (arkworks suite)
-ark-bn254 = { version = "0.4", optional = true }
-ark-ec = { version = "0.4", optional = true }
-ark-serialize = { version = "0.4", optional = true }
-ark-ff = { version = "0.4", optional = true }
-sha2 = { version = "0.10", optional = true }
-num-bigint = { version = "0.4", optional = true }
+ark-bn254 = { version = "0.4", default-features = false, features = ["curve"], optional = true }
+ark-ec = { version = "0.4", default-features = false, optional = true }
+ark-serialize = { version = "0.4", default-features = false, optional = true }
+ark-ff = { version = "0.4", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+num-bigint = { version = "0.4", default-features = false, optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
-default = ["async"]
-async = ["tokio"]
+default = ["std", "async"]
+# Disable default features for a `no_std` + `alloc` build (e.g. wasm32 /
+# Soroban tooling). See README "no_std / WASM support".
+std = [
+    "reqwest",
+    "thiserror",
+    "serde/std",
+    "serde_json/std",
+    "chrono/default",
+    "ark-bn254?/std",
+    "ark-ec?/std",
+    "ark-serialize?/std",
+    "ark-ff?/std",
+    "sha2?/std",
+    "num-bigint?/std",
+]
+async = ["std", "tokio"]
 zk-verify = ["ark-bn254", "ark-ec", "ark-serialize", "ark-ff", "sha2", "num-bigint"]
 
 [[example]]

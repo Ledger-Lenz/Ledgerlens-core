@@ -68,3 +68,43 @@ If you spin up a new consumer or recover from an extended event bus outage, you 
 python cli.py publish-backlog --since 2026-07-01T00:00:00Z
 ```
 This replays all scores generated at or after the provided timestamp in chronological order.
+
+When the event was produced inside a traced pipeline pass, the envelope also
+carries a top-level `"trace_id"` (32 hex chars) for correlation with API
+responses and webhooks. See [Observability](observability.md#end-to-end-pipeline-trace-id).
+
+## Dead-letter queue and replay
+
+A publish that still fails after `EVENT_BUS_MAX_RETRIES` attempts is **not
+dropped**. The serialised event (partition key + envelope bytes) is written to
+the `event_bus_dead_letters` table in the LedgerLens SQLite database
+(`LEDGERLENS_DB_PATH`), and an error is logged.
+
+### Metrics and alerts
+
+| Metric | Type | Description |
+|---|---|---|
+| `ledgerlens_event_bus_dead_lettered_total{backend}` | Counter | Events dead-lettered |
+| `ledgerlens_event_bus_dead_letter_events` | Gauge | Events waiting for replay |
+| `ledgerlens_event_bus_dead_letter_oldest_age_seconds` | Gauge | Age of the oldest waiting event (0 when empty) |
+| `ledgerlens_event_bus_dead_letter_replays_total{result}` | Counter | Replay attempts (`replayed` / `failed`) |
+
+The `EventBusDeadLetters` alert fires when any event has waited 5 minutes.
+`EventBusDeadLetterStale` fires when the oldest has waited over 1 hour
+(`monitoring/alerts.yml`). The metrics appear in the *Event bus dead letters*
+row of the Wash-Trading Detection dashboard
+(`monitoring/grafana/wash_trading_detection_dashboard.json`).
+
+### Replaying
+
+After the broker fault is fixed, replay with the configured backend:
+
+```bash
+ledgerlens event-bus-replay --list      # inspect waiting events and their last error
+ledgerlens event-bus-replay             # replay all; exits 1 if any replay failed
+ledgerlens event-bus-replay --limit 100 # replay the oldest 100
+```
+
+Replayed events are removed from the store. Failed replays stay queued with
+`replay_attempts` incremented. Replay resends the original envelope bytes, so
+consumers' `(wallet, asset_pair, timestamp)` idempotency rule still applies.

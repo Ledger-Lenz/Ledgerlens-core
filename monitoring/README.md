@@ -15,6 +15,7 @@ All alerts include:
 
 ### Recording Rules
 
+- **recording_rules.yml** — SLO good/total ratios, error budgets, and the multi-window error-ratio inputs for burn-rate alerts
 - **recording_rules_cost.yml** — Cost and capacity projection rules
 
 These rules join Kubernetes resource metrics (kube-state-metrics, cadvisor) with configurable cost coefficients to produce:
@@ -192,6 +193,91 @@ Pipeline has not completed a run in over 5 minutes. Check:
 - No exceptions in logs
 - `LEDGERLENS_DB_PATH` is writable
 
+## SLO Burn-Rate Alerts
+
+Each published SLO (defined in [docs/slo.md](../docs/slo.md)) has a fast-burn and a
+slow-burn alert pair, following the Google SRE workbook multi-window,
+multi-burn-rate design. Both windows must exceed the threshold, so a short blip
+that has already recovered does not page, and the short window lets the alert
+resolve quickly once the problem stops.
+
+| SLO | Target | Budget | Fast burn (page) | Slow burn (ticket) |
+|-----|--------|--------|------------------|--------------------|
+| Scoring latency (<2s) | 99.0% | 1.0% | `ScoringLatencySLOFastBurn` | `ScoringLatencySLOSlowBurn` |
+| Webhook delivery | 99.0% | 1.0% | `WebhookDeliverySLOFastBurn` | `WebhookDeliverySLOSlowBurn` |
+| Soroban submission | 99.0% | 1.0% | `SorobanSubmissionSLOFastBurn` | `SorobanSubmissionSLOSlowBurn` |
+| Score availability | 99.5% | 0.5% | `ScoreAvailabilitySLOFastBurn` | `ScoreAvailabilitySLOSlowBurn` |
+
+| Alert class | Burn rate | Long / short window | `for` | Severity | Budget spent before firing |
+|-------------|-----------|---------------------|-------|----------|----------------------------|
+| Fast burn | 14.4x | 1h / 5m | 2m | `critical` | 2% of 30-day budget |
+| Slow burn | 6x | 6h / 30m | 15m | `warning` | 5% of 30-day budget |
+
+Inputs are the `ledgerlens:<slo>_slo:error_ratio_rate{5m,30m,1h,6h}` recording
+rules in `recording_rules.yml`.
+
+### Threshold validation
+
+Thresholds follow the SRE workbook values, which are derived from error-budget
+math rather than from any single incident. An alert can only fire after it has
+consumed the budget fraction in the table above, so a transient 5-minute spike
+(for example, a single Horizon outage blip) cannot trigger the fast-burn alert
+unless it also pushes the 1h error ratio past 14.4x budget.
+
+To measure the false-positive rate against historical data, backtest each alert
+expression over the last 30 days of Prometheus data and compare firing intervals
+with the incident log:
+
+```bash
+# Against a live Prometheus:
+curl -G "$PROM/api/v1/query_range" \
+  --data-urlencode 'query=ledgerlens:score_availability_slo:error_ratio_rate1h > (14.4 * 0.005) and ledgerlens:score_availability_slo:error_ratio_rate5m > (14.4 * 0.005)' \
+  --data-urlencode "start=$(date -d '30 days ago' +%s)" --data-urlencode "end=$(date +%s)" --data-urlencode step=60
+```
+
+False-positive rate = firing episodes with no matching incident / total firing
+episodes. Record the result here when thresholds are retuned; target is below 10%
+for fast burn and below 25% for slow burn.
+
+## Cardinality Guidelines
+
+Unbounded label values (wallet addresses, transaction hashes, raw URLs, client
+IPs) create a new time series per value and can take down the metrics backend.
+`scripts/check_metric_cardinality.py` runs in CI and enforces
+[`cardinality_budget.yml`](cardinality_budget.yml):
+
+- **Forbidden labels** (`wallet`, `address`, `tx_hash`, `url`, `ip`, ...) are
+  always rejected, in Python metric definitions and in `by (...)` clauses of any
+  rule file in this directory.
+- **Every label needs a declared bound.** Adding a new label means adding it to
+  `labels:` with a maximum number of distinct values and a comment explaining
+  what bounds it.
+- **Per-metric series budget.** The product of a metric's label bounds (times
+  bucket count for histograms) must stay under `max_series_per_metric` (5000).
+  Exceeding it requires a `metric_overrides` entry with a written justification.
+
+When adding a metric:
+
+1. Label only by small, closed sets: status, result, method, route template,
+   configured asset pair.
+2. Never label by an identifier. Per-wallet detail belongs in logs, the audit
+   trail, or the database, not Prometheus.
+3. Normalise before labelling: route templates instead of paths, status class
+   instead of arbitrary strings, bucketed values instead of raw numbers.
+4. Run `python scripts/check_metric_cardinality.py` locally before opening a PR.
+
+### Audit (current state)
+
+No metric or recording rule uses a per-wallet or other unbounded label. The labels
+with the largest value sets are bounded as follows:
+
+| Label | Metrics | What bounds it |
+|-------|---------|----------------|
+| `asset_pair` | `wallets_scored_total`, `scoring_latency_seconds` | Only configured `ASSET_PAIRS` |
+| `endpoint` | `api_request_duration_seconds`, `http_requests_total` | FastAPI route templates; `_normalise_endpoint()` for outbound calls |
+| `namespace_id` | `waf_blocks_total` | One value per tenant namespace |
+| `pod` | cost recording rules | Deployment replica count (churns on rollout; series expire) |
+
 ## Recording Rule Reference
 
 ### Cost Metrics
@@ -331,3 +417,10 @@ The `.github/workflows/cost-monitoring-validation.yml` workflow automatically va
 - Cost metrics unit tests
 
 Runs on every PR touching monitoring files.
+
+## Wash-trading detection dashboard
+
+`grafana/wash_trading_detection_dashboard.json` puts the Benford anomaly rate,
+drift status, alert volume, on-chain publication latency/backlog and event-bus
+dead letters on one time axis. It is annotated with model promotions and
+rollbacks. See `docs/runbooks/wash_trading_dashboard.md` for how to use it on call.

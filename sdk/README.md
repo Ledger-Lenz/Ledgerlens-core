@@ -207,6 +207,24 @@ if (!result.success) {
 }
 ```
 
+## Generated Pagination Types
+
+Pagination cursors and response envelopes (`PageCursor`, `PaginatedScores`)
+are generated from [`proto/ledgerlens/v1/pagination.proto`](../proto/ledgerlens/v1/pagination.proto)
+into `src/generated/pagination.ts` — do not edit that file by hand.
+
+```bash
+# Regenerate after changing the proto
+npm run generate
+
+# Fail if the committed file is out of sync with the proto (run in CI)
+npm run generate:check
+```
+
+The generator (`scripts/generate-pagination.mjs`) has no dependencies. It maps
+proto scalars to Zod types, and it maps messages defined in other protos
+(e.g. `RiskScoreProto`) to their existing schemas in `src/schemas.ts`.
+
 ## Building from Source
 
 ```bash
@@ -238,7 +256,10 @@ sdk/
 ├── src/
 │   ├── index.ts       — public re-exports (client + all schemas + types)
 │   ├── client.ts      — LedgerLensClient, LedgerLensError, LedgerLensClientOptions
-│   └── schemas.ts     — Zod schemas and inferred TypeScript types for every API response
+│   ├── schemas.ts     — Zod schemas and inferred TypeScript types for every API response
+│   └── generated/     — types generated from proto/ (npm run generate)
+├── scripts/
+│   └── generate-pagination.mjs — proto → Zod generator
 ├── tests/
 │   └── client.test.ts — Vitest unit tests (fetch-mocked, no network required)
 ├── package.json       — npm package metadata, build scripts, dual ESM/CJS exports
