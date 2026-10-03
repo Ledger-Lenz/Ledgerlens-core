@@ -17,6 +17,8 @@ from api.auth import require_admin_key
 from detection.api_key_store import (
     check_rate_limit,
     create_api_key,
+    force_revoke_api_key,
+    list_api_key_audit_events,
     list_api_keys,
     lookup_key,
     revoke_api_key,
@@ -63,6 +65,29 @@ def revoke_key(key_id: str) -> dict:
     if not revoke_api_key(key_id):
         raise HTTPException(status_code=404, detail=f"API key {key_id} not found or already revoked")
     return {"key_id": key_id, "status": "revoked"}
+
+
+@router.post(
+    "/{key_id}/force-revoke",
+    summary="Force-revoke API key",
+    description=(
+        "Immediately invalidate a key suspected of compromise, ignoring any rotation "
+        "grace period. The event is recorded in the API key audit log."
+    ),
+)
+def force_revoke_key(key_id: str, reason: str = "suspected compromise") -> dict:
+    if not force_revoke_api_key(key_id, reason=reason):
+        raise HTTPException(status_code=404, detail=f"API key {key_id} not found or already revoked")
+    return {"key_id": key_id, "status": "revoked", "reason": reason}
+
+
+@router.get(
+    "/audit",
+    summary="API key audit log",
+    description="Return rotation and revocation audit events, optionally filtered by key_id.",
+)
+def get_audit_events(key_id: str | None = None) -> list[dict]:
+    return list_api_key_audit_events(key_id)
 
 
 @router.post(

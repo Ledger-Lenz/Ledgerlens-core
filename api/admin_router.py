@@ -356,7 +356,16 @@ def fl_privacy_status() -> FLPrivacyStatus:
 class SuppressionCreate(BaseModel):
     wallet: str
     reason: str
-    expires_at: Optional[str] = None
+    expires_at: str | None = None
+    requested_by: str = ""
+    approvers: list[str] = []
+
+
+class SuppressionRenew(BaseModel):
+    renewed_by: str
+    approvers: list[str] = []
+    justification: str
+    expires_at: str | None = None
 
 
 @router.post("/suppressions", status_code=201, include_in_schema=False)
@@ -364,12 +373,45 @@ def add_suppression(body: SuppressionCreate) -> dict:
     """Add an alert suppression rule for a wallet.
 
     The wallet will generate no alert events while an active rule exists.
-    Rules expire automatically at ``expires_at`` (ISO-8601 UTC); omit to
-    create a permanent rule.
+    Requires two approvers distinct from ``requested_by`` (Issue #995).
+    Rules expire at ``expires_at`` (ISO-8601 UTC, at most 180 days out);
+    omit it for the 90-day default. There are no permanent rules.
     """
+    from detection.override_approval import ApprovalError
     from detection.suppressions import get_store
-    store = get_store()
-    return store.add(wallet=body.wallet, reason=body.reason, expires_at=body.expires_at)
+    try:
+        return get_store().add(
+            wallet=body.wallet,
+            reason=body.reason,
+            expires_at=body.expires_at,
+            requested_by=body.requested_by,
+            approvers=body.approvers,
+        )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/suppressions/{rule_id}/renew", include_in_schema=False)
+def renew_suppression(rule_id: int, body: SuppressionRenew) -> dict:
+    """Extend a suppression rule's expiry. Requires the same dual approval as creating one."""
+    from detection.override_approval import ApprovalError
+    from detection.suppressions import get_store
+    try:
+        renewed = get_store().renew(
+            rule_id, body.renewed_by, body.approvers, body.justification, body.expires_at
+        )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if renewed is None:
+        raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
+    return renewed
+
+
+@router.get("/suppressions/audit", include_in_schema=False)
+def list_suppression_audit(wallet: str | None = None) -> list[dict]:
+    """Return the suppression audit trail, optionally for one wallet."""
+    from detection.suppressions import get_store
+    return get_store().list_audit(wallet)
 
 
 @router.get("/suppressions", include_in_schema=False)
@@ -380,10 +422,10 @@ def list_suppressions() -> list[dict]:
 
 
 @router.delete("/suppressions/{rule_id}", include_in_schema=False)
-def delete_suppression(rule_id: int) -> dict:
+def delete_suppression(rule_id: int, deleted_by: str = "unknown") -> dict:
     """Remove a suppression rule by ID."""
     from detection.suppressions import get_store
-    deleted = get_store().delete(rule_id)
+    deleted = get_store().delete(rule_id, deleted_by=deleted_by)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Suppression rule {rule_id} not found")
     return {"deleted": rule_id}

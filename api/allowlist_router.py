@@ -13,10 +13,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from api.auth import require_admin_key
+from detection.override_approval import ApprovalError
 from detection.wallet_override_store import (
     add_override,
+    list_override_audit,
     list_overrides,
     remove_override,
+    renew_override,
 )
 
 router = APIRouter(prefix="/admin", tags=["Allowlist / Denylist"])
@@ -26,19 +29,44 @@ class OverrideRequest(BaseModel):
     wallet: str
     reason: str = ""
     added_by: str = ""
+    approvers: list[str] = []
+    expires_at: str | None = None
+
+
+class RenewRequest(BaseModel):
+    renewed_by: str
+    approvers: list[str] = []
+    justification: str
+    expires_at: str | None = None
 
 
 def _add(list_type: str, body: OverrideRequest) -> dict:
-    """Add an override, surfacing a duplicate active entry as 409."""
+    """Add an override: missing approvals are 422, a duplicate active entry is 409."""
     try:
         return add_override(
             wallet=body.wallet,
             list_type=list_type,
             reason=body.reason,
             added_by=body.added_by,
+            approvers=body.approvers,
+            expires_at=body.expires_at,
         )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _renew(list_type: str, wallet: str, body: RenewRequest) -> dict:
+    try:
+        renewed = renew_override(
+            wallet, list_type, body.renewed_by, body.approvers, body.justification, body.expires_at
+        )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if renewed is None:
+        raise HTTPException(status_code=404, detail=f"Wallet {wallet!r} has no active {list_type} entry")
+    return renewed
 
 
 def _remove(list_type: str, wallet: str, removed_by: str) -> dict:
@@ -53,7 +81,10 @@ def _remove(list_type: str, wallet: str, removed_by: str) -> dict:
     "/allowlist",
     status_code=201,
     summary="Add wallet to allowlist",
-    description="Allowlisted wallets return score=0 with override='allowlisted' immediately.",
+    description=(
+        "Allowlisted wallets return score=0 with override='allowlisted' immediately. "
+        "Requires two approvers distinct from added_by; expires after 90 days unless renewed."
+    ),
     dependencies=[Depends(require_admin_key)],
 )
 def add_to_allowlist(body: OverrideRequest) -> dict:
@@ -64,7 +95,10 @@ def add_to_allowlist(body: OverrideRequest) -> dict:
     "/denylist",
     status_code=201,
     summary="Add wallet to denylist",
-    description="Denylisted wallets return score=100 with override='denylisted' immediately.",
+    description=(
+        "Denylisted wallets return score=100 with override='denylisted' immediately. "
+        "Requires two approvers distinct from added_by; expires after 90 days unless renewed."
+    ),
     dependencies=[Depends(require_admin_key)],
 )
 def add_to_denylist(body: OverrideRequest) -> dict:
@@ -115,3 +149,33 @@ def remove_from_allowlist(wallet: str, removed_by: str = "") -> dict:
 )
 def remove_from_denylist(wallet: str, removed_by: str = "") -> dict:
     return _remove("denylist", wallet, removed_by)
+
+
+@router.post(
+    "/allowlist/{wallet}/renew",
+    summary="Renew allowlist entry",
+    description="Extend an active allowlist entry's expiry. Requires two approvers distinct from renewed_by.",
+    dependencies=[Depends(require_admin_key)],
+)
+def renew_allowlist(wallet: str, body: RenewRequest) -> dict:
+    return _renew("allowlist", wallet, body)
+
+
+@router.post(
+    "/denylist/{wallet}/renew",
+    summary="Renew denylist entry",
+    description="Extend an active denylist entry's expiry. Requires two approvers distinct from renewed_by.",
+    dependencies=[Depends(require_admin_key)],
+)
+def renew_denylist(wallet: str, body: RenewRequest) -> dict:
+    return _renew("denylist", wallet, body)
+
+
+@router.get(
+    "/overrides/audit",
+    summary="Wallet override audit trail",
+    description="Requester, approvers, justification and before/after state for every override change.",
+    dependencies=[Depends(require_admin_key)],
+)
+def get_override_audit(wallet: str | None = None) -> list[dict]:
+    return list_override_audit(wallet)

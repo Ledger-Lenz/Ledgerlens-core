@@ -54,3 +54,31 @@ To use a package with a blocked license:
 | High | 7 days — patch, pin, or document accepted risk |
 | Medium | 30 days — tracked in GitHub Issues |
 | Low | Best-effort — tracked in GitHub Issues |
+
+## Vulnerability waiver review
+
+Accepted CRITICAL/HIGH findings are recorded in
+`security/vulnerability-waivers.yml`. Every entry **must** have an `expires`
+date (`YYYY-MM-DD`); an entry without one is rejected by
+`scripts/check_vuln_waivers.py`. There is no permanent waiver.
+
+Enforcement (`.github/workflows/vuln-waiver-expiry.yml`):
+
+- On every push and pull request, `check_vuln_waivers.py --audit-waivers`
+  fails the build if any waiver's `expires` date has passed, even if the
+  finding is no longer reported.
+- Every Monday, the same job opens (or comments on) a
+  "Vulnerability waiver re-review due" issue listing waivers that have
+  expired or expire within 14 days.
+
+Renewal process:
+
+1. Re-check the advisory: is a fixed version now available? If so, upgrade
+   and delete the waiver instead of renewing it.
+2. If the risk is still acceptable, update `reason` with the current
+   justification (why the vulnerable path is still unreachable or mitigated)
+   and set a new `expires` no more than 90 days out.
+3. Open a PR with the change. A maintainer other than the author reviews
+   it, checking that the new reason still holds.
+4. If nobody renews the waiver, it expires and CI fails until the dependency
+   is fixed or the waiver is renewed.

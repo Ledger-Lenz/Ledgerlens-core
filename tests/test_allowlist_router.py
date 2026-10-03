@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from config.settings import settings as _settings
 
 WALLET = "GA" + "A" * 54
+APPROVAL = {"added_by": "ops", "reason": "partner", "approvers": ["alice", "bob"]}
 
 
 @pytest.fixture
@@ -35,7 +36,7 @@ def test_add_to_allowlist_is_readable_by_the_scoring_path(client):
     """The insert must succeed against the store-owned schema and be visible to it."""
     from detection.wallet_override_store import get_active_override
 
-    resp = client.post("/admin/allowlist", json={"wallet": WALLET, "reason": "partner", "added_by": "ops"})
+    resp = client.post("/admin/allowlist", json={"wallet": WALLET, **APPROVAL})
     assert resp.status_code == 201
     assert resp.json()["list_type"] == "allowlist"
 
@@ -46,13 +47,13 @@ def test_add_to_allowlist_is_readable_by_the_scoring_path(client):
 
 
 def test_duplicate_add_returns_409(client):
-    assert client.post("/admin/allowlist", json={"wallet": WALLET}).status_code == 201
-    resp = client.post("/admin/allowlist", json={"wallet": WALLET})
+    assert client.post("/admin/allowlist", json={"wallet": WALLET, **APPROVAL}).status_code == 201
+    resp = client.post("/admin/allowlist", json={"wallet": WALLET, **APPROVAL})
     assert resp.status_code == 409
 
 
 def test_remove_soft_deletes_and_preserves_history(client):
-    client.post("/admin/denylist", json={"wallet": WALLET, "reason": "wash"})
+    client.post("/admin/denylist", json={"wallet": WALLET, **APPROVAL, "reason": "wash"})
 
     resp = client.delete(f"/admin/denylist/{WALLET}?removed_by=ops")
     assert resp.status_code == 200
@@ -72,8 +73,8 @@ def test_remove_unknown_wallet_returns_404(client):
 
 
 def test_listing_is_paginated_per_list_type(client):
-    client.post("/admin/allowlist", json={"wallet": WALLET})
-    client.post("/admin/denylist", json={"wallet": "GB" + "B" * 54})
+    client.post("/admin/allowlist", json={"wallet": WALLET, **APPROVAL})
+    client.post("/admin/denylist", json={"wallet": "GB" + "B" * 54, **APPROVAL})
 
     assert len(client.get("/admin/allowlist").json()) == 1
     assert len(client.get("/admin/denylist").json()) == 1

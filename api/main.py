@@ -37,7 +37,6 @@ from api.auth import require_admin_key, require_compliance_key
 from api.api_key_router import router as api_key_router, require_scope
 from api.admin_router import router as admin_router
 from api.analyst import router as analyst_router
-from api.api_keys_router import router as api_keys_router
 from api.export_router import router as export_router
 from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router

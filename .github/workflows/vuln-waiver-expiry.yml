@@ -1,0 +1,54 @@
+name: Vulnerability Waiver Expiry
+
+# Issue #994: fail CI on any expired, unrenewed waiver in
+# security/vulnerability-waivers.yml, and open a reminder issue ahead of
+# upcoming expiries so waivers get re-reviewed instead of lapsing silently.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit-waivers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Audit waiver expiry
+        id: audit
+        run: |
+          set -o pipefail
+          python scripts/check_vuln_waivers.py --audit-waivers --warn-days 14 | tee waiver-audit.txt
+
+      - name: Open reminder issue for upcoming or expired waivers
+        if: always() && github.event_name != 'pull_request' && hashFiles('waiver-audit.txt') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! grep -qE '^(UPCOMING|EXPIRED)' waiver-audit.txt; then
+            exit 0
+          fi
+          title="Vulnerability waiver re-review due"
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          body=$(printf 'The following entries in `security/vulnerability-waivers.yml` need re-review (see docs/dependency_policy.md, "Vulnerability waiver review"):\n\n```\n%s\n```\n' "$(grep -E '^(UPCOMING|EXPIRED)' waiver-audit.txt)")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

@@ -227,3 +227,22 @@ strictly simpler than either external proxy.
 - Wildcard namespace (`namespace_id='*'`) admin keys are exempted from
   per-namespace quota but still subject to the global per-minute rate limit,
   preventing an admin key from becoming an accidental DoS bypass.
+
+## Removal of `api/api_keys_router.py` (Issue #992)
+
+`api/api_keys_router.py` duplicated the `/admin/api-keys` endpoints of
+`api/api_key_router.py` with its own SHA-256 table and scope checks. It has
+been removed; `api/api_key_router.py` is now the only API-key management
+router and delegates entirely to `detection.api_key_store`.
+
+Migration for external callers:
+
+| Removed (legacy) | Replacement |
+|------------------|-------------|
+| `POST /admin/api-keys` returning integer `id` | `POST /admin/api-keys` returning string `key_id` (UUID) |
+| `DELETE /admin/api-keys/{id}` (integer) | `DELETE /admin/api-keys/{key_id}` |
+| `X-Api-Key` header on scoped routes | `X-LedgerLens-Api-Key` header |
+
+Keys issued by the legacy router are carried over by
+`python cli.py db-migrate` (which runs `migrate_legacy_api_keys`); see the
+`db-migrate` docstring in `cli.py` for details.
