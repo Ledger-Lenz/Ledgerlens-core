@@ -1357,3 +1357,11 @@ For issues and questions:
 _Built for the Stellar ecosystem. Open source. Community owned._
 
 </div>
+
+## Handsoff notes
+
+<!-- handsoff-issue-948 -->
+- #948: Benchmark and regression-track on-chain verification gas/resource cost
+
+<!-- handsoff-issue-957 -->
+- #957: Detect stream gaps and automatically backfill after Horizon disconnects

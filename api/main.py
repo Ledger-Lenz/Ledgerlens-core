@@ -14,6 +14,7 @@ Run with:
     uvicorn api.main:app --reload
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -44,8 +45,11 @@ from api.namespace import list_namespaces
 from api.gateway import GatewayMiddleware
 from config.settings import get_runtime_risk_score_threshold, settings
 from detection.tracing import (
+    TRACE_ID_HEADER,
     configure_tracing,
+    ensure_trace_id,
     start_span,
+    use_trace_id,
 )
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -203,6 +207,24 @@ async def _nightly_retention_task() -> None:
             logger.error("[retention] Nightly job failed: %s", exc)
 
 
+async def _audit_chain_verification_task() -> None:
+    """Async background task: verify the audit log hash chain once per hour.
+
+    Chain breaks are surfaced as CRITICAL logs and the
+    ``ledgerlens_audit_chain_broken_entries`` gauge by ``verify_and_alert``.
+    """
+    import asyncio
+
+    from storage.audit_log import verify_and_alert
+
+    while True:
+        try:
+            await asyncio.to_thread(verify_and_alert)
+        except Exception as exc:
+            logger.error("[audit] Scheduled chain verification failed: %s", exc)
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; drain requests and clean up on shutdown."""
@@ -249,12 +271,14 @@ async def _lifespan(application: FastAPI):
 
     import asyncio as _asyncio
     _retention_task = _asyncio.create_task(_nightly_retention_task())
+    _audit_verify_task = _asyncio.create_task(_audit_chain_verification_task())
     yield
 
     # ── Shutdown sequence ────────────────────────────────────────────────
     import asyncio
 
     _retention_task.cancel()
+    _audit_verify_task.cancel()
 
     _shutting_down = True
     logger.info("[shutdown] Stopping new requests (returning 503)")
@@ -361,6 +385,20 @@ async def _metrics_middleware(request: Request, call_next):
             ).observe(duration)
         except Exception:
             pass
+
+
+@app.middleware("http")
+async def _trace_id_middleware(request: Request, call_next):
+    """Echo the request's pipeline trace ID in ``X-Trace-ID`` for client correlation.
+
+    An inbound ``X-Trace-ID`` is honoured so callers can stitch their own
+    trace; otherwise the active OTel trace (or a fresh ID) is used.
+    """
+    trace_id = ensure_trace_id(request.headers.get(TRACE_ID_HEADER, "").lower() or None)
+    with use_trace_id(trace_id):
+        response = await call_next(request)
+    response.headers[TRACE_ID_HEADER] = trace_id
+    return response
 
 
 @app.middleware("http")
@@ -1990,6 +2028,54 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
     return p.model_dump()
 
 
+class ProposalSignOff(BaseModel):
+    signer: str
+    role: str
+    evidence: dict[str, str] = {}
+
+
+def _proposal_int_id(proposal_id: str) -> int:
+    try:
+        return int(proposal_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="proposal_id must be an integer")
+
+
+@v1_router.post(
+    "/governance/proposals/{proposal_id}/signoffs",
+    dependencies=[Depends(require_admin_key)],
+    tags=["Governance"],
+    summary="Sign off proposal",
+    description=(
+        "Record a role sign-off (with evidence references) required by the "
+        "proposal's approval policy (admin only). See docs/governance_protocol.md."
+    ),
+)
+def signoff_proposal(proposal_id: str, body: ProposalSignOff):
+    try:
+        so = GovernanceEngine().record_signoff(_proposal_int_id(proposal_id), body.signer, body.role, body.evidence)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"proposal_id": so.proposal_id, "role": so.role, "signer": so.signer, "signed_at": so.signed_at.isoformat()}
+
+
+@v1_router.get(
+    "/governance/proposals/{proposal_id}/approval-chain",
+    dependencies=[Depends(require_admin_key)],
+    tags=["Governance"],
+    summary="Proposal approval chain",
+    description="Votes, sign-offs, missing approvals and, once executed, the recorded approval chain.",
+)
+def proposal_approval_chain(proposal_id: str):
+    pid = _proposal_int_id(proposal_id)
+    engine = GovernanceEngine()
+    try:
+        chain = engine.approval_chain(pid)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"current": chain, "recorded": engine.recorded_approval(pid)}
+
+
 @v1_router.post(
     "/governance/proposals/{proposal_id}/execute",
     dependencies=[Depends(require_admin_key)],
@@ -2040,6 +2126,40 @@ class SARPackageRequest(BaseModel):
     wallet: str
     start_date: str
     end_date: str
+    # Mandatory human review (see docs/compliance_export.md). `draft_sha256`
+    # must match the draft returned by /compliance/sar-narrative/draft, and
+    # `approved_narrative` carries the analyst's edits, if any.
+    reviewer: str | None = None
+    draft_sha256: str | None = None
+    approved_narrative: str | None = None
+    review_notes: str = ""
+
+
+class SARDraftRequest(BaseModel):
+    wallet: str
+    start_date: str
+    end_date: str
+
+
+def _sar_review_from_request(body: SARPackageRequest):
+    """Build the analyst review for a SAR export request, or raise 403."""
+    from detection.compliance_exporter import draft_sar_narrative
+    from detection.sar_narrative import SARNarrativeNotReviewed, review_sar_narrative
+
+    if not body.reviewer or not body.draft_sha256:
+        raise HTTPException(
+            status_code=403,
+            detail="SAR narrative requires human review: supply reviewer and draft_sha256",
+        )
+    draft = draft_sar_narrative(body.wallet, body.start_date, body.end_date)
+    if hashlib.sha256(draft.encode("utf-8")).hexdigest() != body.draft_sha256:
+        raise HTTPException(status_code=409, detail="SAR narrative draft changed since review; re-review it")
+    try:
+        return review_sar_narrative(
+            draft, body.reviewer, edited_text=body.approved_narrative, notes=body.review_notes
+        )
+    except SARNarrativeNotReviewed as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @v1_router.get(
@@ -2059,6 +2179,24 @@ def compliance_ivms(wallet: str, dry_run: bool = Query(False)) -> dict:
 
     validate_stellar_address(wallet)
     return asdict(export_travel_rule(wallet, dry_run=dry_run))
+
+
+@v1_router.post(
+    "/compliance/sar-narrative/draft",
+    dependencies=[Depends(require_compliance_key)],
+    include_in_schema=False,
+)
+def compliance_sar_narrative_draft(body: SARDraftRequest) -> dict:
+    """Return the auto-generated SAR narrative draft for analyst review.
+
+    The draft cannot be exported directly; submit its ``draft_sha256`` with a
+    ``reviewer`` (and any edits) to ``/compliance/sar-package``.
+    """
+    from detection.compliance_exporter import draft_sar_narrative
+
+    validate_stellar_address(body.wallet)
+    draft = draft_sar_narrative(body.wallet, body.start_date, body.end_date)
+    return {"draft": draft, "draft_sha256": hashlib.sha256(draft.encode("utf-8")).hexdigest()}
 
 
 @v1_router.post(
@@ -2083,6 +2221,7 @@ def compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)
     )
 
     validate_stellar_address(body.wallet)
+    review = _sar_review_from_request(body)
     output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
     try:
         zip_path = export_sar_package(
@@ -2091,6 +2230,7 @@ def compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)
             end_date=body.end_date,
             output_dir=output_dir,
             dry_run=dry_run,
+            review=review,
         )
     except ComplianceScoreTooLow as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2648,6 +2788,7 @@ def root_compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(F
     )
     from fastapi.responses import FileResponse as _FileResponse
 
+    review = _sar_review_from_request(body)
     output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
     try:
         pkg_path = export_sar_package(
@@ -2656,6 +2797,7 @@ def root_compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(F
             end_date=body.end_date,
             output_dir=output_dir,
             dry_run=dry_run,
+            review=review,
         )
     except ComplianceScoreTooLow as exc:
         raise HTTPException(status_code=400, detail=str(exc))

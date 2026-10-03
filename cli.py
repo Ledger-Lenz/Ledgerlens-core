@@ -1948,6 +1948,9 @@ def red_team(
     evasion_threshold: float = typer.Option(0.05, help="Maximum allowed evasion rate (5%)"),
     report_dir: str = typer.Option("./red_team_reports", help="Directory to write campaign reports"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
+    record: bool = typer.Option(
+        True, help="Record the result against each model's current version (see model_registry)"
+    ),
 ) -> None:
     """Run automated red-team attack campaigns and exit 1 if any campaign fails (CI gate)."""
     from detection.model_inference import load_models
@@ -1974,6 +1977,16 @@ def red_team(
     for c in summary.campaigns:
         typer.echo(f"  {c.attack_type.value}: evasion_rate={c.evasion_rate:.3f} {'OK' if c.passed else 'FAIL'}")
 
+    if record:
+        from detection.model_registry import get_current_version, record_red_team_result
+
+        for pointer in sorted(Path(model_dir).glob("*_latest.txt")):
+            name = pointer.name[: -len("_latest.txt")]
+            version = get_current_version(name, model_dir)
+            if version:
+                record_red_team_result(name, version, model_dir, summary.to_dict())
+                typer.echo(f"Recorded red-team result for {name} v{version}")
+
     if not summary.passed:
         raise typer.Exit(1)
 
@@ -1983,6 +1996,25 @@ app.add_typer(config_app, name="config")
 
 db_app = typer.Typer(help="Database commands: migrations, rollback, and data retention")
 app.add_typer(db_app, name="db")
+
+audit_app = typer.Typer(help="Audit log commands")
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command("verify")
+def audit_verify(
+    db_path: str = typer.Option(None, "--db-path", help="Path to the audit log database"),
+) -> None:
+    """Verify the audit log hash chain; exit 1 if any entry was tampered with."""
+    from storage.audit_log import verify_and_alert
+
+    failures = verify_and_alert(db_path)
+    if failures:
+        for failure in failures:
+            typer.echo(failure["error"], err=True)
+        typer.echo(f"Chain broken: {len(failures)} entry(ies) failed verification")
+        raise typer.Exit(1)
+    typer.echo("Audit log chain intact")
 
 
 @db_app.command("retention")
@@ -2305,6 +2337,31 @@ def re_encrypt_webhook_secrets() -> None:
                 
         conn.commit()
     typer.echo(f"Re-encryption complete. Successfully re-encrypted {reencrypted_count} webhook secrets under the current encryption key.")
+
+
+@app.command("event-bus-replay")
+def event_bus_replay(
+    limit: int = typer.Option(None, help="Maximum number of dead-lettered events to replay (default: all)"),
+    list_only: bool = typer.Option(False, "--list", help="List dead-lettered events without replaying them"),
+) -> None:
+    """Replay risk-score events dead-lettered by the internal event bus.
+
+    Run after the underlying Kafka/NATS fault is fixed. Successfully replayed
+    events are removed from the dead-letter store; failures stay for a retry.
+    """
+    from detection.event_bus import get_dead_letter_store, get_event_bus
+
+    store = get_dead_letter_store()
+    if list_only:
+        for entry in store.entries(limit=limit):
+            typer.echo(f"{entry.id}\t{entry.backend}\t{entry.created_at}\tattempts={entry.replay_attempts}\t{entry.error}")
+        typer.echo(f"{store.count()} dead-lettered event(s).")
+        return
+
+    result = get_event_bus().replay_dead_letters(store, limit=limit)
+    typer.echo(f"Replayed {result.replayed}, failed {result.failed}, remaining {result.remaining}.")
+    if result.failed:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

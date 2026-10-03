@@ -417,3 +417,10 @@ The `.github/workflows/cost-monitoring-validation.yml` workflow automatically va
 - Cost metrics unit tests
 
 Runs on every PR touching monitoring files.
+
+## Wash-trading detection dashboard
+
+`grafana/wash_trading_detection_dashboard.json` puts the Benford anomaly rate,
+drift status, alert volume, on-chain publication latency/backlog and event-bus
+dead letters on one time axis. It is annotated with model promotions and
+rollbacks. See `docs/runbooks/wash_trading_dashboard.md` for how to use it on call.

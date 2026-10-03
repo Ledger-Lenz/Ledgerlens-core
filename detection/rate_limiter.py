@@ -37,6 +37,12 @@ Sliding-window-counter (chosen) vs. alternatives:
   described in Cloudflare's and Stripe's public rate-limiting writeups
   and is an appropriate trade for a per-minute abuse control.
 
+Verification: the aggregate limit across independent replica processes is
+tested in ``tests/test_rate_limiter.py``
+(``test_two_replica_processes_share_one_effective_quota``); per-check
+overhead under concurrent load is measured against a p99 budget by
+``benchmarks/benchmark_rate_limiter.py`` (``make benchmark-check``).
+
 Failure mode (explicit, deliberate choice: fail OPEN with a bounded,
 observable degradation)
 ------------------------------------------------------------------------

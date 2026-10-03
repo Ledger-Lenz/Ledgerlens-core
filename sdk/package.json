@@ -39,6 +39,8 @@
     "test:watch": "vitest",
     "example": "tsx examples/basic-usage.ts",
     "typecheck": "tsc --noEmit",
+    "generate": "node scripts/generate-pagination.mjs",
+    "generate:check": "node scripts/generate-pagination.mjs --check",
     "lint": "eslint .",
     "lint:types": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",

@@ -1,0 +1,82 @@
+name: Release
+
+# Per-component releases driven by release-please (release-please-config.json).
+# Releases are created as drafts and are only published once the SBOM job has
+# attached a CycloneDX SBOM for the component, so no release can go out
+# without one. See docs/releasing.md.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      paths_released: ${{ steps.release.outputs.paths_released }}
+      all: ${{ toJSON(steps.release.outputs) }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  sbom:
+    name: SBOM (${{ matrix.path }})
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        path: ${{ fromJSON(needs.release-please.outputs.paths_released) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ matrix.path == '.' && fromJSON(needs.release-please.outputs.all).tag_name || fromJSON(needs.release-please.outputs.all)[format('{0}--tag_name', matrix.path)] }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SBOM tooling
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          if [[ "${{ matrix.path }}" == crates/* || "${{ matrix.path }}" == contracts/* ]]; then
+            cargo install cargo-cyclonedx --locked
+          fi
+
+      - name: Generate SBOM
+        run: |
+          set -euo pipefail
+          name="${TAG//\//-}.cdx.json"
+          case "${{ matrix.path }}" in
+            .)
+              syft scan file:requirements/base.txt -o "cyclonedx-json=${name}" ;;
+            go)
+              syft scan dir:go -o "cyclonedx-json=${name}" ;;
+            packages/*)
+              python -m venv /tmp/sbom-venv
+              /tmp/sbom-venv/bin/pip install --quiet "./${{ matrix.path }}"
+              pip install --quiet cyclonedx-bom
+              cyclonedx-py environment /tmp/sbom-venv --output-format JSON --outfile "${name}" ;;
+            sdk)
+              (cd sdk && npm install --ignore-scripts && npm sbom --sbom-format cyclonedx) > "${name}" ;;
+            crates/*|contracts/*)
+              cargo cyclonedx --manifest-path "${{ matrix.path }}/Cargo.toml" --format json --override-filename sbom
+              mv "${{ matrix.path }}/sbom.json" "${name}" ;;
+            *)
+              echo "No SBOM generator configured for ${{ matrix.path }}" >&2; exit 1 ;;
+          esac
+          # Refuse to publish an empty or malformed SBOM.
+          jq -e '.bomFormat == "CycloneDX" and (.components | length) > 0' "${name}" > /dev/null
+          sha256sum "${name}" > "${name}.sha256"
+          echo "SBOM=${name}" >> "$GITHUB_ENV"
+
+      - name: Attach SBOM and publish release
+        run: |
+          gh release upload "$TAG" "$SBOM" "$SBOM.sha256" --clobber
+          gh release edit "$TAG" --draft=false

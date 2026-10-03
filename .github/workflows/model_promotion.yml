@@ -1,0 +1,141 @@
+name: Model Promotion
+
+# Trains a candidate model, runs the full red-team suite against it, and
+# promotes (publishes) the model artifacts only if every campaign stays within
+# the evasion-rate threshold. See docs/red_team.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      evasion_threshold:
+        description: "Maximum allowed evasion rate per attack type"
+        default: "0.05"
+  push:
+    branches: [main]
+    paths:
+      - "detection/**"
+      - "config/**"
+
+env:
+  # Newer mlflow refuses its legacy filesystem tracking backend unless set.
+  MLFLOW_ALLOW_FILE_STORE: "true"
+  # Training HMAC-signs models; the red-team step needs the same key to load them.
+  LEDGERLENS_MODEL_SIGNING_KEY: "model-promotion-ci-signing-key"
+  EVASION_THRESHOLD: ${{ inputs.evasion_threshold || '0.05' }}
+
+jobs:
+  red-team-gate:
+    name: Train candidate and run red-team gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" --quiet
+
+      - name: Restore red-team history
+        uses: actions/cache@v4
+        with:
+          path: red_team_history/
+          key: red-team-history-${{ github.run_id }}
+          restore-keys: red-team-history-
+
+      - name: Train candidate model
+        run: python cli.py train --n-normal-accounts 200 --n-wash-rings 30
+
+      - name: Run red-team suite (blocking)
+        run: |
+          python cli.py red-team \
+            --model-dir models \
+            --report-dir ./red_team_reports \
+            --n-samples 200 \
+            --evasion-threshold "$EVASION_THRESHOLD"
+
+      - name: Update red-team history
+        if: always()
+        run: |
+          mkdir -p red_team_history
+          cp models/*.redteam.json red_team_history/ 2>/dev/null || true
+          python - <<'PY'
+          import json, pathlib
+          rows = []
+          for p in sorted(pathlib.Path("red_team_history").glob("*.redteam.json")):
+              r = json.loads(p.read_text())
+              worst = max((c["evasion_rate"] for c in r["campaigns"]), default=0.0)
+              rows.append((r["executed_at"], r["model"], r["version"], worst, r["passed"]))
+          lines = ["## Red-team results by model version", "",
+                   "| Executed | Model | Version | Worst evasion rate | Passed |",
+                   "|---|---|---|---|---|"]
+          lines += [f"| {e} | {m} | {v} | {w:.3f} | {p} |" for e, m, v, w, p in sorted(rows, reverse=True)]
+          summary = "\n".join(lines) + "\n"
+          pathlib.Path("red_team_history/SUMMARY.md").write_text(summary)
+          print(summary)
+          PY
+          cat red_team_history/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload red-team report and history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: red-team-${{ github.sha }}
+          path: |
+            red_team_reports/
+            red_team_history/
+          retention-days: 90
+
+      - name: Upload candidate models
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-models-${{ github.sha }}
+          path: models/
+          retention-days: 30
+
+  promote:
+    name: Promote model
+    needs: red-team-gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" --quiet
+
+      - name: Download candidate models
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-models-${{ github.sha }}
+          path: models/
+
+      - name: Verify every model version passed the red-team gate
+        run: |
+          python - <<'PY'
+          import pathlib
+          from detection.model_registry import assert_red_team_passed, get_current_version
+          for pointer in sorted(pathlib.Path("models").glob("*_latest.txt")):
+              name = pointer.name[: -len("_latest.txt")]
+              version = get_current_version(name, "models")
+              assert_red_team_passed(name, version, "models")
+              print(f"{name} v{version}: red-team gate passed")
+          PY
+
+      - name: Publish promoted models
+        uses: actions/upload-artifact@v4
+        with:
+          name: promoted-models-${{ github.sha }}
+          path: models/
+          retention-days: 90

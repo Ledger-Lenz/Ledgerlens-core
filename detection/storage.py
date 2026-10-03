@@ -5,6 +5,11 @@ integration point is wired up (see README's "Open Integration Points"),
 `run_pipeline.py` and the local API (`api/main.py`) persist and read
 `RiskScore` records here.
 
+This module is the single persistence abstraction for detection data. A
+parallel SQLAlchemy Core store (`detection/storage_orm.py`) previously
+duplicated `RiskScoreStore.upsert_trades` but had no callers; it was removed
+in #978 to avoid divergent query and transaction semantics.
+
 ## How to add a new migration
 1. Append a tuple to `_MIGRATIONS`:
        (version, "short description", "ALTER TABLE ... or CREATE TABLE ...")

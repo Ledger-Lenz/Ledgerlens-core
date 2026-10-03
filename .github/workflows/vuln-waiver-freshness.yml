@@ -1,0 +1,35 @@
+name: Vulnerability Waiver Freshness
+
+# Fails when a waiver in security/vulnerability-waivers.yml references an
+# advisory that now has an upstream fix (#1016). Runs nightly as well, since
+# fixes get published upstream without any change in this repository.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "security/vulnerability-waivers.yml"
+      - "scripts/check_vuln_waivers.py"
+  pull_request:
+    paths:
+      - "security/vulnerability-waivers.yml"
+      - "scripts/check_vuln_waivers.py"
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  waiver-freshness:
+    name: Stale waiver check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check waivers against OSV
+        run: |
+          pip install pyyaml
+          python scripts/check_vuln_waivers.py --check-stale

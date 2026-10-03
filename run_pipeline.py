@@ -243,7 +243,7 @@ def run(
     # Assign a fresh correlation ID for this pipeline pass
     set_correlation_id(str(uuid.uuid4()))
 
-    from api.metrics import pipeline_run_duration_seconds, wallets_scored_total, scoring_latency_seconds
+    from api.metrics import benford_flags_total, pipeline_run_duration_seconds, wallets_scored_total, scoring_latency_seconds
 
     tracer = get_tracer("ledgerlens.pipeline")
     _t_start = time.monotonic()
@@ -411,6 +411,8 @@ def run(
                     scoring_latency_seconds.labels(asset_pair=pair_key).observe(_elapsed)
                     _result = "above_threshold" if score.score >= get_runtime_risk_score_threshold() else "below_threshold"
                     wallets_scored_total.labels(asset_pair=pair_key, result=_result).inc()
+                    if score.benford_flag:
+                        benford_flags_total.labels(asset_pair=pair_key).inc()
                 r.add_output(Dataset(namespace=f"{settings.openlineage_namespace}.sqlite", name="feature_distribution_snapshots"))
 
         logger.info("Computed %d risk scores", len(scores))
@@ -465,10 +467,14 @@ def _enqueue_webhook_alerts(scores: list[RiskScore]) -> None:
         from detection.webhook_queue import enqueue, init_db as init_q
         from detection.webhook_registry import get_matching_subscribers, init_db as init_r
 
+        from detection.tracing import ensure_trace_id
+
         init_r()
         init_q()
+        trace_id = ensure_trace_id()
         for score in scores:
             payload = score.model_dump()
+            payload["trace_id"] = trace_id
             payload["score_lower"] = score.score_lower
             payload["score_upper"] = score.score_upper
             for sub in get_matching_subscribers(score):

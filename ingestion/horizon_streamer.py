@@ -512,6 +512,10 @@ class HorizonStreamer:
             self._throttle_level = max(0, self._throttle_level - 1)
 
     async def _enqueue(self, trade: Trade) -> bool:
+        from detection.tracing import ensure_trace_id
+
+        # Every downstream hop (scoring, API, webhook delivery) reuses this ID.
+        trade.trace_id = ensure_trace_id(trade.trace_id)
         await self._maybe_throttle()
         before_dropped = self.queue.dropped_count()
         accepted = await self.queue.put(trade)

@@ -340,3 +340,31 @@ def test_get_latest_scores_filter_by_asset_pair(db_path):
     results = get_latest_scores(asset_pair="XLM/USDC", db_path=db_path)
     assert len(results) == 1
     assert results[0].asset_pair == "XLM/USDC"
+
+
+def test_risk_score_store_upsert_trades_ignores_duplicate_paging_tokens(db_path):
+    """Regression for #978: behavior previously duplicated in storage_orm.py."""
+    from detection.storage import RiskScoreStore
+    from ingestion.data_models import Asset, Trade
+
+    def _trade(trade_id: str) -> Trade:
+        return Trade(
+            id=trade_id,
+            paging_token=f"pt-{trade_id}",
+            ledger_close_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            base_account="GA",
+            counter_account="GB",
+            base_asset=Asset(code="XLM", issuer=None),
+            counter_asset=Asset(code="USDC", issuer="GC"),
+            base_amount=10.0,
+            counter_amount=1.0,
+            price=0.1,
+            base_is_seller=True,
+        )
+
+    store = RiskScoreStore(db_path)
+    assert store.upsert_trades([]) == 0
+    assert store.upsert_trades([_trade("a"), _trade("b")]) == 2
+    assert store.upsert_trades([_trade("b"), _trade("c")]) == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 3

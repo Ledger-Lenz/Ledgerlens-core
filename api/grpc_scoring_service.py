@@ -1,11 +1,27 @@
-"""gRPC Internal Scoring Service for Low-Latency Score Delivery (Issue #338)."""
+"""gRPC Internal Scoring Service for Low-Latency Score Delivery (Issue #338).
+
+Streaming flow control (#971)
+-----------------------------
+Streaming responses are produced on a worker thread into a bounded per-client
+buffer (``settings.grpc_stream_buffer_size`` messages).  When the client reads
+slower than scores are produced the buffer fills and the producer blocks, so
+server memory per stream is capped at the buffer size rather than growing
+without bound.  If the buffer stays full for
+``settings.grpc_slow_client_timeout_seconds`` the client is considered stuck:
+the RPC is cancelled with ``RESOURCE_EXHAUSTED`` and
+``ledgerlens_grpc_backpressure_disconnects_total`` is incremented.  Buffer
+depth is exported as ``ledgerlens_grpc_stream_buffer_occupancy``.
+"""
 
 from __future__ import annotations
 
 import concurrent.futures
 import logging
+import queue
 import secrets
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 
 import grpc
 
@@ -80,6 +96,87 @@ def _to_proto(score_obj) -> scoring_pb2.RiskScoreProto:
     return proto
 
 
+class _StreamAbort(Exception):
+    def __init__(self, code: grpc.StatusCode, details: str) -> None:
+        super().__init__(details)
+        self.code = code
+        self.details = details
+
+
+def _stream_with_backpressure(
+    produce: Callable[[], Iterator], context: grpc.ServicerContext
+) -> Iterator:
+    """Relay *produce()* to the client through a bounded buffer.
+
+    The producer runs on its own thread and blocks when the buffer is full;
+    a client that keeps the buffer full past the slow-client timeout is
+    disconnected with RESOURCE_EXHAUSTED.
+    """
+    from api.metrics import grpc_backpressure_disconnects_total, grpc_stream_buffer_occupancy
+
+    buf: queue.Queue = queue.Queue(maxsize=settings.grpc_stream_buffer_size)
+    slow_timeout = settings.grpc_slow_client_timeout_seconds
+    stop = threading.Event()
+    finished = threading.Event()
+    state: dict = {"error": None, "slow": False}
+
+    def _put(item) -> bool:
+        deadline = time.monotonic() + slow_timeout
+        while not stop.is_set():
+            try:
+                buf.put(item, timeout=min(0.05, max(deadline - time.monotonic(), 0)))
+                grpc_stream_buffer_occupancy.observe(buf.qsize())
+                return True
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    state["slow"] = True
+                    return False
+        return False
+
+    def _run() -> None:
+        try:
+            for item in produce():
+                if not _put(item):
+                    break
+        except Exception as exc:  # re-raised on the RPC thread
+            state["error"] = exc
+        finally:
+            finished.set()
+            if state["slow"]:
+                grpc_backpressure_disconnects_total.inc()
+                logger.warning(
+                    "gRPC slow client disconnected peer=%s buffer=%d timeout=%.1fs",
+                    context.peer(),
+                    buf.maxsize,
+                    slow_timeout,
+                )
+                context.cancel()
+
+    threading.Thread(target=_run, name="grpc-stream-producer", daemon=True).start()
+    try:
+        while True:
+            try:
+                item = buf.get(timeout=0.05)
+            except queue.Empty:
+                if finished.is_set() and buf.empty():
+                    break
+                continue
+            yield item
+    finally:
+        stop.set()
+
+    if state["slow"]:
+        context.abort(
+            grpc.StatusCode.RESOURCE_EXHAUSTED,
+            f"Client consumed too slowly (buffer full for {slow_timeout}s)",
+        )
+    error = state["error"]
+    if isinstance(error, _StreamAbort):
+        context.abort(error.code, error.details)
+    if error is not None:
+        raise error
+
+
 class ScoringServicer(scoring_pb2_grpc.ScoringServiceServicer):
     """gRPC Servicer implementing ScoringService."""
 
@@ -97,17 +194,23 @@ class ScoringServicer(scoring_pb2_grpc.ScoringServiceServicer):
     ):
         _authenticate(context, required_scope="read:scores")
         max_batch = settings.grpc_max_batch_wallets
-        count = 0
-        for request in request_iterator:
-            count += 1
-            if count > max_batch:
-                context.abort(
-                    grpc.StatusCode.RESOURCE_EXHAUSTED,
-                    f"Batch size exceeds maximum limit of {max_batch} wallets",
+
+        def produce():
+            count = 0
+            for request in request_iterator:
+                count += 1
+                if count > max_batch:
+                    raise _StreamAbort(
+                        grpc.StatusCode.RESOURCE_EXHAUSTED,
+                        f"Batch size exceeds maximum limit of {max_batch} wallets",
+                    )
+                scores = storage.get_latest_scores(
+                    request.wallet, asset_pair=request.asset_pair or None
                 )
-            scores = storage.get_latest_scores(request.wallet, asset_pair=request.asset_pair or None)
-            if scores:
-                yield _to_proto(scores[0])
+                if scores:
+                    yield _to_proto(scores[0])
+
+        yield from _stream_with_backpressure(produce, context)
 
 
 class AuthInterceptor(grpc.ServerInterceptor):

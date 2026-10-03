@@ -153,6 +153,39 @@ Cumulative ε is persisted in the `federated_audit_log` SQLite table across serv
 - The aggregated soft labels `p_global` (weighted average of all participants' noisy predictions on the public dataset).
 - The server's public key (for audit verification).
 
+### Secure Aggregation  (Issue #1034)
+
+`detection/federated/secure_agg.py` implements Bonawitz-style pairwise masking
+so the coordinator only ever sees the aggregate, never one participant's raw
+update:
+
+1. Each participant publishes an X25519 public key for the round.
+2. Every pair derives a shared secret, expands it with HKDF (bound to the
+   `round_id`) into a pseudorandom mask; the lexicographically lower id adds
+   the mask and the higher id subtracts it.
+3. Updates are fixed-point encoded (`FRAC_BITS = 24`) in Z/2^64, so masks
+   cancel exactly in the sum.
+4. `SecureAggregator` keeps only a running sum of masked vectors, exposes no
+   per-participant accessor, and `aggregate()` refuses to return anything
+   until **every** expected participant has reported.
+
+**Guarantee:** an honest-but-curious coordinator learns only the sum of the
+updates. Each individual masked vector is indistinguishable from uniform noise.
+
+**Assumptions and limits:**
+- At least `MIN_PARTICIPANTS = 3` participants per round; with two, either
+  one could subtract its own update from the aggregate.
+- The coordinator does not collude with all-but-one participants (colluders
+  can always subtract their own updates from the aggregate).
+- Public keys are distributed authentically (e.g. bound to the participant's
+  registered signing key); a coordinator that substitutes keys can unmask.
+- No dropout recovery: a missing participant blocks the round, which must be
+  restarted with a new `round_id` and participant set.
+- Update values must satisfy `|x| < 2^39` so the fixed-point sum does not
+  overflow.
+- Krum/Multi-Krum inspects individual updates and therefore cannot run on
+  securely aggregated rounds; the two defences are mutually exclusive per round.
+
 ### Authentication
 Each participant generates an Ed25519 keypair:
 

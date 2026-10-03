@@ -1,12 +1,15 @@
 """Delivery queue for webhook alerts — SQLite-backed with at-least-once semantics.
 
 Items stay ``pending`` until acknowledged.  Failed deliveries are retried with
-exponential backoff (``2^N * 5s``, capped at 1 hour).  After 8 attempts an
-item moves to ``dead`` (dead-letter queue).
+exponential backoff (``2^N * 5s``, capped at 1 hour) minus up to 20% random
+jitter so failing endpoints are not retried in lockstep.  After 8 attempts an
+item moves to ``dead`` (dead-letter queue) and a ``webhook.dead_lettered``
+ERROR log alert is emitted.
 """
 
 import json
 import logging
+import random
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +38,15 @@ CREATE INDEX IF NOT EXISTS idx_webhook_queue_next_attempt ON webhook_delivery_qu
 MAX_ATTEMPTS = 8
 BASE_DELAY = 5          # seconds
 MAX_DELAY = 3600        # 1 hour cap
+JITTER_RATIO = 0.2      # up to 20% of the delay is randomly shaved off
+
+_jitter = random.random
+
+
+def compute_backoff(attempt: int) -> float:
+    """Seconds to wait before retry *attempt*: capped exponential with jitter."""
+    delay = min(2**attempt * BASE_DELAY, MAX_DELAY)
+    return delay * (1 - JITTER_RATIO * _jitter())
 
 
 @dataclass
@@ -114,14 +126,17 @@ def mark_delivered(delivery_id: int, response_status: int, db_path: str | None =
         conn.commit()
 
 
-def mark_failed(delivery_id: int, error: str, max_attempts: int = MAX_ATTEMPTS, db_path: str | None = None):
+def mark_failed(
+    delivery_id: int, error: str, max_attempts: int = MAX_ATTEMPTS, db_path: str | None = None
+) -> str | None:
+    """Record a failed attempt; return the new status (``pending``/``dead``)."""
     with _connect(db_path) as conn:
         row = conn.execute(
             "SELECT attempt_count FROM webhook_delivery_queue WHERE id = ?",
             (delivery_id,),
         ).fetchone()
         if not row:
-            return
+            return None
 
         attempt = row[0] + 1
         now = datetime.now(timezone.utc)
@@ -131,14 +146,22 @@ def mark_failed(delivery_id: int, error: str, max_attempts: int = MAX_ATTEMPTS, 
                 "UPDATE webhook_delivery_queue SET attempt_count = ?, status = 'dead', last_error = ? WHERE id = ?",
                 (attempt, error, delivery_id),
             )
+            status = "dead"
+            logger.error(
+                "webhook.dead_lettered delivery_id=%d attempts=%d last_error=%s",
+                delivery_id,
+                attempt,
+                error,
+            )
         else:
-            delay = min(2**attempt * BASE_DELAY, MAX_DELAY)
-            next_at = (now + timedelta(seconds=delay)).isoformat()
+            next_at = (now + timedelta(seconds=compute_backoff(attempt))).isoformat()
             conn.execute(
                 "UPDATE webhook_delivery_queue SET attempt_count = ?, next_attempt_at = ?, last_error = ?, status = 'pending' WHERE id = ?",
                 (attempt, next_at, error, delivery_id),
             )
+            status = "pending"
         conn.commit()
+        return status
 
 
 def get_dead_letters(db_path: str | None = None) -> list[Delivery]:

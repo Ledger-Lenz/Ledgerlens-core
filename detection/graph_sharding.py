@@ -1,13 +1,74 @@
-"""Adaptive sharded graph engine partitioner using community detection."""
+"""Adaptive sharded graph engine partitioner using community detection.
+
+Rebalancing
+-----------
+When shard-holding workers are added or removed the shard count changes and
+:meth:`GraphShardPartitioner.rebalance` computes a migration plan from the
+previous :class:`ShardAssignment` to a new one:
+
+1. The graph is re-partitioned with the new shard count.
+2. New shard ids are relabelled to maximise overlap with the previous
+   assignment (greedy, largest overlap first), so nodes whose community did
+   not change keep their shard and are not moved.
+3. Every node whose shard differs becomes a single ``(source, target)`` move.
+   Nodes that were owned by a removed shard always move.
+
+Consistency guarantees during transition:
+
+* **Single owner** - each graph node appears in exactly one shard of the new
+  assignment and in at most one move, so a handoff never leaves a node owned
+  by two shards once the plan is applied.
+* **No loss** - every node of the input graph is present in the new
+  assignment; nodes that disappeared from the graph are listed in
+  ``RebalancePlan.dropped`` rather than silently discarded.
+* **Chaining** - a plan's ``assignment`` is a valid ``previous`` input, so a
+  worker addition/removal that arrives while a plan is still in flight is
+  handled by rebalancing again from that plan (pass it as ``in_flight``).
+  Nodes whose in-flight move is superseded are reported as ownership
+  conflicts; the newer plan is authoritative for them.
+
+Rebalance duration, moved nodes and ownership conflicts are exported as
+Prometheus metrics when ``prometheus_client`` is installed.
+"""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import networkx as nx
 
 logger = logging.getLogger(__name__)
+
+# Prometheus metrics (lazy import to avoid hard dependency)
+_rebalance_metrics = None
+
+
+def _get_rebalance_metrics():
+    global _rebalance_metrics
+    if _rebalance_metrics is not None:
+        return _rebalance_metrics or None
+    try:
+        from prometheus_client import Counter, Histogram
+
+        _rebalance_metrics = (
+            Histogram(
+                "ledgerlens_graph_shard_rebalance_duration_seconds",
+                "Time taken to compute a graph shard rebalance plan",
+            ),
+            Counter(
+                "ledgerlens_graph_shard_rebalance_moves_total",
+                "Graph nodes moved between shards by rebalances",
+            ),
+            Counter(
+                "ledgerlens_graph_shard_ownership_conflicts_total",
+                "In-flight node moves superseded by a newer rebalance",
+            ),
+        )
+    except ImportError:
+        _rebalance_metrics = False
+    return _rebalance_metrics or None
 
 
 @dataclass
@@ -16,6 +77,15 @@ class ShardAssignment:
     boundary_nodes: dict[str, set[int]]
     shard_count: int
     modularity: float
+
+
+@dataclass
+class RebalancePlan:
+    assignment: ShardAssignment
+    moves: dict[str, tuple[int, int]] = field(default_factory=dict)
+    dropped: set[str] = field(default_factory=set)
+    ownership_conflicts: set[str] = field(default_factory=set)
+    duration_seconds: float = 0.0
 
 
 class GraphShardPartitioner:
@@ -64,6 +134,69 @@ class GraphShardPartitioner:
             modularity=modularity,
         )
 
+    def rebalance(
+        self,
+        previous: ShardAssignment,
+        edge_data: dict[tuple[str, str], list],
+        in_flight: RebalancePlan | None = None,
+    ) -> RebalancePlan:
+        """Plan the migration from *previous* to this partitioner's shard count."""
+        start = time.perf_counter()
+        fresh = self.partition(edge_data)
+
+        # Relabel new shards to maximise overlap with the previous assignment.
+        overlap: dict[tuple[int, int], int] = {}
+        for node, new_shard in fresh.node_to_shard.items():
+            old_shard = previous.node_to_shard.get(node)
+            if old_shard is not None and old_shard < fresh.shard_count:
+                key = (new_shard, old_shard)
+                overlap[key] = overlap.get(key, 0) + 1
+        relabel: dict[int, int] = {}
+        used: set[int] = set()
+        for (new_shard, old_shard), _ in sorted(overlap.items(), key=lambda kv: (-kv[1], kv[0])):
+            if new_shard not in relabel and old_shard not in used:
+                relabel[new_shard] = old_shard
+                used.add(old_shard)
+        free = iter(i for i in range(fresh.shard_count) if i not in used)
+        for new_shard in range(fresh.shard_count):
+            if new_shard not in relabel:
+                relabel[new_shard] = next(free)
+
+        node_to_shard = {n: relabel[s] for n, s in fresh.node_to_shard.items()}
+        assignment = ShardAssignment(
+            node_to_shard=node_to_shard,
+            boundary_nodes={n: {relabel[s] for s in shards} for n, shards in fresh.boundary_nodes.items()},
+            shard_count=fresh.shard_count,
+            modularity=fresh.modularity,
+        )
+
+        moves: dict[str, tuple[int, int]] = {}
+        for node, target in node_to_shard.items():
+            source = previous.node_to_shard.get(node)
+            if source is not None and source != target:
+                moves[node] = (source, target)
+        dropped = set(previous.node_to_shard) - set(node_to_shard)
+        conflicts = set(moves) & set(in_flight.moves) if in_flight is not None else set()
+
+        duration = time.perf_counter() - start
+        metrics = _get_rebalance_metrics()
+        if metrics is not None:
+            duration_hist, moves_counter, conflicts_counter = metrics
+            duration_hist.observe(duration)
+            moves_counter.inc(len(moves))
+            conflicts_counter.inc(len(conflicts))
+        logger.info(
+            "Graph shard rebalance %d -> %d shards: %d moves, %d dropped, %d conflicts",
+            previous.shard_count, assignment.shard_count, len(moves), len(dropped), len(conflicts),
+        )
+        return RebalancePlan(
+            assignment=assignment,
+            moves=moves,
+            dropped=dropped,
+            ownership_conflicts=conflicts,
+            duration_seconds=duration,
+        )
+
     def _detect_communities(self, graph: nx.Graph, n: int) -> list[set[str]]:
         if n == 0:
             return []
@@ -83,7 +216,13 @@ class GraphShardPartitioner:
     ) -> list[set[str]]:
         target = max(1, n // shard_count)
         merged = self._merge_small_communities(communities, target)
-        return self._split_large_communities(merged, target, shard_count)
+        result = self._split_large_communities(merged, target, shard_count)
+        # Fold surplus communities into the smallest shards so shard ids stay < shard_count.
+        result.sort(key=len, reverse=True)
+        while len(result) > shard_count:
+            surplus = result.pop()
+            min(result[:shard_count], key=len).update(surplus)
+        return result
 
     def _merge_small_communities(self, communities: list[set[str]], target: int) -> list[set[str]]:
         small: list[set[str]] = []

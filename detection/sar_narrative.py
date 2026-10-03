@@ -11,7 +11,11 @@ See `detection.compliance_exporter` for the package assembly that consumes this.
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 SAR_TEMPLATE = (
@@ -105,3 +109,97 @@ def generate_sar_narrative(
         chi_p=float(chi_p),
     )
     return narrative
+
+
+# ---------------------------------------------------------------------------
+# Mandatory human review
+#
+# A generated narrative is only ever a *draft*.  Before it may be exported it
+# must be approved by a named compliance analyst via `review_sar_narrative`,
+# and every export path must obtain the final text through
+# `require_approved_narrative`, which refuses unreviewed drafts and reviews
+# that were made against a different draft.
+# ---------------------------------------------------------------------------
+
+
+class SARNarrativeNotReviewed(PermissionError):
+    """Raised when a SAR narrative is exported without a valid human review."""
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class SARNarrativeReview:
+    """Recorded human approval of an auto-generated SAR narrative draft."""
+
+    reviewer: str
+    reviewed_at: str
+    draft_sha256: str
+    final_text: str
+    edited: bool
+    diff: str
+    notes: str = ""
+
+    @property
+    def final_sha256(self) -> str:
+        return _sha256(self.final_text)
+
+    def to_audit_record(self) -> dict[str, Any]:
+        """Serialisable audit record: reviewer, timestamp, hashes and edits."""
+        record = asdict(self)
+        record.pop("final_text")
+        record["final_sha256"] = self.final_sha256
+        return record
+
+
+def review_sar_narrative(
+    draft: str,
+    reviewer: str,
+    *,
+    edited_text: str | None = None,
+    notes: str = "",
+) -> SARNarrativeReview:
+    """Record a compliance analyst's approval of ``draft``.
+
+    ``edited_text`` is the analyst's corrected narrative, if they changed the
+    draft; the edits are captured as a unified diff for the audit trail.
+    """
+    if not reviewer or not reviewer.strip():
+        raise SARNarrativeNotReviewed("a named reviewer is required to approve a SAR narrative")
+    final_text = draft if edited_text is None else edited_text
+    if not final_text.strip():
+        raise SARNarrativeNotReviewed("an approved SAR narrative must not be empty")
+    diff = "".join(
+        difflib.unified_diff(
+            draft.splitlines(keepends=True),
+            final_text.splitlines(keepends=True),
+            fromfile="draft",
+            tofile="approved",
+        )
+    )
+    return SARNarrativeReview(
+        reviewer=reviewer.strip(),
+        reviewed_at=datetime.now(timezone.utc).isoformat(),
+        draft_sha256=_sha256(draft),
+        final_text=final_text,
+        edited=final_text != draft,
+        diff=diff,
+        notes=notes,
+    )
+
+
+def require_approved_narrative(draft: str, review: SARNarrativeReview | None) -> str:
+    """Return the exportable narrative text, or raise if it was not reviewed.
+
+    The review must be bound to this exact draft (by SHA-256), so an approval
+    of an earlier draft cannot be reused after the underlying data changes.
+    """
+    if not isinstance(review, SARNarrativeReview):
+        raise SARNarrativeNotReviewed("SAR narrative has not been reviewed by a compliance analyst")
+    if not review.reviewer.strip():
+        raise SARNarrativeNotReviewed("SAR narrative review has no recorded reviewer")
+    if review.draft_sha256 != _sha256(draft):
+        raise SARNarrativeNotReviewed("SAR narrative review does not match the current draft")
+    return review.final_text

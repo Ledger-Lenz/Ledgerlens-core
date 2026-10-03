@@ -20,9 +20,11 @@ Security notes:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -44,6 +46,44 @@ class GovernanceVoteError(GovernanceError):
     """Raised when a vote cannot be cast."""
 
 
+class GovernanceApprovalError(GovernanceError):
+    """Raised when a change lacks the sign-offs/evidence its approval policy requires."""
+
+
+# ---------------------------------------------------------------------------
+# Approval policy (see docs/governance_protocol.md, "Change approval workflow")
+#
+# A passed committee vote is necessary but not sufficient to execute a
+# significant change: each proposal type also needs named sign-offs from
+# distinct committee members in specific roles, and the evidence listed
+# below must be attached to those sign-offs.  The proposer can never sign
+# off their own change, and one person cannot fill two roles.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ApprovalPolicy:
+    roles: frozenset[str]
+    evidence: frozenset[str]
+
+
+APPROVAL_POLICIES: dict[str, ApprovalPolicy] = {
+    # Detection-policy change (thresholds, confidence floors, ...).
+    "config_change": ApprovalPolicy(
+        roles=frozenset({"risk_owner", "compliance_officer"}),
+        evidence=frozenset({"impact_analysis"}),
+    ),
+    # Promotion of a new model version to live inference.
+    "model_promotion": ApprovalPolicy(
+        roles=frozenset({"model_owner", "independent_validator", "compliance_officer"}),
+        evidence=frozenset({"backtest_report", "robustness_report", "red_team_report"}),
+    ),
+    # Committee membership is governed by the committee vote alone.
+    "committee_update": ApprovalPolicy(roles=frozenset(), evidence=frozenset()),
+}
+
+_MODEL_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -51,7 +91,7 @@ class GovernanceVoteError(GovernanceError):
 @dataclass
 class Proposal:
     id: Optional[int]
-    proposal_type: Literal["config_change", "committee_update"]
+    proposal_type: Literal["config_change", "committee_update", "model_promotion"]
     payload: dict
     proposer: str
     status: str  # active | passed | rejected | executed | failed
@@ -68,6 +108,15 @@ class Vote:
     voter: str
     decision: Literal["for", "against", "abstain"]
     cast_at: datetime
+
+
+@dataclass
+class SignOff:
+    proposal_id: int
+    role: str
+    signer: str
+    evidence: dict
+    signed_at: datetime
 
 
 @dataclass
@@ -255,6 +304,31 @@ class GovernanceEngine:
         ).fetchone()
         return row[0] if row else 0
 
+    @staticmethod
+    def _ensure_approval_tables(conn) -> None:
+        # Separate execute() calls, not executescript(): the latter commits
+        # first, which would drop execute_proposal's BEGIN EXCLUSIVE lock.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS governance_signoffs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                signer TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                signed_at TIMESTAMP NOT NULL,
+                UNIQUE(proposal_id, role),
+                UNIQUE(proposal_id, signer)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS governance_approval_records (
+                proposal_id INTEGER PRIMARY KEY,
+                approval_chain TEXT NOT NULL,
+                chain_sha256 TEXT NOT NULL,
+                recorded_at TIMESTAMP NOT NULL
+            )
+        """)
+
     def _is_committee_member(self, conn, member: str) -> bool:
         row = conn.execute(
             "SELECT 1 FROM governance_committee WHERE member = ? AND active = 1",
@@ -277,8 +351,13 @@ class GovernanceEngine:
         Raises GovernanceError if proposer is not an active committee member or
         proposal_type is invalid.
         """
-        if proposal_type not in ("config_change", "committee_update"):
+        if proposal_type not in APPROVAL_POLICIES:
             raise GovernanceError(f"Invalid proposal_type: {proposal_type!r}")
+
+        if proposal_type == "model_promotion":
+            name = str(payload.get("model_name", ""))
+            if not _MODEL_NAME_RE.match(name) or not payload.get("version"):
+                raise GovernanceError("model_promotion requires a valid model_name and version")
 
         # Validate config_change payload
         if proposal_type == "config_change":
@@ -429,6 +508,123 @@ class GovernanceEngine:
     # close_proposal
     # ------------------------------------------------------------------
 
+    def record_signoff(self, proposal_id: int, signer: str, role: str, evidence: dict | None = None) -> SignOff:
+        """Record a named sign-off in ``role`` for a proposal, with its evidence.
+
+        ``evidence`` maps evidence kinds (e.g. ``"red_team_report"``) to a
+        reference such as a report path, URL or artifact hash.
+        """
+        evidence = {k: v for k, v in (evidence or {}).items() if v}
+        with self._conn() as conn:
+            self._ensure_approval_tables(conn)
+            row = conn.execute(
+                "SELECT * FROM governance_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise GovernanceError(f"Proposal {proposal_id} not found")
+            if row["status"] not in ("active", "passed"):
+                raise GovernanceApprovalError(
+                    f"Proposal {proposal_id} is {row['status']!r}; sign-offs are closed"
+                )
+            policy = APPROVAL_POLICIES[row["proposal_type"]]
+            if role not in policy.roles:
+                raise GovernanceApprovalError(
+                    f"Role {role!r} is not part of the {row['proposal_type']} approval policy"
+                )
+            if not self._is_committee_member(conn, signer):
+                raise GovernanceApprovalError(f"Signer {signer!r} is not an active committee member")
+            if signer == row["proposer"]:
+                raise GovernanceApprovalError("The proposer cannot sign off their own change")
+
+            now = self._now()
+            try:
+                conn.execute(
+                    """INSERT INTO governance_signoffs (proposal_id, role, signer, evidence, signed_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (proposal_id, role, signer, json.dumps(evidence, sort_keys=True), now.isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GovernanceApprovalError(
+                    f"Role {role!r} is already signed, or {signer!r} already signed another role"
+                ) from exc
+            conn.commit()
+        return SignOff(proposal_id=proposal_id, role=role, signer=signer, evidence=evidence, signed_at=now)
+
+    @staticmethod
+    def _build_approval_chain(conn, row) -> dict:
+        """Assemble the full approval chain for a proposal row on ``conn``."""
+        policy = APPROVAL_POLICIES[row["proposal_type"]]
+        votes = conn.execute(
+            "SELECT voter, decision, cast_at FROM governance_votes WHERE proposal_id = ? ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+        signoffs = conn.execute(
+            "SELECT role, signer, evidence, signed_at FROM governance_signoffs WHERE proposal_id = ? ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+        signoff_list = [
+            {"role": r["role"], "signer": r["signer"], "evidence": json.loads(r["evidence"]), "signed_at": r["signed_at"]}
+            for r in signoffs
+        ]
+        evidence_kinds = {k for so in signoff_list for k in so["evidence"]}
+        return {
+            "proposal_id": row["id"],
+            "proposal_type": row["proposal_type"],
+            "payload": json.loads(row["payload"]),
+            "proposer": row["proposer"],
+            "submitted_at": row["submitted_at"],
+            "status": row["status"],
+            "votes": [dict(v) for v in votes],
+            "signoffs": signoff_list,
+            "missing_roles": sorted(policy.roles - {so["role"] for so in signoff_list}),
+            "missing_evidence": sorted(policy.evidence - evidence_kinds),
+        }
+
+    def approval_chain(self, proposal_id: int) -> dict:
+        """Return the current approval chain (votes, sign-offs, gaps) for a proposal."""
+        with self._conn() as conn:
+            self._ensure_approval_tables(conn)
+            row = conn.execute(
+                "SELECT * FROM governance_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise GovernanceError(f"Proposal {proposal_id} not found")
+            return self._build_approval_chain(conn, row)
+
+    def recorded_approval(self, proposal_id: int) -> dict | None:
+        """Return the immutable approval chain recorded when a proposal executed."""
+        with self._conn() as conn:
+            self._ensure_approval_tables(conn)
+            row = conn.execute(
+                "SELECT * FROM governance_approval_records WHERE proposal_id = ?", (proposal_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "approval_chain": json.loads(row["approval_chain"]),
+            "chain_sha256": row["chain_sha256"],
+            "recorded_at": row["recorded_at"],
+        }
+
+    def live_change_approval(self, proposal_type: str, target: str) -> dict | None:
+        """Trace a live setting or model to the approval chain that put it live.
+
+        ``target`` is the setting key for ``config_change`` or the model name
+        for ``model_promotion``.  Returns the recorded chain of the most
+        recently executed proposal for that target, or ``None``.
+        """
+        field_name = {"config_change": "key", "model_promotion": "model_name"}[proposal_type]
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, payload FROM governance_proposals
+                   WHERE proposal_type = ? AND status = 'executed' ORDER BY executed_at DESC, id DESC""",
+                (proposal_type,),
+            ).fetchall()
+        for row in rows:
+            if json.loads(row["payload"]).get(field_name) == target:
+                return self.recorded_approval(row["id"])
+        return None
+
     def close_proposal(self, proposal_id: int) -> Proposal:
         """Tally and set status to 'passed' or 'rejected'. Idempotent after closure."""
         with self._conn() as conn:
@@ -487,6 +683,16 @@ class GovernanceEngine:
             payload = json.loads(row["payload"])
             proposal_type = row["proposal_type"]
 
+            # Enforce the approval policy: a passed vote alone is not enough.
+            self._ensure_approval_tables(conn)
+            chain = self._build_approval_chain(conn, row)
+            if chain["missing_roles"] or chain["missing_evidence"]:
+                conn.close()
+                raise GovernanceApprovalError(
+                    f"Proposal {proposal_id} lacks required approvals: "
+                    f"missing roles {chain['missing_roles']}, missing evidence {chain['missing_evidence']}"
+                )
+
             error: Optional[str] = None
             try:
                 if proposal_type == "config_change":
@@ -530,6 +736,14 @@ class GovernanceEngine:
                     else:
                         raise GovernanceError(f"Unknown committee action: {action!r}")
 
+                elif proposal_type == "model_promotion":
+                    from detection.model_registry import list_model_versions, rollback_model
+
+                    name, version = payload["model_name"], str(payload["version"])
+                    if version not in list_model_versions(name, settings.model_dir):
+                        raise GovernanceError(f"Model {name} version {version} not found in model registry")
+                    rollback_model(name, version, settings.model_dir)
+
                 else:
                     raise GovernanceError(f"Unknown proposal_type: {proposal_type!r}")
 
@@ -541,6 +755,14 @@ class GovernanceEngine:
                 conn.execute(
                     "UPDATE governance_proposals SET status = 'executed', executed_at = ? WHERE id = ?",
                     (now, proposal_id),
+                )
+                chain["status"] = "executed"
+                chain["executed_at"] = now
+                chain_json = json.dumps(chain, sort_keys=True)
+                conn.execute(
+                    """INSERT INTO governance_approval_records
+                       (proposal_id, approval_chain, chain_sha256, recorded_at) VALUES (?, ?, ?, ?)""",
+                    (proposal_id, chain_json, hashlib.sha256(chain_json.encode("utf-8")).hexdigest(), now),
                 )
             else:
                 conn.execute(

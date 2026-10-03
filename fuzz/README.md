@@ -14,8 +14,27 @@ the byte-level parsers in `ingestion/solana_adapter.py`.
 | `fuzz_evm_rpc_parser.py` | `UniswapV3Adapter._parse_swap_event` + `CurveAdapter._parse_exchange_event` | `ingestion/uniswap_adapter.py`, `ingestion/curve_adapter.py` | `python fuzz/fuzz_evm_rpc_parser.py fuzz/corpus/fuzz_evm_rpc_parser -max_total_time=60` |
 | `fuzz_solana_vaa_parser.py` | `_extract_stellar_address_from_vaa` + `_stellar_pubkey_to_address` + `_crc16_xmodem` | `ingestion/solana_adapter.py` | `python fuzz/fuzz_solana_vaa_parser.py fuzz/corpus/fuzz_solana_vaa_parser -max_total_time=60` |
 
-CI (`.github/workflows/nightly_fuzz.yml`) runs every `fuzz/fuzz_*.py` harness for 300s
-each on a nightly schedule; there is no separate `fuzz-nightly.yml`.
+## Continuous fuzzing
+
+`.github/workflows/nightly_fuzz.yml` runs all five harnesses nightly (and on
+manual dispatch) as a parallel matrix, 300s each:
+
+1. **Fuzz** — each harness runs against its cached, growing corpus
+   (`fuzz/corpus/<harness>/`) *plus* the committed regression corpus
+   (`fuzz/regression/<harness>/`), so every known crash is replayed first.
+   Findings are written to `fuzz/artifacts/<harness>/`.
+2. **Track** — per-harness libFuzzer stats (execs, corpus size, crash count)
+   are uploaded as `fuzz-results-<harness>` artifacts and summarised in the
+   run's job summary, giving a run-over-run history.
+3. **Triage** — `scripts/fuzz_triage.py` replays every crash, computes a
+   signature (exception type + innermost in-repo frames) and keeps only the
+   smallest input per signature. Signatures already in the regression corpus
+   are reported as *known*, so one bug class never produces duplicates.
+4. **Regress** — new unique reproducers are committed to
+   `fuzz/regression/<harness>/<signature>.bin` via an automatically opened PR.
+   `tests/test_fuzz_regression.py` replays that corpus on every CI run.
+
+(`fuzz-nightly.yml` is a separate workflow for the Rust contract fuzzers.)
 
 ## Prerequisites
 
@@ -80,8 +99,9 @@ python fuzz/fuzz_trade_parser.py \
     fuzz/corpus/crash-<hash>
 ```
 
-The minimised file is written to `crash-<hash>-min`. Add the minimised bytes
-as a regression fixture in `tests/test_data_models.py`.
+The minimised file is written to `crash-<hash>-min`. Copy it into
+`fuzz/regression/<harness>/` (the nightly triage job does this automatically)
+so it is replayed on every CI run.
 
 ## Corpus format
 
@@ -94,11 +114,15 @@ bytes are fed directly to the binary parsers.
 may contain data resembling real wallet addresses. Use synthetically generated
 or randomly mutated seeds only.
 
-## Adding a new harness
+## Adding a new fuzz target
 
 1. Create `fuzz/fuzz_<target>.py` following the structure of an existing harness.
 2. Catch only the exception types that are already handled as "expected" in the
    production ingestion code. Let everything else propagate as a finding.
-3. Add the harness to the loop in `.github/workflows/nightly_fuzz.yml`.
-4. Add a smoke-test case in `tests/test_fuzz_harness_smoke.py`.
-5. Update this README's harness table.
+3. Add `fuzz_<target>` to the `matrix.harness` list in
+   `.github/workflows/nightly_fuzz.yml`.
+4. Create `fuzz/regression/fuzz_<target>/.gitkeep` (the regression corpus dir).
+5. Add an Atheris-free `_call_<target>` mirror and smoke cases in
+   `tests/test_fuzz_harness_smoke.py`, and register it in `_CALLERS` in
+   `tests/test_fuzz_regression.py` (a test fails until you do).
+6. Update this README's harness table.

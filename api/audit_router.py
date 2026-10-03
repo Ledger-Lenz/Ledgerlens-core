@@ -11,6 +11,8 @@ GET /audit/wallet/{wallet}/verify
     Chain integrity verification result (valid / tampered / no_events).
 GET /audit/summary
     Summary statistics: events in last 24h, unique wallets, integrity violations.
+GET /audit/log/verify
+    Hash-chain verification of the immutable admin audit log (storage/audit_log.py).
 
 Security
 --------
@@ -193,3 +195,23 @@ async def get_audit_summary(
     store = _get_store()
     stats = await store.summary()
     return AuditSummaryResponse(**stats)
+
+
+@router.get(
+    "/log/verify",
+    summary="Verify the admin audit log hash chain",
+    description=(
+        "Walks the immutable audit log (storage/audit_log.py), recomputing each "
+        "entry hash and prev_hash link. Any break is also raised as an alert."
+    ),
+)
+def verify_audit_log_chain(
+    _: str = Depends(require_admin_key),
+) -> dict:
+    from storage.audit_log import verify_and_alert
+
+    failures = verify_and_alert()
+    return {
+        "intact": not failures,
+        "broken_entries": [{"id": f["id"], "error": f["error"]} for f in failures],
+    }

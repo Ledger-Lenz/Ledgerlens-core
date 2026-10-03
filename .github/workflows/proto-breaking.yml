@@ -1,0 +1,66 @@
+name: Proto Breaking Change Check
+
+on:
+  pull_request:
+    paths:
+      - "proto/**"
+      - ".github/workflows/proto-breaking.yml"
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+  push:
+    branches: [main]
+    paths:
+      - "proto/**"
+
+jobs:
+  buf-breaking:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Compare against the last released proto (latest release tag). Fall
+      # back to the PR base branch (or the previous commit on push) when no
+      # release tag exists yet.
+      - name: Resolve comparison ref
+        id: against
+        run: |
+          ref=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$ref" ]; then
+            if [ -n "${{ github.base_ref }}" ]; then
+              ref="origin/${{ github.base_ref }}"
+            else
+              ref="${{ github.event.before }}"
+            fi
+          fi
+          echo "Comparing proto/ against: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: buf breaking
+        id: breaking
+        continue-on-error: true
+        run: buf breaking proto --against ".git#ref=${{ steps.against.outputs.ref }},subdir=proto"
+
+      # Intentional breaks need an explicit, reviewable override: the PR must
+      # carry the `proto-breaking-change` label AND a non-empty
+      # "## Proto breaking change justification" section in its description.
+      - name: Enforce override policy
+        if: steps.breaking.outcome == 'failure'
+        env:
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'proto-breaking-change') }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          justification=$(printf '%s\n' "$PR_BODY" | awk '
+            /^## Proto breaking change justification/ {found=1; next}
+            found && /^## / {exit}
+            found {print}' | tr -d '[:space:]')
+          if [ "$HAS_LABEL" = "true" ] && [ -n "$justification" ]; then
+            echo "::warning::Breaking proto change approved via 'proto-breaking-change' label with justification."
+            exit 0
+          fi
+          echo "::error::Undocumented breaking proto change. See proto/README.md#compatibility-policy for how to request an override."
+          exit 1

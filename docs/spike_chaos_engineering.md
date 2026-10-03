@@ -60,6 +60,7 @@ Toxiproxy intercepts network traffic between the application and its dependencie
     *   **Circuit Breaking:** [`test_circuit_breaker.py`](file:///c:/Users/Lc/Desktop/Ledgerlens-core/tests/chaos/test_circuit_breaker.py) checks that `SorobanPublisher` isolates API failures.
     *   **Cache Fallbacks:** [`test_redis_fallback.py`](file:///c:/Users/Lc/Desktop/Ledgerlens-core/tests/chaos/test_redis_fallback.py) ensures cold tier activation when Redis is down.
     *   **Lock Contention:** [`test_sqlite_wal_lock.py`](file:///c:/Users/Lc/Desktop/Ledgerlens-core/tests/chaos/test_sqlite_wal_lock.py) verifies SQLite WAL locks return 503 instead of 500.
+    *   **Shard Node Failure:** [`test_graph_shard_failure.py`](../tests/chaos/test_graph_shard_failure.py) kills graph-shard workers (single mid-operation kill and multi-node up to `shard_count - 1`) and verifies rebalancing with no data loss within the 30 s recovery SLO.
 
 > [!TIP]
 > To fully integrate Layer 1 into standard PR flows, we should update `.github/workflows/ci.yml` or modify `.github/workflows/chaos.yml` to trigger on `pull_request` events, running the suite automatically on every code change.

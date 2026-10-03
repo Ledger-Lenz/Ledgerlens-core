@@ -48,3 +48,34 @@ func WithInsecureSkipVerify() Option {
 		}
 	}
 }
+
+// RetryPolicy controls how the client retries failed requests.
+//
+// Retries are only applied to idempotent methods (GET, HEAD, DELETE), never to
+// POST, and only on transport errors or HTTP 429/500/502/503/504 — the same
+// status set as the shared LedgerLens Python HTTP client. Delays use
+// exponential backoff with full jitter, capped at MaxBackoff; a Retry-After
+// header on a 429 response takes precedence (also capped at MaxBackoff).
+// Cancelling the request context aborts any pending backoff immediately.
+type RetryPolicy struct {
+	// MaxAttempts is the total number of attempts including the first.
+	// Values <= 1 disable retries (the default).
+	MaxAttempts int
+	// InitialBackoff is the base delay before the first retry (default 500 ms).
+	InitialBackoff time.Duration
+	// MaxBackoff caps any single delay (default 30 s).
+	MaxBackoff time.Duration
+}
+
+// WithRetryPolicy enables retries for idempotent requests. See RetryPolicy.
+func WithRetryPolicy(p RetryPolicy) Option {
+	return func(c *Client) {
+		if p.InitialBackoff <= 0 {
+			p.InitialBackoff = 500 * time.Millisecond
+		}
+		if p.MaxBackoff <= 0 {
+			p.MaxBackoff = 30 * time.Second
+		}
+		c.retry = p
+	}
+}

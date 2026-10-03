@@ -4,6 +4,7 @@ import io
 import threading
 from collections import defaultdict
 from collections import deque
+from collections.abc import Iterator
 from datetime import datetime, timezone, timedelta
 
 import pyarrow as pa
@@ -29,6 +30,11 @@ _RATE_WINDOW_SECONDS = 3600
 
 _COLUMNS = ["id", "wallet", "asset_pair", "score", "benford_flag", "ml_flag", "confidence", "timestamp"]
 _MAX_WINDOW_DAYS = 90
+_PARQUET_SCHEMA = pa.schema([
+    ("id", pa.int64()), ("wallet", pa.string()), ("asset_pair", pa.string()),
+    ("score", pa.int64()), ("benford_flag", pa.int64()), ("ml_flag", pa.int64()),
+    ("confidence", pa.int64()), ("timestamp", pa.string()),
+])
 
 
 def _check_rate_limit(admin_key: str) -> None:
@@ -43,7 +49,7 @@ def _check_rate_limit(admin_key: str) -> None:
         dq.append(now)
 
 
-def _query_rows(from_date: str, to_date: str, min_score: int, wallet: str | None) -> list[dict]:
+def _build_query(from_date: str, to_date: str, min_score: int, wallet: str | None) -> tuple[str, list]:
     try:
         from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
@@ -53,22 +59,69 @@ def _query_rows(from_date: str, to_date: str, min_score: int, wallet: str | None
     if (to_dt - from_dt) > timedelta(days=_MAX_WINDOW_DAYS):
         raise HTTPException(status_code=400, detail=f"Export window cannot exceed {_MAX_WINDOW_DAYS} days")
 
-    sql = (
-        "SELECT id, wallet, asset_pair, score, benford_flag, ml_flag, confidence, timestamp "
-        "FROM risk_scores WHERE timestamp >= ? AND timestamp < ? AND score >= ?"
-    )
+    where = "FROM risk_scores WHERE timestamp >= ? AND timestamp < ? AND score >= ?"
     params: list = [from_dt.isoformat(), to_dt.isoformat(), min_score]
 
     if wallet:
-        sql += " AND wallet = ?"
+        where += " AND wallet = ?"
         params.append(wallet)
 
-    sql += " ORDER BY timestamp DESC"
+    return where, params
 
+
+def _prepare_export(from_date: str, to_date: str, min_score: int, wallet: str | None) -> tuple[str, list]:
+    """Validate the request and enforce the row cap before any bytes are sent.
+
+    Returns the SELECT statement to stream. Raises 413 when the result set
+    exceeds ``settings.export_max_rows`` so a single export can never pin an
+    unbounded amount of server memory or DB cursor time.
+    """
+    where, params = _build_query(from_date, to_date, min_score, wallet)
     with _connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
+        (count,) = conn.execute(f"SELECT COUNT(*) {where}", params).fetchone()
+    if count > settings.export_max_rows:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Export exceeds {settings.export_max_rows} rows; narrow the date range or filters",
+        )
+    sql = f"SELECT {', '.join(_COLUMNS)} {where} ORDER BY timestamp DESC"
+    return sql, params
 
-    return [dict(zip(_COLUMNS, row)) for row in rows]
+
+def _iter_row_chunks(sql: str, params: list) -> Iterator[list[dict]]:
+    """Yield result rows in chunks of ``settings.export_chunk_size``.
+
+    Only one chunk is held in memory at a time.
+    """
+    chunk_size = max(1, settings.export_chunk_size)
+    with _connect() as conn:
+        cursor = conn.execute(sql, params)
+        while True:
+            rows = cursor.fetchmany(chunk_size)
+            if not rows:
+                break
+            yield [dict(zip(_COLUMNS, row)) for row in rows]
+
+
+def _csv_stream(sql: str, params: list) -> Iterator[str]:
+    yield ",".join(_COLUMNS) + "\n"
+    for chunk in _iter_row_chunks(sql, params):
+        yield "".join(",".join(str(row[c]) for c in _COLUMNS) + "\n" for row in chunk)
+
+
+def _parquet_stream(sql: str, params: list) -> Iterator[bytes]:
+    """Write one Parquet row group per chunk, flushing bytes as they are produced."""
+    buf = io.BytesIO()
+    writer = pq.ParquetWriter(buf, _PARQUET_SCHEMA, compression="snappy")
+    try:
+        for chunk in _iter_row_chunks(sql, params):
+            writer.write_table(pa.Table.from_pylist(chunk, schema=_PARQUET_SCHEMA))
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate()
+    finally:
+        writer.close()
+    yield buf.getvalue()
 
 
 def _filename(fmt: str, from_date: str, to_date: str) -> str:
@@ -85,17 +138,11 @@ def export_csv(
 ) -> StreamingResponse:
     """Stream risk scores as CSV. Max 90-day window. Requires admin key."""
     _check_rate_limit(x_ledgerlens_admin_key or "")
-    rows = _query_rows(from_date, to_date, min_score, wallet)
-
-    buf = io.StringIO()
-    buf.write(",".join(_COLUMNS) + "\n")
-    for row in rows:
-        buf.write(",".join(str(row[c]) for c in _COLUMNS) + "\n")
-    buf.seek(0)
+    sql, params = _prepare_export(from_date, to_date, min_score, wallet)
 
     filename = _filename("csv", from_date, to_date)
     return StreamingResponse(
-        iter([buf.getvalue()]),
+        _csv_stream(sql, params),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
@@ -111,25 +158,11 @@ def export_parquet(
 ) -> StreamingResponse:
     """Stream risk scores as Parquet (snappy compressed). Max 90-day window. Requires admin key."""
     _check_rate_limit(x_ledgerlens_admin_key or "")
-    rows = _query_rows(from_date, to_date, min_score, wallet)
-
-    if rows:
-        table = pa.Table.from_pylist(rows)
-    else:
-        schema = pa.schema([
-            ("id", pa.int64()), ("wallet", pa.string()), ("asset_pair", pa.string()),
-            ("score", pa.int64()), ("benford_flag", pa.int64()), ("ml_flag", pa.int64()),
-            ("confidence", pa.int64()), ("timestamp", pa.string()),
-        ])
-        table = pa.table({col: pa.array([], type=schema.field(col).type) for col in _COLUMNS})
-
-    buf = io.BytesIO()
-    pq.write_table(table, buf, compression="snappy")
-    buf.seek(0)
+    sql, params = _prepare_export(from_date, to_date, min_score, wallet)
 
     filename = _filename("parquet", from_date, to_date)
     return StreamingResponse(
-        iter([buf.getvalue()]),
+        _parquet_stream(sql, params),
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

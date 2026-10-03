@@ -100,6 +100,24 @@ Links Stellar wallets to their EVM counterparts and computes EVM-side trading st
 - `score_hypothesis(stellar_wallet, evm_wallet, bridge_events)` — compute Bayesian confidence score for the link hypothesis (returns `WalletLinkHypothesis`)
 - `persist_hypothesis(hypothesis)` — persist accepted hypotheses (confidence >= 0.7) to SQLite
 - `get_accepted_links(stellar_wallet, min_confidence=None)` — retrieve accepted link hypotheses sorted by confidence descending
+- `link_confidences(stellar_wallet, lookback_days=90)` — `{evm_wallet: confidence}` for every bridged EVM wallet, instead of a binary linked/not-linked list
+- `fit_calibration(llrs, labels)` — fit Platt scaling on labeled true/false link pairs
+
+#### Confidence-scoring methodology
+
+Each hypothesis sums log-likelihood ratios from four evidence features (timing
+similarity, amount match, direction consistency, address pattern). Because
+those features are not truly independent, the raw posterior `sigmoid(llr)` is
+over-confident. `confidence` is therefore Platt-scaled:
+`sigmoid(a * llr + b)`, with `(a, b)` fitted by logistic regression on a
+labeled set of known true and false cross-chain link pairs
+(`CrossChainLinker(calibration=(a, b))` to apply a fitted pair). Calibration
+is validated by expected calibration error and Brier score on a held-out
+labeled set (`tests/test_cross_chain_confidence.py`).
+
+Downstream, `cross_chain_round_trip_score` is multiplied by the wallet's
+highest link confidence, so round trips through weak links count for less than
+round trips through confirmed ones.
 
 ## Seven Cross-Chain Features
 
@@ -113,7 +131,7 @@ These features are appended to the end of `FEATURE_NAMES` (backward-compatible; 
 | `evm_counterparty_concentration` | HHI of counterparty addresses in EVM trades (0=diverse, 1=monopoly) | High = trading with very few counterparties |
 | `bridge_volume_ratio` | EVM bridge volume / (Stellar SDEX volume + EVM bridge volume) | High = activity concentrated on bridge |
 | `cross_chain_time_lag_median_h` | Median hours between paired EVM and Stellar trades | Very low = near-instant round-trips |
-| `cross_chain_round_trip_score` | Correlation score (0–1) for Stellar→EVM→Stellar round-trip bridge patterns based on amount similarity (within 5%), timing proximity (within 24h), and intermediate hops | High = strong evidence of multi-network wash cycles |
+| `cross_chain_round_trip_score` | Correlation score (0–1) for Stellar→EVM→Stellar round-trip bridge patterns based on amount similarity (within 5%), timing proximity (within 24h), and intermediate hops, weighted by the highest calibrated link confidence | High = strong evidence of multi-network wash cycles |
 
 ## API Changes
 
@@ -174,6 +192,44 @@ CREATE TABLE IF NOT EXISTS bridge_transfers (
 CREATE INDEX IF NOT EXISTS idx_bridge_stellar ON bridge_transfers(stellar_wallet, timestamp);
 CREATE INDEX IF NOT EXISTS idx_bridge_evm ON bridge_transfers(evm_wallet, timestamp);
 ```
+
+## Bridge-Spanning Path-Payment Cycles
+
+`detection/path_payment_engine.py` detects multi-hop round trips on Stellar.
+A wash or obfuscation route can instead leave Stellar through a bridge and come
+back — e.g. `A → B → C` via path payments, `C` bridges USDC out to EVM wallet
+`E`, and `E` bridges it back to `A`. Single-chain analysis sees no cycle.
+
+**How it is stitched together**
+
+1. `CrossChainCorrelator.match_round_trips(transfers)` pairs each
+   `stellar_to_evm` transfer (from `ingestion/bridge_loader.py`) with every
+   `evm_to_stellar` transfer from the **same EVM wallet** that arrives within
+   the correlator window (24 h) at a matching amount (±5%). The shared EVM
+   wallet resolves bridged identity: it ties the outbound `stellar_wallet` to
+   the inbound one, even when they differ.
+2. `bridge_hop_edges()` turns each pair into one synthetic `HopEdge`
+   `(out.stellar_wallet, out.token) → (in.stellar_wallet, in.token)` carrying
+   the inbound `amount_usd`, with `operation_id = "bridge:<out tx>:<in tx>"`.
+3. `PathCycleDetector.ingest_bridge_transfers(transfers)` adds those edges to
+   the hop graph and re-runs cycle detection for the affected wallets. Bridge
+   and Stellar hops can arrive in either order. Detected cycles expose
+   `PathPaymentCycle.crosses_bridge`.
+
+**Current limitations**
+
+- The EVM leg is collapsed into one hop; intermediate EVM hops, swaps, or
+  wallet-to-wallet transfers on the other chain are not traced (the round trip
+  must return from the same EVM wallet that received the funds).
+- Bridge hop amounts are `amount_usd`, while Stellar hops are in asset units.
+  Recovery ratios are only meaningful when the route's origin asset is a USD
+  stablecoin (e.g. USDC); for other assets, cycles may be missed or mis-scored.
+- Node continuity requires the bridged `token` code to equal the Stellar
+  asset code on both sides (e.g. `USDC`); issuer is not compared.
+- The whole route, bridge included, must fit within the detector's
+  `cycle_window_seconds` (max 24 h) and `max_depth` (7 hops, bridge hop counts
+  as one); the correlator's own window and amount tolerance also apply.
+- Transfers without `amount_usd` are skipped.
 
 ## Security Notes
 

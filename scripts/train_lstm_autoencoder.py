@@ -162,6 +162,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--patience", type=int, default=10,
         help="Early-stopping patience: stop after this many epochs without an improvement in validation loss.",
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="checkpoints",
+        help="Directory for periodic LSTM training checkpoints.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help="Save a checkpoint every N completed training epochs.",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default=None,
+        help="Path to an LSTM training checkpoint to resume.",
+    )
     return parser.parse_args(argv)
 
 
@@ -248,12 +264,134 @@ def _generate_synthetic_sequences(n: int, sequence_length: int) -> list[np.ndarr
     return seqs
 
 
+def _lstm_training_config(args: argparse.Namespace) -> dict:
+    return {
+        key: getattr(args, key)
+        for key in (
+            "lr",
+            "hidden_dim",
+            "num_layers",
+            "dropout",
+            "sequence_length",
+            "batch_size",
+            "val_split",
+            "seed",
+            "patience",
+        )
+    }
+
+
+def _save_lstm_training_checkpoint(
+    checkpoint_dir: str | os.PathLike[str],
+    *,
+    epoch: int,
+    global_step: int,
+    model,
+    optimizer,
+    best_val_loss: float,
+    best_state: dict | None,
+    patience_counter: int,
+    dataset_fingerprint: str,
+    training_config: dict,
+    current_mlflow_run_id: str | None,
+    original_mlflow_run_id: str | None,
+    resumed: bool,
+) -> Path:
+    import torch
+
+    checkpoint_path = Path(checkpoint_dir) / f"lstm_autoencoder_epoch_{epoch:04d}.pt"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "model_type": "lstm_autoencoder",
+        "checkpoint_identifier": checkpoint_path.name,
+        "checkpoint_path": str(checkpoint_path),
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_loss": best_val_loss,
+        "best_state": best_state,
+        "patience_counter": patience_counter,
+        "dataset_fingerprint": dataset_fingerprint,
+        "training_config": training_config,
+        "python_rng_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "current_mlflow_run_id": current_mlflow_run_id,
+        "original_mlflow_run_id": original_mlflow_run_id,
+        "resumed": resumed,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temporary_path = checkpoint_path.with_suffix(".tmp")
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+
+    if current_mlflow_run_id:
+        from detection.mlflow_tracker import log_checkpoint_metadata
+
+        log_checkpoint_metadata(
+            {
+                "model": "lstm_autoencoder",
+                "current_mlflow_run_id": current_mlflow_run_id,
+                "original_mlflow_run_id": original_mlflow_run_id,
+                "resumed": resumed,
+                "best_val_loss": best_val_loss,
+                "dataset_fingerprint": dataset_fingerprint,
+            },
+            checkpoint_path=str(checkpoint_path),
+            epoch=epoch,
+            step=global_step,
+        )
+    logger.info("Saved resumable LSTM checkpoint to %s", checkpoint_path)
+    return checkpoint_path
+
+
+def _read_lstm_training_checkpoint(checkpoint_path: str | os.PathLike[str]) -> dict:
+    import torch
+
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError(f"Could not load LSTM training checkpoint {checkpoint_path}: {exc}") from exc
+
+    required = {
+        "epoch",
+        "global_step",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "best_val_loss",
+        "best_state",
+        "patience_counter",
+        "dataset_fingerprint",
+        "training_config",
+        "python_rng_state",
+        "torch_rng_state",
+    }
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Invalid LSTM training checkpoint {checkpoint_path}: expected a mapping")
+    if checkpoint.get("format_version") != 1 or checkpoint.get("model_type") != "lstm_autoencoder":
+        raise ValueError(f"Invalid LSTM training checkpoint {checkpoint_path}: unsupported format or model")
+    missing = required.difference(checkpoint)
+    if missing:
+        raise ValueError(
+            f"Invalid LSTM training checkpoint {checkpoint_path}: missing {', '.join(sorted(missing))}"
+        )
+    return checkpoint
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 
-def train(args: argparse.Namespace) -> None:
+def _train(
+    args: argparse.Namespace,
+    *,
+    checkpoint: dict | None,
+    current_mlflow_run_id: str | None,
+    original_mlflow_run_id: str | None,
+    resumed: bool,
+) -> None:
     try:
         import torch
         import torch.nn as nn
@@ -262,6 +400,10 @@ def train(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     from detection.temporal_patterns import LSTMAutoencoder
+    from detection.mlflow_tracker import log_artifact, log_metrics
+
+    if args.checkpoint_every < 1:
+        raise ValueError("checkpoint_every must be a positive integer")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -273,6 +415,13 @@ def train(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     logger.info("Training on %d sequences of length %d.", len(sequences), args.sequence_length)
+    dataset_fingerprint = hashlib.sha256(
+        b"".join(
+            str(sequence.shape).encode() + np.asarray(sequence, dtype=np.float32).tobytes()
+            for sequence in sequences
+        )
+    ).hexdigest()
+    training_config = _lstm_training_config(args)
 
     # --- Train/val split -------------------------------------------------------
     random.shuffle(sequences)
@@ -302,9 +451,32 @@ def train(args: argparse.Namespace) -> None:
     best_val_loss = float("inf")
     patience_counter = 0
     best_state = None
-    epoch = 0
+    start_epoch = 1
+    global_step = 0
 
-    for epoch in range(1, args.epochs + 1):
+    if checkpoint is not None:
+        if checkpoint["dataset_fingerprint"] != dataset_fingerprint:
+            raise ValueError("Resume checkpoint was created from a different LSTM training dataset")
+        if checkpoint["training_config"] != training_config:
+            raise ValueError("Resume checkpoint does not match the current LSTM training configuration")
+        start_epoch = int(checkpoint["epoch"]) + 1
+        global_step = int(checkpoint["global_step"])
+        best_val_loss = float(checkpoint["best_val_loss"])
+        patience_counter = int(checkpoint["patience_counter"])
+        best_state = checkpoint["best_state"]
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimiser.load_state_dict(checkpoint["optimizer_state_dict"])
+        random.setstate(checkpoint["python_rng_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        logger.info("Resuming LSTM training from epoch %d", start_epoch)
+
+    if args.epochs < start_epoch:
+        raise ValueError(
+            f"--epochs ({args.epochs}) must be greater than the saved epoch ({start_epoch - 1})"
+        )
+
+    epoch = start_epoch - 1
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_batches = make_batch(train_seqs, args.batch_size)
         train_loss_total = 0.0
@@ -314,6 +486,7 @@ def train(args: argparse.Namespace) -> None:
             loss = criterion(recon, batch)
             loss.backward()
             optimiser.step()
+            global_step += 1
             train_loss_total += loss.item()
 
         # Validation
@@ -327,6 +500,8 @@ def train(args: argparse.Namespace) -> None:
 
         avg_train = train_loss_total / max(len(train_batches), 1)
         avg_val = val_loss_total / max(len(val_batches), 1)
+        if current_mlflow_run_id:
+            log_metrics({"train_loss": avg_train, "val_loss": avg_val}, step=epoch)
         logger.info(
             "Epoch %3d/%d  train_loss=%.5f  val_loss=%.5f",
             epoch,
@@ -335,15 +510,35 @@ def train(args: argparse.Namespace) -> None:
             avg_val,
         )
 
+        should_stop = False
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= args.patience:
-                logger.info("Early stopping after %d epochs without improvement.", args.patience)
-                break
+            should_stop = patience_counter >= args.patience
+
+        if epoch % args.checkpoint_every == 0 or epoch == args.epochs or should_stop:
+            _save_lstm_training_checkpoint(
+                args.checkpoint_dir,
+                epoch=epoch,
+                global_step=global_step,
+                model=model,
+                optimizer=optimiser,
+                best_val_loss=best_val_loss,
+                best_state=best_state,
+                patience_counter=patience_counter,
+                dataset_fingerprint=dataset_fingerprint,
+                training_config=training_config,
+                current_mlflow_run_id=current_mlflow_run_id,
+                original_mlflow_run_id=original_mlflow_run_id,
+                resumed=resumed,
+            )
+
+        if should_stop:
+            logger.info("Early stopping after %d epochs without improvement.", args.patience)
+            break
 
     if best_state is None:
         best_state = model.state_dict()
@@ -390,6 +585,63 @@ def train(args: argparse.Namespace) -> None:
             indent=2,
         )
     logger.info("Training metadata written to %s.", meta_path)
+
+    if current_mlflow_run_id:
+        log_artifact(save_path)
+        log_artifact(meta_path)
+
+
+def train(args: argparse.Namespace) -> None:
+    from detection.mlflow_tracker import (
+        _HAS_MLFLOW,
+        log_hyperparameters,
+        mlflow_run,
+    )
+
+    checkpoint = (
+        _read_lstm_training_checkpoint(args.resume_from_checkpoint)
+        if args.resume_from_checkpoint
+        else None
+    )
+    original_run_id = None
+    if checkpoint is not None:
+        original_run_id = (
+            checkpoint.get("original_mlflow_run_id")
+            or checkpoint.get("current_mlflow_run_id")
+        )
+
+    if not _HAS_MLFLOW:
+        return _train(
+            args,
+            checkpoint=checkpoint,
+            current_mlflow_run_id=None,
+            original_mlflow_run_id=original_run_id,
+            resumed=checkpoint is not None,
+        )
+
+    with mlflow_run(
+        experiment_name="lstm-autoencoder-training",
+        parent_run_id=original_run_id,
+    ) as current_run_id:
+        log_hyperparameters(
+            {
+                "model": "lstm_autoencoder",
+                "epochs": args.epochs,
+                "learning_rate": args.lr,
+                "sequence_length": args.sequence_length,
+                "batch_size": args.batch_size,
+                "seed": args.seed,
+                "resumed": checkpoint is not None,
+                "original_mlflow_run_id": original_run_id or "",
+            }
+        )
+        return _train(
+            args,
+            checkpoint=checkpoint,
+            current_mlflow_run_id=current_run_id or None,
+            original_mlflow_run_id=original_run_id or current_run_id or None,
+            resumed=checkpoint is not None,
+        )
 
 
 # ---------------------------------------------------------------------------
