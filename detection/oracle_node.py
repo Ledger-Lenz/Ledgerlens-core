@@ -14,6 +14,9 @@ ORACLE_DOMAIN_SEPARATOR = b"LedgerLens-Oracle-v2"
 SOROBAN_SYMBOL_SCVAL_TYPE = 15
 MAX_SYMBOL_LENGTH = 32
 
+HEARTBEAT_DOMAIN_SEPARATOR = b"LedgerLens-Oracle-Heartbeat-v1"
+DEFAULT_HEARTBEAT_INTERVAL = 5.0
+
 
 @dataclass(frozen=True)
 class OracleReport:
@@ -169,6 +172,7 @@ class OracleNode:
             
         self.name = name
         self.last_seen: float | None = None
+        self._last_heartbeat_sent: float | None = None
 
     @property
     def public_key_hex(self) -> str:
@@ -204,6 +208,50 @@ class OracleNode:
         sig = self._private_key.sign(message)
         self.last_seen = time.time()
         return sig
+
+    def sign_heartbeat(self, timestamp: int | None = None) -> bytes:
+        """
+        Sign a liveness heartbeat for the coordinator.
+
+        The heartbeat binds the node's public key and a timestamp so the
+        coordinator can verify freshness and attribute liveness to a specific
+        node. Returns a 64-byte ED25519 signature.
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+        if not 0 <= timestamp <= 2**64 - 1:
+            raise ValueError("timestamp must fit u64")
+        message = self._heartbeat_message(timestamp)
+        sig = self._private_key.sign(message)
+        self._last_heartbeat_sent = time.time()
+        return sig
+
+    def heartbeat_payload(self, timestamp: int | None = None) -> dict:
+        """
+        Build a signed heartbeat payload suitable for sending to the
+        coordinator. Includes the node name, public key, timestamp and
+        signature so the coordinator can verify liveness.
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+        signature = self.sign_heartbeat(timestamp)
+        return {
+            "node": self.name,
+            "public_key": self.public_key_hex,
+            "timestamp": timestamp,
+            "signature": signature.hex(),
+        }
+
+    def _heartbeat_message(self, timestamp: int) -> bytes:
+        body = (
+            HEARTBEAT_DOMAIN_SEPARATOR
+            + self.name.encode("utf-8")
+            + b"|"
+            + bytes.fromhex(self.public_key_hex)
+            + b"|"
+            + struct.pack(">Q", timestamp)
+        )
+        return hashlib.sha256(body).digest()
 
     @staticmethod
     def _canonical_message(

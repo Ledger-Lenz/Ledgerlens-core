@@ -51,6 +51,13 @@ class OracleCoordinator:
     reports.
     """
 
+    # A node is considered dead if no heartbeat arrives within this window.
+    HEARTBEAT_TIMEOUT_SECONDS: float = 30.0
+    # Minimum number of active nodes required to keep quorum achievable.
+    MIN_ACTIVE_NODES: int = 2
+    # Alert when active nodes drop to (or below) this many.
+    ALERT_ACTIVE_NODES: int = 3
+
     def __init__(self, nodes: list[OracleNode], threshold: int = 3):
         if threshold > len(nodes):
             raise ValueError(f"Threshold {threshold} > node count {len(nodes)}")
@@ -75,7 +82,8 @@ class OracleCoordinator:
         confidence: int,
         model_version: int,
     ) -> QuorumSignature:
-        """Collect signatures from all nodes; stop after threshold is reached."""
+        """Collect signatures from active nodes; stop after threshold is reached."""
+        self.reconfigure_quorum()
         message = OracleNode._canonical_message(
             wallet,
             asset_pair,
@@ -87,7 +95,7 @@ class OracleCoordinator:
             model_version,
         )
         signatures = []
-        for node in self.nodes:
+        for node in self.active_nodes():
             try:
                 sig = node.sign_score_submission(
                     wallet,
