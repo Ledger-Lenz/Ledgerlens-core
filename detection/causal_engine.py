@@ -64,12 +64,14 @@ Each edge below encodes a domain-knowledge causal claim:
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import logging
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import networkx as nx
 import numpy as np
@@ -1099,14 +1101,13 @@ def _normalise_prices(prices: pd.DataFrame) -> pd.DataFrame | None:
     return df if not df.empty else None
 
 
-def _build_panel(
+def _prepare_pair_context(
     trades: pd.DataFrame,
     prices: pd.DataFrame,
-    wallet: str,
     pair: str | None,
     window_minutes: int,
-) -> pd.DataFrame | None:
-    """Build the windowed treatment/outcome/confounder panel, or None if infeasible."""
+) -> dict | None:
+    """Wallet-independent panel inputs for one pair (shared across a batch)."""
     price_df = _normalise_prices(prices)
     if price_df is None or trades is None or trades.empty:
         return None
@@ -1135,10 +1136,7 @@ def _build_panel(
     counter = trades_df["counter_account"] if "counter_account" in trades_df.columns else pd.Series(
         [None] * len(trades_df), index=trades_df.index
     )
-    wallet_mask = (trades_df["base_account"] == wallet) | (counter == wallet)
-
     volume = trades_df.groupby("_window")["_amount"].sum()
-    treated_windows = set(trades_df.loc[wallet_mask, "_window"])
 
     panel = pd.DataFrame(
         {
@@ -1151,8 +1149,47 @@ def _build_panel(
 
     panel["hour"] = panel.index.hour.astype(float)
     panel["volume"] = panel.index.map(lambda w: float(volume.get(w, 0.0)))
+    return {"panel": panel, "trades": trades_df, "counter": counter}
+
+
+def _wallet_panel(ctx: dict, wallet: str) -> pd.DataFrame:
+    """Attach ``wallet``'s treatment indicator to a prepared pair context."""
+    trades_df = ctx["trades"]
+    wallet_mask = (trades_df["base_account"] == wallet) | (ctx["counter"] == wallet)
+    treated_windows = set(trades_df.loc[wallet_mask, "_window"])
+    panel = ctx["panel"].copy()
     panel["treated"] = panel.index.map(lambda w: 1 if w in treated_windows else 0)
     return panel
+
+
+def _build_panel(
+    trades: pd.DataFrame,
+    prices: pd.DataFrame,
+    wallet: str,
+    pair: str | None,
+    window_minutes: int,
+) -> pd.DataFrame | None:
+    """Build the windowed treatment/outcome/confounder panel, or None if infeasible."""
+    ctx = _prepare_pair_context(trades, prices, pair, window_minutes)
+    if ctx is None:
+        return None
+    return _wallet_panel(ctx, wallet)
+
+
+def _pdc_from_panel(panel: pd.DataFrame | None) -> float:
+    if panel is None or len(panel) < _MIN_WINDOWS:
+        return 0.0
+    if panel["treated"].nunique() < 2:
+        return 0.0
+
+    try:
+        return _doubly_robust_ate(panel)
+    except Exception:
+        treated = panel[panel["treated"] == 1]["outcome"]
+        control = panel[panel["treated"] == 0]["outcome"]
+        if treated.empty or control.empty:
+            return 0.0
+        return float(treated.mean() - control.mean())
 
 
 def estimate_pdc(
@@ -1171,20 +1208,56 @@ def estimate_pdc(
 
     Returns ``0.0`` when there is insufficient data or no treatment overlap.
     """
-    panel = _build_panel(trades, prices, wallet, pair, window_minutes)
-    if panel is None or len(panel) < _MIN_WINDOWS:
-        return 0.0
-    if panel["treated"].nunique() < 2:
-        return 0.0
+    return _pdc_from_panel(_build_panel(trades, prices, wallet, pair, window_minutes))
 
-    try:
-        return _doubly_robust_ate(panel)
-    except Exception:
-        treated = panel[panel["treated"] == 1]["outcome"]
-        control = panel[panel["treated"] == 0]["outcome"]
-        if treated.empty or control.empty:
-            return 0.0
-        return float(treated.mean() - control.mean())
+
+def estimate_pdc_batch(
+    trades: pd.DataFrame,
+    prices: pd.DataFrame,
+    wallets: list[str],
+    pair: str,
+    window_minutes: int = 5,
+) -> dict[str, float]:
+    """Batched :func:`estimate_pdc` for many wallets on one pair.
+
+    Price normalisation, resampling, trade parsing and window volumes are
+    computed once and shared across all ``wallets``; only the per-wallet
+    treatment indicator and DR-IPW fit run per wallet. Results are identical
+    to calling :func:`estimate_pdc` per wallet.
+    """
+    ctx = _prepare_pair_context(trades, prices, pair, window_minutes)
+    if ctx is None:
+        return {w: 0.0 for w in wallets}
+    return {w: _pdc_from_panel(_wallet_panel(ctx, w)) for w in wallets}
+
+
+_CAUSAL_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _causal_executor() -> ThreadPoolExecutor:
+    global _CAUSAL_EXECUTOR
+    if _CAUSAL_EXECUTOR is None:
+        _CAUSAL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="causal")
+    return _CAUSAL_EXECUTOR
+
+
+async def estimate_pdc_batch_async(
+    trades: pd.DataFrame,
+    prices: pd.DataFrame,
+    wallets: list[str],
+    pair: str,
+    window_minutes: int = 5,
+) -> dict[str, float]:
+    """Run :func:`estimate_pdc_batch` on a dedicated worker pool.
+
+    Keeps causal computation off the event loop so the primary detection
+    pipeline is not blocked while PDC estimates are computed.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _causal_executor(),
+        partial(estimate_pdc_batch, trades, prices, wallets, pair, window_minutes),
+    )
 
 
 # ---------------------------------------------------------------------------

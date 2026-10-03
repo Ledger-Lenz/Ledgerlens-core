@@ -18,12 +18,13 @@ def db_path(tmp_path):
 
 @pytest.fixture
 def client(db_path, tmp_path):
-    from api.admin_router import router
+    from api.admin_router import require_break_glass, router
     from api.auth import require_admin_key
 
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[require_admin_key] = lambda: None
+    app.dependency_overrides[require_break_glass] = lambda: None
     with patch.object(_settings, "model_dir", str(tmp_path / "models")):
         yield TestClient(app)
 

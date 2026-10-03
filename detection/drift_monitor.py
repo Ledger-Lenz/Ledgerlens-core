@@ -271,6 +271,7 @@ def is_drift_detected(
     report: dict[str, float],
     psi_threshold: float = 0.20,
     min_drifted_features: int = 3,
+    retrain_callback=None,
 ) -> bool:
     """Determine if drift is detected based on the drift report.
 
@@ -281,6 +282,11 @@ def is_drift_detected(
         report: Dict mapping feature names to PSI values.
         psi_threshold: PSI threshold above which a feature is considered drifted.
         min_drifted_features: Minimum number of drifted features to trigger retraining.
+
+    If `retrain_callback` is supplied, it is invoked with the drifted feature
+    report after detection. This keeps batch PSI checks connected to the same
+    retraining pipeline contract as streaming detectors without forcing
+    synchronous model training in the report calculation.
 
     Returns:
         True if drift is detected, False otherwise.
@@ -294,6 +300,15 @@ def is_drift_detected(
             drifted_count,
             psi_threshold,
         )
+        if retrain_callback is not None:
+            retrain_callback(
+                {
+                    "event": "drift.detected",
+                    "drifted_features": {
+                        name: psi for name, psi in report.items() if psi > psi_threshold
+                    },
+                }
+            )
     else:
         logger.info(
             "No drift detected: %d features exceed PSI threshold (%.3f)",

@@ -299,3 +299,93 @@ def test_ring_beyond_overlap_buffer_missed():
             "Ring spanning beyond overlap buffer was unexpectedly detected. "
             "This is a documented limitation of the sharded graph engine."
         )
+
+
+# ---------------------------------------------------------------------------
+# Rebalancing under shard-holder addition/removal (Issue #983)
+# ---------------------------------------------------------------------------
+
+
+def _clustered_edges(clusters: int = 6, size: int = 8) -> dict:
+    edges = {}
+    for c in range(clusters):
+        members = [f"C{c}N{i}" for i in range(size)]
+        for i, a in enumerate(members):
+            for b in members[i + 1:]:
+                edges[(a, b)] = []
+        edges[(members[0], f"C{(c + 1) % clusters}N0")] = []
+    return edges
+
+
+def _process(assignment, work_items):
+    """Simulate each shard processing the work items for nodes it owns."""
+    processed = []
+    for shard in range(assignment.shard_count):
+        processed.extend(n for n in work_items if assignment.node_to_shard[n] == shard)
+    return processed
+
+
+@pytest.mark.parametrize("before,after", [(3, 4), (4, 3), (2, 6), (6, 1)])
+def test_rebalance_preserves_every_node_exactly_once(before, after):
+    edges = _clustered_edges()
+    previous = GraphShardPartitioner(before).partition(edges)
+    plan = GraphShardPartitioner(after).rebalance(previous, edges)
+
+    assert set(plan.assignment.node_to_shard) == set(previous.node_to_shard)
+    assert not plan.dropped
+    assert all(0 <= s < plan.assignment.shard_count for s in plan.assignment.node_to_shard.values())
+    for node, (source, target) in plan.moves.items():
+        assert previous.node_to_shard[node] == source
+        assert plan.assignment.node_to_shard[node] == target != source
+
+    work = sorted(plan.assignment.node_to_shard)
+    processed = _process(plan.assignment, work)
+    assert sorted(processed) == work  # no loss, no duplicates
+
+
+def test_rebalance_same_shard_count_moves_nothing():
+    edges = _clustered_edges()
+    previous = GraphShardPartitioner(4).partition(edges)
+    plan = GraphShardPartitioner(4).rebalance(previous, edges)
+    assert plan.moves == {}
+
+
+def test_removed_shard_nodes_are_all_moved():
+    edges = _clustered_edges()
+    previous = GraphShardPartitioner(4).partition(edges)
+    plan = GraphShardPartitioner(3).rebalance(previous, edges)
+    orphaned = {n for n, s in previous.node_to_shard.items() if s >= 3}
+    assert orphaned <= set(plan.moves)
+
+
+def test_rebalance_during_in_flight_rebalance():
+    edges = _clustered_edges()
+    initial = GraphShardPartitioner(3).partition(edges)
+    first = GraphShardPartitioner(5).rebalance(initial, edges)  # worker added
+    second = GraphShardPartitioner(2).rebalance(first.assignment, edges, in_flight=first)  # workers removed
+
+    assert second.ownership_conflicts == set(second.moves) & set(first.moves)
+    assert set(second.assignment.node_to_shard) == set(initial.node_to_shard)
+    work = sorted(second.assignment.node_to_shard)
+    assert sorted(_process(second.assignment, work)) == work
+
+
+def test_rebalance_reports_dropped_nodes():
+    edges = _clustered_edges()
+    previous = GraphShardPartitioner(3).partition(edges)
+    shrunk = {k: v for k, v in edges.items() if "C5" not in k[0] and "C5" not in k[1]}
+    plan = GraphShardPartitioner(3).rebalance(previous, shrunk)
+    assert plan.dropped == {n for n in previous.node_to_shard if n.startswith("C5")}
+
+
+def test_rebalance_records_metrics():
+    prometheus_client = pytest.importorskip("prometheus_client")
+    edges = _clustered_edges()
+    previous = GraphShardPartitioner(2).partition(edges)
+    before = prometheus_client.REGISTRY.get_sample_value(
+        "ledgerlens_graph_shard_rebalance_duration_seconds_count"
+    ) or 0
+    plan = GraphShardPartitioner(4).rebalance(previous, edges)
+    registry = prometheus_client.REGISTRY
+    assert registry.get_sample_value("ledgerlens_graph_shard_rebalance_duration_seconds_count") == before + 1
+    assert registry.get_sample_value("ledgerlens_graph_shard_rebalance_moves_total") >= len(plan.moves)

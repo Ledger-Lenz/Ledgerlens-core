@@ -4,6 +4,7 @@ Verifies that ``train_ensemble`` creates an MLflow run with the correct
 parameter keys, metric keys, and model artifacts.
 """
 
+import json
 import os
 
 import mlflow
@@ -11,7 +12,11 @@ import pandas as pd
 import pytest
 
 from detection.feature_engineering import FEATURE_NAMES
-from detection.mlflow_tracker import _compute_dataset_hash, mlflow_run
+from detection.mlflow_tracker import (
+    _compute_dataset_hash,
+    log_checkpoint_metadata,
+    mlflow_run,
+)
 from detection.model_training import train_ensemble
 
 
@@ -64,6 +69,47 @@ def test_mlflow_run_logs_training_duration(tmp_mlruns):
     runs = client.search_runs(experiment_ids=[experiment.experiment_id])
     durations = [r.data.metrics.get("training_duration_seconds", 0.0) for r in runs if r.data.metrics]
     assert any(d > 0.0 for d in durations)
+
+
+def test_checkpoint_metadata_preserves_run_lineage(tmp_mlruns, tmp_path):
+    with mlflow_run(
+        experiment_name="checkpoint-lineage", tracking_uri=tmp_mlruns
+    ) as parent_id:
+        pass
+
+    checkpoint_path = tmp_path / "lstm_epoch_0002.pt"
+    checkpoint_path.touch()
+    with mlflow_run(
+        experiment_name="checkpoint-lineage",
+        tracking_uri=tmp_mlruns,
+        parent_run_id=parent_id,
+    ) as resumed_id:
+        log_checkpoint_metadata(
+            {
+                "original_mlflow_run_id": parent_id,
+                "current_mlflow_run_id": resumed_id,
+                "resumed": True,
+            },
+            checkpoint_path=str(checkpoint_path),
+            epoch=2,
+            step=17,
+        )
+
+    client = mlflow.tracking.MlflowClient(tmp_mlruns)
+    resumed_run = client.get_run(resumed_id)
+    assert resumed_run.data.tags["mlflow.parentRunId"] == parent_id
+    assert resumed_run.data.tags["training.original_run_id"] == parent_id
+    assert resumed_run.data.tags["training.resumed"] == "true"
+
+    artifact_path = client.download_artifacts(
+        resumed_id, "checkpoints/lstm_epoch_0002.pt.json"
+    )
+    with open(artifact_path, encoding="utf-8") as artifact_file:
+        metadata = json.load(artifact_file)
+    assert metadata["checkpoint_identifier"] == checkpoint_path.name
+    assert metadata["checkpoint_path"] == str(checkpoint_path)
+    assert metadata["progress_epoch"] == 2
+    assert metadata["progress_step"] == 17
 
 
 def test_compute_dataset_hash_stable():

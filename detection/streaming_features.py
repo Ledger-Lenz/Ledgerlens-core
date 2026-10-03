@@ -34,6 +34,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -56,6 +57,9 @@ _WINDOW_SECONDS: dict[str, int] = {
 
 _DIGITS = list(range(1, 10))
 _BENFORD_EXPECTED = [math.log10(1 + 1 / d) for d in _DIGITS]
+# Per-digit binomial standard deviation sqrt(p(1-p)), precomputed so the
+# per-trade Benford z-score needs no square roots beyond sqrt(n).
+_BENFORD_SD = [math.sqrt(p * (1 - p)) for p in _BENFORD_EXPECTED]
 
 # Off-hours UTC: 00:00–05:59
 _OFF_HOURS = frozenset(range(0, 6))
@@ -217,21 +221,20 @@ class WindowState:
         n = self.digit_count
         if n == 0:
             return 0.0, 0.0, 0.0
-        observed = [c / n for c in self.digit_histogram]
-        chi_sq = sum(
-            (observed[i] * n - _BENFORD_EXPECTED[i] * n) ** 2 / (_BENFORD_EXPECTED[i] * n)
-            for i in range(9)
-            if _BENFORD_EXPECTED[i] * n > 0
-        )
-        mad = float(sum(abs(observed[i] - _BENFORD_EXPECTED[i]) for i in range(9)) / 9)
-        zscores = []
-        for i in range(9):
-            p = _BENFORD_EXPECTED[i]
-            obs_p = observed[i]
-            numerator = abs(obs_p - p) - 1.0 / (2 * n)
-            denominator = math.sqrt(p * (1 - p) / n)
-            zscores.append(max(numerator, 0.0) / denominator if denominator > 0 else 0.0)
-        return float(chi_sq), float(mad), float(max(zscores))
+        # Single pass over the 9 digits; this runs for every window on every
+        # trade, so it is the dominant cost of the streaming hot path.
+        chi_sq = 0.0
+        abs_dev_sum = 0.0
+        max_z = 0.0
+        continuity = 1.0 / (2 * n)
+        sqrt_n = math.sqrt(n)
+        for count, p, sd in zip(self.digit_histogram, _BENFORD_EXPECTED, _BENFORD_SD):
+            expected = p * n
+            chi_sq += (count - expected) ** 2 / expected
+            dev = abs(count / n - p)
+            abs_dev_sum += dev
+            max_z = max(max_z, (dev - continuity) * sqrt_n / sd)
+        return float(chi_sq), float(abs_dev_sum / 9), float(max_z)
 
     def counterparty_concentration(self) -> float:
         """Fraction of volume traded against the single largest counterparty."""
@@ -349,11 +352,15 @@ class StreamingFeatureEngine:
         self, trade: Trade, wallet: str
     ) -> tuple[int, float, str, int, str, str, bool, int | None, int, int]:
         """Extract the fields needed by `WindowState.update`."""
+        # Stdlib datetime arithmetic only: constructing a pandas Timestamp per
+        # trade was a measurable share of per-trade latency.  Naive times are
+        # UTC, matching the previous pandas semantics.
         ts = trade.ledger_close_time
-        if hasattr(ts, "timestamp"):
-            ts_sec = int(ts.timestamp())
-        else:
-            ts_sec = int(pd.Timestamp(ts).timestamp())
+        if not isinstance(ts, datetime):
+            ts = pd.Timestamp(ts).to_pydatetime()
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ts_sec = int(ts.timestamp())
 
         amount = float(trade.base_amount) if trade.base_amount else 0.0
 
@@ -367,12 +374,7 @@ class StreamingFeatureEngine:
             gave = _asset_symbol(trade.counter_asset)
             got = _asset_symbol(trade.base_asset)
 
-        ts_pd = pd.Timestamp(trade.ledger_close_time)
-        if ts_pd.tzinfo is None:
-            ts_pd = ts_pd.tz_localize("UTC")
-        else:
-            ts_pd = ts_pd.tz_convert("UTC")
-        hour = ts_pd.hour
+        hour = (ts_sec // _SECONDS_PER_HOUR) % 24
         self_match = (trade.base_account == trade.counter_account)
         digit = _first_digit(amount)
         minute_key = ts_sec // 60

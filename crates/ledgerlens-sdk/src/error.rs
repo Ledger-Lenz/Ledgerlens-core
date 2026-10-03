@@ -1,4 +1,5 @@
-use std::fmt;
+use alloc::string::{String, ToString};
+use core::fmt;
 
 /// Errors that can occur when using the LedgerLens client.
 ///
@@ -41,6 +42,7 @@ pub enum LedgerLensError {
     TlsError(String),
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for LedgerLensError {}
 
 impl fmt::Display for LedgerLensError {
@@ -63,6 +65,7 @@ impl fmt::Display for LedgerLensError {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<reqwest::Error> for LedgerLensError {
     fn from(e: reqwest::Error) -> Self {
         if e.is_status() {
@@ -111,7 +114,7 @@ pub enum ZkVerifyError {
     InvalidThreshold(u32),
 }
 
-#[cfg(feature = "zk-verify")]
+#[cfg(all(feature = "zk-verify", feature = "std"))]
 impl std::error::Error for ZkVerifyError {}
 
 #[cfg(feature = "zk-verify")]

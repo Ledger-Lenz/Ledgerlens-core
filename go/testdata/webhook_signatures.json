@@ -1,0 +1,17 @@
+[
+  {
+    "secret": "whsec_test_secret",
+    "body": "{\"event\":\"risk_score_alert\",\"wallet\":\"GABC\",\"score\":87}",
+    "signature": "sha256=2e1b1d2a6dbb4597dc74eab9b8ffbc8e1ab290fa529280569fa84789d53ef66c"
+  },
+  {
+    "secret": "another-secret",
+    "body": "{\"event\":\"ring_detected\",\"ring_id\":\"r-1\",\"members\":[\"GA\",\"GB\"]}",
+    "signature": "sha256=ada50f73d5c30c22062b140d6e9105f17c2335719aa6d198b2b2552b9edb22f9"
+  },
+  {
+    "secret": "s3cr3t-\u00e9\u00e8",
+    "body": "",
+    "signature": "sha256=67e15919e64fbbf87b639774d3c1c78fd13f747d3cbe31fed48531ad1558786d"
+  }
+]

@@ -1,0 +1,1 @@
+{"id": "GHSA-unfixed-0002", "aliases": ["CVE-2099-0002"], "affected": [{"package": {"name": "otherlib", "ecosystem": "PyPI"}, "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}]}]}

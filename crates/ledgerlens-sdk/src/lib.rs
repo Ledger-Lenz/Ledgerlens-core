@@ -29,9 +29,19 @@
 //!
 //! ## Feature Flags
 //!
-//! - `async` (default): Enable async/await support via `tokio`.
+//! - `std` (default): HTTP client and `std::error::Error` impls.
+//! - `async` (default): Enable async/await support via `tokio` (implies `std`).
 //! - `zk-verify`: Enable ZK threshold proof verification using ark-bn254.
+//!
+//! Build with `default-features = false` for a `no_std` + `alloc` target such
+//! as `wasm32-unknown-unknown`; only models, errors and (with `zk-verify`)
+//! proof verification are available there.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
 pub mod client;
 pub mod error;
 pub mod models;
@@ -40,6 +50,7 @@ pub mod models;
 pub mod zk;
 
 // Re-exports for convenience.
+#[cfg(feature = "std")]
 pub use client::LedgerLensClient;
 pub use error::LedgerLensError;
 pub use models::{CrossChainLink, HealthStatus, Ring, RiskScore, WalletScoresResponse};

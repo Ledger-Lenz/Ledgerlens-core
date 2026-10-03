@@ -87,6 +87,28 @@ PARQUET_SCHEMA_FIELDS: list[str] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Schema versioning / evolution (see docs/parquet_schema_evolution.md)
+# ---------------------------------------------------------------------------
+
+#: Current export schema version, embedded in every file's key-value metadata.
+SCHEMA_VERSION = "1.0"
+#: Parquet key-value metadata key carrying the schema version.
+SCHEMA_VERSION_METADATA_KEY = b"ledgerlens.schema_version"
+#: Version assumed for files written before the version tag existed (they
+#: share the 1.0 column layout but carry no tag).
+LEGACY_SCHEMA_VERSION = "1.0"
+
+#: Registry of every published schema version and its column list. Append a
+#: new entry (never edit an old one) when the schema changes.
+SCHEMA_REGISTRY: dict[str, list[str]] = {
+    "1.0": list(PARQUET_SCHEMA_FIELDS),
+}
+
+#: Column renames as ``{old_name: new_name}``; applied when reading older files.
+FIELD_RENAMES: dict[str, str] = {}
+
+
 def _build_schema():
     """Return the canonical PyArrow schema for Trade Parquet exports.
 
@@ -117,7 +139,42 @@ def _build_schema():
         pa.field("price", pa.decimal128(22, 7)),
         pa.field("base_is_seller", pa.bool_()),
         pa.field("trade_type", pa.string()),
-    ])
+    ]).with_metadata({SCHEMA_VERSION_METADATA_KEY: SCHEMA_VERSION.encode()})
+
+
+def read_schema_version(path: str | Path) -> str:
+    """Return the schema version tag embedded in a Parquet export file.
+
+    Files written before versioning was introduced carry no tag and are
+    reported as :data:`LEGACY_SCHEMA_VERSION`.
+    """
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    metadata = pq.read_schema(path).metadata or {}
+    raw = metadata.get(SCHEMA_VERSION_METADATA_KEY)
+    return raw.decode() if raw else LEGACY_SCHEMA_VERSION
+
+
+def read_parquet_compatible(path: str | Path) -> "pa.Table":
+    """Read an export file of any schema version as the current schema.
+
+    Applies :data:`FIELD_RENAMES`, fills columns missing from older files with
+    nulls, drops columns unknown to the current schema, and casts to the
+    current column types.
+    """
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    table = pq.read_table(path)
+    table = table.rename_columns([FIELD_RENAMES.get(c, c) for c in table.column_names])
+    schema = _build_schema()
+    columns = []
+    for field in schema:
+        if field.name in table.column_names:
+            columns.append(table.column(field.name).cast(field.type))
+        else:
+            columns.append(pa.nulls(table.num_rows, type=field.type))
+    return pa.table(columns, schema=schema)
 
 
 # Expose as a module-level alias so code can write ``PARQUET_SCHEMA``
@@ -242,7 +299,7 @@ class ParquetExporter:
     """
 
     _MANIFEST_FILENAME = "manifest.json"
-    _SCHEMA_VERSION = "1.0"
+    _SCHEMA_VERSION = SCHEMA_VERSION
 
     def __init__(
         self,

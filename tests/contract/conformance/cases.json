@@ -1,0 +1,239 @@
+{
+  "_conformance_version": "1",
+  "cases": [
+    {
+      "id": "health_ok",
+      "operation": "health",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/health",
+        "query": {}
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "ok",
+          "db": "ok",
+          "models": "loaded"
+        }
+      },
+      "expect": {
+        "ok": {
+          "status": "ok"
+        }
+      }
+    },
+    {
+      "id": "health_unauthorized",
+      "operation": "health",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/health",
+        "query": {}
+      },
+      "response": {
+        "status": 401,
+        "body": {
+          "detail": "Invalid API key"
+        }
+      },
+      "expect": {
+        "error": {
+          "status": 401
+        }
+      }
+    },
+    {
+      "id": "health_not_found",
+      "operation": "health",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/health",
+        "query": {}
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "detail": "Not Found"
+        }
+      },
+      "expect": {
+        "error": {
+          "status": 404
+        }
+      }
+    },
+    {
+      "id": "health_rate_limited",
+      "operation": "health",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/health",
+        "query": {}
+      },
+      "response": {
+        "status": 429,
+        "body": {
+          "detail": "Rate limit exceeded"
+        }
+      },
+      "expect": {
+        "error": {
+          "status": 429
+        }
+      }
+    },
+    {
+      "id": "health_server_error",
+      "operation": "health",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/health",
+        "query": {}
+      },
+      "response": {
+        "status": 500,
+        "body": {
+          "detail": "Internal Server Error"
+        }
+      },
+      "expect": {
+        "error": {
+          "status": 500
+        }
+      }
+    },
+    {
+      "id": "scores_list",
+      "operation": "list_scores",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/scores",
+        "query": {}
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          {
+            "wallet": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "asset_pair": "XLM/USDC",
+            "score": 82,
+            "benford_flag": true,
+            "ml_flag": true,
+            "confidence": 90,
+            "disputed": false,
+            "timestamp": "2026-01-01T00:00:00+00:00"
+          },
+          {
+            "wallet": "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "asset_pair": "XLM/EURC",
+            "score": 15,
+            "benford_flag": false,
+            "ml_flag": false,
+            "confidence": 90,
+            "disputed": false,
+            "timestamp": "2026-01-01T00:00:00+00:00"
+          }
+        ]
+      },
+      "expect": {
+        "ok": {
+          "wallets": [
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+          ],
+          "scores": [
+            82,
+            15
+          ]
+        }
+      }
+    },
+    {
+      "id": "scores_filtered_by_asset_pair",
+      "operation": "list_scores",
+      "args": {
+        "asset_pair": "XLM/USDC"
+      },
+      "request": {
+        "method": "GET",
+        "path": "/scores",
+        "query": {
+          "asset_pair": "XLM/USDC"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          {
+            "wallet": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "asset_pair": "XLM/USDC",
+            "score": 82,
+            "benford_flag": true,
+            "ml_flag": true,
+            "confidence": 90,
+            "disputed": false,
+            "timestamp": "2026-01-01T00:00:00+00:00"
+          }
+        ]
+      },
+      "expect": {
+        "ok": {
+          "wallets": [
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          ],
+          "scores": [
+            82
+          ]
+        }
+      }
+    },
+    {
+      "id": "scores_empty",
+      "operation": "list_scores",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/scores",
+        "query": {}
+      },
+      "response": {
+        "status": 200,
+        "body": []
+      },
+      "expect": {
+        "ok": {
+          "wallets": [],
+          "scores": []
+        }
+      }
+    },
+    {
+      "id": "scores_server_error",
+      "operation": "list_scores",
+      "args": {},
+      "request": {
+        "method": "GET",
+        "path": "/scores",
+        "query": {}
+      },
+      "response": {
+        "status": 503,
+        "body": {
+          "detail": "Service Unavailable"
+        }
+      },
+      "expect": {
+        "error": {
+          "status": 503
+        }
+      }
+    }
+  ]
+}

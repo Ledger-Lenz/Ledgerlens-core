@@ -9,6 +9,8 @@ The :class:`AnalystFeedbackStore` extends this module with importance-weighted
 analyst corrections that are merged into the training pipeline during retrain.
 """
 
+import hashlib
+import json
 import math
 import sqlite3
 from contextlib import contextmanager
@@ -167,8 +169,11 @@ def get_recent_feedback(
 
 FEEDBACK_DECAY_LAMBDA = 0.05
 
+# Named ``analyst_corrections`` (not ``analyst_feedback``) because
+# ``detection.storage`` already owns an ``analyst_feedback`` verdicts table with
+# a different schema in the same database.
 _ANALYST_CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS analyst_feedback (
+CREATE TABLE IF NOT EXISTS analyst_corrections (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     wallet          TEXT NOT NULL,
     asset_pair      TEXT NOT NULL,
@@ -176,10 +181,11 @@ CREATE TABLE IF NOT EXISTS analyst_feedback (
     original_score  INTEGER NOT NULL CHECK(original_score BETWEEN 0 AND 100),
     confidence      REAL NOT NULL CHECK(confidence BETWEEN 0.0 AND 1.0),
     has_feature_vector INTEGER NOT NULL DEFAULT 0,
-    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_dispute_id TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_feedback_wallet ON analyst_feedback(wallet);
-CREATE INDEX IF NOT EXISTS idx_feedback_created ON analyst_feedback(created_at);
+CREATE INDEX IF NOT EXISTS idx_corrections_wallet ON analyst_corrections(wallet);
+CREATE INDEX IF NOT EXISTS idx_corrections_created ON analyst_corrections(created_at);
 """
 
 
@@ -221,8 +227,12 @@ class AnalystFeedbackStore:
         analyst_label: int,
         original_score: int,
         confidence: float = 1.0,
+        source_dispute_id: str | None = None,
     ) -> FeedbackRecord:
         """Persist an analyst correction.
+
+        ``source_dispute_id`` tags corrections generated from a confirmed
+        false-positive dispute so they trace back to that dispute.
 
         Returns the persisted FeedbackRecord with computed importance_weight.
         """
@@ -233,18 +243,18 @@ class AnalystFeedbackStore:
         if not (0.0 <= confidence <= 1.0):
             raise ValueError("confidence must be in [0.0, 1.0]")
 
-        has_fv = self._check_feature_vector(wallet)
+        has_fv = self._check_feature_vector(wallet, asset_pair)
         now = datetime.now(timezone.utc)
 
         conn = self._connect_and_init()
         try:
             cursor = conn.execute(
-                """INSERT INTO analyst_feedback
+                """INSERT INTO analyst_corrections
                    (wallet, asset_pair, analyst_label, original_score, confidence,
-                    has_feature_vector, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    has_feature_vector, created_at, source_dispute_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (wallet, asset_pair, analyst_label, original_score,
-                 confidence, int(has_fv), now.isoformat()),
+                 confidence, int(has_fv), now.isoformat(), source_dispute_id),
             )
             conn.commit()
             row_id = cursor.lastrowid
@@ -280,7 +290,7 @@ class AnalystFeedbackStore:
         try:
             rows = conn.execute(
                 """SELECT wallet, analyst_label, confidence, created_at
-                   FROM analyst_feedback
+                   FROM analyst_corrections
                    WHERE has_feature_vector = 1 AND created_at >= ?
                    ORDER BY created_at DESC""",
                 (cutoff,),
@@ -308,12 +318,12 @@ class AnalystFeedbackStore:
         """Return paginated correction history (most recent first)."""
         conn = self._connect_and_init()
         try:
-            total = conn.execute("SELECT COUNT(*) FROM analyst_feedback").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM analyst_corrections").fetchone()[0]
             offset = (page - 1) * page_size
             rows = conn.execute(
                 """SELECT id, wallet, asset_pair, analyst_label, original_score,
                           confidence, has_feature_vector, created_at
-                   FROM analyst_feedback
+                   FROM analyst_corrections
                    ORDER BY created_at DESC
                    LIMIT ? OFFSET ?""",
                 (page_size, offset),
@@ -343,20 +353,48 @@ class AnalystFeedbackStore:
 
         return records, total
 
+    def training_snapshot(self) -> tuple[list[dict], str]:
+        """Return all corrections for the next training run plus a content hash.
+
+        Rows are ordered by id and include ``source_dispute_id`` provenance.
+        The SHA-256 hash covers the canonical JSON of the rows, so any added,
+        removed, or altered correction changes the data-snapshot hash recorded
+        by the reproducibility harness.
+        """
+        conn = self._connect_and_init()
+        try:
+            rows = conn.execute(
+                """SELECT id, wallet, asset_pair, analyst_label, original_score,
+                          confidence, has_feature_vector, created_at,
+                          source_dispute_id
+                   FROM analyst_corrections ORDER BY id"""
+            ).fetchall()
+        finally:
+            conn.close()
+
+        keys = ("id", "wallet", "asset_pair", "analyst_label", "original_score",
+                "confidence", "has_feature_vector", "created_at",
+                "source_dispute_id")
+        snapshot = [dict(zip(keys, r)) for r in rows]
+        digest = hashlib.sha256(
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return snapshot, digest
+
     def correction_count(self) -> int:
         """Total number of persisted corrections."""
         conn = self._connect_and_init()
         try:
-            return conn.execute("SELECT COUNT(*) FROM analyst_feedback").fetchone()[0]
+            return conn.execute("SELECT COUNT(*) FROM analyst_corrections").fetchone()[0]
         finally:
             conn.close()
 
-    def _check_feature_vector(self, wallet: str) -> bool:
-        """Check if a feature vector exists for this wallet."""
+    def _check_feature_vector(self, wallet: str, asset_pair: str) -> bool:
+        """Check if a feature vector exists for this wallet and asset pair."""
         try:
             from detection.storage import get_feature_vector
 
-            fv = get_feature_vector(wallet, db_path=self._db_path)
+            fv = get_feature_vector(wallet, asset_pair, db_path=self._db_path)
             return fv is not None and len(fv) > 0
         except (ValueError, LookupError, OSError, sqlite3.Error):
             return False

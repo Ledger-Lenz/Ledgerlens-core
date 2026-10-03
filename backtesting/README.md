@@ -23,6 +23,50 @@ Each row represents one Stellar wallet:
 | `label` | `1` = confirmed wash trader, `0` = clean |
 | `start_date` / `end_date` | Observation window used when scoring the wallet |
 
+## Walk-forward mode (recommended default)
+
+**Use walk-forward evaluation for all model evaluation going forward.**
+Scoring a whole labelled history with a model trained on overlapping data
+lets information from the evaluation period leak into training (lookahead
+bias), which inflates metrics relative to real deployment.
+
+`run_walk_forward_backtest(df, config, fit, predict, threshold=70)` trains
+strictly on data observed before a boundary `T`, evaluates strictly on
+`[T, T + test_window)`, then moves `T` forward by `step`. Each fold is
+checked by `assert_no_lookahead`, which raises `LookaheadBiasError` if any
+training feature or label postdates the fold cutoff or any row appears in
+both windows.
+
+```python
+import pandas as pd
+from backtesting.backtest_runner import WalkForwardConfig, run_walk_forward_backtest
+
+config = WalkForwardConfig(
+    train_window=pd.Timedelta(days=90),   # None = expanding window over all prior history
+    test_window=pd.Timedelta(days=30),
+    step=pd.Timedelta(days=30),
+    time_column="timestamp",              # when the features were observed
+    label_time_column="label_known_at",   # optional: when the label became known
+    gap=pd.Timedelta(days=1),             # optional embargo between train and test
+)
+report = run_walk_forward_backtest(df, config, fit=train_fn, predict=score_fn)
+report.aggregate["auc_roc"], [f.metrics for f in report.folds]
+```
+
+| Setting | Meaning |
+|---------|---------|
+| `train_window` | Rolling training window length; `None` for an expanding window |
+| `test_window` | Length of each evaluation window |
+| `step` | How far the train/test boundary advances per fold |
+| `time_column` | Feature-observation timestamp column |
+| `label_time_column` | Optional; rows whose label was not yet known at the cutoff are excluded from training |
+| `gap` | Optional embargo so trailing-window features computed near the boundary cannot straddle it |
+
+`fit(train_df)` returns a model; `predict(model, test_df)` returns 0–100
+scores. `tests/test_backtest_runner.py::TestWalkForward` includes a synthetic
+lookahead-bias trap: a memorising model that scores perfectly under a leaky
+evaluation and exactly at chance under walk-forward.
+
 ## Running a backtest
 
 From the repository root (after training models with `python cli.py train`):

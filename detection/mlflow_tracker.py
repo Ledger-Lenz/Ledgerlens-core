@@ -19,6 +19,7 @@ import contextlib
 import hashlib
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,7 @@ def mlflow_run(
     experiment_name: str | None = None,
     tracking_uri: str | None = None,
     nested: bool = False,
+    parent_run_id: str | None = None,
 ) -> Generator[str, None, None]:
     """Context manager that creates (or reuses) an MLflow run.
 
@@ -90,6 +92,9 @@ def mlflow_run(
     nested:
         If ``True``, start a nested (child) run inside an already-active run.
 
+    parent_run_id:
+        Optional MLflow parent run ID for a new run resumed from a training
+        checkpoint.
     Yields
     ------
     str
@@ -114,7 +119,12 @@ def mlflow_run(
         yield ""
         return
 
-    run = mlflow.start_run(experiment_id=exp.experiment_id, nested=nested)
+    tags = {"mlflow.parentRunId": parent_run_id} if parent_run_id else None
+    run = mlflow.start_run(
+        experiment_id=exp.experiment_id,
+        nested=nested,
+        tags=tags,
+    )
     run_id = run.info.run_id
     logger.info("Started MLflow run: %s", run_id)
 
@@ -148,6 +158,50 @@ def log_metrics(metrics: dict, step: int | None = None) -> None:
             mlflow.log_metric(key, value, step=step)
         except Exception as exc:
             logger.warning("Failed to log metric %s=%s: %s", key, value, exc)
+
+
+def log_checkpoint_metadata(
+    metadata: dict,
+    *,
+    checkpoint_path: str,
+    epoch: int,
+    step: int,
+) -> None:
+    """Log checkpoint provenance and resume lineage to the active MLflow run."""
+    if not _HAS_MLFLOW:
+        return
+
+    checkpoint_id = Path(checkpoint_path).name
+    artifact_metadata = {
+        **metadata,
+        "checkpoint_identifier": checkpoint_id,
+        "checkpoint_path": str(checkpoint_path),
+        "progress_epoch": epoch,
+        "progress_step": step,
+    }
+    tags = {
+        "training.latest_checkpoint": str(checkpoint_path),
+        "training.resumed": str(bool(metadata.get("resumed", False))).lower(),
+    }
+    original_run_id = metadata.get("original_mlflow_run_id")
+    if original_run_id:
+        tags["training.original_run_id"] = str(original_run_id)
+
+    try:
+        mlflow.log_dict(artifact_metadata, f"checkpoints/{checkpoint_id}.json")
+        mlflow.set_tags(tags)
+    except Exception as exc:
+        logger.warning("Failed to log checkpoint metadata for %s: %s", checkpoint_path, exc)
+
+
+def log_artifact(path: str) -> None:
+    """Log a local file to the active MLflow run when tracking is available."""
+    if not _HAS_MLFLOW:
+        return
+    try:
+        mlflow.log_artifact(path)
+    except Exception as exc:
+        logger.warning("Failed to log MLflow artifact %s: %s", path, exc)
 
 
 def log_training_dataset_metadata(df: pd.DataFrame) -> None:

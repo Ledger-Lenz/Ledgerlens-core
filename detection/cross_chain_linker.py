@@ -4,6 +4,12 @@ Links Stellar wallets to their EVM counterparts via bridge transfer records,
 and computes aggregate statistics that describe the cross-chain trading behaviour
 of the linked EVM wallets. Includes Bayesian probabilistic scoring for
 cross-chain identity assertions.
+
+Confidence calibration (Issue #1035): the raw log-likelihood ratio assumes
+independent evidence and is over-confident. ``confidence`` is therefore
+Platt-scaled, ``sigmoid(a * llr + b)``, with ``(a, b)`` fitted on a labeled set
+of known true/false link pairs via :meth:`CrossChainLinker.fit_calibration`.
+The default ``(1.0, 0.0)`` is the uncalibrated posterior at even prior odds.
 """
 
 import json
@@ -68,9 +74,48 @@ class CrossChainLinker:
     assertions.
     """
 
-    def __init__(self, db_path: str | None = None, min_confidence: float = CONFIDENCE_THRESHOLD) -> None:
+    def __init__(
+        self,
+        db_path: str | None = None,
+        min_confidence: float = CONFIDENCE_THRESHOLD,
+        calibration: tuple[float, float] = (1.0, 0.0),
+    ) -> None:
         self._db_path = db_path
         self.min_confidence = min_confidence
+        self.calibration = calibration
+
+    def fit_calibration(
+        self, log_likelihood_ratios: list[float], labels: list[int]
+    ) -> tuple[float, float]:
+        """Fit Platt scaling on labeled link pairs (1 = true link, 0 = not).
+
+        Sets and returns ``(a, b)`` so that ``sigmoid(a * llr + b)`` is a
+        calibrated probability that the pair belongs to the same entity.
+        """
+        from sklearn.linear_model import LogisticRegression
+
+        x = [[max(min(v, 700.0), -700.0)] for v in log_likelihood_ratios]
+        model = LogisticRegression(C=1e6).fit(x, labels)
+        self.calibration = (float(model.coef_[0][0]), float(model.intercept_[0]))
+        return self.calibration
+
+    def link_confidences(self, stellar_wallet: str, lookback_days: int = 90) -> dict[str, float]:
+        """Return ``{evm_wallet: calibrated link confidence}`` for bridged wallets."""
+        transfers = get_bridge_transfers(
+            stellar_wallet=stellar_wallet,
+            since_days=lookback_days,
+            db_path=self._db_path,
+        )
+        by_evm: dict[str, list[BridgeTransfer]] = {}
+        for t in transfers:
+            by_evm.setdefault(t.evm_wallet, []).append(t)
+        result: dict[str, float] = {}
+        for evm_wallet, events in by_evm.items():
+            try:
+                result[evm_wallet] = self.score_hypothesis(stellar_wallet, evm_wallet, events).confidence
+            except ValueError:
+                result[evm_wallet] = 0.0
+        return result
 
     # ── Bayesian scoring ─────────────────────────────────────────────────
 
@@ -100,7 +145,8 @@ class CrossChainLinker:
 
         features = self._compute_features(stellar_wallet, evm_wallet, bridge_events)
         llr = self._log_likelihood_ratio(features)
-        confidence = self._sigmoid(llr)
+        a, b = self.calibration
+        confidence = self._sigmoid(a * llr + b)
         status = self._classify(confidence)
 
         return WalletLinkHypothesis(

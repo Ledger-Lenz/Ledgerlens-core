@@ -138,6 +138,9 @@ class Trade(IngestionModel):
     path_payment_id: StrictString | None = None  # originating path payment operation ID
     hop_index: int | None = None         # position in the path (0 = first hop)
     source: str = "stellar"              # ingestion origin: "stellar" | "solana" | ...
+    # Pipeline trace ID stamped at ingestion (detection.tracing); excluded from
+    # serialisation so persisted/exported trade shapes are unchanged.
+    trace_id: str | None = Field(default=None, exclude=True)
 
     @field_validator("base_amount", "counter_amount", "price", mode="before")
     @classmethod

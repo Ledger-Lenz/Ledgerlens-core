@@ -30,6 +30,12 @@ def db_path(tmp_path):
     return str(tmp_path / "queue.db")
 
 
+@pytest.fixture(autouse=True)
+def _no_jitter(monkeypatch):
+    """Exact-delay assertions below assume zero jitter."""
+    monkeypatch.setattr("detection.webhook_queue._jitter", lambda: 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Enqueue
 # ---------------------------------------------------------------------------

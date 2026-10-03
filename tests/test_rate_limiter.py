@@ -419,3 +419,14 @@ def test_redis_backed_check_latency_within_budget(tcp_fake_redis):
     # budget, so this is intentionally loose -- the point is "not
     # pathological", not a tight perf gate.
     assert redis_per_call_ms < 50.0
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("backend", ["redis", "local"])
+def test_limiter_overhead_within_budget(backend):
+    """Per-check p99 stays within the budget in benchmarks/benchmark_rate_limiter.py
+    (run with ``-m benchmark``; ``make benchmark-check``)."""
+    from benchmarks.benchmark_rate_limiter import run
+
+    result = run(backend, iterations=1000, threads=4)
+    assert result["p99_ms"] < result["p99_budget_ms"], result

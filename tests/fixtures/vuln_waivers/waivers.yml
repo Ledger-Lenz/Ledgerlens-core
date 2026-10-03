@@ -1,0 +1,13 @@
+waivers:
+  - id: GHSA-patched-0001
+    ecosystem: python
+    package: examplelib
+    reason: Fixture — advisory has since been patched upstream in 2.4.1.
+    expires: 2099-12-31
+    added_by: fixture
+  - id: GHSA-unfixed-0002
+    ecosystem: python
+    package: otherlib
+    reason: Fixture — advisory has no upstream fix.
+    expires: 2099-12-31
+    added_by: fixture

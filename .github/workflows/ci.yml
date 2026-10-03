@@ -10,6 +10,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Threat model traceability ─────────────────────────────────────────────
+  # Every STRIDE threat in docs/threat_model.md must map to a test (or a
+  # tracked gap) in docs/threat_test_matrix.md.
+  threat-matrix:
+    name: Threat matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_threat_matrix.py
+
   # ── Lock-file freshness ────────────────────────────────────────────────────
   # Fails the PR when any requirements/*.txt is stale relative to its *.in
   # source or pyproject.toml.
@@ -83,6 +96,13 @@ jobs:
           pip install ruff==0.4.10 --quiet
           ruff check .
 
+      - name: Metric cardinality budget
+        run: |
+          pip install pyyaml==6.0.2 --quiet
+          python scripts/check_metric_cardinality.py
+      - name: Lint metric names
+        run: python scripts/lint_metric_names.py
+
       - name: Test
         run: |
           # The repository has many integration, optional-dependency, schema,
@@ -98,9 +118,12 @@ jobs:
             tests/test_benford_engine.py \
             tests/test_storage.py \
             tests/test_event_bus.py \
+            tests/test_event_bus_dead_letter.py \
+            tests/test_pipeline_trace_propagation.py \
             tests/test_webhook_queue.py \
             tests/test_http_client.py \
-            tests/test_exceptions.py
+            tests/test_exceptions.py \
+            tests/test_fuzz_regression.py
 
   # ── Go SDK ────────────────────────────────────────────────────────────────
   go-sdk:
@@ -149,6 +172,30 @@ jobs:
       - name: Run scoring pipeline benchmarks
         run: make benchmark-check
 
+  # ── Detection accuracy benchmark ──────────────────────────────────────────
+  detection-benchmark:
+    name: Detection benchmark (precision/recall)
+    needs: lock-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/test.txt
+
+      - name: Install from lockfile
+        run: |
+          pip install --upgrade pip==24.0
+          pip install -r requirements/test.txt
+          pip install -e . --no-deps
+
+      - name: Report precision/recall deltas vs. baseline
+        run: python -m benchmarks.detection.run
+
   # ── Rust SDK ──────────────────────────────────────────────────────────────
   rust-sdk:
     name: Rust SDK
@@ -182,8 +229,40 @@ jobs:
       - name: cargo check (zk-verify)
         run: cargo check --features zk-verify
 
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: cargo check (no_std, wasm32)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features
+
+      - name: cargo check (no_std + zk-verify, wasm32)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features zk-verify
+
       - name: cargo test
         run: cargo test
+
+      # tests/api_contract_test.rs checks the SDK models against
+      # docs/openapi.json, which schema.yml keeps in sync with api/.
+      - name: API contract tests
+        run: cargo test --test api_contract_test
+
+      # Semver policy (see README "Semver Policy"): changes to the public API
+      # in src/ need a CHANGELOG entry, and the Cargo.toml version must have a
+      # matching CHANGELOG release heading.
+      - name: Semver / CHANGELOG gate
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::Cargo.toml version $version has no '## [$version]' heading in CHANGELOG.md"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --depth=1 origin "${{ github.base_ref }}"
+            if ! git diff --quiet FETCH_HEAD -- src/ && git diff --quiet FETCH_HEAD -- CHANGELOG.md; then
+              echo "::error::crates/ledgerlens-sdk/src changed without a CHANGELOG.md entry"
+              exit 1
+            fi
+          fi
 
       - name: cargo clippy
         run: cargo clippy -- -D warnings
@@ -260,10 +339,15 @@ jobs:
         run: cargo fmt -p oracle_aggregator -p ledgerlens-zk-verifier -- --check
 
   # ── Contract fuzz (PR smoke) ──────────────────────────────────────────────
+  # Required status check: "Contract fuzz (PR smoke)" must be marked required in
+  # the main branch protection rules. It runs on every PR (no path filter) so a
+  # required check is never left pending. Per-PR budget: 120s per target, after
+  # replaying every committed regression input in fuzz/regressions/<target>/.
   fuzz:
     name: Contract fuzz (PR smoke)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -284,6 +368,16 @@ jobs:
             contracts/zk_verifier/fuzz/corpus
           key: fuzz-corpus-${{ github.sha }}
           restore-keys: fuzz-corpus-
+
+      - name: Replay fuzz regression inputs
+        run: |
+          for dir in contracts/*/fuzz/regressions/*/; do
+            [ -n "$(find "$dir" -type f ! -name .gitkeep)" ] || continue
+            target=$(basename "$dir")
+            crate=$(dirname "$(dirname "$(dirname "$dir")")")
+            echo "Replaying regressions for $crate::$target"
+            (cd "$crate" && cargo +nightly fuzz run "$target" "fuzz/regressions/$target" -- -runs=0) || exit 1
+          done
 
       - name: Fuzz oracle_aggregator (120s each)
         run: |

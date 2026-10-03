@@ -46,6 +46,9 @@ def build_training_dataset(
         return pd.DataFrame(columns=[*FEATURE_NAMES, "wallet", "label"])
 
     as_of = as_of or pd.Timestamp(trades["ledger_close_time"].max())
+    # Point-in-time correctness: nothing after `as_of` may influence features,
+    # including the transaction graph and ring membership built below.
+    trades = trades[trades["ledger_close_time"] <= as_of]
     account_metadata = account_metadata or {}
     graph = build_transaction_graph(trades)
     rings = find_wash_rings(graph)

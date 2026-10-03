@@ -30,3 +30,8 @@
 - [x] Fix `get_slo_status_from_registry` to log on ImportError
 - [x] Update tests if needed
 
+
+## Threat-matrix test gaps (see `docs/threat_test_matrix.md`)
+- [ ] [B4-I] Add a regression test that `/metrics` is not publicly readable when no auth key is configured (after switching metrics to fail closed)
+- [ ] [B5-E] Add a test that the federated server API never returns an individual participant's update, only the aggregate
+- [ ] [B6-I] Add a test that `MODEL_SIGNING_PRIVATE_KEY` never appears in logs, reprs, or files written during signing

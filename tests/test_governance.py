@@ -11,6 +11,7 @@ import pytest
 
 import config.settings as settings_module
 from detection.governance import (
+    GovernanceApprovalError,
     GovernanceEngine,
     GovernanceError,
     GovernanceVoteError,
@@ -103,6 +104,11 @@ def _add_members(db_path, *members):
         )
     conn.commit()
     conn.close()
+
+
+def _sign_off_config(engine, pid, risk_owner="bob", compliance="carol"):
+    engine.record_signoff(pid, risk_owner, "risk_owner", {"impact_analysis": "reports/backtest.json"})
+    engine.record_signoff(pid, compliance, "compliance_officer")
 
 
 def _force_status(db_path, pid, status):
@@ -264,6 +270,7 @@ class TestExecuteProposal:
         engine.cast_vote(p.id, "bob", "for")
         engine.cast_vote(p.id, "carol", "for")
         _force_status(db_path, p.id, "passed")
+        _sign_off_config(engine, p.id)
         return p.id
 
     def test_config_change_calls_reloader(self, db_path):
@@ -316,6 +323,7 @@ class TestFullLifecycle:
         p = engine.close_proposal(p.id)
         assert p.status == "passed"
 
+        _sign_off_config(engine, p.id)
         p = engine.execute_proposal(p.id)
         assert p.status == "executed"
         mock_reloader.apply.assert_called_once_with("RISK_SCORE_THRESHOLD", "80")
@@ -393,3 +401,116 @@ class TestSettingsReloader:
             assert settings_module.settings._default_risk_score_threshold == 92
         finally:
             os.chdir(orig)
+
+
+# ---------------------------------------------------------------------------
+# Change approval workflow (required sign-offs + evidence)
+# ---------------------------------------------------------------------------
+
+class TestApprovalWorkflow:
+    def _passed(self, db_path, proposal_type="config_change", payload=None):
+        _add_members(db_path, "alice", "bob", "carol", "dave")
+        engine = GovernanceEngine(db_path=db_path, settings_reloader=MagicMock(spec=SettingsReloader))
+        payload = payload or {"key": "RISK_SCORE_THRESHOLD", "new_value": "75"}
+        p = engine.submit_proposal("alice", proposal_type, payload)
+        engine.cast_vote(p.id, "dave", "for")
+        _force_status(db_path, p.id, "passed")
+        return engine, p.id
+
+    def test_passed_vote_without_signoffs_is_blocked(self, db_path):
+        engine, pid = self._passed(db_path)
+        with pytest.raises(GovernanceApprovalError, match="risk_owner"):
+            engine.execute_proposal(pid)
+        # Blocked, not failed: the change can proceed once approvals land.
+        assert engine.approval_chain(pid)["status"] == "passed"
+        engine._reloader.apply.assert_not_called()
+
+    def test_missing_evidence_is_blocked(self, db_path):
+        engine, pid = self._passed(db_path)
+        engine.record_signoff(pid, "bob", "risk_owner")
+        engine.record_signoff(pid, "carol", "compliance_officer")
+        with pytest.raises(GovernanceApprovalError, match="impact_analysis"):
+            engine.execute_proposal(pid)
+
+    def test_partial_signoffs_are_blocked(self, db_path):
+        engine, pid = self._passed(db_path)
+        engine.record_signoff(pid, "bob", "risk_owner", {"impact_analysis": "r.json"})
+        with pytest.raises(GovernanceApprovalError, match="compliance_officer"):
+            engine.execute_proposal(pid)
+
+    def test_proposer_cannot_sign_off_own_change(self, db_path):
+        engine, pid = self._passed(db_path)
+        with pytest.raises(GovernanceApprovalError, match="proposer"):
+            engine.record_signoff(pid, "alice", "risk_owner", {"impact_analysis": "r.json"})
+
+    def test_one_signer_cannot_fill_two_roles(self, db_path):
+        engine, pid = self._passed(db_path)
+        engine.record_signoff(pid, "bob", "risk_owner", {"impact_analysis": "r.json"})
+        with pytest.raises(GovernanceApprovalError):
+            engine.record_signoff(pid, "bob", "compliance_officer")
+
+    def test_non_member_and_unknown_role_rejected(self, db_path):
+        engine, pid = self._passed(db_path)
+        with pytest.raises(GovernanceApprovalError, match="committee"):
+            engine.record_signoff(pid, "mallory", "risk_owner")
+        with pytest.raises(GovernanceApprovalError, match="approval policy"):
+            engine.record_signoff(pid, "bob", "model_owner")
+
+    def test_executed_change_is_traceable_to_recorded_chain(self, db_path):
+        engine, pid = self._passed(db_path)
+        _sign_off_config(engine, pid)
+        assert engine.execute_proposal(pid).status == "executed"
+
+        record = engine.live_change_approval("config_change", "RISK_SCORE_THRESHOLD")
+        assert record is not None
+        chain = record["approval_chain"]
+        assert chain["proposal_id"] == pid
+        assert chain["proposer"] == "alice"
+        assert chain["status"] == "executed"
+        assert {so["role"]: so["signer"] for so in chain["signoffs"]} == {
+            "risk_owner": "bob",
+            "compliance_officer": "carol",
+        }
+        assert chain["missing_roles"] == [] and chain["missing_evidence"] == []
+        assert [v["voter"] for v in chain["votes"]] == ["dave"]
+        assert len(record["chain_sha256"]) == 64
+
+        with pytest.raises(GovernanceApprovalError, match="closed"):
+            engine.record_signoff(pid, "dave", "risk_owner")
+
+    def test_model_promotion_requires_robustness_and_red_team_evidence(self, db_path, tmp_path, monkeypatch):
+        import config.settings as settings_module
+
+        (tmp_path / "xgboost_v202606010000.joblib").write_bytes(b"")
+        monkeypatch.setattr(settings_module.settings, "model_dir", str(tmp_path), raising=False)
+        engine, pid = self._passed(
+            db_path, "model_promotion", {"model_name": "xgboost", "version": "202606010000"}
+        )
+        engine.record_signoff(pid, "bob", "model_owner", {"backtest_report": "bt.json"})
+        engine.record_signoff(pid, "carol", "independent_validator", {"robustness_report": "rb.json"})
+        engine.record_signoff(pid, "dave", "compliance_officer")
+        with pytest.raises(GovernanceApprovalError, match="red_team_report"):
+            engine.execute_proposal(pid)
+
+    def test_model_promotion_executes_with_full_approval(self, db_path, tmp_path, monkeypatch):
+        import config.settings as settings_module
+
+        (tmp_path / "xgboost_v202606010000.joblib").write_bytes(b"")
+        monkeypatch.setattr(settings_module.settings, "model_dir", str(tmp_path), raising=False)
+        engine, pid = self._passed(
+            db_path, "model_promotion", {"model_name": "xgboost", "version": "202606010000"}
+        )
+        engine.record_signoff(pid, "bob", "model_owner", {"backtest_report": "bt.json"})
+        engine.record_signoff(
+            pid, "carol", "independent_validator", {"robustness_report": "rb.json", "red_team_report": "rt.json"}
+        )
+        engine.record_signoff(pid, "dave", "compliance_officer")
+        assert engine.execute_proposal(pid).status == "executed"
+        assert (tmp_path / "xgboost_latest.txt").read_text() == "202606010000"
+        assert engine.live_change_approval("model_promotion", "xgboost")["approval_chain"]["proposal_id"] == pid
+
+    def test_model_promotion_rejects_unsafe_model_name(self, db_path):
+        _add_members(db_path, "alice")
+        engine = _make_engine(db_path)
+        with pytest.raises(GovernanceError):
+            engine.submit_proposal("alice", "model_promotion", {"model_name": "../etc", "version": "1"})

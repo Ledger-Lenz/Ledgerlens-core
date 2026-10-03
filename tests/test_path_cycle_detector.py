@@ -219,3 +219,16 @@ def test_max_cycle_length_must_be_at_least_two():
     graph = build_path_payment_graph(_three_hop_cycle())
     with pytest.raises(ValueError):
         detect_path_payment_cycles(graph, max_cycle_length=1)
+
+
+def test_cycle_search_honors_cycle_budget():
+    graph = build_path_payment_graph(_three_hop_cycle())
+    assert len(detect_path_payment_cycles(graph, max_cycles=1)) == 1
+
+
+def test_cycle_search_validates_budget():
+    graph = build_path_payment_graph(_three_hop_cycle())
+    with pytest.raises(ValueError, match="max_cycle_search_seconds"):
+        detect_path_payment_cycles(graph, max_cycle_search_seconds=-1)
+    with pytest.raises(ValueError, match="max_cycles"):
+        detect_path_payment_cycles(graph, max_cycles=0)

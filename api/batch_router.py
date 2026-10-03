@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from config.settings import settings
@@ -46,6 +46,13 @@ def _init_batch_table() -> None:
                 completed_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS batch_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
 
 
 _init_batch_table()
@@ -73,6 +80,21 @@ def _expire_old_jobs() -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=_JOB_TTL_HOURS)).isoformat()
     with _connect() as conn:
         conn.execute("DELETE FROM batch_jobs WHERE created_at < ?", (cutoff,))
+        key_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=settings.batch_idempotency_window_hours)
+        ).isoformat()
+        conn.execute("DELETE FROM batch_idempotency WHERE created_at < ?", (key_cutoff,))
+
+
+def _job_for_key(idempotency_key: str) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute(
+            """SELECT j.* FROM batch_idempotency k
+               JOIN batch_jobs j ON j.job_id = k.job_id
+               WHERE k.idempotency_key = ?""",
+            (idempotency_key,),
+        ).fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +161,27 @@ async def _process_batch(job_id: str, wallets: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 @router.post("/batch", response_model=BatchJobQueued, status_code=202)
-async def create_batch_job(body: BatchRequest, background_tasks: BackgroundTasks):
-    """Queue a batch scoring job for up to 1000 wallets."""
+async def create_batch_job(
+    body: BatchRequest,
+    background_tasks: BackgroundTasks,
+    idempotency_key: str | None = Header(default=None, max_length=255),
+):
+    """Queue a batch scoring job for up to 1000 wallets.
+
+    Clients may send an ``Idempotency-Key`` header. A retry carrying the same
+    key within ``batch_idempotency_window_hours`` returns the original job
+    instead of queueing the batch again.
+    """
     _expire_old_jobs()
+
+    if idempotency_key:
+        existing = _job_for_key(idempotency_key)
+        if existing is not None:
+            return BatchJobQueued(
+                job_id=existing["job_id"],
+                status=existing["status"],
+                estimated_seconds=max(1, existing["total_wallets"] // 50),
+            )
 
     if len(_active_jobs) >= _MAX_CONCURRENT:
         raise HTTPException(
@@ -165,6 +205,25 @@ async def create_batch_job(body: BatchRequest, background_tasks: BackgroundTasks
                VALUES (?, ?, ?, ?, ?, 0, ?)""",
             (job_id, "queued", body.priority, json.dumps(body.wallets), len(body.wallets), now),
         )
+        if idempotency_key:
+            try:
+                conn.execute(
+                    "INSERT INTO batch_idempotency (idempotency_key, job_id, created_at) VALUES (?, ?, ?)",
+                    (idempotency_key, job_id, now),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent request with the same key won the race; drop
+                # our job and return theirs.
+                conn.rollback()
+                _active_jobs.discard(job_id)
+                existing = _job_for_key(idempotency_key)
+                if existing is None:
+                    raise HTTPException(status_code=409, detail="Idempotency key conflict")
+                return BatchJobQueued(
+                    job_id=existing["job_id"],
+                    status=existing["status"],
+                    estimated_seconds=max(1, existing["total_wallets"] // 50),
+                )
 
     background_tasks.add_task(_process_batch, job_id, body.wallets)
     return BatchJobQueued(job_id=job_id, status="queued", estimated_seconds=estimated)

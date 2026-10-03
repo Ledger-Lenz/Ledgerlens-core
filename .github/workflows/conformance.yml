@@ -1,0 +1,67 @@
+name: SDK Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "sdk/**"
+      - "go/**"
+      - "crates/ledgerlens-sdk/**"
+      - "tests/contract/conformance/**"
+      - ".github/workflows/conformance.yml"
+
+env:
+  LEDGERLENS_CONFORMANCE_URL: http://127.0.0.1:8787
+
+jobs:
+  conformance:
+    name: conformance (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [typescript, go, rust]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start reference server
+        run: |
+          python tests/contract/conformance/reference_server.py 8787 &
+          for _ in $(seq 1 20); do
+            curl -sf -X POST "$LEDGERLENS_CONFORMANCE_URL/__conformance/select?case=health_ok" && exit 0
+            sleep 0.5
+          done
+          echo "reference server failed to start" && exit 1
+
+      - if: matrix.sdk == 'typescript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+      - if: matrix.sdk == 'typescript'
+        working-directory: sdk
+        run: |
+          npm ci
+          npx vitest run tests/conformance.test.ts
+
+      - if: matrix.sdk == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - if: matrix.sdk == 'go'
+        working-directory: go
+        run: go test -v -run TestConformance ./...
+
+      - if: matrix.sdk == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+      - if: matrix.sdk == 'rust'
+        uses: Swatinem/rust-cache@v2
+      - if: matrix.sdk == 'rust'
+        run: cargo test -p ledgerlens-sdk --test conformance_test -- --nocapture

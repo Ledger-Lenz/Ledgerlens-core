@@ -21,7 +21,12 @@ import config.settings as settings_module
 from detection.benford_engine import BenfordStreamCounter
 from detection.feature_engineering import FEATURE_NAMES
 from detection.gnn_model import _HAS_PYG, safe_load_gnn_checkpoint
-from detection.model_signing import assert_within_model_dir, safe_joblib_load
+from detection.model_signing import (
+    ModelIntegrityError,
+    assert_within_model_dir,
+    safe_joblib_load,
+    verify_model_file,
+)
 from detection.adversarial_features import apply_adversarial_boost
 
 logger = logging.getLogger("ledgerlens.model_inference")
@@ -164,6 +169,28 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
 _NON_VOTING_MODELS = frozenset({"temporal_lstm", "gnn", "meta_learner"})
 
 
+def _verify_or_alert(path: str, signing_key: bytes) -> None:
+    """Verify a model artifact's signature, logging CRITICAL and re-raising on failure.
+
+    Signature verification is a hard precondition to loading any model; there is
+    no fallback to an unverified artifact.
+    """
+    try:
+        verify_model_file(path, signing_key)
+    except ModelIntegrityError as exc:
+        logger.critical("Refusing to load unverified model artifact %s: %s", os.path.basename(path), exc)
+        raise
+
+
+def _load_verified(path: str, signing_key: bytes):
+    """Load a joblib model artifact, failing closed on any signature problem."""
+    try:
+        return safe_joblib_load(path, signing_key)
+    except ModelIntegrityError as exc:
+        logger.critical("Refusing to load unverified model artifact %s: %s", os.path.basename(path), exc)
+        raise
+
+
 def _load_models_base(model_dir: str | None = None) -> dict:
     """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
     model_dir = model_dir or settings_module.settings.model_dir
@@ -175,11 +202,13 @@ def _load_models_base(model_dir: str | None = None) -> dict:
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             assert_within_model_dir(path, model_dir)
-            models[name] = safe_joblib_load(path, signing_key)
+            models[name] = _load_verified(path, signing_key)
 
     gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
     if os.path.exists(gnn_path) and _HAS_PYG:
         try:
+            assert_within_model_dir(gnn_path, model_dir)
+            _verify_or_alert(gnn_path, signing_key)
             models["gnn"] = safe_load_gnn_checkpoint(gnn_path)
         except RuntimeError as exc:
             logger.error("GNN checkpoint failed validation: %s", exc)
@@ -190,7 +219,10 @@ def _load_models_base(model_dir: str | None = None) -> dict:
     if os.path.exists(meta_path):
         try:
             assert_within_model_dir(meta_path, model_dir)
-            models["meta_learner"] = safe_joblib_load(meta_path, signing_key)
+            models["meta_learner"] = _load_verified(meta_path, signing_key)
+        except ModelIntegrityError:
+            # Fail closed: an unverified meta-learner must never degrade silently.
+            raise
         except Exception as exc:
             logger.warning("Failed to load meta_learner.joblib: %s — using equal-weight averaging", exc)
     else:
