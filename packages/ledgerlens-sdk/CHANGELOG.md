@@ -5,6 +5,16 @@ All notable changes to `ledgerlens-sdk` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1](https://github.com/Ledger-Lenz/Ledgerlens-core/compare/python-sdk-v0.1.0...python-sdk-v0.1.1) (2026-10-05)
+
+
+### Documentation
+
+* **sdk:** add CHANGELOG.md and link from README ([#788](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/788)) ([bc172a8](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/bc172a8e8c5bf4c3a69546fdc2ab350ce328db5a))
+* **sdk:** add CHANGELOG.md to packages/ledgerlens-sdk ([#788](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/788)) ([454a9f1](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/454a9f1227cc7e126e83ca178f20cb7f39d436e9))
+* **sdk:** add Quick Start section to packages/ledgerlens-sdk/README.md ([e66d250](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/e66d2504f73932a3700e4b46ac7243e8fc1e2958))
+* **sdk:** add Quick Start section to packages/ledgerlens-sdk/README.md ([0eaba6a](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/0eaba6a89a5fc9fa395c3ced52b2d4a5c9c26c35))
+
 ## [Unreleased]
 
 _No unreleased changes yet._

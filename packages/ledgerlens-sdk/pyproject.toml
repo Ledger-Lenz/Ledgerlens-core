@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ledgerlens-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "Typed Python client for the LedgerLens wash-trading detection API"
 readme = "README.md"
 license = { text = "MIT" }
