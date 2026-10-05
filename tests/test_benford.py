@@ -11,6 +11,7 @@ from detection.benford_engine import (
     is_anomalous,
     mean_absolute_deviation,
     z_scores,
+    digit_distribution_at_position,
 )
 
 
@@ -118,6 +119,29 @@ def test_compute_benford_metrics_on_benford_like_data_is_not_anomalous():
 
     metrics = compute_benford_metrics(amounts)
     assert metrics["mad"] < 0.015
+
+
+def test_higher_order_digits_are_scored():
+    amounts = [10.0] * 200 + [19.0] * 10 + [20.0] * 10
+    metrics = compute_benford_metrics(amounts)
+    assert metrics["second_digit_mad"] > 0.0
+    assert metrics["higher_order_mad"] == max(
+        metrics["second_digit_mad"], metrics["third_digit_mad"]
+    )
+    assert set(digit_distribution_at_position(amounts, 2)) == set(range(10))
+
+
+def test_higher_order_digit_anomaly_can_flag_when_first_digit_is_stable():
+    leading_counts = {1: 300, 2: 180, 3: 120, 4: 100, 5: 80, 6: 70, 7: 60, 8: 50, 9: 40}
+    amounts = [
+        float(f"{leading}{digit}0")
+        for leading, count in leading_counts.items()
+        for digit in range(10)
+        for _ in range(count // 10)
+    ]
+    metrics = compute_benford_metrics(amounts)
+    assert metrics["mad"] < 0.015
+    assert is_anomalous(metrics)
 
 
 def test_pair_series_with_asset_pair_column():

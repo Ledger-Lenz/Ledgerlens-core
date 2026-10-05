@@ -47,6 +47,8 @@ class GNNRingScoreResponse(BaseModel):
     """Whether the GNN model is loaded.  False means score is from SCC fallback."""
     fallback_used: bool
     """True when the score was computed via SCC fallback (model not fitted)."""
+    evidence: dict
+    """Structured node and edge evidence for analyst review."""
 
 
 class GNNHealthResponse(BaseModel):
@@ -113,10 +115,12 @@ async def get_gnn_ring_score(
         graph = _build_graph_for_wallet(wallet)
         score = detector.predict(wallet, graph)
         neighbours = detector.top_neighbours(wallet, graph, k=k)
+        evidence = detector.explain(wallet, graph, k=k)
     except Exception as exc:
         logger.warning("GNN scoring error for %s: %s", wallet[:8], exc)
         score = 0.0
         neighbours = []
+        evidence = {"wallet": wallet, "score": 0.0, "nodes": [], "edges": [], "fallback_used": True}
         fallback_used = True
 
     return GNNRingScoreResponse(
@@ -125,6 +129,7 @@ async def get_gnn_ring_score(
         top_neighbours=neighbours,
         model_fitted=detector._fitted,
         fallback_used=fallback_used,
+        evidence=evidence,
     )
 
 

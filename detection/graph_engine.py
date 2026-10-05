@@ -21,6 +21,34 @@ RING_APPROX_BUDGET_ENV = "LEDGERLENS_RING_APPROX_SAMPLE_NODES"
 _RANDOM_WALK_LENGTH = 32
 
 
+def _ring_cache_key(
+    graph: nx.DiGraph,
+    min_ring_size: int,
+    max_ring_size: int,
+    min_cycle_volume: float,
+) -> tuple:
+    """Build a cheap mutation-sensitive key for module-level ring detection."""
+    volume_total = 0.0
+    trade_total = 0
+    for _, _, attrs in graph.edges(data=True):
+        volume_total += float(attrs.get("total_volume", 0.0))
+        trade_total += int(attrs.get("trade_count", attrs.get("payment_count", 0)))
+    return (
+        min_ring_size,
+        max_ring_size,
+        min_cycle_volume,
+        graph.number_of_nodes(),
+        graph.number_of_edges(),
+        round(volume_total, 9),
+        trade_total,
+    )
+
+
+def invalidate_ring_cache(graph: nx.DiGraph) -> None:
+    """Invalidate cached module-level ring results after external mutation."""
+    graph.graph.pop("_wash_ring_cache", None)
+
+
 def build_transaction_graph(trades: pd.DataFrame) -> nx.DiGraph:
     """Build a directed graph from a trades DataFrame.
 
@@ -232,7 +260,9 @@ def find_wash_rings(
             }
         )
 
-    return sorted(rings, key=lambda ring: (ring["total_volume"], ring["cycle_volume"]), reverse=True)
+    result = sorted(rings, key=lambda ring: (ring["total_volume"], ring["cycle_volume"]), reverse=True)
+    graph.graph["_wash_ring_cache"] = (cache_key, result)
+    return result
 
 
 def _random_walk_sample(graph: nx.DiGraph, node_budget: int, seed: Optional[int]) -> set:
@@ -310,6 +340,22 @@ def _component_total_volume(subgraph: nx.DiGraph) -> float:
             for _, _, data in subgraph.edges(data=True)
         )
     )
+
+
+def _ring_evidence(subgraph: nx.DiGraph) -> dict[str, list[dict]]:
+    """Return compact node and edge evidence suitable for analyst review."""
+    nodes = [{"account": account} for account in sorted(subgraph.nodes())]
+    edges = [
+        {
+            "source": source,
+            "target": target,
+            "total_volume": float(data.get("total_volume", 0.0)),
+            "trade_count": int(data.get("trade_count", data.get("payment_count", 0))),
+        }
+        for source, target, data in subgraph.edges(data=True)
+    ]
+    edges.sort(key=lambda edge: edge["total_volume"], reverse=True)
+    return {"nodes": nodes, "edges": edges}
 
 
 def _avg_trade_count(subgraph: nx.DiGraph) -> float:

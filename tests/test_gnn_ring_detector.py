@@ -198,6 +198,20 @@ class TestTopNeighbours:
         # Target wallet itself should NOT be in results
         assert wallets[0] not in neighbours
 
+    def test_explain_returns_structured_node_and_edge_evidence(self):
+        wallet = f"G{'N'*54}0"
+        other = f"G{'N'*54}1"
+        graph = build_transaction_graph(
+            [_make_trade(wallet, other, amount=42.0)],
+            _default_node_fn,
+        )
+        detector = GNNRingDetector(fallback_to_scc=True)
+        evidence = detector.explain(wallet, graph, k=2)
+        assert evidence["wallet"] == wallet
+        assert evidence["nodes"][0]["wallet"] == wallet
+        assert evidence["edges"][0]["source"] == wallet
+        assert evidence["edges"][0]["total_volume"] == 42.0
+
 
 # ── Test: checksum verification ───────────────────────────────────────────────
 
