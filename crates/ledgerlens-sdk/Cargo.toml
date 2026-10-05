@@ -1,6 +1,6 @@
 [package]
 name = "ledgerlens-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rust client SDK for the LedgerLens risk scoring API with optional ZK proof verification"
 edition = "2021"
 license = "MIT"
