@@ -11,6 +11,25 @@ tags) and installed with `go get github.com/Ledger-Lenz/Ledgerlens-core/go@go/vX
 This changelog is scoped to the `go/` directory only. Changes to the wider
 `ledgerlens-core` repository are tracked in the [root CHANGELOG](../CHANGELOG.md).
 
+## [0.2.0](https://github.com/Ledger-Lenz/Ledgerlens-core/compare/go/v0.1.0...go/v0.2.0) (2026-10-05)
+
+
+### Features
+
+* SDK conformance suite, TS WebSocket reconnect, Go webhook verify, proto breaking-change CI ([#1052](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/1052)) ([e5ac40c](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/e5ac40c3bbbda5a2a6b32d849ea967ac1deca139)), closes [#987](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/987) [#988](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/988) [#989](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/989) [#990](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/990)
+* SDK resilience, generated pagination types, semver contract, shard rebalancing ([#1071](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/1071)) ([56ade25](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/56ade25d9e5c4660de5010b3ad1fe5c12536f714)), closes [#983](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/983) [#984](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/984) [#985](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/985) [#986](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/986)
+
+
+### Documentation
+
+* **go:** document minimum supported Go version ([056f02e](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/056f02eeb8387694681119898d23c28bc3d0108c))
+* **go:** document minimum supported Go version ([8434e55](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/8434e5503aa54a22766237ee24b72b453246491f))
+
+
+### Code Refactoring
+
+* **sdk:** dedupe reqwest client builder; docs(go): document minimum Go version ([6545377](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/65453774dfbaadb870e79737deaa2ffd9c43cfa6)), closes [#784](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/784) [#783](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/783)
+
 ## [Unreleased]
 
 ### Added
