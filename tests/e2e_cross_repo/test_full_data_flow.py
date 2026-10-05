@@ -17,10 +17,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
+import pytest
 import requests
 
 from detection.risk_score import RiskScore
 from tests.e2e_cross_repo.conftest import record_assertion
+
+# conftest-level pytestmark does not propagate to test modules, so the
+# `-m cross_repo_e2e` selection in CI needs the marker declared here.
+pytestmark = pytest.mark.cross_repo_e2e
 
 
 # ---------------------------------------------------------------------------
@@ -328,3 +333,69 @@ def test_score_on_chain(api_base_url: str, deployed_score_contract: str, stub_se
         )
 
     record_assertion(10)  # one per meaningful assert above
+
+
+# ---------------------------------------------------------------------------
+# Test 4: On-chain / API score consistency after publication (Issue #1038)
+# ---------------------------------------------------------------------------
+
+# Maximum time the API may lag the on-chain record after publication.
+# Documented in docs/testing_guide.md ("Cross-repo E2E: propagation budget").
+PROPAGATION_BUDGET_SECONDS = 30.0
+POLL_INTERVAL_SECONDS = 0.5
+FIXTURE_SCORE_VERSION = "e2e-consistency-v1"
+
+
+def test_on_chain_api_score_consistency(api_base_url: str, stub_server) -> None:
+    """A published score must be reported identically by the API and the chain.
+
+    Flow:
+      1. Compute a RiskScore in core and publish it (POST, as
+         detection/soroban_publisher.py does after on-chain submission).
+      2. Read the on-chain record for the wallet.
+      3. Poll the API until it reports the same score and score_version, or
+         fail once PROPAGATION_BUDGET_SECONDS elapses.
+    """
+    import time
+
+    stub_server.clear_scores()
+
+    score = _make_risk_score(score=88)
+    payload = score.model_dump(mode="json")
+    payload["score_version"] = FIXTURE_SCORE_VERSION
+
+    resp = requests.post(urljoin(api_base_url, "/api/v1/scores"), json=payload, timeout=10)
+    assert resp.status_code == 200, f"Publish failed: HTTP {resp.status_code} — {resp.text}"
+    tx_hash = resp.json()["tx_hash"]
+
+    chain_resp = requests.get(urljoin(api_base_url, f"/contract/scores/{score.wallet}"), timeout=10)
+    assert chain_resp.status_code == 200, (
+        f"On-chain read failed: HTTP {chain_resp.status_code} — {chain_resp.text}"
+    )
+    on_chain = chain_resp.json()
+    assert on_chain["tx_hash"] == tx_hash, f"On-chain record is not from this publication: {on_chain}"
+
+    deadline = time.monotonic() + PROPAGATION_BUDGET_SECONDS
+    api_score: dict | None = None
+    while time.monotonic() < deadline:
+        get_resp = requests.get(urljoin(api_base_url, f"/api/v1/scores/{score.wallet}"), timeout=10)
+        if get_resp.status_code == 200:
+            api_score = get_resp.json()["scores"][-1]
+            if (
+                api_score["score"] == on_chain["score"]
+                and api_score.get("score_version") == on_chain["score_version"]
+            ):
+                break
+        time.sleep(POLL_INTERVAL_SECONDS)
+    else:
+        pytest.fail(
+            f"API did not converge to the on-chain score within "
+            f"{PROPAGATION_BUDGET_SECONDS}s: on-chain={on_chain}, api={api_score}"
+        )
+
+    assert api_score["score"] == on_chain["score"] == score.score
+    assert api_score["score_version"] == on_chain["score_version"] == FIXTURE_SCORE_VERSION
+    assert api_score["wallet"] == on_chain["wallet"]
+    assert api_score["asset_pair"] == on_chain["asset_pair"]
+
+    record_assertion(7)

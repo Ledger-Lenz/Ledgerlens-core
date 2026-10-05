@@ -16,6 +16,25 @@ Security notes
 - A hard cap of ``MAX_TRADES_PER_WALLET_WINDOW`` trades per wallet protects
   against unbounded memory growth from high-volume accounts.
 - Checkpoint contents must not be exposed via the public API.
+
+Window-tolerance contract
+-------------------------
+Events are keyed on ``trade.ledger_close_time`` and may arrive out of order
+or late (network retries, backfill).  :meth:`WalletWindow.add` handles them
+as follows:
+
+- **In order** (``ledger_close_time`` >= newest trade in the window):
+  appended.
+- **Out of order, within tolerance** (older than the newest trade but no
+  older than ``WINDOW_TOLERANCE_HOURS`` (24 h) before *now*): late-merged
+  into its chronological position, so sub-window queries include it.
+  Counted as ``reason="out_of_order"``.
+- **Beyond tolerance** (older than ``now - WINDOW_TOLERANCE_HOURS``):
+  rejected -- not stored, ``add`` returns ``False``.  Counted as
+  ``reason="beyond_window"``.
+
+Both cases increment the ``ledgerlens_rolling_window_late_events_total``
+Prometheus counter (labelled by ``reason``).
 """
 
 from __future__ import annotations
@@ -34,7 +53,34 @@ from ingestion.data_models import Asset, Trade, TradeType
 logger = logging.getLogger("ledgerlens.rolling_window")
 
 WINDOW_HOURS = [1, 4, 24]
+WINDOW_TOLERANCE_HOURS = 24
 MAX_TRADES_PER_WALLET_WINDOW = 10_000
+
+# Prometheus metric (lazy import to avoid hard dependency)
+_late_events_counter = None
+
+
+def _get_late_events_counter():
+    global _late_events_counter
+    if _late_events_counter is not None:
+        return _late_events_counter
+    try:
+        from prometheus_client import Counter
+
+        _late_events_counter = Counter(
+            "ledgerlens_rolling_window_late_events_total",
+            "Trades delivered out of order or beyond the rolling-window tolerance",
+            ["reason"],
+        )
+    except ImportError:
+        _late_events_counter = None
+    return _late_events_counter
+
+
+def _record_late_event(reason: str) -> None:
+    counter = _get_late_events_counter()
+    if counter is not None:
+        counter.labels(reason=reason).inc()
 
 _CHECKPOINT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rolling_window_checkpoints (
@@ -79,16 +125,33 @@ class WalletWindow:
     # Public interface
     # ------------------------------------------------------------------
 
-    def add(self, trade: Trade) -> None:
-        """Append *trade* and evict stale entries older than 24 h."""
-        self._evict(hours=24)
+    def add(self, trade: Trade) -> bool:
+        """Add *trade* per the window-tolerance contract and evict stale entries.
+
+        Returns ``False`` when the trade is rejected as beyond tolerance.
+        """
+        self._evict(hours=WINDOW_TOLERANCE_HOURS)
+        trade_time = _as_utc(trade.ledger_close_time)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_TOLERANCE_HOURS)
+        if trade_time < cutoff:
+            _record_late_event("beyond_window")
+            logger.debug("WalletWindow: rejecting trade beyond window tolerance (%s)", trade_time)
+            return False
         if len(self._trades) >= MAX_TRADES_PER_WALLET_WINDOW:
             logger.warning(
                 "WalletWindow cap (%d) reached; dropping oldest trade",
                 MAX_TRADES_PER_WALLET_WINDOW,
             )
             self._trades.popleft()
+        if self._trades and trade_time < _as_utc(self._trades[-1].ledger_close_time):
+            _record_late_event("out_of_order")
+            index = len(self._trades)
+            while index > 0 and _as_utc(self._trades[index - 1].ledger_close_time) > trade_time:
+                index -= 1
+            self._trades.insert(index, trade)
+            return True
         self._trades.append(trade)
+        return True
 
     def get(self, hours: int) -> List[Trade]:
         """Return trades whose ``ledger_close_time`` falls within the last *hours*."""

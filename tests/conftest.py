@@ -16,6 +16,9 @@ import pytest
 # MLflow ≥ 2.22 deprecated the filesystem tracking backend.
 # Allow it in the test environment without requiring a database migration.
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+# Per-tier WAF rate limiting would throttle the shared "testclient" IP across
+# the suite; tests that exercise it enable it explicitly.
+os.environ.setdefault("LEDGERLENS_WAF_TIER_RATE_LIMIT_ENABLED", "false")
 
 TEST_SIGNING_KEY = "test-signing-key-for-unit-tests-only"
 

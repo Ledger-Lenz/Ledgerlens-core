@@ -2,7 +2,8 @@
 
 LedgerLens exposes a Prometheus-compatible metrics endpoint at `GET /metrics`
 (configurable via `METRICS_ENDPOINT`, default `/metrics`). All metric names are
-prefixed with `ledgerlens_`.
+prefixed with `ledgerlens_`. New metrics must follow the
+[metric naming convention](metric_naming.md), which CI enforces.
 
 ## Quick Start
 
@@ -225,6 +226,19 @@ This is the primary SLO metric for LedgerLens's "real-time" claim.
 ```promql
 histogram_quantile(0.95, rate(ledgerlens_ledger_close_to_score_seconds_bucket[10m])) > 60
 ```
+
+---
+
+### Graph Shard Rebalancing
+
+Emitted by `GraphShardPartitioner.rebalance()` in `detection/graph_sharding.py`
+(see the module docstring for the rebalancing algorithm and guarantees).
+
+| Metric | Type | Description |
+|---|---|---|
+| `ledgerlens_graph_shard_rebalance_duration_seconds` | Histogram | Time taken to compute a rebalance plan |
+| `ledgerlens_graph_shard_rebalance_moves_total` | Counter | Graph nodes moved between shards |
+| `ledgerlens_graph_shard_ownership_conflicts_total` | Counter | In-flight node moves superseded by a newer rebalance |
 
 ---
 

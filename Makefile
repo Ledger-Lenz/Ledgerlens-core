@@ -1,7 +1,8 @@
 .DEFAULT_GOAL := help
 
 .PHONY: install install-dev install-test install-docs install-fuzz install-chain install-ml \
-        lock lock-check lint test test-e2e test-chaos mutation-test \
+        lock lock-check lint verify verify-py verify-rust verify-contracts-rust verify-go verify-ts \
+        verify-fuzz verify-contract test test-e2e test-chaos mutation-test \
         generate-data train serve \
         fuzz-quick docs docs-serve \
         benchmark-check \
@@ -67,6 +68,56 @@ lock-check: ## Dry-run check that all lockfiles are up to date
 lint: ## Run ruff lint checks
 	ruff check .
 
+# ── Pre-push gate ────────────────────────────────────────────────────────────
+# `make verify` mirrors the CI gate (.github/workflows/ci.yml + contract.yml):
+# every category runs in parallel, logs go to .verify/<category>.log, and a
+# pass/fail table is printed at the end. Exits non-zero if any category fails.
+# A category whose toolchain is missing (cargo/go/npm) is reported as FAIL so
+# nothing is silently skipped. Run a single category with e.g. `make verify-go`.
+VERIFY_CATEGORIES := verify-py verify-rust verify-contracts-rust verify-go verify-ts verify-fuzz verify-contract
+VERIFY_PY_TESTS := tests/test_settings.py tests/test_risk_score.py tests/test_features.py \
+	tests/test_graph_engine.py tests/test_benford_engine.py tests/test_storage.py \
+	tests/test_event_bus.py tests/test_webhook_queue.py tests/test_http_client.py \
+	tests/test_exceptions.py
+
+verify: ## Run the full CI pre-push gate locally (Python, Rust, Go, TS, fuzz smoke, contract tests)
+	@mkdir -p .verify
+	@for t in $(VERIFY_CATEGORIES); do \
+	  ( $(MAKE) --no-print-directory $$t > .verify/$$t.log 2>&1; echo $$? > .verify/$$t.status ) & \
+	done; wait; \
+	failed=0; echo ""; echo "── make verify summary ──"; \
+	for t in $(VERIFY_CATEGORIES); do \
+	  if [ "$$(cat .verify/$$t.status)" = "0" ]; then printf "  PASS  %s\n" $$t; \
+	  else printf "  FAIL  %s  (see .verify/%s.log)\n" $$t $$t; failed=1; fi; \
+	done; \
+	exit $$failed
+
+verify-py: ## CI Python gate: lockfiles, ruff, stable pytest suite
+	$(MAKE) --no-print-directory lock-check
+	ruff check .
+	pytest -q $(VERIFY_PY_TESTS)
+
+verify-rust: ## CI Rust SDK gate: check, test, clippy, fmt
+	cd crates/ledgerlens-sdk && cargo check && cargo check --features zk-verify && \
+	  cargo test && cargo clippy -- -D warnings && cargo fmt --check
+
+verify-contracts-rust: ## CI Soroban contracts gate: build + tests
+	cargo build -p oracle_aggregator -p ledgerlens-zk-verifier
+	cargo test -p oracle_aggregator -p ledgerlens-zk-verifier \
+	  --features oracle_aggregator/testutils,ledgerlens-zk-verifier/testutils
+
+verify-go: ## CI Go SDK gate: vet + race tests
+	cd go && go vet ./... && go test ./... -race -count=1
+
+verify-ts: ## TypeScript SDK gate: lint, format, typecheck, tests
+	cd sdk && npm run lint && npm run format:check && npm run typecheck && npm test
+
+verify-fuzz: ## Fast fuzz smoke pass (5s per Atheris harness)
+	$(MAKE) --no-print-directory fuzz-quick FUZZ_SECONDS=5
+
+verify-contract: ## Consumer/provider contract tests (contract.yml)
+	pytest tests/contract -q
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 test: ## Run the full pytest suite
 	pytest
@@ -124,14 +175,16 @@ benchmark-check: ## Run benchmark tests
 # ── Fuzz testing ──────────────────────────────────────────────────────────────
 # Runs each Atheris harness for 30 seconds — a quick pre-merge smoke check.
 # Requires: pip install atheris  (or: make install-fuzz)
-fuzz-quick: ## Run each Atheris fuzz harness for 30 seconds
-	@echo "Running fuzz harnesses for 30s each..."
+FUZZ_SECONDS ?= 30
+
+fuzz-quick: ## Run each Atheris fuzz harness for FUZZ_SECONDS (default 30) seconds
+	@echo "Running fuzz harnesses for $(FUZZ_SECONDS)s each..."
 	@failed=0; \
 	for harness in fuzz/fuzz_*.py; do \
 	  name=$$(basename "$$harness" .py); \
 	  mkdir -p fuzz/corpus/$$name; \
 	  echo "  $$name ..."; \
-	  python "$$harness" "fuzz/corpus/$$name" -max_total_time=30 -print_final_stats=1 2>&1 || failed=1; \
+	  python "$$harness" "fuzz/corpus/$$name" -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 2>&1 || failed=1; \
 	  if find "fuzz/corpus/$$name" -name 'crash-*' | grep -q .; then \
 	    echo "  CRASH detected in $$name"; \
 	    failed=1; \

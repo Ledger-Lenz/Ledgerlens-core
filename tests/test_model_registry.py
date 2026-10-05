@@ -7,6 +7,7 @@ import pytest
 from sklearn.ensemble import RandomForestClassifier
 
 import config.settings as settings_module
+import detection.model_registry as model_registry
 
 from detection.model_registry import (
     _compute_version_hash,
@@ -14,6 +15,7 @@ from detection.model_registry import (
     list_model_versions,
     load_latest_model,
     load_shap_importances,
+    promote_model_version,
     rollback_model,
     save_shap_importances,
     save_versioned_model,
@@ -29,6 +31,15 @@ def dummy_model():
     model = RandomForestClassifier(n_estimators=5, random_state=42)
     model.fit(X, y)
     return model
+
+
+@pytest.fixture(autouse=True)
+def bypass_robustness_evaluation_for_registry_unit_tests(monkeypatch):
+    monkeypatch.setattr(
+        model_registry,
+        "validate_model_promotion_robustness",
+        lambda candidate_models, reference_models=None: {"passed": True, "models": {}},
+    )
 
 
 class TestComputeVersionHash:
@@ -324,6 +335,45 @@ class TestSigningIntegration:
         monkeypatch.setattr(settings_module.settings, "model_signing_key", "")
         with pytest.raises(ModelIntegrityError, match="LEDGERLENS_MODEL_SIGNING_KEY"):
             load_latest_model("rf", model_dir)
+
+
+def test_model_promotion_does_not_update_pointer_when_robustness_fails(
+    tmp_path, dummy_model, monkeypatch
+):
+    from detection.model_registry import ModelPromotionError
+
+    model_dir = str(tmp_path)
+    save_versioned_model(dummy_model, "rf", "previous", model_dir)
+    save_versioned_model(dummy_model, "rf", "candidate", model_dir)
+    rollback_model("rf", "previous", model_dir)
+    def reject_promotion(candidate_models, reference_models=None):
+        raise ModelPromotionError({"passed": False, "models": {"rf": {"passed": False}}})
+
+    monkeypatch.setattr(model_registry, "validate_model_promotion_robustness", reject_promotion)
+
+    with pytest.raises(ModelPromotionError):
+        promote_model_version("candidate", ["rf"], model_dir)
+
+    assert get_current_version("rf", model_dir) == "previous"
+
+
+def test_saving_new_registry_version_is_gated_before_activation(
+    tmp_path, dummy_model, monkeypatch
+):
+    from detection.model_registry import ModelPromotionError
+
+    model_dir = str(tmp_path)
+    save_versioned_model(dummy_model, "rf", "previous", model_dir)
+
+    def reject_promotion(candidate_models, reference_models=None):
+        raise ModelPromotionError({"passed": False})
+
+    monkeypatch.setattr(model_registry, "validate_model_promotion_robustness", reject_promotion)
+    with pytest.raises(ModelPromotionError):
+        save_versioned_model(dummy_model, "rf", "candidate", model_dir)
+
+    assert get_current_version("rf", model_dir) == "previous"
+    assert not (tmp_path / "rf_vcandidate.joblib").exists()
 
 
 # ---------------------------------------------------------------------------

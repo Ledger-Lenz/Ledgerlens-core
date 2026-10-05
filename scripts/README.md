@@ -108,12 +108,16 @@ Key flags (all have `argparse` defaults; run `--help` for the complete list):
 | `--neg-sample-ratio` | `3` | Negatives per positive; also the BCE `pos_weight` |
 | `--graph-mode` | `homogeneous` | `homogeneous` (wallet-only) or `heterogeneous` (wallet+asset+order) |
 | `--conv-type` | `sage` | `sage` or `hgt`, only used in heterogeneous mode |
+| `--seed` | `42` | Seed for Python, NumPy, and PyTorch randomness |
+| `--as-of` | Current UTC time | Time anchor for negative-label windows and synthetic graph timestamps; pass an explicit timezone-aware value to reproduce a database-backed run |
 
 Environment: `LEDGERLENS_DB_PATH` and `GNN_MODEL_PATH` are read as defaults for
 `--db-path` / `--model-path`.
 
 Output: encoder + classifier state dicts and training metadata saved to the
-`--model-path` checkpoint, plus a SHA-256 checksum file alongside it.
+`--model-path` checkpoint, plus a SHA-256 checksum and `<model>.training.json`
+provenance file (effective label fingerprint, seed/config, model-state hash,
+and artifact hash).
 
 ### Related docs
 
@@ -179,8 +183,11 @@ No environment variables are consulted.
 
 Output: model state-dict + architecture metadata at
 `{model_dir}/lstm_autoencoder.pt`, a SHA-256 checksum, and a
-`lstm_training_metadata.json` recording val loss, sequence count, epochs run, and
-the full arg set.
+`lstm_training_metadata.json` recording val loss, sequence count, epochs run,
+the effective sequence fingerprint, learned-state hash, and full arg set.
+
+For the reproducibility guarantee, fingerprint definitions, and verification
+steps, see [`docs/training_reproducibility.md`](../docs/training_reproducibility.md).
 
 ### Related docs
 

@@ -108,13 +108,34 @@ This keeps only the inputs that provide unique coverage.
 
 ## CI Behavior
 
-**On every PR:**
-- All 6 targets run for 120 seconds each (~12 min total)
+**On every PR** (`CI / Contract fuzz (PR smoke)` in `.github/workflows/ci.yml`):
+- This is a **required status check** on `main` — contract changes cannot merge
+  unless it passes. It runs on every PR (no path filter) so it is never left pending.
+- Every committed regression input is replayed first (see below)
+- All 6 targets then run for 120 seconds each (~12 min total)
 - Crash artifacts uploaded if any target fails
 
-**Nightly (2 AM UTC):**
-- All 6 targets run for 30 minutes each
+**Nightly (2 AM UTC)** (`.github/workflows/fuzz-nightly.yml`):
+- Regression inputs replayed, then all 6 targets run for 30 minutes each
 - Corpus cached and grows over time
+- Any crash uploads artifacts (90-day retention) and opens a GitHub issue
+
+## Regression Inputs
+
+Every crash found by CI or locally must be captured as a permanent regression test:
+
+```bash
+# Minimize, then commit under the target's regressions directory
+cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/crash-<hash>
+cp fuzz/artifacts/<target>/minimized-from-<hash> fuzz/regressions/<target>/
+```
+
+Files in `fuzz/regressions/<target>/` are replayed once each (`-runs=0`) on every
+PR and nightly run, so a fixed crash can never silently regress. Replay locally with:
+
+```bash
+cargo +nightly fuzz run <target> fuzz/regressions/<target> -- -runs=0
+```
 
 ## Expected Panics
 
@@ -159,3 +180,28 @@ See [docs/contract_fuzzing.md](../docs/contract_fuzzing.md) for:
 - Security considerations
 - Corpus management
 - Complete troubleshooting guide
+
+## Contract Test Vectors
+
+`tests/fixtures/contract_vectors.json` is generated from the canonical Python
+models (`detection/risk_score.py`, `ingestion/data_models.py`) and consumed by
+the Python, Rust, and TypeScript SDK contract tests. The `contract-vectors` job
+in `.github/workflows/schema.yml` regenerates it on every PR and push to `main`
+and **fails if the result differs from the committed file** — so a change to
+contract behaviour cannot merge without regenerated vectors.
+
+To intentionally update the vectors:
+
+```bash
+python scripts/generate_contract_vectors.py      # regenerate the fixture
+git diff tests/fixtures/contract_vectors.json    # review what changed
+python scripts/check_contract_vectors.py         # field-level drift report
+pytest tests/test_contract_vectors.py            # Python round-trip tests
+```
+
+Then update any affected SDK (`sdk/src/schemas.ts`,
+`crates/ledgerlens-sdk/src/models.rs`,
+`packages/ledgerlens-sdk/src/ledgerlens/models.py`,
+`proto/ledgerlens/v1/scoring.proto`) and commit the fixture in the same PR.
+Never hand-edit the fixture; CI will reject anything the generator does not
+reproduce exactly.

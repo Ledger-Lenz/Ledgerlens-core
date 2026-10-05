@@ -1,0 +1,40 @@
+name: SDK Contract Verification
+
+# Verifies the API against each SDK's published consumer contract
+# (tests/contract/pacts/sdk/*.json). Fails when an API change breaks a
+# contract an SDK depends on. See docs/contract_testing.md.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "api/**"
+      - "detection/**"
+      - "sdk/**"
+      - "go/**"
+      - "crates/ledgerlens-sdk/**"
+      - "tests/contract/**"
+      - ".github/workflows/sdk-contract.yml"
+
+jobs:
+  sdk-contract:
+    name: Provider verification (TypeScript, Go, Rust SDKs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx
+
+      - name: Verify SDK consumer contracts
+        run: pytest tests/contract/test_sdk_consumer_contracts.py -v

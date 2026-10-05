@@ -11,6 +11,41 @@ model.
 Issue #147: Extended with PedersenParams, PedersenCommitment, ThresholdProof
 dataclasses and higher-level commit/open/prove_below_threshold/verify_below_threshold
 functions for privacy-preserving score attestation.
+
+Security assumptions and parameters (issue #945)
+------------------------------------------------
+The scheme relies on the following assumptions:
+
+* **Discrete-log (DL) assumption on BN254.** The Pedersen commitment
+  ``C = value*G + blinding*H`` is *binding* only if no efficient adversary can
+  find ``a`` with ``H = a*G``. If such ``a`` were known, a commitment could be
+  opened to two different values (``value' = value + a*(blinding - blinding')``),
+  breaking binding. ``H`` is therefore derived via a nothing-up-my-sleeve
+  SHA-256 hash (see :func:`h_generator`) so its discrete log w.r.t. ``G1`` is
+  unknown to everyone, including the authors.
+
+* **Hiding is unconditional (information-theoretic).** For any fixed value,
+  ``blinding`` is sampled uniformly from ``[0, curve_order)`` via
+  :func:`secrets.randbelow`, so ``C`` is uniformly distributed over the group
+  and is statistically independent of ``value``. Hiding does *not* depend on
+  any computational assumption; it only requires that the blinding factor is
+  never reused or leaked.
+
+* **Collision resistance of SHA-256.** The outer commitment
+  (:func:`score_commitment`) binds ``(wallet, score, features, salt, C)``; its
+  binding reduces to SHA-256 collision resistance plus a 256-bit random salt.
+
+Parameters:
+
+* Curve: BN254 (alt_bn128); field prime ``p`` and group order ``q`` from
+  ``py_ecc.bn128`` (``q`` is ~254 bits).
+* Generators: ``G1`` (standard base point) and ``H`` (nothing-up-my-sleeve).
+* Blinding: uniform in ``[0, q)``, 254 bits of entropy.
+* Salt: 32 bytes (256 bits) from ``os.urandom``.
+
+These properties are exercised by the adversarial tests in
+``tests/test_zk_commitment_properties.py`` (named cases ``test_binding_*`` and
+``test_hiding_*``).
 """
 
 from __future__ import annotations
@@ -229,73 +264,7 @@ def prove_below_threshold(
     from detection.zk_prover import generate_threshold_proof, ProofError
 
     if score < threshold:
-        raise ValueError(f"Cannot prove: score {score} is below threshold {threshold}")
-
-    salt = generate_salt()
-    wallet = ""
-    try:
-        _comm_hex, sc_coords, proof_dict = generate_threshold_proof(
-            wallet, score, {}, salt, threshold
+        raise ValueError(
+            f"cannot prove score >= threshold: score={score} < threshold={threshold}"
         )
-    except ProofError as e:
-        raise ValueError(str(e)) from e
-
-    range_commitments = [(b["commit_x"], b["commit_y"]) for b in proof_dict["bits"]]
-    range_responses = [
-        {"c0": b["c0"], "c1": b["c1"], "s0": b["s0"], "s1": b["s1"]}
-        for b in proof_dict["bits"]
-    ]
-
-    # Fiat-Shamir challenge: hash of commitment + threshold
-    challenge = int.from_bytes(
-        hashlib.sha256(
-            sc_coords[0].to_bytes(32, "big")
-            + sc_coords[1].to_bytes(32, "big")
-            + threshold.to_bytes(1, "big")
-        ).digest(),
-        "big",
-    ) % curve_order
-
-    return ThresholdProof(
-        commitment=sc_coords,
-        threshold=threshold,
-        challenge=challenge,
-        response=0,  # response field is carried inside range_responses
-        range_commitments=range_commitments,
-        range_responses=range_responses,
-        wallet=wallet,
-    )
-
-
-def verify_below_threshold(
-    commitment: PedersenCommitment,
-    threshold: int,
-    proof: ThresholdProof,
-) -> bool:
-    """Verify that the committed score satisfies score >= threshold.
-
-    Returns True iff the proof is cryptographically valid.
-    """
-    from detection.zk_prover import verify_threshold_proof
-
-    if proof.threshold != threshold:
-        return False
-
-    # Reconstruct the proof_dict format expected by zk_prover
-    if len(proof.range_commitments) != len(proof.range_responses):
-        return False
-
-    proof_dict = {
-        "score_commit_x": proof.commitment[0],
-        "score_commit_y": proof.commitment[1],
-        "bits": [
-            {
-                "commit_x": rc[0],
-                "commit_y": rc[1],
-                **rr,
-            }
-            for rc, rr in zip(proof.range_commitments, proof.range_responses)
-        ],
-    }
-
-    return verify_threshold_proof(threshold, proof_dict, proof.wallet)
+    return generate_threshold_proof(score, threshold, commitment)

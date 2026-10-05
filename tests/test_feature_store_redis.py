@@ -263,3 +263,61 @@ def test_is_using_redis_true_with_fakeredis():
         fs = FeatureStore(redis_url="redis://localhost:6379/0")
 
     assert fs.is_using_redis()
+
+
+# ---------------------------------------------------------------------------
+# Partition recovery (catch-up) — degraded-mode contract
+# ---------------------------------------------------------------------------
+
+def test_partition_recovery_prefers_newer_fallback_state():
+    """State written during a Redis outage must not be shadowed by the stale
+    pre-outage Redis copy once Redis is reachable again."""
+    _requires_fakeredis()
+    from datetime import timedelta
+
+    client = _fake_client()
+    with patch("redis.from_url", return_value=client):
+        store = FeatureStore(redis_url="redis://fake:6379/0")
+
+    before = datetime.now(timezone.utc) - timedelta(minutes=5)
+    store.set_state(WalletFeatureState(
+        wallet="GA1", asset_pair="USDC/XLM", last_updated=before, trade_count=1,
+    ))
+
+    # Partition: Redis writes fail, state lands in the fallback dict.
+    with patch.object(client, "setex", side_effect=ConnectionError("partitioned")):
+        store.set_state(WalletFeatureState(
+            wallet="GA1", asset_pair="USDC/XLM",
+            last_updated=datetime.now(timezone.utc), trade_count=7,
+        ))
+
+    # Healed: the newer degraded-mode state wins and is written back to Redis.
+    recovered = store.get_state("GA1", "USDC/XLM")
+    assert recovered.trade_count == 7
+    assert store._fallback_dict == {}
+    stored = WalletFeatureState.model_validate_json(
+        client.get(FeatureStore._hash_key("GA1", "USDC/XLM"))
+    )
+    assert stored.trade_count == 7
+
+
+def test_partition_recovery_keeps_newer_redis_state():
+    _requires_fakeredis()
+    from datetime import timedelta
+
+    client = _fake_client()
+    with patch("redis.from_url", return_value=client):
+        store = FeatureStore(redis_url="redis://fake:6379/0")
+
+    key = FeatureStore._hash_key("GA2", "USDC/XLM")
+    store._fallback_dict[key] = WalletFeatureState(
+        wallet="GA2", asset_pair="USDC/XLM",
+        last_updated=datetime.now(timezone.utc) - timedelta(hours=1), trade_count=1,
+    )
+    store._lru_order.append(key)
+    client.set(key, WalletFeatureState(
+        wallet="GA2", asset_pair="USDC/XLM",
+        last_updated=datetime.now(timezone.utc), trade_count=9,
+    ).model_dump_json())
+
+    assert store.get_state("GA2", "USDC/XLM").trade_count == 9

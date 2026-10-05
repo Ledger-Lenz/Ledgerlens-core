@@ -1,7 +1,9 @@
 """Atheris fuzz harness for the Solana Wormhole VAA byte-level parser.
 
-Targets the byte-level parsing functions in ingestion/solana_adapter.py:
+Targets the byte-level parsing functions in ingestion/solana_adapter.py and
+ingestion/wormhole_vaa.py:
   - _extract_stellar_address_from_vaa(tx_dict)
+  - parse_vaa(raw) / verify_vaa(vaa, guardian_set)
   - _stellar_pubkey_to_address(raw_key: bytes)
   - _crc16_xmodem(data: bytes)
 
@@ -22,6 +24,10 @@ Two sub-harnesses are exercised per input:
 Expected (safe) exceptions
 --------------------------
 ValueError, KeyError, IndexError, struct.error — malformed byte layouts.
+(VAAError subclasses ValueError.)
+
+Findings are folded in as permanent regression tests in
+tests/test_wormhole_vaa.py (``FUZZ_REGRESSION_INPUTS``).
 
 Running locally (byte-level fuzzing, no JSON layer):
     python fuzz/fuzz_solana_vaa_parser.py fuzz/corpus/fuzz_solana_vaa_parser -max_total_time=60
@@ -45,6 +51,11 @@ with atheris.instrument_imports():
         _extract_stellar_address_from_vaa,
         _stellar_pubkey_to_address,
     )
+    from ingestion.wormhole_vaa import GuardianSet, parse_vaa, verify_vaa
+
+# Fixed single-guardian set so verification paths are exercised; fuzz inputs
+# must never verify against it.
+_GUARDIAN_SET = GuardianSet(index=0, addresses=(b"\x11" * 20,))
 
 
 def _make_tx_dict(raw_bytes: bytes) -> dict:
@@ -76,8 +87,13 @@ def TestOneInput(data: bytes) -> None:  # noqa: N802
     vaa_bytes = fdp.ConsumeBytes(min(fdp.remaining_bytes(), 256))
     tx = _make_tx_dict(vaa_bytes)
     try:
-        _extract_stellar_address_from_vaa(tx)
+        _extract_stellar_address_from_vaa(tx, guardian_set=_GUARDIAN_SET)
     except (ValueError, KeyError, IndexError, struct.error):
+        pass
+    try:
+        verify_vaa(parse_vaa(vaa_bytes), _GUARDIAN_SET)
+        raise AssertionError("fuzz input verified against a fixed guardian set")
+    except ValueError:
         pass
 
     # Sub-harness 2: raw pubkey → Stellar address encoder + CRC.

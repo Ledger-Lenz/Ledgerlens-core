@@ -235,3 +235,19 @@ my-workspace/
   ingestion.
 - Correctness of the Soroban contract's `submit_score` and `get_score`
   functions when fed real core scores.
+
+## Cross-repo E2E: propagation budget
+
+`tests/e2e_cross_repo/test_full_data_flow.py::test_on_chain_api_score_consistency`
+publishes a score, reads the on-chain record, then polls the API until it
+reports the same `score` and `score_version`. The test **fails** (not warns)
+if the two have not converged within the propagation budget:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `PROPAGATION_BUDGET_SECONDS` | 30 s | Max time the API may lag the on-chain record after publication |
+| `POLL_INTERVAL_SECONDS` | 0.5 s | API polling interval |
+
+The suite runs in `.github/workflows/cross_repo_e2e.yml` on every push and
+pull request to `main` (plus the weekly schedule). Change the budget only
+together with this table.

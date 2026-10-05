@@ -7,7 +7,16 @@
 #   docker build --target runtime-chain .    ← + EVM/chain deps (web3, k8s)
 #   docker build --target runtime-ml .       ← + ML deps (mlflow, torch)
 #   docker build --target dev .              ← all extras (local dev / CI)
-FROM python:3.12-slim AS builder
+#
+# Supply chain: base images are pinned by digest (bump PYTHON_IMAGE together
+# with the tag comment when rebasing), and SOURCE_DATE_EPOCH clamps file and
+# layer timestamps so the same commit rebuilds to the same image digest — see
+# docs/container-supply-chain.md for signing/provenance verification.
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
+ARG SOURCE_DATE_EPOCH=0
+
+FROM ${PYTHON_IMAGE} AS builder
+ARG SOURCE_DATE_EPOCH
 
 # Pinned OS packages — update these in sync with security advisories
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,23 +37,25 @@ COPY requirements/ requirements/
 # this repo use >= constraints (to be solved by the developer's pip-compile run);
 # for fully hermetic container builds, run `make lock` first and commit the
 # hash-annotated output from pip-compile --generate-hashes.
+# --no-compile: .pyc files embed source mtimes and would break reproducibility;
+# the runtime sets PYTHONDONTWRITEBYTECODE so none are written later either.
 RUN pip install --upgrade pip==24.0 wheel==0.43.0 && \
-    pip install --no-cache-dir --prefix=/install -r requirements/base.txt
+    pip install --no-cache-dir --no-compile --prefix=/install -r requirements/base.txt
 
 # ─── Builder-chain stage ────────────────────────────────────────────────────
 FROM builder AS builder-chain
 
-RUN pip install --no-cache-dir --prefix=/install -r requirements/chain.txt
+RUN pip install --no-cache-dir --no-compile --prefix=/install -r requirements/chain.txt
 
 # ─── Builder-ml stage ───────────────────────────────────────────────────────
 FROM builder AS builder-ml
 
-RUN pip install --no-cache-dir --prefix=/install -r requirements/ml.txt
+RUN pip install --no-cache-dir --no-compile --prefix=/install -r requirements/ml.txt
 
 # ─── Builder-dev stage ──────────────────────────────────────────────────────
 FROM builder AS builder-dev
 
-RUN pip install --no-cache-dir --prefix=/install -r requirements/dev.txt
+RUN pip install --no-cache-dir --no-compile --prefix=/install -r requirements/dev.txt
 
 # ─── Runtime environment variables ──────────────────────────────────────────
 # Every setting in config/settings.py has a safe default (see .env.example for
@@ -87,7 +98,8 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements/dev.txt
 # methods in config/settings.py for the full set.
 # ────────────────────────────────────────────────────────────────────────────
 # ─── Common runtime base ────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime-base
+FROM ${PYTHON_IMAGE} AS runtime-base
+ARG SOURCE_DATE_EPOCH
 
 # lightgbm's compiled extension dynamically links against libgomp (GNU
 # OpenMP) at import time; python:3.12-slim doesn't ship it, so loading any
@@ -96,7 +108,7 @@ FROM python:3.12-slim AS runtime-base
 # API tries to load models at startup.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache
 
 ARG BUILD_VERSION="0.0.0"
 

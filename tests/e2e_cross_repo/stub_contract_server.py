@@ -77,6 +77,7 @@ class SubmitScoreRequest(BaseModel):
     score_upper: float | None = None
     prediction_set: list[int] | None = None
     coverage_guarantee: float | None = None
+    score_version: str | None = None
 
 
 class SubmitScoreResponse(BaseModel):
@@ -91,6 +92,7 @@ class SubmitScoreResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 _score_store: dict[str, list[dict]] = {}  # wallet -> list of score dicts
+_chain_store: dict[str, dict] = {}  # wallet -> latest on-chain (contract) record
 STUB_CONTRACT_ID = "CSTUB0000000000000000000000000000000000000000000000000000"
 
 
@@ -225,9 +227,17 @@ def create_stub_app() -> FastAPI:
         if wallet not in _score_store:
             _score_store[wallet] = []
         _score_store[wallet].append(score_dict)
+        tx_hash = f"stub_tx_{uuid.uuid4().hex[:16]}"
+        _chain_store[wallet] = {
+            "wallet": wallet,
+            "asset_pair": body.asset_pair,
+            "score": body.score,
+            "score_version": body.score_version,
+            "tx_hash": tx_hash,
+        }
 
         return SubmitScoreResponse(
-            tx_hash=f"stub_tx_{uuid.uuid4().hex[:16]}",
+            tx_hash=tx_hash,
             contract_id=STUB_CONTRACT_ID,
             stored=True,
         )
@@ -240,10 +250,19 @@ def create_stub_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
         return {"scores": scores, "source": "stub", "contract_id": STUB_CONTRACT_ID}
 
+    @app.get("/contract/scores/{wallet}", include_in_schema=False)
+    def get_on_chain_score(wallet: str) -> dict:
+        """Stand-in for the contract's ``get_score`` read (ledger state)."""
+        record = _chain_store.get(wallet)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"No on-chain score for wallet {wallet}")
+        return record
+
     @app.delete("/api/v1/scores", include_in_schema=False)
     def clear_scores() -> dict:
         """Clear all stored scores (used for test isolation/idempotency)."""
         _score_store.clear()
+        _chain_store.clear()
         return {"cleared": True}
 
     return app

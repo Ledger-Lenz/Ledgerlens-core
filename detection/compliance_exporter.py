@@ -32,7 +32,12 @@ from scipy import stats
 
 from config.settings import settings
 from detection.benford_engine import compute_benford_metrics
-from detection.sar_narrative import generate_sar_narrative, risk_level_from_score
+from detection.sar_narrative import (
+    SARNarrativeReview,
+    generate_sar_narrative,
+    require_approved_narrative,
+    risk_level_from_score,
+)
 from detection.storage import (
     _connect,
     count_compliance_exports_since,
@@ -227,29 +232,9 @@ def _collect_shap(wallet: str, asset_pairs: set[str], db_path: str | None) -> di
     return explanations
 
 
-def generate_sar_package(
-    wallet: str,
-    start_date: str,
-    end_date: str,
-    output_dir: str,
-    db_path: str | None = None,
-) -> str:
-    """Generate a SAR evidence ZIP archive for ``wallet`` over ``[start, end]``.
-
-    The archive contains:
-
-    - ``sar_narrative.txt`` — auto-generated plain-English narrative.
-    - ``evidence/alerts.json`` — all alerts for the wallet in the date range.
-    - ``evidence/score_history.csv`` — risk score time series.
-    - ``evidence/graph_export.gexf`` — account relationship graph (Form 111).
-    - ``evidence/shap_explanations.json`` — model explainability report.
-    - ``manifest.json`` — SHA-256 of every included file for integrity checks.
-
-    Returns the path to the generated ZIP file.
-    """
+def _sar_context(wallet: str, start_date: str, end_date: str, db_path: str | None) -> dict:
+    """Gather everything the SAR narrative and evidence files are built from."""
     init_db(db_path)
-    os.makedirs(output_dir, exist_ok=True)
-
     score_history = get_score_history(wallet, start_date, end_date, db_path=db_path)
     alerts = get_alerts(wallet=wallet, start=start_date, end=end_date, db_path=db_path)
     amounts, counterparties, volume_xlm = _gather_trade_context(wallet, start_date, end_date, db_path)
@@ -258,9 +243,6 @@ def generate_sar_package(
     peak_score = max((row["score"] for row in score_history), default=0)
     chi_sq, chi_p = _benford_chi(amounts)
     graph = _build_relationship_graph(wallet, counterparties, alerts)
-    shap_explanations = _collect_shap(wallet, asset_pairs, db_path)
-
-    # --- Render each artifact into memory ---
     narrative = generate_sar_narrative(
         wallet=wallet,
         start_date=start_date,
@@ -273,6 +255,62 @@ def generate_sar_package(
         chi_sq=chi_sq,
         chi_p=chi_p,
     )
+    return {
+        "score_history": score_history,
+        "alerts": alerts,
+        "asset_pairs": asset_pairs,
+        "graph": graph,
+        "narrative": narrative,
+    }
+
+
+def draft_sar_narrative(wallet: str, start_date: str, end_date: str, db_path: str | None = None) -> str:
+    """Return the auto-generated SAR narrative *draft* for analyst review.
+
+    The draft is not exportable; pass it to
+    :func:`detection.sar_narrative.review_sar_narrative` and supply the
+    resulting review to :func:`generate_sar_package` / :func:`export_sar_package`.
+    """
+    return _sar_context(wallet, start_date, end_date, db_path)["narrative"]
+
+
+def generate_sar_package(
+    wallet: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str,
+    db_path: str | None = None,
+    review: SARNarrativeReview | None = None,
+) -> str:
+    """Generate a SAR evidence ZIP archive for ``wallet`` over ``[start, end]``.
+
+    ``review`` is mandatory: it must be a human approval of the current
+    narrative draft (see :func:`draft_sar_narrative`), otherwise
+    :class:`SARNarrativeNotReviewed` is raised and nothing is written.
+
+    The archive contains:
+
+    - ``sar_narrative.txt`` — the analyst-approved narrative.
+    - ``sar_review.json`` — reviewer identity, timestamp, draft/final hashes and edits.
+    - ``evidence/alerts.json`` — all alerts for the wallet in the date range.
+    - ``evidence/score_history.csv`` — risk score time series.
+    - ``evidence/graph_export.gexf`` — account relationship graph (Form 111).
+    - ``evidence/shap_explanations.json`` — model explainability report.
+    - ``manifest.json`` — SHA-256 of every included file for integrity checks.
+
+    Returns the path to the generated ZIP file.
+    """
+    context = _sar_context(wallet, start_date, end_date, db_path)
+    narrative = require_approved_narrative(context["narrative"], review)
+    assert review is not None  # guaranteed by require_approved_narrative
+    os.makedirs(output_dir, exist_ok=True)
+
+    score_history = context["score_history"]
+    alerts = context["alerts"]
+    graph = context["graph"]
+    shap_explanations = _collect_shap(wallet, context["asset_pairs"], db_path)
+
+    # --- Render each artifact into memory ---
 
     alerts_json = json.dumps(alerts, indent=2, sort_keys=True)
 
@@ -301,6 +339,7 @@ def generate_sar_package(
     # name -> bytes
     files: dict[str, bytes] = {
         "sar_narrative.txt": narrative.encode("utf-8"),
+        "sar_review.json": json.dumps(review.to_audit_record(), indent=2, sort_keys=True).encode("utf-8"),
         "evidence/alerts.json": alerts_json.encode("utf-8"),
         "evidence/score_history.csv": score_history_csv.encode("utf-8"),
         "evidence/graph_export.gexf": graph_gexf,
@@ -353,8 +392,12 @@ def export_sar_package(
     output_dir: str,
     dry_run: bool = False,
     db_path: str | None = None,
+    review: SARNarrativeReview | None = None,
 ) -> str:
     """Compliance-gated wrapper around :func:`generate_sar_package`.
+
+    Raises :class:`SARNarrativeNotReviewed` unless ``review`` is a recorded
+    human approval of the current narrative draft.
 
     Raises :class:`ComplianceRateLimitExceeded` if the configured hourly
     export rate limit has been reached, or :class:`ComplianceScoreTooLow` if
@@ -370,7 +413,7 @@ def export_sar_package(
     if risk.ledgerlens_score < settings.compliance_sar_min_score:
         raise ComplianceScoreTooLow(risk.ledgerlens_score, settings.compliance_sar_min_score)
 
-    zip_path = generate_sar_package(wallet, start_date, end_date, output_dir, db_path=db_path)
+    zip_path = generate_sar_package(wallet, start_date, end_date, output_dir, db_path=db_path, review=review)
 
     if not dry_run:
         log_compliance_export(

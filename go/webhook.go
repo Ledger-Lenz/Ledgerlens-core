@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,34 @@ import (
 // timestamps (5 minutes), matching the README's "SHOULD reject timestamps
 // older than 5 minutes" guidance.
 const DefaultWebhookMaxAge = 5 * time.Minute
+
+// Errors returned by VerifySignature.
+var (
+	// ErrInvalidWebhookSignature means X-LedgerLens-Signature did not match the body.
+	ErrInvalidWebhookSignature = errors.New("ledgerlens: invalid webhook signature")
+	// ErrStaleWebhookTimestamp means X-LedgerLens-Timestamp was missing,
+	// malformed, in the future, or older than the allowed max age.
+	ErrStaleWebhookTimestamp = errors.New("ledgerlens: stale or invalid webhook timestamp")
+)
+
+// VerifySignature verifies an inbound webhook exactly as api/webhook_sender.py
+// signs it: signatureHeader (X-LedgerLens-Signature) must equal
+// "sha256=" + hex(HMAC-SHA256(secret, body)), and timestampHeader
+// (X-LedgerLens-Timestamp) must be within maxAge of now. Pass
+// DefaultWebhookMaxAge unless you need a different replay window.
+//
+// body must be the raw, unmodified request body. The signature comparison is
+// constant-time (hmac.Equal). Returns nil on success, otherwise
+// ErrInvalidWebhookSignature or ErrStaleWebhookTimestamp.
+func VerifySignature(body []byte, secret, signatureHeader, timestampHeader string, maxAge time.Duration) error {
+	if !VerifyWebhookSignature(body, secret, signatureHeader) {
+		return ErrInvalidWebhookSignature
+	}
+	if !VerifyWebhookTimestamp(timestampHeader, maxAge) {
+		return ErrStaleWebhookTimestamp
+	}
+	return nil
+}
 
 // VerifyWebhookSignature reports whether the HMAC-SHA256 signature in
 // signature matches the expected digest of body using secret.

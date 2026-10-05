@@ -12,6 +12,21 @@ training-dataset equivalents this factory's `wash_ring` mirrors (same
 round-lot amounts, same round-trip handoff shape) so wash rings produced
 here are detectable by the same Benford / round-trip features used in
 training.
+
+Fixture isolation
+-----------------
+Tests may run in parallel (``pytest -n auto``) and in any order, so a factory
+must never hand two tests the same mutable object. Rules for new factories:
+
+- Build every return value fresh per call; never return or embed a
+  module-level instance. Shared module constants must be immutable (tuples,
+  frozensets, strings) or copied on use -- ``NATIVE`` / ``USDC`` are mutable
+  ``Asset`` models, so ``TradeFactory.trade`` copies them into each ``Trade``.
+- Seed a local ``random.Random(seed)`` per call; never use the global
+  ``random`` state or a module-level RNG.
+- Never use mutable default arguments (``[]``, ``{}``, model instances).
+- In ``conftest.py``, patch global state only via ``monkeypatch`` (or a
+  fixture that restores it) so it is undone after each test.
 """
 
 from __future__ import annotations
@@ -90,8 +105,9 @@ class TradeFactory:
             ledger_close_time=ledger_close_time,
             base_account=base_account,
             counter_account=counter_account,
-            base_asset=base_asset,
-            counter_asset=counter_asset,
+            # Copy so no two Trades share (and can mutate) the same Asset.
+            base_asset=base_asset.model_copy(),
+            counter_asset=counter_asset.model_copy(),
             base_amount=base_amount,
             counter_amount=counter_amount if counter_amount is not None else round(base_amount * price, 7),
             price=price,

@@ -27,8 +27,8 @@ CREATE TABLE IF NOT EXISTS shap_value_history (
     shap_value REAL,
     recorded_at TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_shap_history_feature_version
-    ON shap_value_history (feature_name, model_version);
+CREATE INDEX IF NOT EXISTS idx_shap_history_model_feature_version
+    ON shap_value_history (model_name, model_version, feature_name);
 """
 
 
@@ -70,21 +70,27 @@ def record_shap_snapshot(
         )
 
 
-def _load_shap_distribution(feature_name: str, model_version: str, db_path: str) -> np.ndarray:
+def _load_shap_distribution(
+    feature_name: str, model_name: str, model_version: str, db_path: str
+) -> np.ndarray:
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
             "SELECT shap_value FROM shap_value_history "
-            "WHERE feature_name = ? AND model_version = ?",
-            (feature_name, model_version),
+            "WHERE feature_name = ? AND model_name = ? AND model_version = ?",
+            (feature_name, model_name, model_version),
         ).fetchall()
     return np.array([r[0] for r in rows], dtype=float)
 
 
 def compute_shap_psi(
-    feature_name: str, reference_version: str, current_version: str, db_path: str
+    feature_name: str,
+    reference_version: str,
+    current_version: str,
+    db_path: str,
+    model_name: str = "default",
 ) -> float:
-    ref = _load_shap_distribution(feature_name, reference_version, db_path)
-    cur = _load_shap_distribution(feature_name, current_version, db_path)
+    ref = _load_shap_distribution(feature_name, model_name, reference_version, db_path)
+    cur = _load_shap_distribution(feature_name, model_name, current_version, db_path)
     if len(ref) == 0 or len(cur) == 0:
         return 0.0
     return compute_psi(ref, cur)
@@ -98,11 +104,15 @@ class KSResult:
 
 
 def compute_shap_ks_test(
-    feature_name: str, reference_version: str, current_version: str, db_path: str
+    feature_name: str,
+    reference_version: str,
+    current_version: str,
+    db_path: str,
+    model_name: str = "default",
 ) -> KSResult:
     from scipy.stats import ks_2samp
-    ref = _load_shap_distribution(feature_name, reference_version, db_path)
-    cur = _load_shap_distribution(feature_name, current_version, db_path)
+    ref = _load_shap_distribution(feature_name, model_name, reference_version, db_path)
+    cur = _load_shap_distribution(feature_name, model_name, current_version, db_path)
     if len(ref) == 0 or len(cur) == 0:
         return KSResult(statistic=0.0, p_value=1.0, significant=False)
     stat, p = ks_2samp(ref, cur)
@@ -144,8 +154,12 @@ def compute_shap_drift_report(
 
     findings: list[ShapDriftFinding] = []
     for feature_name in FEATURE_NAMES:
-        shap_psi = compute_shap_psi(feature_name, reference_version, current_version, db_path)
-        ks_result = compute_shap_ks_test(feature_name, reference_version, current_version, db_path)
+        shap_psi = compute_shap_psi(
+            feature_name, reference_version, current_version, db_path, model_name=model_name
+        )
+        ks_result = compute_shap_ks_test(
+            feature_name, reference_version, current_version, db_path, model_name=model_name
+        )
         input_psi = (input_psi_dict or {}).get(feature_name, 0.0)
         input_stable_but_shap_drifted = input_psi < 0.10 and shap_psi >= SHAP_DRIFT_PSI_THRESHOLD
         flagged = shap_psi >= SHAP_DRIFT_PSI_THRESHOLD

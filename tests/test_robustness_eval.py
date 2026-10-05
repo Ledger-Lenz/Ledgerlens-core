@@ -1,5 +1,9 @@
 import pandas as pd
+import pytest
+import numpy as np
 
+import detection.adversarial_attack as adversarial_attack
+import detection.robustness_eval as robustness_eval
 from detection.robustness_eval import compute_robustness_report
 from tests.test_adversarial_attack import DummyModel
 from detection.feature_engineering import FEATURE_NAMES
@@ -32,3 +36,45 @@ def test_compute_report_and_persistence():
     persisted = get_latest_robustness_report()
     assert persisted is not None
     assert persisted.get("model_version") == report.model_version
+
+
+@pytest.mark.parametrize(("attacked_probability", "expected"), [(0.9, True), (0.1, False)])
+def test_promotion_gate_runs_feature_attacks_and_enforces_evasion_limit(
+    monkeypatch, attacked_probability, expected
+):
+    class FixedModel:
+        def __init__(self, probability):
+            self.probability = probability
+
+        def predict_proba(self, X):
+            return np.tile([1.0 - self.probability, self.probability], (len(X), 1))
+
+    examples = pd.DataFrame([{**{name: 0.1 for name in FEATURE_NAMES}, "label": 1}
+                             for _ in range(2)])
+    monkeypatch.setattr(
+        robustness_eval,
+        "generate_adversarial_dataset",
+        lambda **kwargs: (pd.DataFrame(), {}, pd.DataFrame(), {}),
+    )
+    monkeypatch.setattr(
+        robustness_eval,
+        "build_training_dataset",
+        lambda *args, **kwargs: examples,
+    )
+    attack_calls = []
+
+    def attack(features, models, **kwargs):
+        attack_calls.append(kwargs)
+        return features, attacked_probability
+
+    monkeypatch.setattr(adversarial_attack, "pgd_attack", attack)
+    monkeypatch.setattr(robustness_eval, "pgd_attack", attack)
+
+    report = robustness_eval.evaluate_promotion_robustness(
+        {"random_forest": FixedModel(0.9)}, sample_size=2
+    )
+
+    assert report["passed"] is expected
+    assert report["models"]["random_forest"]["evasion_rate"] == (0.0 if expected else 1.0)
+    assert len(attack_calls) == 2
+    assert all(call["steps"] > 0 for call in attack_calls)

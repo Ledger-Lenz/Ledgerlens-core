@@ -7,6 +7,7 @@ generating adversarial datasets and scoring them with pre-trained models.
 import json
 import math
 import numpy as np
+import pandas as pd
 from pydantic import BaseModel
 from scipy.stats import norm
 from sklearn.metrics import f1_score, roc_auc_score
@@ -18,6 +19,11 @@ from detection.adversarial_attack import FEATURE_CONSTRAINTS, pgd_attack
 
 from detection.feature_engineering import FEATURE_NAMES
 
+PROMOTION_MAX_EVASION_RATE = 0.5
+PROMOTION_MAX_EVASION_REGRESSION = 0.05
+PROMOTION_ATTACK_EPSILON = 0.1
+PROMOTION_ATTACK_STEPS = 3
+
 
 class RobustnessReport(BaseModel):
     model_version: str
@@ -27,6 +33,108 @@ class RobustnessReport(BaseModel):
     certified_radius: float
     n_samples: int
     epsilon: float
+
+
+def evaluate_promotion_robustness(
+    candidate_models: dict,
+    reference_models: dict | None = None,
+    *,
+    max_evasion_rate: float = PROMOTION_MAX_EVASION_RATE,
+    max_evasion_regression: float = PROMOTION_MAX_EVASION_REGRESSION,
+    sample_size: int = 20,
+    seed: int = 42,
+) -> dict:
+    """Run feature-space attacks against candidate models before promotion.
+
+    The held-out adversarial dataset is built through the production feature
+    pipeline, including adversarial feature extraction. Candidate evasion is
+    bounded absolutely and, when incumbent models are available, relative to
+    the incumbent's result on the same examples.
+    """
+    if not candidate_models:
+        raise ValueError("candidate_models must not be empty")
+    if not 0.0 <= max_evasion_rate <= 1.0:
+        raise ValueError("max_evasion_rate must be in [0, 1]")
+    if not 0.0 <= max_evasion_regression <= 1.0:
+        raise ValueError("max_evasion_regression must be in [0, 1]")
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+
+    trades, metadata, events, labels = generate_adversarial_dataset(
+        n_normal_accounts=20,
+        n_wash_rings=10,
+        ring_size=4,
+        seed=seed,
+    )
+    dataset = build_training_dataset(
+        trades, labels, account_metadata=metadata, order_book_events=events
+    )
+    positive_rows = dataset.loc[dataset["label"] == 1, FEATURE_NAMES]
+    if positive_rows.empty:
+        raise ValueError("adversarial promotion dataset contains no wash-positive examples")
+    if len(positive_rows) > sample_size:
+        indices = np.random.default_rng(seed).choice(
+            len(positive_rows), size=sample_size, replace=False
+        )
+        positive_rows = positive_rows.iloc[indices]
+
+    def measure(model) -> dict[str, float | int]:
+        evaded = 0
+        clean_detected = 0
+        for _, row in positive_rows.iterrows():
+            features = {name: float(row[name]) for name in FEATURE_NAMES}
+            clean_probability = float(model.predict_proba(pd.DataFrame([features]))[:, 1][0])
+            clean_detected += clean_probability >= 0.5
+            _, attacked_probability = pgd_attack(
+                features,
+                {"candidate": model},
+                epsilon=PROMOTION_ATTACK_EPSILON,
+                alpha=PROMOTION_ATTACK_EPSILON / PROMOTION_ATTACK_STEPS,
+                steps=PROMOTION_ATTACK_STEPS,
+            )
+            evaded += attacked_probability < 0.5
+        count = len(positive_rows)
+        return {
+            "clean_recall": clean_detected / count,
+            "evasion_rate": evaded / count,
+            "n_samples": count,
+        }
+
+    reference_metrics = {
+        name: measure(model)
+        for name, model in (reference_models or {}).items()
+        if name in candidate_models
+    }
+    model_results = {}
+    passed = True
+    for name, model in candidate_models.items():
+        candidate_metrics = measure(model)
+        reference_rate = reference_metrics.get(name, {}).get("evasion_rate")
+        regression = (
+            candidate_metrics["evasion_rate"] - reference_rate
+            if reference_rate is not None
+            else 0.0
+        )
+        model_passed = (
+            candidate_metrics["evasion_rate"] <= max_evasion_rate
+            and regression <= max_evasion_regression
+        )
+        model_results[name] = {
+            **candidate_metrics,
+            "reference_evasion_rate": reference_rate,
+            "evasion_regression": regression,
+            "passed": model_passed,
+        }
+        passed = passed and model_passed
+
+    return {
+        "passed": passed,
+        "max_evasion_rate": max_evasion_rate,
+        "max_evasion_regression": max_evasion_regression,
+        "epsilon": PROMOTION_ATTACK_EPSILON,
+        "steps": PROMOTION_ATTACK_STEPS,
+        "models": model_results,
+    }
 
 
 

@@ -3,6 +3,12 @@ kind: NetworkChaos
 metadata:
   name: ledgerlens-redis-partition
   namespace: chaos-mesh
+  annotations:
+    # Verification: run while the partition is active; asserts graceful
+    # degraded mode (HTTP 200, status=degraded, feature_store_redis circuit
+    # open/half_open), then recovery (status=ok, circuit closed).
+    # Contract: chaos-mesh/README.md#feature-store-degraded-mode-contract
+    ledgerlens.io/verify: "python chaos-mesh/verify_experiment.py --expect-degraded feature_store_redis"
 spec:
   action: partition
   mode: all

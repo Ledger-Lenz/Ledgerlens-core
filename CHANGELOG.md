@@ -6,9 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Releases are automated via [release-please](https://github.com/googleapis/release-please-action)
-(`.github/workflows/release-please.yml`, `release-please-config.json`,
+(`.github/workflows/release.yml`, `release-please-config.json`,
 `.release-please-manifest.json`) — merges to `main` with conventional-commit
-messages drive version bumps, this file, and the tagged GHCR image publish.
+messages drive version bumps and changelogs.
+This file covers the Python core only; the SDKs, `packages/*` and contracts
+keep their own `CHANGELOG.md` next to their sources (see
+[docs/releasing.md](docs/releasing.md)).
 
 ## [Unreleased]
 ### Fixed

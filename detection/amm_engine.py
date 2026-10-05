@@ -34,6 +34,10 @@ def _pair_key(row: pd.Series) -> tuple:
     return (base.get("code"), base.get("issuer"), counter.get("code"), counter.get("issuer"))
 
 
+def _is_pool_trade(value: object) -> bool:
+    return value == TradeType.LIQUIDITY_POOL or value == TradeType.LIQUIDITY_POOL.value
+
+
 def pool_round_trip_ratio(
     trades: pd.DataFrame,
     account: str,
@@ -48,7 +52,7 @@ def pool_round_trip_ratio(
         return 0.0
 
     mask = (
-        (trades["trade_type"] == TradeType.LIQUIDITY_POOL)
+        trades["trade_type"].map(_is_pool_trade)
         & (trades["liquidity_pool_id"] == pool_id)
         & (trades["base_account"] == account)
     )
@@ -70,6 +74,120 @@ def pool_round_trip_ratio(
                 break
 
     return round_trips / n
+
+
+@dataclass
+class AMMRoundTripAnomaly:
+    wallet: str
+    pool_id: str
+    asset_pair: str
+    buy_time: datetime
+    sell_time: datetime
+    base_amount: float
+    gross_profit_quote: float
+    fee_adjusted_profit_quote: float
+    fee_adjusted_return_ratio: float
+
+
+def detect_profitable_pool_round_trips(
+    trades: pd.DataFrame,
+    window: pd.Timedelta = pd.Timedelta(hours=1),
+    fee_rate: float = 0.003,
+    min_profit_quote: float = 0.0,
+) -> list[AMMRoundTripAnomaly]:
+    """Find same-wallet AMM buy/sell cycles profitable after pool fees.
+
+    Execution prices already include price impact and slippage. The fee
+    adjustment uses the pool's 30 bp default fee, so positive net returns
+    distinguish asymmetric AMM extraction from a direction-only round trip.
+    """
+    if not 0.0 <= fee_rate < 1.0:
+        raise ValueError("fee_rate must be in [0, 1)")
+    if window < pd.Timedelta(0):
+        raise ValueError("window must be non-negative")
+    if min_profit_quote < 0.0:
+        raise ValueError("min_profit_quote must be non-negative")
+
+    required = {
+        "trade_type", "liquidity_pool_id", "base_account", "base_asset",
+        "counter_asset", "base_amount", "counter_amount", "base_is_seller",
+        "ledger_close_time",
+    }
+    if trades.empty or not required.issubset(trades.columns):
+        return []
+
+    pool_trades = trades.loc[trades["trade_type"].map(_is_pool_trade)]
+    anomalies: list[AMMRoundTripAnomaly] = []
+    for (pool_id, wallet), wallet_trades in pool_trades.groupby(
+        ["liquidity_pool_id", "base_account"], dropna=True
+    ):
+        ordered = wallet_trades.sort_values("ledger_close_time").reset_index(drop=True)
+        for buy_idx, buy in ordered.iterrows():
+            if bool(buy["base_is_seller"]):
+                continue
+            buy_time = pd.Timestamp(buy["ledger_close_time"])
+            buy_amount = float(buy["base_amount"])
+            if buy_amount <= 0:
+                continue
+            buy_pair = _pair_key(buy)
+
+            for _, sell in ordered.iloc[buy_idx + 1 :].iterrows():
+                sell_time = pd.Timestamp(sell["ledger_close_time"])
+                if sell_time - buy_time > window:
+                    break
+                if not bool(sell["base_is_seller"]) or _pair_key(sell) != buy_pair:
+                    continue
+
+                sell_amount = float(sell["base_amount"])
+                if sell_amount <= 0:
+                    continue
+                matched_amount = min(buy_amount, sell_amount)
+                buy_quote = float(buy["counter_amount"]) * matched_amount / buy_amount
+                sell_quote = float(sell["counter_amount"]) * matched_amount / sell_amount
+                cost_after_fees = buy_quote * (1.0 + fee_rate)
+                proceeds_after_fees = sell_quote * (1.0 - fee_rate)
+                net_profit = proceeds_after_fees - cost_after_fees
+                if net_profit > min_profit_quote:
+                    base_asset, _, counter_asset, _ = buy_pair
+                    anomalies.append(
+                        AMMRoundTripAnomaly(
+                            wallet=str(wallet),
+                            pool_id=str(pool_id),
+                            asset_pair=f"{base_asset}/{counter_asset}",
+                            buy_time=buy_time.to_pydatetime(),
+                            sell_time=sell_time.to_pydatetime(),
+                            base_amount=matched_amount,
+                            gross_profit_quote=sell_quote - buy_quote,
+                            fee_adjusted_profit_quote=net_profit,
+                            fee_adjusted_return_ratio=proceeds_after_fees / cost_after_fees,
+                        )
+                    )
+                    break
+
+    return anomalies
+
+
+def amm_round_trips_to_alerts(anomalies: list[AMMRoundTripAnomaly]) -> list[dict]:
+    """Convert fee-adjusted profitable AMM cycles into pool-manipulation alerts."""
+    return [
+        {
+            "alert_type": "POOL_MANIPULATION",
+            "wallet": anomaly.wallet,
+            "asset_pair": anomaly.asset_pair,
+            "pool_id": anomaly.pool_id,
+            "timestamp": anomaly.sell_time.isoformat(),
+            "detail": {
+                "detection": "profitable_amm_round_trip",
+                "buy_time": anomaly.buy_time.isoformat(),
+                "sell_time": anomaly.sell_time.isoformat(),
+                "base_amount": anomaly.base_amount,
+                "gross_profit_quote": anomaly.gross_profit_quote,
+                "fee_adjusted_profit_quote": anomaly.fee_adjusted_profit_quote,
+                "fee_adjusted_return_ratio": anomaly.fee_adjusted_return_ratio,
+            },
+        }
+        for anomaly in anomalies
+    ]
 
 
 def pool_sandwich_count(

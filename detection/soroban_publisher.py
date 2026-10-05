@@ -718,6 +718,10 @@ class SorobanPublisher:
                 scval.to_symbol(score.asset_pair),
                 scval.to_uint32(max(0, min(100, score.score))),
                 scval.to_uint64(int(score.timestamp.timestamp())),
+                # Propagate the aggregation-contract version (Issue #932).
+                # Downstream on-chain consumers can assert on this field to
+                # detect silent formula changes.
+                scval.to_string(score.score_version),
             ]
 
             if zk_bundle:

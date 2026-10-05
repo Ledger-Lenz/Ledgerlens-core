@@ -16,6 +16,11 @@ Security
   Invalid address → 422 for the entire request.
 - Connection limit: 10 concurrent SSE connections per API key (429 when exceeded).
 - Namespace isolation enforced at the SSEConnectionManager layer.
+- Authenticated streams re-validate their credentials (and the route's
+  required scope) every ``stream_auth_recheck_interval_seconds`` (default 30s,
+  0 disables).  A revoked key or downgraded scope ends the stream on the next
+  emitted chunk after the interval elapses, i.e. within interval + heartbeat
+  interval.  Each re-check is one gateway key lookup per connection.
 
 Example (JavaScript EventSource client)
 -----------------------------------------
@@ -31,6 +36,8 @@ Example (JavaScript EventSource client)
 """
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from typing import Optional
 
@@ -47,7 +54,19 @@ from api.streaming import (
 )
 from config.settings import settings
 
+logger = logging.getLogger("ledgerlens.stream")
+
 router = APIRouter(prefix="/stream", tags=["Score Streaming (SSE)"])
+
+
+def _auth_still_valid(request: Request) -> bool:
+    """Re-run gateway authentication and scope checks for a live stream."""
+    from api.gateway import _check_scope, _resolve_auth, _resolve_routes, ann
+
+    key_meta = _resolve_auth(request)
+    if key_meta is None:
+        return False
+    return _check_scope(ann(request, _resolve_routes(request.app)), key_meta)
 
 # ---------------------------------------------------------------------------
 # Lazy singletons
@@ -191,7 +210,13 @@ async def stream_scores(
     except Exception:
         pass  # Redis unavailable — skip limit enforcement
 
+    recheck_interval = settings.stream_auth_recheck_interval_seconds
+    # Only streams that authenticated at connect time are re-checked, so
+    # deployments with the gateway disabled keep working.
+    recheck = recheck_interval > 0 and _auth_still_valid(request)
+
     async def event_generator():
+        next_check = time.monotonic() + recheck_interval
         try:
             async for chunk in manager.subscribe(
                 connection_id=connection_id,
@@ -199,6 +224,13 @@ async def stream_scores(
                 last_event_id=last_event_id,
                 request=request,
             ):
+                if recheck and time.monotonic() >= next_check:
+                    if not _auth_still_valid(request):
+                        logger.warning(
+                            "SSE credentials revoked connection=%s, closing", connection_id
+                        )
+                        return
+                    next_check = time.monotonic() + recheck_interval
                 yield chunk
         finally:
             try:

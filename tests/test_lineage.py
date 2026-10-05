@@ -27,7 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from config.settings import settings
-from detection.lineage import LineageEmitter, Dataset, get_lineage_graph
+from detection.lineage import LineageEmitter, Dataset, get_lineage_graph, get_model_lineage
 from api.main import app
 
 
@@ -339,3 +339,56 @@ def test_lineage_graph_not_found(clean_db):
     """Non-existent dataset name returns empty graph, not an error."""
     graph = get_lineage_graph("nonexistent-dataset", db_path=clean_db)
     assert graph == {"nodes": [], "edges": []}
+
+
+def test_model_lineage_query_api(clean_db, monkeypatch):
+    """Model lineage is queryable by model name and includes its data/feature hashes."""
+    monkeypatch.setattr(settings, "lineage_enabled", True)
+    monkeypatch.setattr(settings, "lineage_backend", "none")
+    monkeypatch.setattr(settings, "ledgerlens_admin_api_key", "secret-admin-key")
+
+    emitter = LineageEmitter()
+    try:
+        inputs = [
+            Dataset(
+                namespace="ledgerlens-core.training-data",
+                name="training_dataframe",
+                facets={"sha256": "data-hash"},
+            ),
+            Dataset(
+                namespace="ledgerlens-core.feature-set",
+                name="feature_schema_v123",
+                facets={"feature_version": "feature-hash"},
+            ),
+        ]
+        with emitter.run("model_training.train_ensemble", inputs) as run:
+            run.add_output(
+                Dataset(
+                    namespace="ledgerlens-core.models",
+                    name="random_forest_vabc.joblib",
+                    facets={
+                        "model_name": "random_forest",
+                        "model_version": "abc",
+                        "training_data_sha256": "data-hash",
+                        "feature_version": "feature-hash",
+                        "config_sha256": "config-hash",
+                        "artifact_sha256": "artifact-hash",
+                    },
+                )
+            )
+    finally:
+        emitter.stop()
+
+    records = get_model_lineage("random_forest", db_path=clean_db)
+    assert len(records) == 1
+    assert records[0]["model_version"] == "abc"
+    assert records[0]["training_data_sha256"] == "data-hash"
+    assert records[0]["feature_version"] == "feature-hash"
+    assert records[0]["inputs"][1]["facets"]["feature_version"] == "feature-hash"
+
+    response = TestClient(app).get(
+        "/v1/admin/lineage/models/random_forest",
+        headers={"X-LedgerLens-Admin-Key": "secret-admin-key"},
+    )
+    assert response.status_code == 200
+    assert response.json()[0]["model_dataset_name"] == "random_forest_vabc.joblib"

@@ -23,10 +23,11 @@ feature changes.
 13. [Working with protobuf definitions](#working-with-protobuf-definitions)
 14. [License and vulnerability policy](#license-and-vulnerability-policy)
 15. [Proposing changes](#proposing-changes)
-16. [Before opening a PR](#before-opening-a-pr)
+16. [Before opening a PR](#before-opening-a-pr) — run `make verify`
 17. [Definition of Done checklist](#definition-of-done-checklist)
 18. [Cross-repo changes](#cross-repo-changes)
 19. [Protobuf style conventions](#protobuf-style-conventions)
+20. [Metric naming conventions](#metric-naming-conventions)
 
 
 ---
@@ -157,6 +158,15 @@ For license compliance requirements that apply to all four ecosystems, see [`doc
 ---
 
 ## Development workflow
+
+> **Before every push, run `make verify`.** It is the recommended pre-push
+> step: it mirrors the CI gate — Python (lockfiles, ruff, stable pytest suite),
+> Rust SDK + Soroban contracts (check/test/clippy/fmt), Go SDK (vet + race
+> tests), TypeScript SDK (lint, format, typecheck, tests), a 5s-per-harness
+> fuzz smoke pass, and contract tests — running every category in parallel
+> and printing a PASS/FAIL line for each. Logs land in `.verify/<category>.log`;
+> re-run one category with e.g. `make verify-go`. A missing toolchain shows up
+> as FAIL rather than being skipped.
 
 ```bash
 python cli.py generate-data   # generate synthetic labelled dataset
@@ -730,3 +740,10 @@ conventions already established there:
   be called out explicitly in the PR description per the
   [Cross-repo changes](#cross-repo-changes) policy above, since `RiskScore` is
   a shared contract.
+
+## Metric naming conventions
+
+New Prometheus metrics must follow [docs/metric_naming.md](docs/metric_naming.md):
+use the `ledgerlens_<subsystem>_<what>_<unit>` shape, end counters with `_total`,
+use base units, and use `snake_case` labels. CI runs
+`python scripts/lint_metric_names.py` and fails on non-conforming names.

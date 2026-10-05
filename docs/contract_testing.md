@@ -106,3 +106,39 @@ pytest tests/contract -q
 The workflow uses a fallback static pact when no broker secrets are configured,
 so forks and local contributors can still run the suite. Verification results
 are only published to the broker for same-repository branches (not forks).
+## SDK consumer contracts
+
+Each SDK publishes the requests it makes and the response shape it relies on
+as a consumer contract in `tests/contract/pacts/sdk/`:
+
+| Consumer | Contract file |
+|---|---|
+| TypeScript SDK (`sdk/`) | `ledgerlens-sdk-typescript-ledgerlens-api.json` |
+| Go SDK (`go/`) | `ledgerlens-sdk-go-ledgerlens-api.json` |
+| Rust SDK (`crates/ledgerlens-sdk/`) | `ledgerlens-sdk-rust-ledgerlens-api.json` |
+
+`tests/contract/test_sdk_consumer_contracts.py` verifies every interaction
+against the real `api.main` app (isolated SQLite DB, seeded per provider
+state, redirects followed like the SDK HTTP clients). Response bodies match
+by *type*: every expected key must be present with the same JSON type, and
+arrays match on their first element. Extra fields returned by the API are
+allowed. The `.github/workflows/sdk-contract.yml` workflow runs this on every
+push to `main` and on PRs touching the API, the SDKs, or the contracts, so an
+API change that breaks a published contract fails CI.
+
+### Adding a consumer expectation
+
+1. When an SDK starts calling a new endpoint (or relies on a new response
+   field), add an interaction to that SDK's contract file:
+   `description`, `providerState`, `request` (`method`, `path`, optional
+   `query`), and `response` (`status`, optional example `body`).
+2. Use an existing provider state, or add one to `_set_up_state` in
+   `test_sdk_consumer_contracts.py`:
+
+   | Provider state | Seeds |
+   |---|---|
+   | `a risk score exists for wallet <G...>` | One `RiskScore` for that wallet |
+   | `no risk score exists for wallet <G...>` | Nothing |
+
+3. Run `pytest tests/contract/test_sdk_consumer_contracts.py` locally and
+   commit the contract change in the same PR as the SDK change.

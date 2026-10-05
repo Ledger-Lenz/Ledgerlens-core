@@ -27,9 +27,12 @@ import functools
 import logging
 import os
 import random
+import re
+import secrets
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from typing import Any, AsyncGenerator, Callable, Generator
 
 from config.settings import settings
@@ -372,6 +375,70 @@ def create_task_with_context(coro) -> asyncio.Task:
             otel_context.detach(token)
 
     return asyncio.create_task(_with_context())
+
+
+# ---------------------------------------------------------------------------
+# Pipeline trace ID (ingestion -> detection -> API response / webhook delivery)
+# ---------------------------------------------------------------------------
+
+TRACE_ID_HEADER = "X-Trace-ID"
+_TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_pipeline_trace_id: ContextVar[str | None] = ContextVar("ledgerlens_trace_id", default=None)
+
+
+def _is_valid_trace_id(trace_id: Any) -> bool:
+    return isinstance(trace_id, str) and bool(_TRACE_ID_RE.match(trace_id)) and trace_id != "0" * 32
+
+
+def new_trace_id() -> str:
+    """Return a fresh W3C-compatible 128-bit trace ID (32 lowercase hex chars)."""
+    return secrets.token_hex(16)
+
+
+def current_trace_id() -> str | None:
+    """Return the active trace ID: the current OTel span's, else the pipeline context's."""
+    if _OTEL_AVAILABLE:
+        span_ctx = trace.get_current_span().get_span_context()
+        if span_ctx.is_valid:
+            return format(span_ctx.trace_id, "032x")
+    return _pipeline_trace_id.get()
+
+
+def ensure_trace_id(trace_id: str | None = None) -> str:
+    """Return ``trace_id`` if valid, else the active trace ID, else a new one."""
+    if _is_valid_trace_id(trace_id):
+        return trace_id  # type: ignore[return-value]
+    return current_trace_id() or new_trace_id()
+
+
+@contextmanager
+def use_trace_id(trace_id: str | None) -> Generator[str | None, None, None]:
+    """Make ``trace_id`` the active pipeline trace for the enclosed block.
+
+    Use at each hop that resumes work for a traced event (e.g. scoring a trade
+    stamped at ingestion, delivering a queued webhook). With OpenTelemetry
+    installed, spans started inside the block join the same trace as children
+    of a remote parent carrying ``trace_id``.
+    """
+    if not _is_valid_trace_id(trace_id):
+        yield current_trace_id()
+        return
+    var_token = _pipeline_trace_id.set(trace_id)
+    otel_token = None
+    if _OTEL_AVAILABLE and current_trace_id() != trace_id:
+        parent = trace.SpanContext(
+            trace_id=int(trace_id, 16),  # type: ignore[arg-type]
+            span_id=random.getrandbits(64) or 1,
+            is_remote=True,
+            trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED),
+        )
+        otel_token = otel_context.attach(trace.set_span_in_context(trace.NonRecordingSpan(parent)))
+    try:
+        yield trace_id
+    finally:
+        if otel_token is not None:
+            otel_context.detach(otel_token)
+        _pipeline_trace_id.reset(var_token)
 
 
 # ---------------------------------------------------------------------------

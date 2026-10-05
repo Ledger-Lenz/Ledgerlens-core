@@ -1,4 +1,3 @@
-import secrets
 import logging
 from typing import Optional
 
@@ -16,9 +15,11 @@ except ImportError as _strawberry_err:  # pragma: no cover
         "  Or install directly:          pip install 'strawberry-graphql[fastapi]'"
     ) from _strawberry_err
 
-from config.settings import settings
+from graphql import GraphQLError
+
+from api import policy
+from api.graphql_cost import QueryCostLimiter
 from detection import storage
-from detection.api_key_store import lookup_key
 from api.cross_chain_router import get_links_for_wallet
 from detection.model_registry import get_current_version
 
@@ -109,44 +110,41 @@ class Query:
 # Auth helpers
 # ---------------------------------------------------------------------------
 
-def _require_scope(info: Info, scope: str) -> None:
+def _enforce(info: Info, scope: str) -> None:
+    """Enforce auth via the shared policy layer (#969), once per request+scope."""
     request = info.context.get("request")
     if request is None:
         logger.warning("GraphQL auth: no request context")
-        raise strawberry.GraphQLError("Unauthorized: no request context")
-    api_key = request.headers.get("X-LedgerLens-Api-Key") or request.headers.get("X-LedgerLens-Admin-Key")
-    if not api_key:
-        logger.warning("GraphQL auth: missing API key")
-        raise strawberry.GraphQLError("Unauthorized: missing API key")
-    # Validate the key against the store
-    key_meta = lookup_key(api_key)
-    if key_meta is None:
-        logger.warning("GraphQL auth: invalid API key")
-        raise strawberry.GraphQLError("Unauthorized: invalid or revoked API key")
-    # Admin keys satisfy any scope
-    scopes = set(key_meta["scopes"].split(",")) if key_meta.get("scopes") else set()
-    if scope not in scopes and "admin" not in scopes:
-        logger.warning("GraphQL auth: key lacks required scope '%s' (has: %s)", scope, scopes)
-        raise strawberry.GraphQLError(f"Forbidden: this field requires the '{scope}' scope")
+        raise GraphQLError("Unauthorized: no request context")
+    cache = info.context.setdefault("_policy_decisions", {})
+    decision = cache.get(scope)
+    if decision is None:
+        decision = policy.enforce(
+            scope,
+            admin_key=request.headers.get("X-LedgerLens-Admin-Key", ""),
+            api_key=request.headers.get("X-LedgerLens-Api-Key", ""),
+        )
+        cache[scope] = decision
+    if decision.status == policy.UNAUTHENTICATED:
+        logger.warning("GraphQL auth: missing or invalid credentials")
+        raise GraphQLError("Unauthorized: missing, invalid or revoked API key")
+    if decision.status == policy.FORBIDDEN:
+        logger.warning("GraphQL auth: key lacks required scope '%s'", scope)
+        raise GraphQLError(f"Forbidden: this field requires the '{scope}' scope")
+    if decision.status == policy.RATE_LIMITED:
+        raise GraphQLError("Rate limit exceeded")
+
+
+def _require_scope(info: Info, scope: str) -> None:
+    _enforce(info, scope)
 
 
 def _require_admin(info: Info) -> None:
-    request = info.context.get("request")
-    if request is None:
-        logger.warning("GraphQL admin auth: no request context")
-        raise strawberry.GraphQLError("Unauthorized: no request context")
-    admin_key = request.headers.get("X-LedgerLens-Admin-Key")
-    if not admin_key:
-        logger.warning("GraphQL admin auth: missing admin key")
-        raise strawberry.GraphQLError("Unauthorized: missing admin key")
-    # Check against configured admin API key
-    if not settings.admin_api_key or not secrets.compare_digest(admin_key, settings.admin_api_key):
-        logger.warning("GraphQL admin auth: invalid admin key")
-        raise strawberry.GraphQLError("Unauthorized: invalid admin key")
+    _enforce(info, "admin")
 
 
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
 
-schema = strawberry.Schema(query=Query)
+schema = strawberry.Schema(query=Query, extensions=[QueryCostLimiter])

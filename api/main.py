@@ -14,11 +14,13 @@ Run with:
     uvicorn api.main:app --reload
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -42,10 +44,14 @@ from api.batch_router import router as batch_router
 from api.cross_chain_router import router as cross_chain_router
 from api.namespace import list_namespaces
 from api.gateway import GatewayMiddleware
+from api.score_cache import aggregate_cache
 from config.settings import get_runtime_risk_score_threshold, settings
 from detection.tracing import (
+    TRACE_ID_HEADER,
     configure_tracing,
+    ensure_trace_id,
     start_span,
+    use_trace_id,
 )
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
@@ -177,6 +183,8 @@ _models: dict = {}
 # ---------------------------------------------------------------------------
 _shutting_down: bool = False
 SHUTDOWN_TIMEOUT = int(os.environ.get("SHUTDOWN_TIMEOUT", "30"))
+# Alert (WARNING log) when draining takes longer than this; see chaos-mesh/README.md.
+SHUTDOWN_DRAIN_BUDGET_S = float(os.environ.get("SHUTDOWN_DRAIN_BUDGET_S", "25"))
 _inflight_requests: int = 0
 _inflight_lock = __import__("threading").Lock()
 
@@ -201,6 +209,24 @@ async def _nightly_retention_task() -> None:
                     logger.info("[retention] %s: archived %d row(s) to %s", table, archived, info.get("archive_path"))
         except Exception as exc:
             logger.error("[retention] Nightly job failed: %s", exc)
+
+
+async def _audit_chain_verification_task() -> None:
+    """Async background task: verify the audit log hash chain once per hour.
+
+    Chain breaks are surfaced as CRITICAL logs and the
+    ``ledgerlens_audit_chain_broken_entries`` gauge by ``verify_and_alert``.
+    """
+    import asyncio
+
+    from storage.audit_log import verify_and_alert
+
+    while True:
+        try:
+            await asyncio.to_thread(verify_and_alert)
+        except Exception as exc:
+            logger.error("[audit] Scheduled chain verification failed: %s", exc)
+        await asyncio.sleep(3600)
 
 
 @asynccontextmanager
@@ -249,18 +275,21 @@ async def _lifespan(application: FastAPI):
 
     import asyncio as _asyncio
     _retention_task = _asyncio.create_task(_nightly_retention_task())
+    _audit_verify_task = _asyncio.create_task(_audit_chain_verification_task())
     yield
 
     # ── Shutdown sequence ────────────────────────────────────────────────
     import asyncio
 
     _retention_task.cancel()
+    _audit_verify_task.cancel()
 
     _shutting_down = True
     logger.info("[shutdown] Stopping new requests (returning 503)")
 
     # Wait for in-flight requests to drain
-    deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+    drain_start = time.monotonic()
+    deadline = drain_start + SHUTDOWN_TIMEOUT
     while time.monotonic() < deadline:
         with _inflight_lock:
             count = _inflight_requests
@@ -273,6 +302,14 @@ async def _lifespan(application: FastAPI):
             count = _inflight_requests
         if count > 0:
             logger.warning("[shutdown] Timed out with %d in-flight requests", count)
+    drain_s = time.monotonic() - drain_start
+    logger.info("[shutdown] drain_seconds=%.2f", drain_s)
+    if drain_s > SHUTDOWN_DRAIN_BUDGET_S:
+        logger.warning(
+            "[shutdown] ALERT drain time %.2fs exceeded budget %.2fs",
+            drain_s,
+            SHUTDOWN_DRAIN_BUDGET_S,
+        )
 
     # Close WebSocket connections
     from api.ws_router import manager as _ws_manager
@@ -361,6 +398,20 @@ async def _metrics_middleware(request: Request, call_next):
             ).observe(duration)
         except Exception:
             pass
+
+
+@app.middleware("http")
+async def _trace_id_middleware(request: Request, call_next):
+    """Echo the request's pipeline trace ID in ``X-Trace-ID`` for client correlation.
+
+    An inbound ``X-Trace-ID`` is honoured so callers can stitch their own
+    trace; otherwise the active OTel trace (or a fresh ID) is used.
+    """
+    trace_id = ensure_trace_id(request.headers.get(TRACE_ID_HEADER, "").lower() or None)
+    with use_trace_id(trace_id):
+        response = await call_next(request)
+    response.headers[TRACE_ID_HEADER] = trace_id
+    return response
 
 
 @app.middleware("http")
@@ -1184,34 +1235,52 @@ class SimilarWalletsResponse(BaseModel):
 _vector_index: Optional[object] = None
 _embedding_store: Optional[object] = None
 _model_version: Optional[str] = None
+_indexed_embedding_revision: Optional[int] = None
+_vector_index_refreshed_at: Optional[float] = None
+_vector_resources_lock = threading.Lock()
 
 
 def _initialize_vector_resources():
-    """Initialize the vector index and embedding store singletons."""
+    """Initialize or refresh the model-versioned vector index snapshot."""
     global _vector_index, _embedding_store, _model_version
-    from config.settings import settings
+    global _indexed_embedding_revision, _vector_index_refreshed_at
     from detection.embedding_store import EmbeddingStore
     from detection.vector_index import create_vector_index
     import numpy as np
 
-    if _embedding_store is None:
-        _embedding_store = EmbeddingStore()
+    with _vector_resources_lock:
+        if _embedding_store is None:
+            _embedding_store = EmbeddingStore()
 
-    # Get the latest model version
-    _model_version = _embedding_store.get_latest_model_version()
-    if _model_version is None:
-        return  # No embeddings yet
+        model_version, revision, embeddings = _embedding_store.get_index_snapshot()
+        if model_version is None:
+            _vector_index = None
+            _model_version = None
+            _indexed_embedding_revision = revision
+            _vector_index_refreshed_at = time.monotonic()
+            return
 
-    if _vector_index is None:
-        _vector_index = create_vector_index()
-        # Load all embeddings from the store
-        wallets = []
-        vectors = []
-        for wallet, embedding_bytes in _embedding_store.get_all_embeddings(_model_version):
-            wallets.append(wallet)
-            vectors.append(np.frombuffer(embedding_bytes, dtype=np.float32))
-        if vectors:
-            _vector_index.add_batch(wallets, np.array(vectors))
+        refresh_due = (
+            _vector_index_refreshed_at is None
+            or time.monotonic() - _vector_index_refreshed_at
+            >= settings.vector_index_refresh_seconds
+        )
+        if (
+            _vector_index is not None
+            and model_version == _model_version
+            and revision == _indexed_embedding_revision
+            and not refresh_due
+        ):
+            return
+
+        index = create_vector_index()
+        if embeddings:
+            wallets, vectors = zip(*embeddings)
+            index.add_batch(list(wallets), np.stack(vectors))
+        _vector_index = index
+        _model_version = model_version
+        _indexed_embedding_revision = revision
+        _vector_index_refreshed_at = time.monotonic()
 
 
 @v1_router.get(
@@ -1232,21 +1301,13 @@ def find_similar_wallets(
     - **503** — vector index not initialized.
     """
     from config.settings import settings
-    from detection.embedding_store import EmbeddingStore
-    from detection.vector_index import create_vector_index
-    import numpy as np
-
     validate_stellar_address(wallet)
 
     # Check rate limit
     client_ip = request.client.host if request.client else "127.0.0.1"
     _check_gnn_similarity_rate_limit(client_ip)
 
-    # Initialize resources if needed
-    if _embedding_store is None:
-        _initialize_vector_resources()
-    if _vector_index is None:
-        _initialize_vector_resources()
+    _initialize_vector_resources()
     if _embedding_store is None or _vector_index is None or _model_version is None:
         raise HTTPException(status_code=503, detail="Vector similarity index not available")
 
@@ -1342,18 +1403,29 @@ def alerts(
     summary="Asset pair risk ranking",
     description="Return each asset pair ranked by average wallet risk score, descending.",
 )
-def asset_risk_ranking() -> list[dict]:
-    """Return each asset pair ranked by its average wallet risk score (descending)."""
-    scores = get_latest_scores()
-    by_pair: dict[str, list[int]] = defaultdict(list)
-    for s in scores:
-        by_pair[s.asset_pair].append(s.score)
+def asset_risk_ranking(response: Response) -> list[dict]:
+    """Return each asset pair ranked by its average wallet risk score (descending).
 
-    ranking = [
-        {"asset_pair": pair, "average_score": round(sum(values) / len(values), 2), "wallet_count": len(values)}
-        for pair, values in by_pair.items()
-    ]
-    return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
+    Served from ``aggregate_cache``; a newly written score invalidates it.
+    ``X-Cache`` (``HIT``/``MISS``) and ``X-Cache-Age`` (seconds) expose freshness.
+    """
+
+    def compute() -> list[dict]:
+        scores = get_latest_scores()
+        by_pair: dict[str, list[int]] = defaultdict(list)
+        for s in scores:
+            by_pair[s.asset_pair].append(s.score)
+
+        ranking = [
+            {"asset_pair": pair, "average_score": round(sum(values) / len(values), 2), "wallet_count": len(values)}
+            for pair, values in by_pair.items()
+        ]
+        return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
+
+    result = aggregate_cache.get_or_compute("assets:risk-ranking", compute)
+    response.headers["X-Cache"] = "HIT" if result.hit else "MISS"
+    response.headers["X-Cache-Age"] = f"{result.age_seconds:.3f}"
+    return result.value
 
 
 @v1_router.get(
@@ -1698,6 +1770,20 @@ def get_lineage(dataset: str) -> dict:
     return get_lineage_graph(dataset)
 
 
+@v1_router.get(
+    "/admin/lineage/models/{model}",
+    tags=["Admin"],
+    summary="Query model training lineage",
+    description="Return data snapshots, feature schema versions, and artifacts used to produce a model.",
+    dependencies=[Depends(require_admin_key)],
+)
+def get_model_training_lineage(model: str) -> list[dict]:
+    """Query completed training lineage by model name, version, or dataset name."""
+    from detection.lineage import get_model_lineage
+
+    return get_model_lineage(model)
+
+
 @v1_router.get("/admin/federated/audit-log", tags=["Admin"], summary="Federated learning audit log", description="Return the most recent federated-round audit records (participant IDs are SHA-256 hashed).", dependencies=[Depends(require_admin_key)])
 def federated_audit_log(
     limit: int = Query(default=50, ge=1, le=1000),
@@ -1990,6 +2076,54 @@ def vote_proposal(proposal_id: str, body: ProposalVote):
     return p.model_dump()
 
 
+class ProposalSignOff(BaseModel):
+    signer: str
+    role: str
+    evidence: dict[str, str] = {}
+
+
+def _proposal_int_id(proposal_id: str) -> int:
+    try:
+        return int(proposal_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="proposal_id must be an integer")
+
+
+@v1_router.post(
+    "/governance/proposals/{proposal_id}/signoffs",
+    dependencies=[Depends(require_admin_key)],
+    tags=["Governance"],
+    summary="Sign off proposal",
+    description=(
+        "Record a role sign-off (with evidence references) required by the "
+        "proposal's approval policy (admin only). See docs/governance_protocol.md."
+    ),
+)
+def signoff_proposal(proposal_id: str, body: ProposalSignOff):
+    try:
+        so = GovernanceEngine().record_signoff(_proposal_int_id(proposal_id), body.signer, body.role, body.evidence)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"proposal_id": so.proposal_id, "role": so.role, "signer": so.signer, "signed_at": so.signed_at.isoformat()}
+
+
+@v1_router.get(
+    "/governance/proposals/{proposal_id}/approval-chain",
+    dependencies=[Depends(require_admin_key)],
+    tags=["Governance"],
+    summary="Proposal approval chain",
+    description="Votes, sign-offs, missing approvals and, once executed, the recorded approval chain.",
+)
+def proposal_approval_chain(proposal_id: str):
+    pid = _proposal_int_id(proposal_id)
+    engine = GovernanceEngine()
+    try:
+        chain = engine.approval_chain(pid)
+    except GovernanceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"current": chain, "recorded": engine.recorded_approval(pid)}
+
+
 @v1_router.post(
     "/governance/proposals/{proposal_id}/execute",
     dependencies=[Depends(require_admin_key)],
@@ -2040,6 +2174,40 @@ class SARPackageRequest(BaseModel):
     wallet: str
     start_date: str
     end_date: str
+    # Mandatory human review (see docs/compliance_export.md). `draft_sha256`
+    # must match the draft returned by /compliance/sar-narrative/draft, and
+    # `approved_narrative` carries the analyst's edits, if any.
+    reviewer: str | None = None
+    draft_sha256: str | None = None
+    approved_narrative: str | None = None
+    review_notes: str = ""
+
+
+class SARDraftRequest(BaseModel):
+    wallet: str
+    start_date: str
+    end_date: str
+
+
+def _sar_review_from_request(body: SARPackageRequest):
+    """Build the analyst review for a SAR export request, or raise 403."""
+    from detection.compliance_exporter import draft_sar_narrative
+    from detection.sar_narrative import SARNarrativeNotReviewed, review_sar_narrative
+
+    if not body.reviewer or not body.draft_sha256:
+        raise HTTPException(
+            status_code=403,
+            detail="SAR narrative requires human review: supply reviewer and draft_sha256",
+        )
+    draft = draft_sar_narrative(body.wallet, body.start_date, body.end_date)
+    if hashlib.sha256(draft.encode("utf-8")).hexdigest() != body.draft_sha256:
+        raise HTTPException(status_code=409, detail="SAR narrative draft changed since review; re-review it")
+    try:
+        return review_sar_narrative(
+            draft, body.reviewer, edited_text=body.approved_narrative, notes=body.review_notes
+        )
+    except SARNarrativeNotReviewed as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @v1_router.get(
@@ -2059,6 +2227,24 @@ def compliance_ivms(wallet: str, dry_run: bool = Query(False)) -> dict:
 
     validate_stellar_address(wallet)
     return asdict(export_travel_rule(wallet, dry_run=dry_run))
+
+
+@v1_router.post(
+    "/compliance/sar-narrative/draft",
+    dependencies=[Depends(require_compliance_key)],
+    include_in_schema=False,
+)
+def compliance_sar_narrative_draft(body: SARDraftRequest) -> dict:
+    """Return the auto-generated SAR narrative draft for analyst review.
+
+    The draft cannot be exported directly; submit its ``draft_sha256`` with a
+    ``reviewer`` (and any edits) to ``/compliance/sar-package``.
+    """
+    from detection.compliance_exporter import draft_sar_narrative
+
+    validate_stellar_address(body.wallet)
+    draft = draft_sar_narrative(body.wallet, body.start_date, body.end_date)
+    return {"draft": draft, "draft_sha256": hashlib.sha256(draft.encode("utf-8")).hexdigest()}
 
 
 @v1_router.post(
@@ -2083,6 +2269,7 @@ def compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)
     )
 
     validate_stellar_address(body.wallet)
+    review = _sar_review_from_request(body)
     output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
     try:
         zip_path = export_sar_package(
@@ -2091,6 +2278,7 @@ def compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(False)
             end_date=body.end_date,
             output_dir=output_dir,
             dry_run=dry_run,
+            review=review,
         )
     except ComplianceScoreTooLow as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2648,6 +2836,7 @@ def root_compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(F
     )
     from fastapi.responses import FileResponse as _FileResponse
 
+    review = _sar_review_from_request(body)
     output_dir = tempfile.mkdtemp(prefix="ledgerlens_sar_")
     try:
         pkg_path = export_sar_package(
@@ -2656,6 +2845,7 @@ def root_compliance_sar_package(body: SARPackageRequest, dry_run: bool = Query(F
             end_date=body.end_date,
             output_dir=output_dir,
             dry_run=dry_run,
+            review=review,
         )
     except ComplianceScoreTooLow as exc:
         raise HTTPException(status_code=400, detail=str(exc))

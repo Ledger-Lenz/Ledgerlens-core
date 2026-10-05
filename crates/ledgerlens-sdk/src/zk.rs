@@ -25,6 +25,8 @@
 //!   primary defence against silent scheme divergence.  See
 //!   `tests/fixtures/zk_proof_vectors.json`.
 
+use alloc::{format, vec, vec::Vec};
+
 use crate::error::ZkVerifyError;
 use crate::models::ThresholdProof;
 

@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional, Protocol
 
 import numpy as np
 
@@ -55,6 +57,72 @@ PAGE_HINKLEY_DELTA = float(os.environ.get("PAGE_HINKLEY_DELTA", "0.005"))
 # How many observations a fired detector stays "active" for, gating whether
 # conformal adaptation reacts to feedback (see conformal.adapt_online).
 DRIFT_ACTIVE_COOLDOWN_OBSERVATIONS = int(os.environ.get("DRIFT_ACTIVE_COOLDOWN_OBSERVATIONS", "200"))
+
+
+class StreamingDriftTest(Protocol):
+    """Interface required by the per-feature streaming detector registry."""
+
+    name: str
+    magnitude: float
+
+    def update(self, value: float) -> bool:
+        ...
+
+    def state(self) -> dict:
+        ...
+
+
+class PerFeatureDriftConfig:
+    """Resolve detector parameters from feature/test-specific overrides.
+
+    Overrides may use ``{feature: {test: {parameter: value}}}``. Flat
+    ``{feature: {parameter: value}}`` values remain supported for PSI settings.
+    """
+
+    def __init__(self, overrides: dict | None = None) -> None:
+        self._overrides = overrides or {}
+
+    @property
+    def overrides(self) -> dict:
+        return self._overrides.copy()
+
+    def value(self, feature: str, test: str, parameter: str, default):
+        feature_config = self._overrides.get(feature, {})
+        test_config = feature_config.get(test, {})
+        if not isinstance(test_config, dict):
+            raise TypeError(f"Configuration for feature {feature!r}, test {test!r} must be a mapping")
+        value = test_config.get(parameter, feature_config.get(parameter, default))
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(
+                f"Threshold {parameter!r} for feature {feature!r}, test {test!r} must be numeric"
+            )
+        return float(value)
+
+
+@dataclass(frozen=True)
+class DriftTestResult:
+    """Common output shape for statistical drift tests."""
+
+    test: str
+    statistic: float
+    threshold: float
+    detected: bool
+    p_value: float | None = None
+
+
+class BatchDriftTest(Protocol):
+    """Interface implemented by distribution-based drift tests."""
+
+    name: str
+    default_threshold: float
+
+    def evaluate(
+        self,
+        reference: np.ndarray,
+        current: np.ndarray,
+        threshold: float,
+    ) -> DriftTestResult:
+        ...
 
 
 def _combine_stats(n1: int, total1: float, var1: float, n2: int, total2: float, var2: float):
@@ -101,6 +169,8 @@ class ADWINDriftDetector:
         Bucket-list compression factor M; memory is O(M log(W/M)).
     """
 
+    name = "adwin"
+
     def __init__(self, delta: float = ADWIN_DELTA, max_buckets_per_row: int = 5):
         if not 0.0 < delta < 1.0:
             raise ValueError("delta must be in (0, 1)")
@@ -118,6 +188,19 @@ class ADWINDriftDetector:
     def estimation(self) -> float:
         """Current window mean (best estimate of the live feature value)."""
         return self.total / self.width if self.width else 0.0
+
+    @property
+    def magnitude(self) -> float:
+        return self.estimation
+
+    def state(self) -> dict:
+        return {
+            "width": self.width,
+            "estimation": self.estimation,
+            "n_detections": self.n_detections,
+            "last_detection_at_width": self.last_detection_at,
+            "delta": self.delta,
+        }
 
     def update(self, value: float) -> bool:
         """Feed one observation; returns True iff a change-point fired."""
@@ -228,6 +311,8 @@ class PageHinkleyDetector:
         Forgetting factor for the running mean (1.0 = no forgetting).
     """
 
+    name = "page_hinkley"
+
     def __init__(self, delta: float = PAGE_HINKLEY_DELTA, threshold: float = PAGE_HINKLEY_THRESHOLD, alpha: float = 1.0):
         self.delta = delta
         self.threshold = threshold
@@ -247,6 +332,20 @@ class PageHinkleyDetector:
     @property
     def n_observations(self) -> int:
         return self._n
+
+    @property
+    def magnitude(self) -> float:
+        return self.statistic
+
+    def state(self) -> dict:
+        return {
+            "statistic": self.statistic,
+            "n_observations": self.n_observations,
+            "n_detections": self.n_detections,
+            "last_detection_at_n": self.last_detection_at,
+            "delta": self.delta,
+            "threshold": self.threshold,
+        }
 
     def update(self, value: float) -> bool:
         self._n += 1
@@ -273,13 +372,38 @@ class DriftDetectorRegistry:
     """
 
     def __init__(self, feature_names, adwin_delta: float = ADWIN_DELTA,
-                 ph_threshold: float = PAGE_HINKLEY_THRESHOLD, ph_delta: float = PAGE_HINKLEY_DELTA):
+                 ph_threshold: float = PAGE_HINKLEY_THRESHOLD, ph_delta: float = PAGE_HINKLEY_DELTA,
+                 retrain_callback=None):
         self._feature_names = list(feature_names)
-        self._adwin = {f: ADWINDriftDetector(delta=adwin_delta) for f in self._feature_names}
-        self._ph = {f: PageHinkleyDetector(delta=ph_delta, threshold=ph_threshold) for f in self._feature_names}
+        self.feature_config = feature_config or PerFeatureDriftConfig()
+        factories: dict[str, Callable[[str], StreamingDriftTest]] = {
+            "adwin": lambda feature: ADWINDriftDetector(
+                delta=self.feature_config.value(feature, "adwin", "delta", adwin_delta)
+            ),
+            "page_hinkley": lambda feature: PageHinkleyDetector(
+                delta=self.feature_config.value(feature, "page_hinkley", "delta", ph_delta),
+                threshold=self.feature_config.value(
+                    feature, "page_hinkley", "threshold", ph_threshold
+                ),
+            ),
+        }
+        for name, factory in (detector_factories or {}).items():
+            if name in factories:
+                raise ValueError(f"Streaming drift test {name!r} is already registered")
+            factories[name] = factory
+        self._detectors = {
+            feature: {name: factory(feature) for name, factory in factories.items()}
+            for feature in self._feature_names
+        }
+        self._adwin = {f: tests["adwin"] for f, tests in self._detectors.items()}
+        self._ph = {f: tests["page_hinkley"] for f, tests in self._detectors.items()}
         self.last_drifted_features: list[str] = []
         self.last_event_at: Optional[str] = None
         self._last_detection_width: Optional[int] = None
+        self._retrain_callback = retrain_callback
+        self._retrain_lock = threading.Lock()
+        self._retraining_in_flight = False
+        self.last_retraining_requested_at: Optional[str] = None
 
     def observe(self, feature_vector: dict) -> list[dict]:
         """Update every known feature's detectors with one observation.
@@ -291,23 +415,28 @@ class DriftDetectorRegistry:
         """
         fired = []
         for name, value in feature_vector.items():
-            adwin = self._adwin.get(name)
-            ph = self._ph.get(name)
-            if adwin is None or ph is None or not isinstance(value, (int, float)):
+            detectors = self._detectors.get(name)
+            if detectors is None or not isinstance(value, (int, float)):
                 continue
             v = float(value)
             if np.isnan(v):
                 continue
-            if adwin.update(v):
-                fired.append({"feature": name, "detector": "adwin", "magnitude": adwin.estimation})
-            if ph.update(v):
-                fired.append({"feature": name, "detector": "page_hinkley", "magnitude": ph.statistic})
+            for detector_name, detector in detectors.items():
+                if detector.update(v):
+                    fired.append(
+                        {
+                            "feature": name,
+                            "detector": detector_name,
+                            "magnitude": detector.magnitude,
+                        }
+                    )
 
         if fired:
             self.last_drifted_features = sorted({e["feature"] for e in fired})
             self.last_event_at = datetime.now(timezone.utc).isoformat()
             self._last_detection_width = max(self._adwin[f].width for f in self.last_drifted_features)
             self._emit_drift_event(fired)
+            self._request_retraining(fired)
         return fired
 
     def is_active(self, cooldown_observations: int = DRIFT_ACTIVE_COOLDOWN_OBSERVATIONS) -> bool:
@@ -341,35 +470,54 @@ class DriftDetectorRegistry:
         except Exception:
             logger.exception("Failed to enqueue drift.detected webhook")
 
+    def _request_retraining(self, fired: list[dict]) -> None:
+        """Start one asynchronous retraining pipeline run for this drift event."""
+        if self._retrain_callback is None:
+            return
+        with self._retrain_lock:
+            if self._retraining_in_flight:
+                logger.info("Retraining already in flight; coalescing drift event")
+                return
+            self._retraining_in_flight = True
+            self.last_retraining_requested_at = datetime.now(timezone.utc).isoformat()
+
+        def run() -> None:
+            try:
+                self._retrain_callback(
+                    {
+                        "event": "drift.detected",
+                        "features": fired,
+                        "timestamp": self.last_retraining_requested_at,
+                    }
+                )
+            except Exception:
+                logger.exception("Drift-triggered retraining pipeline failed")
+            finally:
+                with self._retrain_lock:
+                    self._retraining_in_flight = False
+
+        threading.Thread(target=run, name="drift-retraining", daemon=True).start()
+
     def state(self) -> dict:
         """JSON-serialisable snapshot of every detector's state, for `/health/drift`."""
         features = {}
         for name in self._feature_names:
-            adwin = self._adwin[name]
-            ph = self._ph[name]
             features[name] = {
-                "adwin": {
-                    "width": adwin.width,
-                    "estimation": adwin.estimation,
-                    "n_detections": adwin.n_detections,
-                    "last_detection_at_width": adwin.last_detection_at,
-                },
-                "page_hinkley": {
-                    "statistic": ph.statistic,
-                    "n_observations": ph.n_observations,
-                    "n_detections": ph.n_detections,
-                    "last_detection_at_n": ph.last_detection_at,
-                },
+                detector_name: detector.state()
+                for detector_name, detector in self._detectors[name].items()
             }
         return {
             "drift_active": self.is_active(),
             "last_drifted_features": self.last_drifted_features,
             "last_event_at": self.last_event_at,
+            "retraining_in_flight": self._retraining_in_flight,
+            "last_retraining_requested_at": self.last_retraining_requested_at,
             "config": {
                 "adwin_delta": ADWIN_DELTA,
                 "page_hinkley_threshold": PAGE_HINKLEY_THRESHOLD,
                 "page_hinkley_delta": PAGE_HINKLEY_DELTA,
                 "cooldown_observations": DRIFT_ACTIVE_COOLDOWN_OBSERVATIONS,
+                "feature_overrides": self.feature_config.overrides,
             },
             "features": features,
         }
@@ -384,5 +532,16 @@ def get_drift_registry() -> DriftDetectorRegistry:
     if _registry is None:
         from detection.feature_engineering import FEATURE_NAMES
 
-        _registry = DriftDetectorRegistry(FEATURE_NAMES)
+        def request_retraining(_event: dict) -> None:
+            # Keep scoring latency independent from the training pipeline.
+            from cli import retrain_check
+
+            retrain_check(
+                psi_threshold=0.20,
+                min_drifted_features=3,
+                force_retrain=False,
+                force_promote=False,
+            )
+
+        _registry = DriftDetectorRegistry(FEATURE_NAMES, retrain_callback=request_retraining)
     return _registry

@@ -15,12 +15,12 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 | `graph_engine.py` | Directed trade graph construction, iterative Tarjan SCC wash-ring discovery, and CSR sparse-matrix fallback for large graphs |
 | `graph_sharding.py` | Adaptive sharded graph engine — Louvain community partitioning with a multiprocessing pool for graphs that exceed `MAX_GRAPH_NODES` |
 | `path_cycle_detector.py` | Cycle detection in path-payment graphs (detects circular routing across Stellar path payments) |
-| `path_payment_engine.py` | Analysis of Stellar path-payment operations as potential wash-trade vectors |
+| `path_payment_engine.py` | Multi-hop path-payment cycle detection and profitable attacker/victim/attacker sandwich sequences |
 | `cross_pair_engine.py` | Cross-pair activity counting, synchrony scoring, burst overlap, and shared-wallet cluster features |
 | `cross_chain_linker.py` | Bayesian hypothesis engine that links Stellar wallets to EVM counterparts via Allbridge bridge events |
 | `cross_chain_correlator.py` | Scores cross-chain trade correlation to detect round-trip wash patterns spanning Stellar and EVM chains |
-| `amm_engine.py` | AMM pool wash-trading detection (pool imbalance, self-swap patterns) |
-| `sandwich_engine.py` | Sandwich attack detection for DEX order flow |
+| `amm_engine.py` | AMM pool wash-trading detection, including same-wallet round trips profitable after pool fees and execution slippage |
+| `sandwich_engine.py` | Sandwich attack detection for order-book and AMM pool trade order flow |
 | `temporal_patterns.py` | Temporal pattern features — inter-trade intervals, alternating buy/sell sequences, and burst-pause cycles |
 | `temporal_model.py` | LSTM / Transformer sequence encoder that processes up to 200 ordered trades per wallet; fused with the tabular ensemble via learned weight `w_seq` |
 | `temporal_dataset.py` | Dataset builder for temporal model training (wallet trade sequences with labels) |
@@ -39,14 +39,14 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 | `dataset.py` | Labelled feature dataset builder — joins feature vectors with wash/clean labels for training |
 | `model_training.py` | Trains the RF / XGBoost / LightGBM ensemble with SMOTE class-imbalance handling; saves versioned `.joblib` artefacts |
 | `model_inference.py` | Real-time risk scoring — loads the active model version and runs batch inference |
-| `model_registry.py` | Model version registry; tracks training metadata and controls promotion of new versions |
+| `model_registry.py` | Model version registry; gates training activation and manual promotion on adversarial robustness checks |
 | `model_signing.py` | Cryptographic signing and signature verification for model artefacts (prevents tampered-model loading) |
 | `model_card.py` | Generates model card metadata (training data, evaluation metrics, intended use) |
 | `ensemble_reweighter.py` | Adjusts per-model ensemble weights at inference time |
 | `adaptive_reweighter.py` | Dynamically reweights ensemble models based on analyst feedback signals |
 | `shadow_scoring.py` | Shadow-mode scoring — runs a candidate model alongside the live model to compare outputs safely before promotion |
-| `drift_monitor.py` | PSI-based feature drift detection; triggers continuous retraining when drift exceeds the configured threshold |
-| `drift_detectors.py` | Pluggable drift detector implementations (PSI, Kolmogorov-Smirnov, and others) |
+| `drift_monitor.py` | Pluggable batch distribution tests (PSI, Kolmogorov-Smirnov, and extensions) with per-feature thresholds and drift alerting |
+| `drift_detectors.py` | Common streaming detector interface and registry for per-feature ADWIN, Page-Hinkley, and custom tests |
 | `shap_drift_monitor.py` | Monitors SHAP value distributions for explanation drift, independent of raw feature drift |
 | `mlflow_tracker.py` | MLflow experiment tracking integration — logs parameters, metrics, and artefacts for every training run |
 
@@ -58,8 +58,8 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 |------|-------------|
 | `gnn_ring_detector.py` | Graph neural network classifier that scores wash-trading ring membership directly from the trade graph |
 | `gnn_model.py` | GNN model architecture (message-passing layers and readout head) |
-| `embedding_store.py` | SQLite-backed store for GNN wallet embeddings with model version and timestamp metadata |
-| `vector_index.py` | FAISS approximate nearest-neighbour index for global similarity search across all stored wallet embeddings |
+| `embedding_store.py` | SQLite-backed store for GNN wallet embeddings with model version, timestamp, and change revision metadata |
+| `vector_index.py` | FAISS approximate nearest-neighbour index for global similarity search; rebuilt immediately when the embedding store revision or model version changes, and periodically as a fallback |
 
 → See [`../docs/gnn_ring_detection.md`](../docs/gnn_ring_detection.md)
 
@@ -76,7 +76,7 @@ The files below are grouped by concern. For deeper treatment of any subsystem, f
 | `counterfactual_translator.py` | Converts counterfactual feature deltas into plain-language remediation advice |
 | `adversarial_attack.py` | Adversarial feature attack strategies (Benford camouflage, timing jitter, graph fragmentation, cross-pair rotation) |
 | `adversarial_features.py` | Feature-level adversarial perturbation generation for robustness testing |
-| `robustness_eval.py` | Adversarial robustness evaluation — measures score degradation under attack and reports certificate bounds |
+| `robustness_eval.py` | Promotion gate using PGD attacks on generated adversarial feature vectors; caps evasion at 50% and regression versus the incumbent at 5% |
 | `conformal.py` | Conformal prediction calibration; populates `score_lower`, `score_upper`, and `prediction_set` fields on `RiskScore` |
 
 → See [`../docs/shap_explanation.md`](../docs/shap_explanation.md), [`../docs/causal_inference.md`](../docs/causal_inference.md), [`../docs/adversarial_robustness.md`](../docs/adversarial_robustness.md), [`../docs/adversarial_testing.md`](../docs/adversarial_testing.md), [`../docs/uncertainty_quantification.md`](../docs/uncertainty_quantification.md)

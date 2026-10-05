@@ -9,15 +9,14 @@ Replaces the previous three-way duplication between:
 Every authenticated request flows through :class:`GatewayMiddleware` once,
 resolving the caller's identity, scope, and quota before the route handler runs.
 
-See ``docs/api_gateway.md`` for architecture and migration guide.
+See ``docs/api_gateway.md`` for architecture and migration guide, and
+``docs/api_policy.md`` for the cross-protocol policy model.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
-import secrets
 import time
 import uuid
 
@@ -25,6 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from api import policy
 from config.settings import settings
 
 logger = logging.getLogger("ledgerlens.gateway")
@@ -96,134 +96,20 @@ def ann(request: Request, routes: list | None = None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Auth resolution
+# Auth resolution — delegates to the shared policy layer (api/policy.py)
 # ---------------------------------------------------------------------------
 
 def _resolve_auth(request: Request) -> dict | None:
-    """Resolve the request's authentication to a key metadata dict.
-
-    Checks, in order:
-    1. ``X-LedgerLens-Admin-Key`` header — matched against ``LEDGERLENS_ADMIN_API_KEY``
-    2. ``X-LedgerLens-Api-Key`` header — looked up in canonical ``api_keys`` store
-    3. ``X-LedgerLens-Compliance-Key`` header — matched against ``LEDGERLENS_COMPLIANCE_API_KEY``
-
-    Returns None if no valid key is found.
-    """
-    from detection.api_key_store import get_api_key_by_hash
-
-    # 1. Admin key
-    admin_key = request.headers.get("x-ledgerlens-admin-key", "")
-    if admin_key and settings.admin_api_key:
-        if secrets.compare_digest(admin_key, settings.admin_api_key):
-            return {
-                "key_id": "__admin__",
-                "key_hash": "",
-                "namespace_id": "*",
-                "scopes": "admin",
-                "rate_limit_per_minute": 0,
-                "daily_quota": 0,
-                "namespace_daily_quota": 0,
-                "auth_type": "admin_key",
-            }
-
-    # 2. Compliance key
-    compliance_key = request.headers.get("x-ledgerlens-compliance-key", "")
-    if compliance_key and settings.compliance_api_key:
-        if secrets.compare_digest(compliance_key, settings.compliance_api_key):
-            return {
-                "key_id": "__compliance__",
-                "key_hash": "",
-                "namespace_id": "*",
-                "scopes": "compliance:read",
-                "rate_limit_per_minute": 0,
-                "daily_quota": 0,
-                "namespace_daily_quota": 0,
-                "auth_type": "compliance_key",
-            }
-
-    # 3. Scoped API key
-    api_key = request.headers.get("x-ledgerlens-api-key", "")
-    if not api_key:
-        return None
-
-    key_hash = hashlib.blake2b(api_key.encode(), digest_size=32).hexdigest()
-    record = get_api_key_by_hash(key_hash)
-    if record is None:
-        return None
-
-    record["auth_type"] = "api_key"
-    return record
-
-
-def _check_scope(required_scope: str | None, key_meta: dict) -> bool:
-    """Check that the key has the required scope.
-
-    ``admin`` scope grants access to everything.
-    Returns True when allowed, False when denied.
-    """
-    if required_scope is None:
-        return True
-    scopes = set(s.strip() for s in key_meta.get("scopes", "").split(",") if s.strip())
-    if required_scope in scopes or "admin" in scopes:
-        return True
-    return False
-
-
-def _check_quota(key_meta: dict) -> tuple[bool, dict]:
-    """Enforce per-key and per-namespace quota (daily + monthly + per-minute).
-
-    Returns (allowed, headers_dict).
-    When not allowed, headers_dict contains Retry-After and/or X-LedgerLens-Quota-Reset.
-    """
-    from detection.api_key_store import (
-        check_daily_quota,
-        check_namespace_quota,
-        check_monthly_quota,
-        check_namespace_monthly_quota,
-        check_rate_limit,
+    """Resolve the request's admin / compliance / scoped API key headers."""
+    return policy.resolve_credentials(
+        admin_key=request.headers.get("x-ledgerlens-admin-key", ""),
+        api_key=request.headers.get("x-ledgerlens-api-key", ""),
+        compliance_key=request.headers.get("x-ledgerlens-compliance-key", ""),
     )
 
-    key_id = key_meta["key_id"]
-    namespace_id = key_meta.get("namespace_id", "")
 
-    # Per-minute rate limit (checked first — fastest to fail). Shared with the
-    # gRPC path and the legacy require_scope dependency via the same
-    # distributed (Redis-backed) counter — see detection/rate_limiter.py.
-    rate_limit = key_meta.get("rate_limit_per_minute", 0)
-    if rate_limit > 0:
-        allowed, retry_after = check_rate_limit(key_id, rate_limit)
-        if not allowed:
-            return False, {"Retry-After": str(retry_after)}
-
-    # Daily quota per key
-    daily_limit = key_meta.get("daily_quota", 0)
-    if daily_limit > 0:
-        allowed, reset_at = check_daily_quota(key_id, daily_limit)
-        if not allowed:
-            return False, {"X-LedgerLens-Quota-Reset": reset_at}
-
-    # Daily quota per namespace (wildcard '*' is exempt)
-    ns_daily_limit = key_meta.get("namespace_daily_quota", 0)
-    if ns_daily_limit > 0 and namespace_id != "*":
-        allowed, reset_at = check_namespace_quota(namespace_id, ns_daily_limit)
-        if not allowed:
-            return False, {"X-LedgerLens-Quota-Reset": reset_at}
-
-    # Monthly quota per key
-    monthly_limit = key_meta.get("monthly_quota", 0)
-    if monthly_limit > 0:
-        allowed, reset_at = check_monthly_quota(key_id, monthly_limit)
-        if not allowed:
-            return False, {"X-LedgerLens-Quota-Reset": reset_at}
-
-    # Monthly quota per namespace (wildcard '*' is exempt)
-    ns_monthly_limit = key_meta.get("namespace_monthly_quota", 0)
-    if ns_monthly_limit > 0 and namespace_id != "*":
-        allowed, reset_at = check_namespace_monthly_quota(namespace_id, ns_monthly_limit)
-        if not allowed:
-            return False, {"X-LedgerLens-Quota-Reset": reset_at}
-
-    return True, {}
+_check_scope = policy.check_scope
+_check_quota = policy.check_quota
 
 
 # ---------------------------------------------------------------------------
@@ -333,34 +219,21 @@ class GatewayMiddleware(BaseHTTPMiddleware):
             _log_access(request, response, None, latency_ms, None)
             return response
 
-        # Resolve auth
-        key_meta = _resolve_auth(request)
-        if key_meta is None:
-            resp = JSONResponse(
-                {"detail": "Unauthorized — provide a valid API key, admin key, or compliance key"},
-                status_code=401,
-            )
-            resp.headers["X-Correlation-ID"] = correlation_id
-            return resp
-
-        # Scope check
-        if not _check_scope(required_scope, key_meta):
-            resp = JSONResponse(
-                {"detail": f"Scope '{required_scope}' required"},
-                status_code=403,
-            )
-            resp.headers["X-Correlation-ID"] = correlation_id
-            return resp
-
-        # Quota enforcement
-        allowed, quota_headers = _check_quota(key_meta)
-        if not allowed:
-            quota_headers["X-Correlation-ID"] = correlation_id
-            return JSONResponse(
-                {"detail": "Quota exceeded"},
-                status_code=429,
-                headers=quota_headers,
-            )
+        decision = policy.enforce(
+            required_scope,
+            admin_key=request.headers.get("x-ledgerlens-admin-key", ""),
+            api_key=request.headers.get("x-ledgerlens-api-key", ""),
+            compliance_key=request.headers.get("x-ledgerlens-compliance-key", ""),
+        )
+        if not decision.allowed:
+            status_code = {
+                policy.UNAUTHENTICATED: 401,
+                policy.FORBIDDEN: 403,
+                policy.RATE_LIMITED: 429,
+            }[decision.status]
+            headers = {**decision.headers, "X-Correlation-ID": correlation_id}
+            return JSONResponse({"detail": decision.detail}, status_code=status_code, headers=headers)
+        key_meta = decision.key_meta
 
         # Forward resolved key metadata for downstream handlers
         request.state.auth_key_meta = key_meta

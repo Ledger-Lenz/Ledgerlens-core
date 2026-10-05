@@ -9,11 +9,15 @@ import pytest
 from detection.drift_monitor import (
     MAX_SNAPSHOT_ROWS,
     MIN_SNAPSHOT_ROWS_AFTER_PRUNE,
+    DriftMonitor,
+    PerFeaturePSIConfig,
     compute_psi,
+    compute_psi_for_feature,
     is_drift_detected,
     record_scored_features,
     run_drift_report,
 )
+from detection.drift_detectors import DriftTestResult
 from detection.feature_engineering import FEATURE_NAMES
 
 
@@ -189,6 +193,17 @@ class TestIsDriftDetected:
         report = {}
         assert is_drift_detected(report) is False
 
+    def test_drift_detection_can_request_retraining(self):
+        requests = []
+        report = {"feature_a": 0.25, "feature_b": 0.22}
+        assert is_drift_detected(
+            report,
+            min_drifted_features=2,
+            retrain_callback=requests.append,
+        )
+        assert requests[0]["event"] == "drift.detected"
+        assert set(requests[0]["drifted_features"]) == {"feature_a", "feature_b"}
+
 
 class TestRunDriftReport:
     """Tests for drift report generation."""
@@ -234,6 +249,74 @@ class TestRunDriftReport:
         db_path = str(tmp_path / "test.db")
         report = run_drift_report(str(training_csv), db_path=db_path)
         assert report == {}
+
+
+class TestCommonDriftTestInterface:
+    def test_batch_tests_share_result_shape_and_feature_thresholds(self, tmp_path):
+        monitor = DriftMonitor(
+            db_path=str(tmp_path / "drift.db"),
+            psi_config=PerFeaturePSIConfig(
+                {
+                    "shifted": {
+                        "psi": {"threshold": 0.1},
+                        "kolmogorov_smirnov": {"threshold": 0.05},
+                    },
+                    "stable": {
+                        "psi": {"threshold": 10.0},
+                        "kolmogorov_smirnov": {"threshold": 0.05},
+                    },
+                }
+            ),
+        )
+        results = monitor.evaluate_distributions(
+            {
+                "shifted": np.arange(100, dtype=float),
+                "stable": np.arange(100, dtype=float),
+            },
+            {
+                "shifted": np.arange(100, 200, dtype=float),
+                "stable": np.arange(100, dtype=float),
+            },
+        )
+
+        assert results["shifted"]["psi"].detected
+        assert results["shifted"]["psi"].threshold == 0.1
+        assert results["shifted"]["kolmogorov_smirnov"].detected
+        assert not results["stable"]["psi"].detected
+        assert isinstance(results["shifted"]["psi"], DriftTestResult)
+        assert results["shifted"]["kolmogorov_smirnov"].p_value is not None
+
+    def test_psi_accounts_for_current_values_outside_reference_range(self):
+        result = compute_psi_for_feature(
+            np.arange(100, dtype=float),
+            np.arange(100, 200, dtype=float),
+        )
+
+        assert result > 0.20
+
+    def test_batch_test_registry_accepts_an_extension(self, tmp_path):
+        class FixedTest:
+            name = "fixed"
+            default_threshold = 0.5
+
+            def evaluate(self, reference, current, threshold):
+                from detection.drift_detectors import DriftTestResult
+
+                return DriftTestResult(
+                    test=self.name,
+                    statistic=0.75,
+                    threshold=threshold,
+                    detected=0.75 > threshold,
+                )
+
+        monitor = DriftMonitor(db_path=str(tmp_path / "drift.db"))
+        result = monitor.evaluate_distributions(
+            {"f": np.array([1.0])},
+            {"f": np.array([2.0])},
+            tests={"fixed": FixedTest()},
+        )
+
+        assert result["f"]["fixed"].detected
 
 
 class TestIntegrationRecordAndDetect:

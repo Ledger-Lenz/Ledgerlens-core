@@ -37,6 +37,23 @@ SHA-256(canonical_json({
 `triggered_by` is validated against a fixed enum, and `chain_hash` is
 computed server-side only.
 
+## Chain of Custody  (Issue #1032)
+
+The chain hash protects events *at rest*; the custody signature protects them
+from generation through storage:
+
+1. **Generation** — `make_scoring_event` signs every event with
+   HMAC-SHA256 over its canonical payload (all decision fields except
+   `chain_hash` and `signature`), keyed by `LEDGERLENS_AUDIT_SECRET`.
+2. **Transport** — the `signature` travels with the event in `to_dict()`;
+   any queue or bus carries it unchanged.
+3. **Storage** — `storage.audit_log.ingest_scoring_event` recomputes the HMAC
+   (constant-time compare) and raises `InvalidEventSignatureError` for
+   unsigned or tampered events; only verified events are appended to the
+   HMAC-chained audit log.
+4. **Export** — exports read from the audit log, whose chain is verified by
+   `verify_chain`, so every exported record traces back to a signed event.
+
 ## Database Schema
 
 ```sql

@@ -74,6 +74,7 @@ from detection.federated.audit import (
     sign_record,
 )
 from detection.federated.krum import KrumAggregator
+from detection.federated.robust_aggregation import AGGREGATION_STRATEGIES, trimmed_mean
 from detection.federated.weighting import apply_weight_share_cap
 
 logger = logging.getLogger("ledgerlens.federated.server")
@@ -128,6 +129,8 @@ class FederatedAggregationServer:
         max_participant_weight_fraction: float | None = None,
         max_n_samples_growth_factor: float | None = None,
         use_krum: bool | None = None,
+        aggregation_strategy: str | None = None,
+        trim_fraction: float | None = None,
     ) -> None:
         self.min_participants = min_participants if min_participants is not None else settings.federated_min_participants
         self.gradient_clip_threshold = gradient_clip_threshold if gradient_clip_threshold is not None else settings.gradient_clip_threshold
@@ -154,6 +157,18 @@ class FederatedAggregationServer:
         # _select_krum_survivors for how f/m are derived from the live
         # participant count each round rather than a static config value.
         self.use_krum = use_krum if use_krum is not None else settings.federated_use_krum
+        self.aggregation_strategy = (
+            aggregation_strategy if aggregation_strategy is not None
+            else settings.federated_aggregation_strategy
+        )
+        if self.aggregation_strategy not in AGGREGATION_STRATEGIES:
+            raise ValueError(
+                f"aggregation_strategy must be one of {AGGREGATION_STRATEGIES}, "
+                f"got {self.aggregation_strategy!r}"
+            )
+        self.trim_fraction = (
+            trim_fraction if trim_fraction is not None else settings.federated_trim_fraction
+        )
         # noise_multiplier > 0 enables the RDP accounting path (σ = clip_norm × nm).
         # 0.0 keeps the legacy linear ε-accumulation for backward compatibility.
         self.noise_multiplier = (
@@ -606,9 +621,14 @@ class FederatedAggregationServer:
                 len(capped_participant_ids),
             )
 
-        agg = np.zeros_like(valid_updates[0].noisy_soft_labels, dtype=float)
-        for u, weight in zip(valid_updates, weights):
-            agg += weight * u.noisy_soft_labels
+        if self.aggregation_strategy == "trimmed_mean":
+            # Unweighted by design: sample-count weighting would let a
+            # Byzantine participant regain influence the trim removed.
+            agg = trimmed_mean([u.noisy_soft_labels for u in valid_updates], self.trim_fraction)
+        else:
+            agg = np.zeros_like(valid_updates[0].noisy_soft_labels, dtype=float)
+            for u, weight in zip(valid_updates, weights):
+                agg += weight * u.noisy_soft_labels
 
         # Server-side DP noise (defence-in-depth).
         # When noise_multiplier > 0, use σ = clip_norm × nm; else use (ε,δ) formula.

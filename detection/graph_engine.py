@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import copy
 import logging
-import multiprocessing
 import os
 import statistics
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Optional
 
 import networkx as nx
@@ -15,6 +15,10 @@ import pandas as pd
 from scipy.sparse import csr_matrix, lil_matrix
 
 logger = logging.getLogger(__name__)
+
+RING_APPROX_THRESHOLD_ENV = "LEDGERLENS_RING_APPROX_THRESHOLD"
+RING_APPROX_BUDGET_ENV = "LEDGERLENS_RING_APPROX_SAMPLE_NODES"
+_RANDOM_WALK_LENGTH = 32
 
 
 def _ring_cache_key(
@@ -171,17 +175,42 @@ def find_wash_rings(
     min_ring_size: int = 3,
     max_ring_size: int = 10,
     min_cycle_volume: float = 0.0,
+    approximation_threshold: Optional[int] = None,
+    sample_node_budget: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> list[dict]:
-    """Find candidate wash rings using Tarjan's SCC algorithm."""
+    """Find candidate wash rings using Tarjan's SCC algorithm.
+
+    When the graph has more than ``approximation_threshold`` nodes (default:
+    ``LEDGERLENS_RING_APPROX_THRESHOLD`` env var, disabled when unset), the
+    search runs on a bounded random-walk sample of at most
+    ``sample_node_budget`` nodes instead of the full graph. Every ring
+    produced this way carries ``"approximate": True`` so downstream consumers
+    know it came from degraded-precision mode. See ``docs/ring_approximation.md``.
+    """
     if min_ring_size < 1:
         raise ValueError("min_ring_size must be at least 1")
     if max_ring_size < min_ring_size:
         raise ValueError("max_ring_size must be greater than or equal to min_ring_size")
 
-    cache_key = _ring_cache_key(graph, min_ring_size, max_ring_size, min_cycle_volume)
-    cached = graph.graph.get("_wash_ring_cache")
-    if cached is not None and cached[0] == cache_key:
-        return cached[1]
+    if approximation_threshold is None:
+        env_threshold = os.environ.get(RING_APPROX_THRESHOLD_ENV)
+        approximation_threshold = int(env_threshold) if env_threshold else None
+    approximate = (
+        approximation_threshold is not None and graph.number_of_nodes() > approximation_threshold
+    )
+    if approximate:
+        budget = sample_node_budget or int(
+            os.environ.get(RING_APPROX_BUDGET_ENV, approximation_threshold)
+        )
+        logger.warning(
+            "Ring detection running in approximation mode: graph has %d nodes (threshold %d), "
+            "sampling %d nodes via bounded random walks",
+            graph.number_of_nodes(),
+            approximation_threshold,
+            budget,
+        )
+        graph = graph.subgraph(_random_walk_sample(graph, budget, seed))
 
     rings: list[dict[str, Any]] = []
     for component in nx.strongly_connected_components(graph):
@@ -210,11 +239,7 @@ def find_wash_rings(
                     "avg_trade_count": avg_trade_count,
                     "timing_tightness": timing_tightness,
                     "truncated": True,
-                    "evidence": {
-                        "nodes": [{"account": account} for account in accounts],
-                        "edges": [],
-                    },
-                    "evidence": _ring_evidence(subgraph),
+                    "approximate": approximate,
                 }
             )
             continue
@@ -231,14 +256,42 @@ def find_wash_rings(
                 "avg_trade_count": avg_trade_count,
                 "timing_tightness": timing_tightness,
                 "truncated": False,
-                "evidence": _ring_evidence(subgraph),
-                "evidence": _ring_evidence(subgraph),
+                "approximate": approximate,
             }
         )
 
     result = sorted(rings, key=lambda ring: (ring["total_volume"], ring["cycle_volume"]), reverse=True)
     graph.graph["_wash_ring_cache"] = (cache_key, result)
     return result
+
+
+def _random_walk_sample(graph: nx.DiGraph, node_budget: int, seed: Optional[int]) -> set:
+    """Collect up to ``node_budget`` nodes via bounded random walks along out-edges.
+
+    Walks start from nodes chosen with probability proportional to out-degree,
+    so dense trading clusters (where rings live) are favoured, and follow
+    directed edges so closed cycles tend to be captured whole.
+    """
+    rng = np.random.default_rng(seed)
+    nodes = list(graph.nodes)
+    if node_budget >= len(nodes):
+        return set(nodes)
+    weights = np.array([graph.out_degree(n) + 1 for n in nodes], dtype=float)
+    weights /= weights.sum()
+    sampled: set = set()
+    for start in rng.choice(len(nodes), size=node_budget * 4, p=weights):
+        if len(sampled) >= node_budget:
+            break
+        current = nodes[start]
+        for _ in range(_RANDOM_WALK_LENGTH):
+            sampled.add(current)
+            if len(sampled) >= node_budget:
+                break
+            successors = list(graph.successors(current))
+            if not successors:
+                break
+            current = successors[rng.integers(len(successors))]
+    return sampled
 
 
 def build_ring_membership_index(
@@ -271,6 +324,7 @@ def build_ring_membership_index(
                 "timing_tightness": timing_tightness,
                 "timing_tightness_score": timing_tightness_score,
                 "truncated": bool(ring.get("truncated", False)),
+                "approximate": bool(ring.get("approximate", False)),
             }
             current = membership.get(account)
             if current is None or _ring_metadata_precedes(metadata, current):
@@ -547,6 +601,10 @@ _SHARDED_GRAPH_INSTANCE: Optional[ShardedTradeGraph] = None
 
 class GraphTooLargeError(Exception):
     """Raised when a graph exceeds MAX_GRAPH_NODES nodes."""
+
+
+class ShardFailureError(RuntimeError):
+    """Raised when every shard fails, leaving no survivor to rebalance onto."""
 
 
 class NodeIndex:
@@ -975,6 +1033,7 @@ class TradeGraph:
                 "timing_tightness": timing_tightness,
                 "timing_tightness_score": timing_tightness_score,
                 "truncated": bool(ring.get("truncated", False)),
+                "approximate": bool(ring.get("approximate", False)),
             }
             if best is None or _ring_metadata_precedes(metadata, best):
                 best = metadata
@@ -987,7 +1046,12 @@ class ShardedTradeGraph(TradeGraph):
 
     Partitions the graph using community detection (:mod:`detection.graph_sharding`),
     runs :meth:`find_wash_rings` per shard in parallel via
-    :class:`multiprocessing.Pool`, and merges results with de-duplication.
+    :class:`concurrent.futures.ProcessPoolExecutor`, and merges results with
+    de-duplication.
+
+    If a shard's worker fails (exception or process death), its partition is
+    rebalanced onto the least-loaded surviving shard and re-run, so up to
+    ``shard_count - 1`` simultaneous shard failures lose no data.
 
     Activated automatically when ``GRAPH_SHARD_ENABLED=true`` (default) and the
     node count exceeds ``MAX_GRAPH_NODES``.
@@ -1004,8 +1068,12 @@ class ShardedTradeGraph(TradeGraph):
         self._overlap_hops = overlap_hops
         self._max_workers = max_workers
         self._shard_assignment: Optional[Any] = None
+        self._failed_shards: list[int] = []
         global _SHARDED_GRAPH_INSTANCE
         _SHARDED_GRAPH_INSTANCE = self
+
+    # Per-shard worker; overridable (module-level function) to inject faults.
+    _shard_worker = None
 
     def find_wash_rings(
         self,
@@ -1050,12 +1118,36 @@ class ShardedTradeGraph(TradeGraph):
             for i, sed in enumerate(shard_edge_data)
         ]
 
+        worker = type(self)._shard_worker or _run_shard_find_rings
+        results: dict[int, list[dict]] = {}
+        failed: list[int] = []
         pool_size = min(self._max_workers, assignment.shard_count)
         if pool_size > 1:
-            with multiprocessing.Pool(pool_size) as pool:
-                shard_results = pool.map(_run_shard_find_rings, worker_inputs)
+            with ProcessPoolExecutor(pool_size) as pool:
+                futures = [(w[0], pool.submit(worker, w)) for w in worker_inputs]
+                for shard_id, future in futures:
+                    try:
+                        results[shard_id] = future.result()[1]
+                    except Exception as exc:  # noqa: BLE001 - any worker failure triggers rebalancing
+                        logger.warning("Shard %d failed: %s", shard_id, exc)
+                        failed.append(shard_id)
         else:
-            shard_results = [_run_shard_find_rings(w) for w in worker_inputs]
+            for w in worker_inputs:
+                try:
+                    results[w[0]] = worker(w)[1]
+                except Exception as exc:  # noqa: BLE001 - any worker failure triggers rebalancing
+                    logger.warning("Shard %d failed: %s", w[0], exc)
+                    failed.append(w[0])
+
+        self._failed_shards = failed
+        if failed:
+            self._rebalance_failed_shards(
+                failed,
+                results,
+                shard_edge_data,
+                (min_ring_size, max_ring_size, min_cycle_volume),
+            )
+        shard_results = sorted(results.items())
 
         all_rings: list[dict] = []
         seen_account_sets: list[frozenset[str]] = []
@@ -1089,6 +1181,36 @@ class ShardedTradeGraph(TradeGraph):
         )
         self._rings_cache = (cache_key, result)
         return result
+
+    def _rebalance_failed_shards(
+        self,
+        failed: list[int],
+        results: dict[int, list[dict]],
+        shard_edge_data: list[dict[tuple[str, str], list]],
+        ring_args: tuple,
+    ) -> None:
+        """Move each failed shard's partition onto the least-loaded survivor and re-run it."""
+        if not results:
+            raise ShardFailureError(
+                f"All {len(failed)} shards failed; no surviving shard to rebalance onto"
+            )
+        node_to_shard = self._shard_assignment.node_to_shard
+        for shard_id in failed:
+            target = min(results, key=lambda s: len(shard_edge_data[s]))
+            shard_edge_data[target].update(shard_edge_data[shard_id])
+            shard_edge_data[shard_id] = {}
+            for node, s in node_to_shard.items():
+                if s == shard_id:
+                    node_to_shard[node] = target
+            _, results[target] = _run_shard_find_rings(
+                (target, shard_edge_data[target], self._node_index, *ring_args)
+            )
+            logger.info("Rebalanced failed shard %d onto shard %d", shard_id, target)
+
+    @property
+    def failed_shards(self) -> list[int]:
+        """Shard ids whose workers failed during the last :meth:`find_wash_rings`."""
+        return list(self._failed_shards)
 
     @property
     def shard_topology(self) -> dict:

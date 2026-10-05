@@ -26,6 +26,8 @@ models/optuna_studies/
 # Runtime state / generated output
 horizon_cursor.txt
 drift_reports/
+checkpoints/
+mlruns/
 reports/*.csv
 reports/*.txt
 reports/*.html
@@ -60,3 +62,4 @@ node_modules/
 # Machine-local development audit-chain signing secret, generated on first use
 # by storage/audit_log.py when LEDGERLENS_AUDIT_SECRET is unset. Never commit.
 .ledgerlens_audit_secret
+.verify/

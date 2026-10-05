@@ -10,6 +10,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from api import policy
+from api.policy import key_cycling_detector
 from config.settings import settings
 from config.correlation import mask_wallet
 
@@ -50,6 +52,10 @@ class WAFMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         try:
+            limited = self._enforce_tier_rate_limit(request)
+            if limited is not None:
+                return limited
+
             # Check for oversized body early (before reading)
             content_length = request.headers.get("content-length")
             if content_length and int(content_length) > self.max_body_bytes:
@@ -93,6 +99,31 @@ class WAFMiddleware(BaseHTTPMiddleware):
         except Exception as e:
             logger.error("WAF middleware error, failing open: %s", e)
             return await call_next(request)
+
+    def _enforce_tier_rate_limit(self, request: Request) -> Response | None:
+        """Per-minute limit by API-key tier, falling back to client IP (#968)."""
+        if not settings.waf_tier_rate_limit_enabled:
+            return None
+        client_ip = request.client.host if request.client else ""
+        api_key = request.headers.get("X-LedgerLens-Api-Key", "")
+        key_cycling_detector.threshold = settings.waf_key_cycling_threshold
+        key_cycling_detector.observe(client_ip, api_key)
+
+        key_meta = policy.resolve_credentials(
+            admin_key=request.headers.get("X-LedgerLens-Admin-Key", ""), api_key=api_key
+        )
+        allowed, retry_after, tier = policy.check_tier_rate_limit(key_meta, client_ip)
+        if allowed:
+            return None
+        logger.warning(
+            "WAF rate limited request: tier=%s bucket=%s", tier,
+            policy.rate_limit_bucket(key_meta, client_ip),
+        )
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"},
+            headers={"Retry-After": str(max(retry_after, 1)), "X-LedgerLens-Tier": tier},
+        )
 
     async def _safe_read_body(self, request: Request) -> Optional[bytes]:
         """Read body with timeout to prevent slowloris attacks."""

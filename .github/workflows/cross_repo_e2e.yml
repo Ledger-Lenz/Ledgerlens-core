@@ -1,11 +1,15 @@
 name: Cross-Repo E2E Tests
 
-# Run on schedule (weekly) or manual dispatch.
+# Runs on every push/PR to main (standard CI, Issue #1038), weekly, or manual dispatch.
 # Uses a documented stub contract server by default (no Docker required).
 # Set LEDGERLENS_USE_REAL_SOROBAN=true for full Soroban deployment fidelity.
 #
 # ADR reference: docs/adr/ADR-005-schema-contract-enforcement.md
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
     - cron: '0 0 * * 0'  # Every Sunday at 00:00 UTC
   workflow_dispatch:

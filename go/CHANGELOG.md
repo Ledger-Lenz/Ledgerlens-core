@@ -13,7 +13,11 @@ This changelog is scoped to the `go/` directory only. Changes to the wider
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `WithRetryPolicy` / `RetryPolicy`: opt-in retry with exponential backoff and
+  full jitter for idempotent requests (GET, HEAD, DELETE) on transport errors
+  and HTTP 429/5xx. Context cancellation aborts pending backoff.
 
 ## [0.1.0] — Unreleased
 

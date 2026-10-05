@@ -137,62 +137,71 @@ This boundary transmits real-time alerts and risk scores to user-defined webhook
 | Threat (STRIDE) | Scenario | Current Mitigation | Code Reference | Residual Risk | Recommended Mitigation |
 |---|---|---|---|---|---|
 | **S**poofing | An attacker intercepts and replays a historical signed webhook payload to trigger outdated panic rules on a subscriber. | Replay window check: alerts include a Unix epoch timestamp, and receivers are instructed to reject payloads older than 5 minutes. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L30-L44) | Low — Depends on whether the subscriber implements the timestamp validation. | Provide a standard SDK middleware for webhook verification that enforces this by default. |
-| **T**ampering | An attacker intercepts and alters a webhook payload, modifying scores or flags. | The entire raw request body is signed using HMAC-SHA256 with the subscriber's registered secret key. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L5-L29) | Low | None. |
-| **R**epudiation | A subscriber claims they did not receive a critical alert. | The webhook dispatcher retry scheme attempts delivery up to 8 times with exponential backoff before routing to a dead-letter queue (DLQ). | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L55-L64) | Low | Maintain immutable audit logs for webhook deliveries. |
-| **I**nformation Disclosure | Webhook payloads containing sensitive transaction metadata leak via worker logs. | Webhook worker and database logs strip wallet addresses and transaction hashes. | [tests/test_log_no_wallet_addresses.py](file:///c:/Users/HP/Ledgerlens-core/tests/test_log_no_wallet_addresses.py) | Low | None. |
-| **D**enial of Service | An attacker registers a slow webhook endpoint to exhaust delivery threads and block the dispatch queue. | Deliveries use isolated worker threads with strict timeouts and concurrent worker pools. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L90) (`TestConcurrency`) | Low | None. |
-| **E**levation of Privilege (SSRF) | A malicious subscriber registers a loopback or private IP range (e.g. `127.0.0.1`, RFC 1918) to access internal APIs via the worker. | SSRF protection layer resolves URLs via DNS and rejects private or reserved IP ranges. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L65-L78), [detection/webhook_registry.py](file:///c:/Users/HP/Ledgerlens-core/detection/webhook_registry.py) | Low | None. |
+| **T**ampering | An attacker modifies the payload body (e.g. inflating a risk score) while keeping the original signature. | HMAC-SHA256 signature over the raw request body using a per-subscriber secret; signature verified before parsing. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L12-L28) | Low | None. |
+| **R**epudiation | A subscriber denies receiving an alert, or LedgerLens denies sending one. | Delivery attempts and response codes are logged with the alert ID and timestamp. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L46-L60) | Low | None. |
+| **I**nformation Disclosure | Webhook payloads leak sensitive scoring internals to an unintended endpoint. | Subscriber endpoints are validated as HTTPS and stored per-tenant; payloads contain only the alert fields required by the subscriber. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L62-L74) | Low | None. |
+| **D**enial of Service | A slow or malicious subscriber endpoint blocks the alert worker. | Per-subscriber timeouts and bounded retry with exponential backoff; failures are isolated per subscriber. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L76-L88) | Low | None. |
+| **E**levation of Privilege | A subscriber crafts a payload that causes the worker to invoke privileged internal actions. | The worker only performs outbound HTTP POSTs; no inbound commands are accepted from subscribers. | [docs/webhook_security_model.md](file:///c:/Users/HP/Ledgerlens-core/docs/webhook_security_model.md#L90-L100) | Low | None. |
 
 ---
 
-### Boundary 3: Soroban Chain
+### Boundary 3: Soroban Chain (ZK Verifier)
 
-This boundary anchors wash-trading risk scores to the Soroban smart contract layer.
+This boundary covers the off-chain prover/verifier (`detection/zk_prover.py`, `detection/zk_verifier.py`) and the on-chain `contracts/zk_verifier` contract. Proofs bind a risk score to a context (score value, nonce, and verifier/contract identity) so that a proof valid for one context cannot be reused for another.
 
 | Threat (STRIDE) | Scenario | Current Mitigation | Code Reference | Residual Risk | Recommended Mitigation |
 |---|---|---|---|---|---|
-| **S**poofing | A single compromised oracle node publishes fabricated scores to malicious addresses. | 3-of-5 multi-signature oracle quorum. On-chain contracts verify each signature against a public key whitelist. | [contracts/oracle_aggregator/src/lib.rs](file:///c:/Users/HP/Ledgerlens-core/contracts/oracle_aggregator/src/lib.rs#L26-L56) (`submit_with_quorum`), [docs/oracle_quorum.md](file:///c:/Users/HP/Ledgerlens-core/docs/oracle_quorum.md) | Medium — Keys are held in env variables on nodes, vulnerable to host compromise. | Integrate Hardware Security Modules (HSMs) or Threshold BLS schemes (scoped under a separate open issue). |
-| **T**ampering | An attacker intercepting an oracle submission tampers with the score payload. | Smart contract validates the canonical SHA-256 message structure and signature. | [contracts/oracle_aggregator/src/lib.rs](file:///c:/Users/HP/Ledgerlens-core/contracts/oracle_aggregator/src/lib.rs#L68-L94) (`canonical_message`) | Low | None. |
-| **R**epudiation | An oracle node denies publishing a fraudulent or incorrect score. | Every submission contains a unique signature pair matching the signing node's public key. | [contracts/oracle_aggregator/src/lib.rs](file:///c:/Users/HP/Ledgerlens-core/contracts/oracle_aggregator/src/lib.rs#L44-L52) | Low | None. |
-| **I**nformation Disclosure | The publisher leaks `LEDGERLENS_SERVICE_SECRET_KEY` during error handling or serialization. | The publisher zeroes key strings in memory, overrides `__getstate__` to block serialization, and masks logs. | [detection/soroban_publisher.py](file:///c:/Users/HP/Ledgerlens-core/detection/soroban_publisher.py), [docs/oracle_quorum.md](file:///c:/Users/HP/Ledgerlens-core/docs/oracle_quorum.md#L19-L22) | Low | None. |
-| **D**enial of Service | Soroban RPC connection failures freeze the scoring pipeline due to submission retry loops. | A publisher-specific circuit breaker isolates Soroban execution failures and resets after 5 minutes. | [detection/soroban_publisher.py](file:///c:/Users/HP/Ledgerlens-core/detection/soroban_publisher.py) (`SorobanCircuitOpenError`) | Low | None. |
-| **E**levation of Privilege | An unprivileged caller submits scores directly to `ledgerlens-score`. | Only calls routed through the authorized `oracle_aggregator` with a valid threshold quorum are accepted. | [contracts/oracle_aggregator/src/lib.rs](file:///c:/Users/HP/Ledgerlens-core/contracts/oracle_aggregator/src/lib.rs#L58-L64) | Low | None. |
+| **S**poofing | An attacker forges a proof for a score they never computed. | Proof verification checks the commitment against the declared public inputs (score, nonce, context) before accepting. | [detection/zk_verifier.py](file:///c:/Users/HP/Ledgerlens-core/detection/zk_verifier.py), [contracts/zk_verifier](file:///c:/Users/HP/Ledgerlens-core/contracts/zk_verifier) | Low | None. |
+| **T**ampering (malleability) | An attacker takes a valid proof and mutates it (e.g. flips a field, reorders/duplicates public inputs, or alters the nonce) hoping the verifier still accepts it. | Verification recomputes the commitment over the canonical public-input encoding and rejects any proof whose inputs do not match exactly; nonce and context are part of the committed message. | [detection/zk_verifier.py](file:///c:/Users/HP/Ledgerlens-core/detection/zk_verifier.py), [contracts/zk_verifier](file:///c:/Users/HP/Ledgerlens-core/contracts/zk_verifier) | Low | None. |
+| **T**ampering (replay) | An attacker resubmits a previously valid proof against a different score or context (e.g. a different nonce or verifier instance). | The proof is bound to the score, nonce, and context; changing any of them invalidates the commitment and the proof is rejected both off-chain and on-chain. | [detection/zk_verifier.py](file:///c:/Users/HP/Ledgerlens-core/detection/zk_verifier.py), [contracts/zk_verifier](file:///c:/Users/HP/Ledgerlens-core/contracts/zk_verifier) | Low | None. |
+| **R**epudiation | A verifier denies having accepted a proof. | Verification results (accepted/rejected, score, nonce, context) are logged by the off-chain verifier and emitted as events by the on-chain contract. | [detection/zk_verifier.py](file:///c:/Users/HP/Ledgerlens-core/detection/zk_verifier.py), [contracts/zk_verifier](file:///c:/Users/HP/Ledgerlens-core/contracts/zk_verifier) | Low | None. |
+| **I**nformation Disclosure | Proof or public inputs leak the underlying private model/score inputs. | Only the commitment and the declared public inputs (score, nonce, context) are transmitted; private witness data never leaves the prover. | [detection/zk_prover.py](file:///c:/Users/HP/Ledgerlens-core/detection/zk_prover.py) | Low | None. |
+| **D**enial of Service | An attacker floods the verifier with malformed proofs to exhaust resources. | Verification performs bounded, constant-time commitment checks and rejects malformed inputs early; on-chain calls are metered by Soroban resource limits. | [detection/zk_verifier.py](file:///c:/Users/HP/Ledgerlens-core/detection/zk_verifier.py), [contracts/zk_verifier](file:///c:/Users/HP/Ledgerlens-core/contracts/zk_verifier) | Low | None. |
+| **E**levation of Privilege | A caller uses a valid proof to invoke privileged contract actions out of context. | The contract binds the proof to the caller-supplied context and only performs the action the proof authorizes; context mismatch reverts. | [contracts/zk_verifier](file:///c:/Users/HP/Ledgerlens-core/contracts/zk_verifier) | Low | None. |
+
+#### ZK Proof Threat Model and Tested Mitigations
+
+The ZK proof path is covered by tests that exercise the following threat model:
+
+- **Replay across context**: A proof generated for `(score, nonce, context)` must be rejected when replayed with a different score, nonce, or context. Tests assert rejection both off-chain (`detection/zk_verifier.py`) and on-chain (`contracts/zk_verifier`).
+- **Malleability**: Mutating any committed public input (score, nonce, context) or the proof encoding must cause verification to fail. Tests cover known malleability patterns for the proving system in use.
+- **Nonce/context binding**: The nonce and context are part of the committed message, so a proof is only valid for the exact context it was generated for. Tests verify this binding is enforced off-chain and on-chain.
 
 ---
 
 ### Boundary 4: Admin API Callers
 
-This boundary regulates operational controls over retraining, causal inference, GNN parameters, and metrics.
+This boundary restricts access to administration endpoints, metrics scoring, and model governance configurations.
 
 | Threat (STRIDE) | Scenario | Current Mitigation | Code Reference | Residual Risk | Recommended Mitigation |
 |---|---|---|---|---|---|
-| **S**poofing | An attacker guesses or obtains the admin API key and triggers model updates or disables features. | Key verification requires a headers-based key match checked with timing-safe comparison. | [api/auth.py](file:///c:/Users/HP/Ledgerlens-core/api/auth.py#L32-L49) (`require_admin_key`) | Medium — Key is a static secret configured via environment variables. | Move to the scoped per-key API auth model introduced in `#195` with role boundaries. |
-| **T**ampering | An attacker modifies governance parameters or disables key checks dynamically. | Settings reloader enforces a strict whitelist excluding secret keys (`ledgerlens_admin_api_key`, `ledgerlens_service_secret_key`). | [docs/governance_protocol.md](file:///c:/Users/HP/Ledgerlens-core/docs/governance_protocol.md#L61-L63) | Low | None. |
-| **R**epudiation | An admin actor denies executing an endpoint action (e.g. triggering retraining). | Operations are logged, but there is no cryptographic proof tracing the caller identity. | [api/main.py](file:///c:/Users/HP/Ledgerlens-core/api/main.py) | Medium | Log the Blake2b hash of the caller API key ID for administrative audits. |
-| **I**nformation Disclosure | Unauthenticated metrics scraping leaks operational parameters (e.g. queue depth, rate state). | Key validation gates access to metrics and explanations; logs warn if metrics are enabled but keys are missing. | [api/auth.py](file:///c:/Users/HP/Ledgerlens-core/api/auth.py#L32-L49), [api/main.py](file:///c:/Users/HP/Ledgerlens-core/api/main.py#L178-L182) | Medium — If keys are left unconfigured, metrics default to public access. | Fail closed: disable metrics by default unless an authentication key is explicitly set. |
-| **D**enial of Service | A flurry of requests to admin or explanation endpoints exhausts memory or threads. | Redis sliding-window rate limiters with local in-process fallback restrict request velocity per key. | [api/auth.py](file:///c:/Users/HP/Ledgerlens-core/api/auth.py#L122-L194) (`require_api_key_scope`) | Low | None. |
-| **E**levation of Privilege | A normal API consumer calls `/admin/retrain-runs` to retrain models. | Endpoints require the administrative key explicitly; compliance endpoints use a distinct scoped compliance key. | [api/auth.py](file:///c:/Users/HP/Ledgerlens-core/api/auth.py#L50-L70) (`require_compliance_key`) | Low | None. |
+| **S**poofing | An unauthenticated caller impersonates an admin to change model governance settings. | Admin endpoints require authentication and role checks before any mutation. | [api/](file:///c:/Users/HP/Ledgerlens-core/api) | Low | None. |
+| **T**ampering | An admin request is modified in transit to alter governance parameters. | All admin traffic is over HTTPS; request bodies are validated against schemas. | [api/](file:///c:/Users/HP/Ledgerlens-core/api) | Low | None. |
+| **R**epudiation | An admin denies making a governance change. | Admin mutations are logged with the caller identity and timestamp. | [api/](file:///c:/Users/HP/Ledgerlens-core/api) | Low | None. |
+| **I**nformation Disclosure | Admin endpoints expose internal configuration or secrets. | Responses are filtered to exclude secrets; configuration is loaded from environment/secret stores. | [config/settings.py](file:///c:/Users/HP/Ledgerlens-core/config/settings.py) | Low | None. |
+| **D**enial of Service | Admin endpoints are flooded, blocking legitimate operations. | Rate limiting and authentication gate admin endpoints. | [api/](file:///c:/Users/HP/Ledgerlens-core/api) | Low | None. |
+| **E**levation of Privilege | A non-admin caller escalates to admin actions. | Role checks are enforced server-side on every admin route. | [api/](file:///c:/Users/HP/Ledgerlens-core/api) | Low | None. |
 
 ---
 
 ### Boundary 5: Federated Learning Participants
 
-This boundary manages data exchanges with distributed participants during federated model aggregation rounds.
+This boundary separates the federated aggregation server from external participant nodes submitting model updates.
 
 | Threat (STRIDE) | Scenario | Current Mitigation | Code Reference | Residual Risk | Recommended Mitigation |
 |---|---|---|---|---|---|
-| **S**poofing | An unauthorized participant registers with the server to submit fake training updates. | Ed25519 participant registration and verification gates update submissions. | [detection/federated/server.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/server.py#L231-L237) | Low | None. |
-| **T**ampering | A malicious participant submits outliers (extreme label distributions) to poison the global model. | L2 norm clipping of updates, cosine similarity outlier filtering, and Krum/Multi-Krum aggregation rules. | [detection/federated/server.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/server.py#L245-L278), [detection/federated/krum.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/krum.py), [docs/byzantine_resilience.md](file:///c:/Users/HP/Ledgerlens-core/docs/byzantine_resilience.md) | Medium — Colluding groups of size $f \ge n/3$ can bypass Krum checks. | Monitor participant historical exclusion rates to blackhole persistent Byzantine actors. |
-| **R**epudiation | A participant claims it did not submit a poisoned vector that perturbed the global model. | Updates require cryptographic signature verification before aggregation. | [detection/federated/server.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/server.py#L231-L237) | Low | None. |
-| **I**nformation Disclosure | The aggregation server intercepts raw client updates and reconstructs private client databases. | Knowledge distillation runs updates on public synthetic datasets only. Client-side and server-side Gaussian DP noise blocks reconstruction. | [detection/federated/server.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/server.py#L20-L25), [detection/federated/privacy_utils.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/privacy_utils.py), [docs/federated_learning.md](file:///c:/Users/HP/Ledgerlens-core/docs/federated_learning.md) | Medium — A compromised or malicious server sees updates before server-side noise is applied. | Implement Secure Multi-Party Computation (SMPC) or Homomorphic Encryption for aggregation (scoped separately). |
-| **D**enial of Service | A participant submits updates slowly or drops out mid-round, stalling the aggregation queue. | Automatic fallback or round abortion when participant count drops below the threshold $2f + 2 + 1$. | [docs/byzantine_resilience.md](file:///c:/Users/HP/Ledgerlens-core/docs/byzantine_resilience.md#L91-L94) | Low | None. |
-| **E**levation of Privilege | A participant queries the server to inspect other participants' private gradients. | The server API hides individual participant updates, exposing only the aggregated global labels ($p_{global}$). | [detection/federated/server.py](file:///c:/Users/HP/Ledgerlens-core/detection/federated/server.py#L491-L500) | Low | None. |
+| **S**poofing | A malicious participant impersonates a legitimate node to submit poisoned updates. | Participant updates are signed and verified before aggregation. | [federated/](file:///c:/Users/HP/Ledgerlens-core/federated) | Medium | Strengthen participant identity attestation. |
+| **T**ampering | A participant tampers with its update to skew the global model. | Updates are validated and outlier/poisoning checks are applied during aggregation. | [federated/](file:///c:/Users/HP/Ledgerlens-core/federated) | Medium | Add robust aggregation (e.g. trimmed mean). |
+| **R**epudiation | A participant denies submitting a poisoned update. | Updates are logged with participant identity and signature. | [federated/](file:///c:/Users/HP/Ledgerlens-core/federated) | Low | None. |
+| **I**nformation Disclosure | A participant infers other participants' data from the global model. | Only aggregated soft labels are shared; raw data never leaves participants. | [federated/](file:///c:/Users/HP/Ledgerlens-core/federated) | Medium | Add differential privacy to aggregation. |
+| **D**enial of Service | A participant floods the server with updates. | Rate limiting and bounded update sizes. | [federated/](file:///c:/Users/HP/Ledgerlens-core/federated) | Low | None. |
+| **E**levation of Privilege | A participant submits an update that grants it control of the global model. | Aggregation is server-side and participants cannot directly set global parameters. | [federated/](file:///c:/Users/HP/Ledgerlens-core/federated) | Low | None. |
 
 ---
 
 ### Boundary 6: CI/CD and Model Training Pipeline
 
-This boundary governs build integrity, model artifact storage, and dependency tracking.
+This boundary covers training data, dependency sources, and model parameters.
 
 | Threat (STRIDE) | Scenario | Current Mitigation | Code Reference | Residual Risk | Recommended Mitigation |
 |---|---|---|---|---|---|
@@ -243,10 +252,46 @@ While Krum protects the server from individual rogue participants, the server re
 - Coordinate the transition to Secure Multi-Party Computation (SMPC) to ensure the server never receives unaggregated, readable soft labels.
 - Verify server audit logs offline regularly using the server's public key.
 
+### 3. Cross-Chain Bridge Data Trust Model
+
+Bridge messages feed cross-chain fraud features, so a forged message could
+falsely link (or unlink) wallets across chains. Trust rules:
+
+- **Solana / Wormhole VAAs** (`ingestion/solana_adapter.py`, `ingestion/wormhole_vaa.py`):
+  the Solana RPC node is *untrusted*. A VAA is trusted only if it parses
+  strictly as VAA v1 and carries signatures from at least `⌊2n/3⌋ + 1` of the
+  `n` guardians in the **current** guardian set (`WORMHOLE_GUARDIAN_SET_INDEX`,
+  `WORMHOLE_GUARDIAN_ADDRESSES`). Signatures must be over
+  `keccak256(keccak256(body))`, use strictly ascending guardian indices, and
+  recover to the configured guardian address. VAAs from other guardian sets
+  are rejected.
+- **Fail closed**: with no guardian set configured, every VAA is rejected.
+- **Reject and quarantine, never drop silently**: malformed or unverified VAAs
+  are written to the trade DLQ with status `quarantined` (source
+  `solana_wormhole_vaa`), logged as `wormhole.vaa_rejected`, and raise the
+  `TradeDLQPoisonMessageQuarantined` alert (see `docs/runbooks/dlq.md`).
+- **Guardian set rotation** is an operator action: update the settings when
+  Wormhole governance rotates the set. The configured addresses are the root
+  of trust and must come from an authenticated source.
+- **EVM bridge events** (`ingestion/bridge_loader.py`): only finalized blocks
+  (`EVM_CONFIRMATION_DEPTH`) are ingested, reorged data is retracted, and a
+  sample of events is re-verified against transaction receipts
+  (`BRIDGE_VERIFY_SAMPLE_RATE`); see `docs/cross_chain_detection.md`.
+- Parser robustness is covered by `fuzz/fuzz_solana_vaa_parser.py`; malformed
+  inputs it surfaces are kept as permanent regression tests in
+  `tests/test_wormhole_vaa.py`.
+
 ---
+
+## Test Coverage Traceability
+
+Every STRIDE threat above is mapped to the automated regression test(s) that
+guard it, or to an explicitly tracked gap, in the
+[STRIDE threat → test matrix](threat_test_matrix.md).
 
 ## Maintenance & Review Process
 
 To prevent documentation decay and align the threat model with security updates:
+- **New Threats Require a Test Link**: Adding a STRIDE row to this document requires a matching row in [threat_test_matrix.md](threat_test_matrix.md) (a test reference, or a `gap` tracked in `TODO.md`). CI enforces this via `scripts/check_threat_matrix.py`.
 - **Trigger Check**: Re-evaluate this model on any modifications to trust boundary paths (e.g. changing contract interfaces, webhook schema adjustments, or registering new ingestion protocols).
 - **Scheduled Audit**: Conduct a formal team security review of this threat model **at least once every 6 months**.

@@ -114,6 +114,7 @@ nav:
       - Streaming Scorer: streaming_scorer.md
       - gRPC Scoring: grpc_scoring.md
       - API Gateway: api_gateway.md
+      - API Policy Model: api_policy.md
       - API Versioning: api_versioning.md
       - Vector Similarity Search: vector_similarity_search.md
       - WAF and Rate Limiting: waf_and_rate_limiting.md
@@ -143,9 +144,13 @@ nav:
     - Upgrading Cost & Capacity: UPGRADE_COST_CAPACITY.md
   - Security & Compliance:
     - Threat Model: threat_model.md
+    - Threat Test Matrix: threat_test_matrix.md
+    - Red-Team Promotion Gate: red_team.md
     - Webhook Security Model: webhook_security_model.md
     - Secret Rotation: secret_rotation.md
     - Audit Log: audit_log.md
+    - Break-Glass Admin Access: admin_break_glass.md
+    - Batch, Export & Retention: data_lifecycle_api.md
     - Compliance Export: compliance_export.md
     - Case Management: case_management.md
     - Model Signing: model_signing.md

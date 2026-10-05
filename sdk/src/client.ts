@@ -197,6 +197,7 @@ export class LedgerLensClient {
    *
    * @param params Optional query parameters:
    *   - `wallet`  — restrict to a single wallet address;
+   *   - `asset_pair` — filter to a single asset pair (e.g. `"XLM/USDC"`);
    *   - `limit`   — maximum number of records to return;
    *   - `offset`  — number of records to skip (pagination);
    *   - `sort_by` — field name to sort by;
@@ -207,6 +208,7 @@ export class LedgerLensClient {
   async getScores(
     params?: {
       wallet?: string;
+      asset_pair?: string;
       limit?: number;
       offset?: number;
       sort_by?: string;
@@ -392,6 +394,71 @@ export class LedgerLensClient {
   }
 
   // -----------------------------------------------------------------------
+  // Batch scoring & export
+  // -----------------------------------------------------------------------
+
+  /**
+   * Queues a batch scoring job via `POST /scores/batch`.
+   *
+   * Pass `idempotencyKey` (e.g. a UUID) so a retry of a timed-out request
+   * returns the original job instead of scoring the batch twice. Reuse the
+   * same key only when retrying the same logical batch.
+   *
+   * @returns The queued job's `job_id`, `status` and `estimated_seconds`.
+   * @throws {LedgerLensError} On a non-2xx response or timeout.
+   */
+  async submitBatch(
+    wallets: string[],
+    options?: { priority?: "normal" | "high"; idempotencyKey?: string },
+  ): Promise<{ job_id: string; status: string; estimated_seconds: number }> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (options?.idempotencyKey) {
+      headers["Idempotency-Key"] = options.idempotencyKey;
+    }
+    const res = await this._fetch("/scores/batch", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ wallets, priority: options?.priority ?? "normal" }),
+    });
+    return parseResponse(
+      res,
+      z.object({
+        job_id: z.string(),
+        status: z.string(),
+        estimated_seconds: z.number(),
+      }),
+      "submitBatch",
+    );
+  }
+
+  /**
+   * Streams a CSV export via `GET /export/scores.csv`.
+   * Requires an admin key (see {@link LedgerLensClientOptions.adminKey}).
+   *
+   * The server sends the export in chunks. Read the returned stream a chunk
+   * at a time rather than buffering it, so large exports use bounded memory.
+   *
+   * @returns The response body as a byte stream.
+   * @throws {LedgerLensError} On a non-2xx response (413 when the export
+   *   exceeds the server's row cap) or timeout.
+   */
+  async exportScoresCsv(params: {
+    from: string;
+    to: string;
+    min_score?: number;
+    wallet?: string;
+  }): Promise<ReadableStream<Uint8Array>> {
+    const res = await this._fetch(`/export/scores.csv${this._buildQuery(params)}`);
+    if (!res.ok || !res.body) {
+      throw new LedgerLensError(
+        `exportScoresCsv failed with HTTP ${res.status}`,
+        res.status,
+      );
+    }
+    return res.body;
+  }
+
+  // -----------------------------------------------------------------------
   // Private helpers
   // -----------------------------------------------------------------------
 
@@ -400,10 +467,11 @@ export class LedgerLensClient {
    * abort-based timeout.
    *
    * @param path Request path beginning with `/` (query string included).
+   * @param init Optional per-request overrides (method, body, extra headers).
    * @returns The raw {@link Response}; status checking happens in `parseResponse`.
    * @throws {LedgerLensError} When the request exceeds the configured timeout.
    */
-  private async _fetch(path: string): Promise<Response> {
+  private async _fetch(path: string, init?: RequestInit): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeout);
@@ -411,6 +479,11 @@ export class LedgerLensClient {
     try {
       const response = await fetch(url, {
         ...this.fetchInit,
+        ...init,
+        headers: {
+          ...(this.fetchInit.headers as Record<string, string>),
+          ...(init?.headers as Record<string, string>),
+        },
         signal: controller.signal,
       });
       return response;

@@ -8,6 +8,8 @@ import pytest
 
 from detection.shadow_scoring import (
     _nearest_rank_percentile,
+    compute_divergence_stats,
+    divergence_out_of_range,
     get_shadow_model_version,
     get_shadow_report,
     store_shadow_score,
@@ -87,3 +89,51 @@ def test_nearest_rank_percentile_uses_expected_rank():
     values = [0.01 * i for i in range(1, 21)]
 
     assert _nearest_rank_percentile(values, 0.95) == pytest.approx(0.19)
+
+
+class TestDivergenceMetric:
+    PRODUCTION = (0.10, 0.50, 0.90, 0.30, 0.70)
+    SHADOW = (0.15, 0.40, 0.90, 0.60, 0.65)
+
+    def test_stats_match_fixed_score_sets(self):
+        stats = compute_divergence_stats(self.PRODUCTION, self.SHADOW)
+        assert stats["count"] == 5
+        assert stats["mean_delta"] == pytest.approx(0.04)
+        assert stats["mean_divergence"] == pytest.approx(0.10)
+        assert stats["p95_divergence"] == pytest.approx(0.30)
+        assert stats["max_divergence"] == pytest.approx(0.30)
+
+    def test_identical_scores_have_zero_divergence(self):
+        stats = compute_divergence_stats(self.PRODUCTION, self.PRODUCTION)
+        assert stats["mean_divergence"] == 0.0
+        assert stats["mean_delta"] == 0.0
+
+    def test_mismatched_lengths_rejected(self):
+        with pytest.raises(ValueError):
+            compute_divergence_stats([0.1], [0.1, 0.2])
+
+    def test_store_emits_signed_delta_histogram(self, shadow_db):
+        from detection.shadow_scoring import _get_delta_histogram
+
+        histogram = _get_delta_histogram()
+        if histogram is None:
+            pytest.skip("prometheus_client not installed")
+        before = histogram._sum.get()
+        store_shadow_score(shadow_db, "GABC", "XLM/USDC", 0.40, 0.65, "v2.0")
+        assert histogram._sum.get() - before == pytest.approx(0.25)
+
+
+class TestDivergenceAlerting:
+    def test_fires_when_divergence_trends_above_range(self):
+        simulated = [0.03, 0.04, 0.12, 0.15, 0.18]
+        assert divergence_out_of_range(simulated, normal_max=0.10, sustained_windows=3)
+
+    def test_single_spike_does_not_fire(self):
+        simulated = [0.03, 0.04, 0.25, 0.05, 0.04]
+        assert not divergence_out_of_range(simulated, normal_max=0.10, sustained_windows=3)
+
+    def test_within_range_does_not_fire(self):
+        assert not divergence_out_of_range([0.02] * 10, normal_max=0.10)
+
+    def test_insufficient_history_does_not_fire(self):
+        assert not divergence_out_of_range([0.5, 0.5], normal_max=0.10, sustained_windows=3)

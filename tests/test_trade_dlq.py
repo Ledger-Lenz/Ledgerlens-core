@@ -183,3 +183,44 @@ def test_classify_version_error(dlq):
 
 def test_classify_unknown(dlq):
     assert dlq.classify_exception(RuntimeError("something weird")) == DLQErrorClass.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# replay() / quarantine / stats
+# ---------------------------------------------------------------------------
+
+def test_replay_success_marks_replayed(dlq):
+    row_id = dlq.push("s", DLQErrorClass.NETWORK_ERROR, "timeout", {"a": 1})
+    seen = []
+    outcome = dlq.replay(row_id, seen.append)
+    assert outcome.status == "replayed"
+    assert seen == [{"a": 1}]
+    assert dlq.get(row_id).status == "replayed"
+
+
+def test_replay_quarantines_after_max_failures(tmp_path):
+    from detection.storage import init_db
+    db = str(tmp_path / "q.db")
+    init_db(db)
+    alerts = []
+    dlq = TradeDLQ(db_path=db, max_replay_failures=2, alert_fn=lambda e, err: alerts.append((e.id, err)))
+    row_id = dlq.push("s", DLQErrorClass.PARSE_ERROR, "bad", {})
+
+    def boom(_record):
+        raise ValueError("still bad")
+
+    assert dlq.replay(row_id, boom).status == "failed"
+    assert dlq.replay(row_id, boom).status == "quarantined"
+    assert dlq.get(row_id).status == "quarantined"
+    assert alerts == [(row_id, "ValueError: still bad")]
+    # Quarantined entries are never retried.
+    assert dlq.replay(row_id, boom).status == "skipped"
+    assert dlq.get(row_id).replay_failures == 2
+
+
+def test_stats_reports_depth_and_age(dlq):
+    assert dlq.stats()["depth"] == 0
+    dlq.push("s", DLQErrorClass.NETWORK_ERROR, "e", {})
+    stats = dlq.refresh_metrics()
+    assert stats["depth"] == 1
+    assert stats["oldest_age_seconds"] >= 0

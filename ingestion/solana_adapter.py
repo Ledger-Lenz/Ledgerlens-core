@@ -24,12 +24,21 @@ import logging
 import math
 import os
 import struct
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from ingestion.data_models import Asset, Trade, TradeType
+from ingestion.wormhole_vaa import (
+    VAA_VERSION,
+    GuardianSet,
+    VAAError,
+    guardian_set_from_settings,
+    parse_vaa,
+    verify_vaa,
+)
 
 if TYPE_CHECKING:
     from ingestion.dedup import IdempotencyKeyStore
@@ -50,6 +59,9 @@ WORMHOLE_CORE = "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth"
 _SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
 SOURCE_LABEL = "solana"
+
+# Sentinel: load the current Wormhole guardian set from settings.
+_FROM_SETTINGS = object()
 
 # Balance deltas at or below this magnitude are treated as noise/rounding.
 _AMOUNT_EPSILON = 1e-9
@@ -345,6 +357,21 @@ class SolanaAdapter:
             if own_client:
                 client.close()
 
+    def _quarantine_vaa(self, sig: str, raw_vaa: bytes, reason: str) -> None:
+        """Quarantine a rejected VAA in the trade DLQ and raise an alert."""
+        logger.error("wormhole.vaa_rejected tx=%s reason=%s", sig, reason)
+        try:
+            from ingestion.dlq import DLQErrorClass, TradeDLQ
+
+            TradeDLQ().quarantine(
+                source="solana_wormhole_vaa",
+                error_class=DLQErrorClass.SCHEMA_ERROR,
+                error_message=reason,
+                raw_record={"signature": sig, "vaa_b64": base64.b64encode(raw_vaa).decode("ascii")},
+            )
+        except Exception:
+            logger.exception("Failed to quarantine rejected VAA for tx %s", sig)
+
     def _parse_wormhole_vaa(
         self,
         solana_address: str,
@@ -360,7 +387,10 @@ class SolanaAdapter:
                 tx = _get_transaction(sig, client, rpc_url=rpc_url)
                 if not tx:
                     continue
-                stellar_addr = _extract_stellar_address_from_vaa(tx)
+                stellar_addr = _extract_stellar_address_from_vaa(
+                    tx,
+                    on_reject=lambda raw, reason, sig=sig: self._quarantine_vaa(sig, raw, reason),
+                )
                 if stellar_addr:
                     logger.info(
                         "wormhole.vaa_link solana=%s stellar=%s",
@@ -373,15 +403,25 @@ class SolanaAdapter:
         return None
 
 
-def _extract_stellar_address_from_vaa(tx: dict) -> str | None:
-    """Scan transaction instruction data for a Wormhole PostedVAA containing a Stellar pubkey.
+def _extract_stellar_address_from_vaa(
+    tx: dict,
+    guardian_set: GuardianSet | None | object = _FROM_SETTINGS,
+    on_reject: Callable[[bytes, str], None] | None = None,
+) -> str | None:
+    """Scan transaction instruction data for a Wormhole VAA emitted from Stellar.
 
-    Wormhole VAAs encode the emitter chain (u16) and emitter address (32 bytes)
-    at bytes 9-43 of the VAA payload.  Stellar chain ID on Wormhole is 6.
-    The emitter address for Stellar is the Stellar account's raw 32-byte ed25519 key,
-    which can be re-encoded to a G... address via base58-check.
+    The VAA follows a 1-byte Wormhole instruction discriminator.  Every VAA
+    is strictly parsed and its guardian signature set verified against the
+    current guardian set (default: from settings) *before* its emitter
+    address is trusted.  Malformed or unverified VAAs are never returned;
+    they are passed to *on_reject* (raw VAA bytes, reason) for quarantine.
+    Stellar's Wormhole chain ID is 6; its emitter address is the Stellar
+    account's raw 32-byte ed25519 key.
     """
     STELLAR_CHAIN_ID = 6
+
+    if guardian_set is _FROM_SETTINGS:
+        guardian_set = guardian_set_from_settings()
 
     instructions = (
         tx.get("transaction", {}).get("message", {}).get("instructions", [])
@@ -406,36 +446,27 @@ def _extract_stellar_address_from_vaa(tx: dict) -> str | None:
             logger.debug("Skipping instruction with undecodable base64 data")
             continue
 
-        # The VAA starts after a 1-byte discriminator (Wormhole instruction enum)
-        # and a 4-byte VAA length prefix.  Minimum usable VAA is ~100 bytes.
-        if len(raw) < 50:
+        # Skip the 1-byte Wormhole instruction discriminator; non-VAA
+        # instructions (other versions / too short) are ignored silently.
+        vaa_bytes = raw[1:]
+        if len(vaa_bytes) < 6 or vaa_bytes[0] != VAA_VERSION:
+            continue
+        try:
+            vaa = parse_vaa(vaa_bytes)
+        except VAAError as exc:
+            if on_reject is not None:
+                on_reject(vaa_bytes, f"malformed: {exc}")
+            continue
+        if vaa.emitter_chain != STELLAR_CHAIN_ID:
+            continue
+        try:
+            verify_vaa(vaa, guardian_set)  # type: ignore[arg-type]
+        except VAAError as exc:
+            if on_reject is not None:
+                on_reject(vaa_bytes, f"unverified: {exc}")
             continue
 
-        # Locate the guardian signatures block to find the VAA body.
-        # VAA header: version(1) guardian_set_index(4) num_signatures(1) signatures(66*n)
-        offset = 1  # skip instruction discriminator
-        if len(raw) < offset + 6:
-            continue
-        vaa_version = raw[offset]
-        if vaa_version != 1:
-            # Only VAA version 1 is currently defined by Wormhole; skip unknown formats.
-            continue
-        num_sigs = raw[offset + 5]
-        body_start = offset + 6 + 66 * num_sigs
-
-        if len(raw) < body_start + 26:
-            continue
-
-        # VAA body: timestamp(4) nonce(4) emitter_chain(2) emitter_address(32) sequence(8) ...
-        emitter_chain = struct.unpack_from(">H", raw, body_start + 8)[0]
-        if emitter_chain != STELLAR_CHAIN_ID:
-            continue
-
-        emitter_bytes = raw[body_start + 10: body_start + 42]
-        if len(emitter_bytes) != 32:
-            continue
-
-        stellar_addr = _stellar_pubkey_to_address(emitter_bytes)
+        stellar_addr = _stellar_pubkey_to_address(vaa.emitter_address)
         if stellar_addr:
             return stellar_addr
 

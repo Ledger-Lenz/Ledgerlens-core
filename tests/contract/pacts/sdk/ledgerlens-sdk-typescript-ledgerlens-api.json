@@ -1,0 +1,40 @@
+{
+  "consumer": {
+    "name": "ledgerlens-sdk-typescript"
+  },
+  "provider": {
+    "name": "ledgerlens-api"
+  },
+  "interactions": [
+    {
+      "description": "getScores lists risk scores",
+      "providerState": "a risk score exists for wallet GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "request": {
+        "method": "GET",
+        "path": "/scores",
+        "query": "limit=10"
+      },
+      "response": {
+        "status": 200,
+        "body": [
+          {
+            "wallet": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "asset_pair": "XLM/USDC",
+            "score": 85,
+            "benford_flag": true,
+            "ml_flag": true,
+            "confidence": 90,
+            "disputed": false,
+            "timestamp": "2024-05-01T12:00:00Z"
+          }
+        ]
+      }
+    }
+  ],
+  "metadata": {
+    "pactSpecification": {
+      "version": "2.0.0"
+    },
+    "matching": "type: response bodies match by shape (keys present, JSON types equal); arrays match on their first element"
+  }
+}

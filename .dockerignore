@@ -43,3 +43,15 @@ models/
 docker-compose*.yml
 toxiproxy.json
 mkdocs.yml
+
+# Non-Python build trees — not needed by the runtime image (minimise surface)
+rust/
+go/
+crates/
+packages/
+sdk/
+chaos-mesh/
+Cargo.toml
+Cargo.lock
+target/
+node_modules/

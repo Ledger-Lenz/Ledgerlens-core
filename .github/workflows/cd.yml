@@ -97,6 +97,12 @@ jobs:
     needs: gate
     if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
+    # id-token + attestations: keyless cosign signing and GitHub build
+    # provenance attestations (see docs/container-supply-chain.md).
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
@@ -119,6 +125,11 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "Skipping CD deployment: DOCKER_USERNAME and/or DOCKER_PASSWORD secrets are not configured."
           fi
+
+      # Clamp all build timestamps to the commit time so the same commit
+      # rebuilds to the same image digest (reproducible builds).
+      - name: Compute SOURCE_DATE_EPOCH
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         if: steps.deploy-config.outputs.enabled == 'true'
@@ -144,6 +155,7 @@ jobs:
           push: false
           load: true
           tags: ${{ env.DOCKER_USERNAME }}/ledgerlens:${{ env.DEPLOY_SHA }}
+          build-args: SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
 
       - name: Install Trivy
         if: steps.deploy-config.outputs.enabled == 'true'
@@ -190,6 +202,30 @@ jobs:
           context: .
           push: true
           tags: ${{ env.DOCKER_USERNAME }}/ledgerlens:${{ env.DEPLOY_SHA }}
+          build-args: SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          # SLSA provenance + SBOM attached to the image index by BuildKit.
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        if: steps.deploy-config.outputs.enabled == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing via GitHub OIDC — the signature is bound to this
+      # workflow identity and recorded in the Rekor transparency log.
+      - name: Sign image with cosign
+        if: steps.deploy-config.outputs.enabled == 'true'
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "docker.io/${DOCKER_USERNAME}/ledgerlens@${IMAGE_DIGEST}"
+
+      - name: Publish build provenance attestation
+        if: steps.deploy-config.outputs.enabled == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: index.docker.io/${{ env.DOCKER_USERNAME }}/ledgerlens
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
       - name: Set up Kubeconfig
         if: steps.deploy-config.outputs.enabled == 'true'

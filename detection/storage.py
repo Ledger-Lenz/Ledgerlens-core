@@ -5,6 +5,11 @@ integration point is wired up (see README's "Open Integration Points"),
 `run_pipeline.py` and the local API (`api/main.py`) persist and read
 `RiskScore` records here.
 
+This module is the single persistence abstraction for detection data. A
+parallel SQLAlchemy Core store (`detection/storage_orm.py`) previously
+duplicated `RiskScoreStore.upsert_trades` but had no callers; it was removed
+in #978 to avoid divergent query and transaction semantics.
+
 ## How to add a new migration
 1. Append a tuple to `_MIGRATIONS`:
        (version, "short description", "ALTER TABLE ... or CREATE TABLE ...")
@@ -1844,6 +1849,27 @@ def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None =
             ],
         )
         conn.commit()
+
+
+def retract_bridge_transfers(
+    chain: str, tx_hashes: set[str] | list[str], db_path: str | None = None
+) -> int:
+    """Delete bridge transfers ingested from reorged (orphaned) EVM blocks.
+
+    Returns the number of rows removed.
+    """
+    hashes = list(tx_hashes)
+    if not hashes:
+        return 0
+    init_db(db_path)
+    placeholders = ",".join("?" for _ in hashes)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            f"DELETE FROM bridge_transfers WHERE chain = ? AND tx_hash_evm IN ({placeholders})",
+            (chain, *hashes),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def get_bridge_transfers(

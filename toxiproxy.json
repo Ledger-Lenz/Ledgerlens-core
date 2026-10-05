@@ -16,5 +16,17 @@
     "listen": "0.0.0.0:16379",
     "upstream": "redis:6379",
     "enabled": true
+  },
+  {
+    "name": "soroban_rpc_proxy",
+    "listen": "0.0.0.0:18002",
+    "upstream": "soroban-testnet.stellar.org:443",
+    "enabled": true
+  },
+  {
+    "name": "oracle_node_proxy",
+    "listen": "0.0.0.0:18003",
+    "upstream": "redis:6379",
+    "enabled": true
   }
 ]

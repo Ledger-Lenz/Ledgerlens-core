@@ -84,12 +84,19 @@ def _make_governance_db(db_path: str) -> None:
 
     init_db(db_path)
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        "INSERT INTO governance_committee (member, added_at, active) VALUES (?,?,1)",
-        ("alice", datetime.now(timezone.utc).isoformat()),
-    )
+    for member in ("alice", "bob", "carol"):
+        conn.execute(
+            "INSERT INTO governance_committee (member, added_at, active) VALUES (?,?,1)",
+            (member, datetime.now(timezone.utc).isoformat()),
+        )
     conn.commit()
     conn.close()
+
+
+def _sign_off(engine: GovernanceEngine, proposal_id: int) -> None:
+    """Record the sign-offs a config_change needs before it may execute."""
+    engine.record_signoff(proposal_id, "bob", "risk_owner", {"impact_analysis": "backtest-2026-06.json"})
+    engine.record_signoff(proposal_id, "carol", "compliance_officer")
 
 
 def _execute_threshold_proposal(db_path: str, new_value: str, cwd: str) -> None:
@@ -109,6 +116,7 @@ def _execute_threshold_proposal(db_path: str, new_value: str, cwd: str) -> None:
         conn.execute("UPDATE governance_proposals SET status='passed' WHERE id=?", (p.id,))
         conn.commit()
         conn.close()
+        _sign_off(engine, p.id)
         result = engine.execute_proposal(p.id)
         assert result.status == "executed", result.execution_error
     finally:
@@ -430,6 +438,7 @@ class TestExecuteProposalEndpoint:
             conn.execute("UPDATE governance_proposals SET status='passed' WHERE id=?", (p.id,))
             conn.commit()
             conn.close()
+            _sign_off(engine, p.id)
 
             app.dependency_overrides[require_admin_key] = lambda: None
             try:

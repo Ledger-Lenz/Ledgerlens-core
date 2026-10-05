@@ -53,7 +53,7 @@ class TestGetWeightedCorrections:
         for days_ago in [0, 30, 60]:
             ts = (now - timedelta(days=days_ago)).isoformat()
             conn.execute(
-                """INSERT INTO analyst_feedback
+                """INSERT INTO analyst_corrections
                    (wallet, asset_pair, analyst_label, original_score,
                     confidence, has_feature_vector, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -79,7 +79,7 @@ class TestGetWeightedCorrections:
         for days_ago in [0, 30, 60]:
             ts = (now - timedelta(days=days_ago)).isoformat()
             conn.execute(
-                """INSERT INTO analyst_feedback
+                """INSERT INTO analyst_corrections
                    (wallet, asset_pair, analyst_label, original_score,
                     confidence, has_feature_vector, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -101,7 +101,7 @@ class TestGetWeightedCorrections:
 
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            """INSERT INTO analyst_feedback
+            """INSERT INTO analyst_corrections
                (wallet, asset_pair, analyst_label, original_score,
                 confidence, has_feature_vector, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",

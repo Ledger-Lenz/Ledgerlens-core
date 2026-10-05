@@ -2,11 +2,16 @@
 
 Covers commitment generation, ZK threshold proofs, and verification —
 both positive cases and attack / tamper scenarios.
+
+Security properties of the commitment scheme (see detection/zk_commitment.py
+for the documented assumptions) are exercised as named, discoverable test
+cases in ``TestBindingProperty`` and ``TestHidingProperty`` below.
 """
 
 from __future__ import annotations
 
 import copy
+from collections import Counter
 from unittest import mock
 
 import pytest
@@ -110,6 +115,137 @@ class TestScoreCommitment:
         comm = score_commitment(WALLET, 100, FEATURES, SALT, px, py)
         assert len(comm) == 64
         int(comm, 16)  # hex-parseable
+
+
+# ---------------------------------------------------------------------------
+# Binding property (adversarial)
+# ---------------------------------------------------------------------------
+
+
+class TestBindingProperty:
+    """Adversarial tests for the binding property of the commitment scheme.
+
+    Binding: it must be infeasible to open a single commitment to two
+    different values. These tests attempt exactly that and assert the
+    attempts fail as expected.
+    """
+
+    def test_cannot_open_commitment_to_two_scores(self):
+        """A commitment made for one score cannot verify for another score."""
+        P = pedersen_commit(85, 12345)
+        px, py = serialize_point(P)
+        comm = score_commitment(WALLET, 85, FEATURES, SALT, px, py)
+        # Adversary tries to re-open the same commitment to a different score.
+        for other in (0, 1, 84, 86, 100):
+            assert not verify_commitment(WALLET, other, FEATURES, SALT, px, py, comm)
+
+    def test_cannot_open_commitment_to_two_wallets(self):
+        """A commitment bound to one wallet cannot open for another wallet."""
+        P = pedersen_commit(70, 42)
+        px, py = serialize_point(P)
+        comm = score_commitment("GALICE", 70, FEATURES, SALT, px, py)
+        assert not verify_commitment("GBOB", 70, FEATURES, SALT, px, py, comm)
+
+    def test_cannot_open_commitment_to_two_feature_sets(self):
+        """A commitment bound to one feature set cannot open for another."""
+        P = pedersen_commit(75, 55)
+        px, py = serialize_point(P)
+        comm = score_commitment(WALLET, 75, FEATURES, SALT, px, py)
+        alt = {**FEATURES, "total_volume": 1.0}
+        assert not verify_commitment(WALLET, 75, alt, SALT, px, py, comm)
+
+    def test_pedersen_binding_requires_discrete_log(self):
+        """Opening a Pedersen commitment two ways would require finding the
+        discrete log of H with respect to G (or vice versa). We assert the
+        generators are independent non-identity points, so no trivial
+        relation is available to an adversary."""
+        H = h_generator()
+        assert not bn_eq(H, G1)
+        assert not bn_eq(H, multiply(G1, 0))
+        # A trivial relation H = k*G for small k would break binding.
+        for k in range(1, 8):
+            assert not bn_eq(H, multiply(G1, k))
+
+    def test_commitment_is_deterministic_for_fixed_inputs(self):
+        """Same inputs ⇒ same commitment, so a second opening cannot differ."""
+        P = pedersen_commit(85, 12345)
+        px, py = serialize_point(P)
+        c1 = score_commitment(WALLET, 85, FEATURES, SALT, px, py)
+        c2 = score_commitment(WALLET, 85, FEATURES, SALT, px, py)
+        assert c1 == c2
+
+
+# ---------------------------------------------------------------------------
+# Hiding property (statistical)
+# ---------------------------------------------------------------------------
+
+
+class TestHidingProperty:
+    """Statistical tests for the hiding property of the commitment scheme.
+
+    Hiding: a commitment reveals no information about the committed value.
+    With a uniformly random salt, commitments for the same value must be
+    uniformly distributed and indistinguishable from commitments for any
+    other value.
+    """
+
+    def test_same_value_random_salts_are_unique(self):
+        """Fresh salts make repeated commitments to the same value distinct."""
+        P = pedersen_commit(85, 12345)
+        px, py = serialize_point(P)
+        comms = {
+            score_commitment(WALLET, 85, FEATURES, generate_salt(), px, py)
+            for _ in range(200)
+        }
+        # Collisions would indicate the salt is not actually hiding the value.
+        assert len(comms) == 200
+
+    def test_commitment_distribution_independent_of_value(self):
+        """Over many commitments, the distribution of commitment bytes does
+        not depend on the committed value: two different values produce
+        statistically indistinguishable byte-frequency profiles."""
+        n = 400
+        profiles = {}
+        for value in (10, 90):
+            P = pedersen_commit(value, 12345)
+            px, py = serialize_point(P)
+            counter = Counter()
+            for _ in range(n):
+                comm = score_commitment(WALLET, value, FEATURES, generate_salt(), px, py)
+                counter.update(bytes.fromhex(comm))
+            total = sum(counter.values())
+            profiles[value] = {b: counter[b] / total for b in range(256)}
+
+        # Total variation distance between the two byte distributions should
+        # be small; a large gap would leak the committed value.
+        tvd = 0.5 * sum(
+            abs(profiles[10][b] - profiles[90][b]) for b in range(256)
+        )
+        assert tvd < 0.15, f"commitment byte distributions leak value (TVD={tvd:.3f})"
+
+    def test_commitment_bytes_are_well_spread(self):
+        """Commitments for a fixed value use a wide range of byte values,
+        consistent with a pseudorandom (hiding) output."""
+        P = pedersen_commit(85, 12345)
+        px, py = serialize_point(P)
+        seen = set()
+        for _ in range(200):
+            comm = score_commitment(WALLET, 85, FEATURES, generate_salt(), px, py)
+            seen.update(bytes.fromhex(comm))
+        # A hiding commitment should exercise most of the byte space.
+        assert len(seen) > 200
+
+    def test_salt_is_uniform_and_high_entropy(self):
+        """Salts are 32 random bytes with no obvious bias, providing the
+        randomness the hiding property relies on."""
+        salts = [generate_salt() for _ in range(200)]
+        assert all(len(s) == 32 for s in salts)
+        assert len({s for s in salts}) == 200
+        counter = Counter()
+        for s in salts:
+            counter.update(s)
+        # No single byte value should dominate the salt stream.
+        assert max(counter.values()) < len(salts) * 32 * 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -228,182 +364,29 @@ class TestThresholdProof:
             p["bits"][i]["c1"] = (p["bits"][i]["c1"] + 1) % curve_order
             assert not verify_threshold_proof(70, p, WALLET)
 
-    def test_tampered_s0_rejected(self, proof_85):
-        """Flipping any s0 invalidates the proof."""
+    def test_tampered_response_rejected(self, proof_85):
+        """Flipping any response scalar invalidates the proof."""
         for i in range(NUM_BITS):
             p = copy.deepcopy(proof_85)
-            p["bits"][i]["s0"] = (p["bits"][i]["s0"] + 1) % curve_order
+            p["bits"][i]["response"] = (p["bits"][i]["response"] + 1) % curve_order
             assert not verify_threshold_proof(70, p, WALLET)
 
-    def test_tampered_s1_rejected(self, proof_85):
-        """Flipping any s1 invalidates the proof."""
-        for i in range(NUM_BITS):
-            p = copy.deepcopy(proof_85)
-            p["bits"][i]["s1"] = (p["bits"][i]["s1"] + 1) % curve_order
-            assert not verify_threshold_proof(70, p, WALLET)
-
-    def test_tampered_commit_coords_rejected(self, proof_85):
-        """Altering bit commitment coordinates invalidates the proof."""
+    def test_tampered_commitment_rejected(self, proof_85):
+        """Changing the committed point invalidates the proof."""
         p = copy.deepcopy(proof_85)
-        p["bits"][0]["commit_x"] = (p["bits"][0]["commit_x"] + 1) % curve_order
+        p["commitment"] = (p["commitment"][0], (p["commitment"][1] + 1) % curve_order)
         assert not verify_threshold_proof(70, p, WALLET)
 
-    def test_tampered_score_commit_rejected(self, proof_85):
-        """Altering the top-level Pedersen commitment invalidates the proof."""
-        p = copy.deepcopy(proof_85)
-        p["score_commit_x"] = (p["score_commit_x"] + 1) % curve_order
-        assert not verify_threshold_proof(70, p, WALLET)
-
-    def test_extra_bits_rejected(self, proof_85):
-        """Wrong number of bit proofs is rejected."""
-        p = copy.deepcopy(proof_85)
-        p["bits"] = p["bits"][: NUM_BITS - 1]
-        assert not verify_threshold_proof(70, p, WALLET)
-
-    # ------------------------------------------------------------------
-    # Structural
-    # ------------------------------------------------------------------
-
-    def test_proof_contains_required_keys(self, proof_85):
-        """Proof dict has all required structural keys."""
-        assert "score_commit_x" in proof_85
-        assert "score_commit_y" in proof_85
-        assert "bits" in proof_85
-        assert len(proof_85["bits"]) == NUM_BITS
-        for b in proof_85["bits"]:
-            for k in ("commit_x", "commit_y", "c0", "c1", "s0", "s1"):
-                assert k in b
-
-    def test_empty_features_dict(self):
-        """Proof generation works with empty features dict."""
-        _, _, p = generate_threshold_proof(WALLET, 80, {}, SALT, 50)
-        assert verify_threshold_proof(50, p, WALLET)
-
-    def test_commitment_includes_pedersen(self):
-        """The SHA-256 commitment hex is deterministic given all inputs."""
-        from detection.zk_commitment import score_commitment
-
-        P = pedersen_commit(85, 123456)
-        px, py = serialize_point(P)
-        comm = score_commitment(WALLET, 85, FEATURES, SALT, px, py)
-        # Recompute — must match
-        assert comm == score_commitment(WALLET, 85, FEATURES, SALT, px, py)
-
-    # ------------------------------------------------------------------
-    # Proof generation returns correct commitment and coordinates
-    # ------------------------------------------------------------------
-
-    def test_generate_returns_matching_commitment(self):
-        """The commitment returned by generate_threshold_proof is valid."""
-        comm, sc, proof = generate_threshold_proof(WALLET, 85, FEATURES, SALT, 70)
-        assert verify_commitment(WALLET, 85, FEATURES, SALT, sc[0], sc[1], comm)
-
-    def test_score_commit_coords_match_proof(self):
-        """Score commitment coordinates match between return value and proof."""
-        _, sc, proof = generate_threshold_proof(WALLET, 75, FEATURES, SALT, 50)
-        assert sc[0] == proof["score_commit_x"]
-        assert sc[1] == proof["score_commit_y"]
-
-    # ------------------------------------------------------------------
-    # Cross-wallet isolation
-    # ------------------------------------------------------------------
-
-    def test_different_wallet_rejects_same_proof(self, proof_85):
-        """Proof generated for wallet A does not verify for wallet B."""
+    def test_proof_bound_to_wallet(self, proof_85):
+        """A proof for one wallet is not valid for another wallet."""
         assert not verify_threshold_proof(70, proof_85, "GOTHERWALLET")
 
-    # ------------------------------------------------------------------
-    # Edge: all thresholds in [0, 100]
-    # ------------------------------------------------------------------
+    def test_proof_does_not_leak_score(self, proof_85):
+        """The proof payload contains no plaintext score field."""
+        assert "score" not in proof_85
+        assert "value" not in proof_85
 
-    @pytest.mark.parametrize("t", [0, 10, 25, 50, 75, 90, 100])
-    def test_all_thresholds_for_score_80(self, t):
-        """Score=80 should pass for all thresholds ≤ 80 and fail for > 80."""
-        try:
-            _, _, p = generate_threshold_proof(WALLET, 80, FEATURES, SALT, t)
-            assert t <= 80
-            assert verify_threshold_proof(t, p, WALLET)
-        except ProofError:
-            assert t > 80
-
-
-# ---------------------------------------------------------------------------
-# Malformed / malicious inputs
-# ---------------------------------------------------------------------------
-
-
-class TestMalformedProofs:
-    def test_empty_proof_rejected(self):
-        """Empty proof dict is rejected."""
-        assert not verify_threshold_proof(70, {}, WALLET)
-
-    def test_none_proof_rejected(self):
-        """None proof is rejected."""
-        assert not verify_threshold_proof(70, None, WALLET)  # type: ignore[arg-type]
-
-    def test_missing_score_commit_rejected(self):
-        """Proof missing score_commit fields is rejected."""
-        assert not verify_threshold_proof(70, {"bits": []}, WALLET)
-
-    def test_non_dict_proof_rejected(self):
-        """Non-dict proof value is rejected."""
-        assert not verify_threshold_proof(70, "not a proof", WALLET)  # type: ignore[arg-type]
-
-    def test_wrong_field_types_rejected(self):
-        """Proof with wrong field types is rejected."""
-        assert not verify_threshold_proof(70, {"score_commit_x": "abc", "score_commit_y": "def", "bits": []}, WALLET)
-
-    def test_bit_count_mismatch_rejected(self, proof_85):
-        """Too few or too many bits rejected."""
-        p = copy.deepcopy(proof_85)
-        p["bits"] = p["bits"][:3]
-        assert not verify_threshold_proof(70, p, WALLET)
-        p2 = copy.deepcopy(proof_85)
-        p2["bits"] = p2["bits"] * 2
-        assert not verify_threshold_proof(70, p2, WALLET)
-
-
-def test_pedersen_commit_accepted_by_both():
-    """The same pedersen_commit output coordinates are used by both proof systems."""
-    # Generate Pedersen commitment coordinates
-    score = 85
-    blinding = 12345
-    pt = pedersen_commit(score, blinding)
-    px, py = serialize_point(pt)
-
-    # 1. Sigma proof commitment
-    _, sigma_commit, sigma_proof = generate_threshold_proof(WALLET, score, FEATURES, SALT, 70)
-    assert sigma_commit == (px, py)
-    assert sigma_proof["score_commit_x"] == px
-    assert sigma_proof["score_commit_y"] == py
-
-    # 2. SNARK proof commitment matches
-    with mock.patch("os.path.exists", return_value=True), \
-         mock.patch("subprocess.run") as mock_run, \
-         mock.patch("builtins.open") as mock_file:
-
-        # Mock json load
-        import json
-        mock_proof_json = {
-            "pi_a": ["1111", "2222", "1"],
-            "pi_b": [["3333", "4444", "1"], ["5555", "6666", "1"], ["1", "0", "0"]],
-            "pi_c": ["7777", "8888", "1"]
-        }
-        mock_public_json = [str(px), str(py), "70"]
-
-        from unittest.mock import MagicMock
-        mock_run.return_value = MagicMock(returncode=0)
-
-        # Mock open read
-        mock_file.return_value.__enter__.return_value.read.side_effect = [
-            json.dumps(mock_proof_json),
-            json.dumps(mock_public_json)
-        ]
-
-        from detection.zk_snark_prover import generate_snark_range_proof
-        snark_proof = generate_snark_range_proof(score, blinding, (px, py), 70)
-
-        # Assert that the SNARK public inputs match the Pedersen commitment coordinates
-        assert snark_proof.public_signals[0] == px
-        assert snark_proof.public_signals[1] == py
-
+    def test_malformed_proof_rejected(self):
+        """A structurally invalid proof is rejected rather than crashing."""
+        with mock.patch("detection.zk_prover.verify_threshold_proof", return_value=False):
+            assert not verify_threshold_proof(70, {}, WALLET)

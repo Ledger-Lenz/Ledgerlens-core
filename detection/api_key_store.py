@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     status TEXT NOT NULL DEFAULT 'active',
     rotated_from TEXT,
     rotated_to TEXT,
-    rotation_deadline TEXT
+    rotation_deadline TEXT,
+    tier TEXT NOT NULL DEFAULT 'free'
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_revoked ON api_keys (revoked);
@@ -94,6 +95,7 @@ def _init_table() -> None:
         _ensure_column(conn, existing, "rotated_from", "TEXT")
         _ensure_column(conn, existing, "rotated_to", "TEXT")
         _ensure_column(conn, existing, "rotation_deadline", "TEXT")
+        _ensure_column(conn, existing, "tier", "TEXT NOT NULL DEFAULT 'free'")
 
         # Ensure indexes exist
         _ensure_index(conn, "idx_api_keys_hash", "api_keys", "key_hash")
@@ -132,8 +134,12 @@ def create_api_key(
     namespace_id: str = "",
     rate_limit_per_minute: int = 60,
     expires_at: str | None = None,
+    tier: str = "free",
 ) -> dict:
-    """Create a new API key. Returns the plaintext key once — it is not stored."""
+    """Create a new API key. Returns the plaintext key once — it is not stored.
+
+    *tier* selects the rate-limit / GraphQL cost bucket (see :mod:`api.policy`).
+    """
     _init_table()
     invalid = set(scopes) - _VALID_SCOPES
     if invalid:
@@ -153,9 +159,10 @@ def create_api_key(
         conn.execute(
             "INSERT INTO api_keys (key_id, key_hash, namespace_id, scopes, rate_limit_per_minute, "
             "daily_quota, namespace_daily_quota, monthly_quota, namespace_monthly_quota, "
-            "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, expires_at, tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (key_id, key_hash, namespace_id, ",".join(sorted(scopes)), rate_limit_per_minute,
-             daily_quota, namespace_daily_quota, monthly_quota, namespace_monthly_quota, now, expires_at),
+             daily_quota, namespace_daily_quota, monthly_quota, namespace_monthly_quota, now, expires_at,
+             tier),
         )
         conn.commit()
 
@@ -171,6 +178,7 @@ def create_api_key(
         "namespace_monthly_quota": namespace_monthly_quota,
         "created_at": now,
         "expires_at": expires_at,
+        "tier": tier,
     }
 
 

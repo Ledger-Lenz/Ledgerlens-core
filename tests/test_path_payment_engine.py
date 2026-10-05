@@ -14,7 +14,10 @@ from detection.path_payment_engine import (
     PathPaymentCycle,
     PathPaymentGraph,
     _score_cycle,
+    detect_path_payment_sandwiches,
+    path_payment_sandwiches_to_alerts,
 )
+from ingestion.data_models import Asset, PathPayment
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,6 +76,71 @@ def _make_7hop_cycle(recovery: float = 0.96, duration_s: int = 3500) -> list[Hop
         _hop(wallets[6], assets[6], wallets[0], "XLM", 100.0 * recovery, duration_s, "op7_6")
     )
     return hops
+
+
+def _payment(
+    payment_id: str,
+    source: str,
+    destination: str,
+    source_asset: Asset,
+    destination_asset: Asset,
+    source_amount: float,
+    destination_amount: float,
+    seconds: int,
+    path: list[Asset],
+) -> PathPayment:
+    return PathPayment(
+        id=payment_id,
+        transaction_hash=f"tx-{payment_id}",
+        timestamp=_BASE + timedelta(seconds=seconds),
+        source_account=source,
+        destination_account=destination,
+        source_asset=source_asset,
+        destination_asset=destination_asset,
+        source_amount=source_amount,
+        destination_amount=destination_amount,
+        path=path,
+        strict_send=True,
+    )
+
+
+def test_detects_profitable_path_payment_sandwich_with_shared_route_asset():
+    xlm = Asset(code="XLM")
+    usdc = Asset(code="USDC", issuer="G" + "A" * 55)
+    btc = Asset(code="BTC", issuer="G" + "B" * 55)
+    payments = [
+        _payment("front", _W, _W2, xlm, usdc, 100.0, 99.0, 0, [btc]),
+        _payment("victim", _W3, _W4, xlm, btc, 500.0, 490.0, 30, [usdc]),
+        _payment("back", _W, _W2, usdc, xlm, 99.0, 101.0, 60, [btc]),
+    ]
+
+    candidates = detect_path_payment_sandwiches(payments)
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.attacker == _W
+    assert candidate.victim == _W3
+    assert candidate.recovery_ratio > 1.0
+    alert = path_payment_sandwiches_to_alerts(candidates)[0]
+    assert alert["alert_type"] == "SANDWICH_ATTACK"
+    assert alert["detail"]["attack_surface"] == "stellar_path_payment"
+
+
+def test_path_payment_sandwich_requires_positive_extraction_and_shared_path():
+    xlm = Asset(code="XLM")
+    usdc = Asset(code="USDC", issuer="G" + "A" * 55)
+    btc = Asset(code="BTC", issuer="G" + "B" * 55)
+    payments = [
+        _payment("front", _W, _W2, xlm, usdc, 100.0, 99.0, 0, []),
+        _payment("victim", _W3, _W4, xlm, btc, 500.0, 490.0, 30, [usdc]),
+        _payment("back", _W, _W2, usdc, xlm, 99.0, 99.0, 60, []),
+    ]
+
+    assert detect_path_payment_sandwiches(payments) == []
+
+    payments[-1] = _payment("back", _W, _W2, usdc, xlm, 99.0, 101.0, 60, [])
+    payments[1] = _payment("victim", _W3, _W4, xlm, btc, 500.0, 490.0, 30, [])
+    assert detect_path_payment_sandwiches(payments) == []
 
 
 # ---------------------------------------------------------------------------

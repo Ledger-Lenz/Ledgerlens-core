@@ -3,6 +3,26 @@
 import json
 import os
 
+import pytest
+
+
+def test_save_models_does_not_activate_candidate_when_robustness_gate_fails(
+    tmp_path, monkeypatch
+):
+    from detection.model_registry import ModelPromotionError
+    import detection.model_registry as model_registry
+    from detection.model_training import save_models
+
+    def reject_promotion(candidate_models, reference_models=None):
+        raise ModelPromotionError({"passed": False})
+
+    monkeypatch.setattr(model_registry, "validate_model_promotion_robustness", reject_promotion)
+    with pytest.raises(ModelPromotionError):
+        save_models({"random_forest": {"model": object()}}, model_dir=str(tmp_path))
+
+    assert not (tmp_path / "random_forest_latest.txt").exists()
+    assert not (tmp_path / "random_forest.joblib").exists()
+
 
 def test_training_with_calibration_creates_metrics(tmp_path):
     """After training with --calibrate, metrics.json must contain

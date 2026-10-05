@@ -174,9 +174,15 @@ class TestSignModelsCommand:
     def test_save_models_produces_signed_artifacts(self, tmp_path, monkeypatch):
         """save_models signs every .joblib it writes."""
         import config.settings as settings_module
+        import detection.model_registry as model_registry
         from sklearn.ensemble import RandomForestClassifier
         from detection.model_training import save_models
 
+        monkeypatch.setattr(
+            model_registry,
+            "validate_model_promotion_robustness",
+            lambda candidate_models, reference_models: {"passed": True, "models": {}},
+        )
         model_dir = str(tmp_path / "models")
         object.__setattr__(settings_module.settings, "model_dir", model_dir)
 

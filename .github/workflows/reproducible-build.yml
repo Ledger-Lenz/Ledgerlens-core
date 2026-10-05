@@ -1,0 +1,47 @@
+name: Reproducible Container Build
+
+# Rebuilds the runtime image twice from scratch with the same
+# SOURCE_DATE_EPOCH and fails if the digests differ. See
+# docs/container-supply-chain.md for the known limits of reproducibility.
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "requirements/**"
+      - ".github/workflows/reproducible-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproducible:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime image twice
+        run: |
+          epoch=$(git log -1 --format=%ct)
+          for n in 1 2; do
+            docker buildx build --no-cache --target runtime \
+              --build-arg SOURCE_DATE_EPOCH="$epoch" \
+              --output "type=oci,dest=$RUNNER_TEMP/img$n.tar,rewrite-timestamp=true" \
+              --metadata-file "$RUNNER_TEMP/meta$n.json" .
+          done
+
+      - name: Compare image digests
+        run: |
+          d1=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta1.json")
+          d2=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta2.json")
+          echo "build 1: $d1"
+          echo "build 2: $d2"
+          if [ "$d1" != "$d2" ]; then
+            echo "::error::Container build is not reproducible ($d1 != $d2). See docs/container-supply-chain.md."
+            exit 1
+          fi
+          echo "✅ Reproducible: $d1"

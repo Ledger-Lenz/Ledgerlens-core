@@ -10,6 +10,13 @@ that pattern directly from `ingestion.data_models.PathPayment` records.
 PathPaymentGraph / PathCycleDetector implement the multi-hop engine described
 in GitHub issue #121: a directed (wallet, asset) hop graph with iterative DFS
 cycle detection bounded to 7 hops.
+
+Bridge-spanning routes: :func:`bridge_hop_edges` stitches a matched Stellar →
+EVM → Stellar bridge round trip (``ingestion.bridge_loader`` transfers,
+paired by ``detection.cross_chain_correlator``) into the hop graph as one
+synthetic hop, so a cycle that leaves Stellar through a bridge and comes back
+is detected like any other path-payment cycle. See
+``docs/cross_chain_detection.md``.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,7 +32,8 @@ from typing import Optional
 
 import pandas as pd
 
-from ingestion.data_models import PathPayment
+from detection.cross_chain_correlator import CrossChainCorrelator, _parse_timestamp
+from ingestion.data_models import BridgeTransfer, PathPayment
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +45,9 @@ _STELLAR_KEY_RE = re.compile(r"^G[A-Z2-7]{55}$")
 MAX_NODES_PER_WALLET = 500
 MAX_EDGES_PER_WALLET = 2000
 MAX_GRAPH_EDGES = 500_000
+
+# operation_id prefix marking a synthetic bridge hop (see bridge_hop_edges).
+BRIDGE_HOP_PREFIX = "bridge:"
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 
@@ -69,6 +81,141 @@ class PathPaymentCycle:
     @property
     def path_length(self) -> int:
         return len(self.hops)
+
+    @property
+    def crosses_bridge(self) -> bool:
+        """True when the cycle leaves Stellar through a bridge and comes back."""
+        return any(h.operation_id.startswith(BRIDGE_HOP_PREFIX) for h in self.hops)
+
+
+@dataclass
+class PathPaymentSandwichCandidate:
+    attacker: str
+    victim: str
+    asset_pair: str
+    front_run_id: str
+    victim_payment_id: str
+    back_run_id: str
+    recovery_ratio: float
+    path_hops: int
+    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+def detect_path_payment_sandwiches(
+    payments: list[PathPayment],
+    max_window: pd.Timedelta = pd.Timedelta(minutes=5),
+    min_return_ratio: float = 1.0,
+) -> list[PathPaymentSandwichCandidate]:
+    """Detect profitable attacker/victim/attacker sequences over routed payments.
+
+    The attacker's opening and closing payments must exchange the same asset
+    pair in opposite directions. A victim payment between them must share an
+    intermediate route asset, and the attacker must recover more of its
+    starting asset than it spent after the complete round trip.
+    """
+    if max_window < pd.Timedelta(0):
+        raise ValueError("max_window must be non-negative")
+    if min_return_ratio < 0:
+        raise ValueError("min_return_ratio must be non-negative")
+    if not payments:
+        return []
+
+    ordered = sorted(payments, key=lambda p: (p.timestamp, p.id))
+    timestamps = [p.timestamp for p in ordered]
+    closings: dict[tuple[str, str, str], list[PathPayment]] = defaultdict(list)
+    for payment in ordered:
+        closings[
+            (
+                payment.source_account,
+                payment.source_asset.pair_symbol,
+                payment.destination_asset.pair_symbol,
+            )
+        ].append(payment)
+
+    candidates: list[PathPaymentSandwichCandidate] = []
+    seen: set[tuple[str, str, str]] = set()
+    for opening_idx, opening in enumerate(ordered):
+        opening_assets = {asset.pair_symbol for asset in opening.path}
+        opening_assets.add(opening.destination_asset.pair_symbol)
+        reverse_key = (
+            opening.source_account,
+            opening.destination_asset.pair_symbol,
+            opening.source_asset.pair_symbol,
+        )
+        first_close_idx = bisect_right(
+            timestamps, opening.timestamp, lo=opening_idx + 1
+        )
+        last_close_idx = bisect_right(
+            timestamps, opening.timestamp + max_window, lo=first_close_idx
+        )
+        for closing in closings.get(reverse_key, []):
+            if closing.timestamp <= opening.timestamp:
+                continue
+            if closing.timestamp > opening.timestamp + max_window:
+                break
+            if closing.id == opening.id:
+                continue
+            recovery_ratio = float(closing.destination_amount / opening.source_amount)
+            if recovery_ratio <= min_return_ratio:
+                continue
+
+            close_assets = {asset.pair_symbol for asset in closing.path}
+            close_assets.add(closing.source_asset.pair_symbol)
+            route_assets = opening_assets | close_assets
+            victim_start = first_close_idx
+            victim_end = min(bisect_left(timestamps, closing.timestamp, lo=victim_start), last_close_idx)
+            for victim in ordered[victim_start:victim_end]:
+                if victim.source_account == opening.source_account or not victim.path:
+                    continue
+                victim_assets = {asset.pair_symbol for asset in victim.path}
+                if not route_assets.intersection(victim_assets):
+                    continue
+
+                signature = (opening.id, victim.id, closing.id)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                candidates.append(
+                    PathPaymentSandwichCandidate(
+                        attacker=opening.source_account,
+                        victim=victim.source_account,
+                        asset_pair=(
+                            f"{opening.source_asset.pair_symbol}/"
+                            f"{opening.destination_asset.pair_symbol}"
+                        ),
+                        front_run_id=opening.id,
+                        victim_payment_id=victim.id,
+                        back_run_id=closing.id,
+                        recovery_ratio=recovery_ratio,
+                        path_hops=len(opening.path) + len(victim.path) + len(closing.path) + 3,
+                    )
+                )
+                break
+
+    return candidates
+
+
+def path_payment_sandwiches_to_alerts(
+    candidates: list[PathPaymentSandwichCandidate],
+) -> list[dict]:
+    """Convert routed-payment sandwich candidates into standard attack alerts."""
+    return [
+        {
+            "alert_type": "SANDWICH_ATTACK",
+            "wallet": candidate.attacker,
+            "asset_pair": candidate.asset_pair,
+            "detail": {
+                "attack_surface": "stellar_path_payment",
+                "victim": candidate.victim,
+                "front_run_id": candidate.front_run_id,
+                "victim_payment_id": candidate.victim_payment_id,
+                "back_run_id": candidate.back_run_id,
+                "recovery_ratio": candidate.recovery_ratio,
+                "path_hops": candidate.path_hops,
+            },
+        }
+        for candidate in candidates
+    ]
 
 
 # ── Scoring ──────────────────────────────────────────────────────────────────
@@ -318,7 +465,6 @@ class PathCycleDetector:
 
     def ingest(self, hop_records: list[dict]) -> list[PathPaymentCycle]:
         """Process raw Horizon path_payment records and return newly detected cycles."""
-        newly_detected: list[PathPaymentCycle] = []
         wallets_to_check: set[str] = set()
 
         for rec in hop_records:
@@ -328,6 +474,23 @@ class PathCycleDetector:
             self._graph.add_hop(edge)
             wallets_to_check.add(edge.src_wallet)
 
+        return self._detect(wallets_to_check)
+
+    def ingest_bridge_transfers(
+        self,
+        transfers: list[BridgeTransfer],
+        correlator: CrossChainCorrelator | None = None,
+    ) -> list[PathPaymentCycle]:
+        """Stitch matched bridge round trips into the hop graph and return newly
+        detected cycles, including routes that span the bridge."""
+        wallets_to_check: set[str] = set()
+        for edge in bridge_hop_edges(transfers, correlator):
+            self._graph.add_hop(edge)
+            wallets_to_check.update((edge.src_wallet, edge.dst_wallet))
+        return self._detect(wallets_to_check)
+
+    def _detect(self, wallets_to_check: set[str]) -> list[PathPaymentCycle]:
+        newly_detected: list[PathPaymentCycle] = []
         for wallet in wallets_to_check:
             for cycle in self._graph.find_cycles(wallet):
                 if cycle.recovery_ratio < self.min_recovery_ratio:
@@ -358,6 +521,38 @@ def _validate_window(seconds: float) -> None:
         raise ValueError(
             f"cycle_window_seconds must be between 300 and 86400, got {seconds}"
         )
+
+
+def bridge_hop_edges(
+    transfers: list[BridgeTransfer],
+    correlator: CrossChainCorrelator | None = None,
+) -> list[HopEdge]:
+    """Convert matched bridge round trips into synthetic Stellar hop edges.
+
+    Each ``(outbound, inbound)`` pair matched by
+    :meth:`CrossChainCorrelator.match_round_trips` (same EVM wallet, within
+    the window, matching amount) becomes one hop from
+    ``(outbound.stellar_wallet, outbound.token)`` to
+    ``(inbound.stellar_wallet, inbound.token)`` carrying the inbound USD
+    amount, stamped at the inbound time. The EVM leg itself is collapsed.
+    """
+    correlator = correlator or CrossChainCorrelator()
+    edges: list[HopEdge] = []
+    for out, inp, _ in correlator.match_round_trips(transfers):
+        if not inp.amount_usd:
+            continue
+        edges.append(
+            HopEdge(
+                src_wallet=out.stellar_wallet,
+                src_asset=out.token,
+                dst_wallet=inp.stellar_wallet,
+                dst_asset=inp.token,
+                amount=inp.amount_usd,
+                ledger_timestamp=_parse_timestamp(inp.timestamp),
+                operation_id=f"{BRIDGE_HOP_PREFIX}{out.tx_hash_evm}:{inp.tx_hash_evm}",
+            )
+        )
+    return edges
 
 
 def _record_to_hop_edge(rec: dict) -> HopEdge | None:

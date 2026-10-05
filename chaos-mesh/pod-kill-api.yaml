@@ -1,5 +1,9 @@
 apiVersion: chaos-mesh.org/v1alpha1
 kind: PodChaos
+# Verified with sustained traffic through the kill:
+#   python chaos-mesh/verify_experiment.py --experiment pod-kill-api.yaml --url <api>
+# SLO: zero silently dropped requests, drain time <= 30s, recovery <= 60s.
+# See "Graceful-shutdown contract" in chaos-mesh/README.md.
 metadata:
   name: ledgerlens-api-pod-kill
   namespace: chaos-mesh

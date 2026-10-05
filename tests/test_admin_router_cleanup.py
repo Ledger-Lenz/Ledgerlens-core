@@ -18,12 +18,13 @@ def db_path(tmp_path):
 
 @pytest.fixture
 def client(db_path, tmp_path):
-    from api.admin_router import router
+    from api.admin_router import require_break_glass, router
     from api.auth import require_admin_key
 
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[require_admin_key] = lambda: None
+    app.dependency_overrides[require_break_glass] = lambda: None
     with patch.object(_settings, "model_dir", str(tmp_path / "models")):
         yield TestClient(app)
 
@@ -58,6 +59,29 @@ def test_promote_model_rejects_unknown_version(client):
     resp = client.post("/admin/models/9.9.9/promote")
     assert resp.status_code == 404
     assert "9.9.9" in resp.json()["detail"]
+
+
+def test_promote_model_returns_409_when_robustness_gate_rejects(client, monkeypatch):
+    from pathlib import Path
+
+    from api import admin_router
+    from detection.model_registry import ModelPromotionError
+
+    model_dir = Path(admin_router.settings.model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("random_forest", "xgboost", "lightgbm"):
+        (model_dir / f"{name}_vcandidate.joblib").write_text("")
+
+    report = {"passed": False, "models": {"random_forest": {"evasion_rate": 0.6}}}
+
+    def reject_promotion(version, model_names, model_dir):
+        raise ModelPromotionError(report)
+
+    monkeypatch.setattr(admin_router, "promote_model_version", reject_promotion)
+    response = client.post("/admin/models/candidate/promote")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["report"] == report
 
 
 def test_module_has_no_dead_rate_limiter():

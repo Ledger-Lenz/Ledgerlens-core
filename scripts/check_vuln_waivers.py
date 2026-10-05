@@ -28,9 +28,18 @@ Usage:
     check_vuln_waivers.py --scanner govulncheck --report /path/to/govulncheck.ndjson
     check_vuln_waivers.py --scanner npm-audit --report /path/to/npm-audit.json
 
+    check_vuln_waivers.py --check-stale [--osv-dir DIR]
+
 Exit code 0: no unwaived CRITICAL/HIGH finding. Exit code 1: at least one
 unwaived (or waived-but-expired) CRITICAL/HIGH finding — the calling CI
 job must not swallow this with ``|| true``.
+
+``--check-stale`` (#1016) needs no scanner report: it looks up every waived
+advisory on OSV and exits 1 if any of them now lists a ``fixed`` version for
+the waived package, i.e. the waiver is masking a vulnerability that an
+upgrade would remove. Waivers whose advisory has no upstream fix pass.
+``--osv-dir`` reads ``<id>.json`` advisories from a local directory instead
+of the OSV API (tests / offline runs). Remediation: docs/dependency_policy.md.
 """
 from __future__ import annotations
 
@@ -38,6 +47,8 @@ import argparse
 import datetime
 import json
 import sys
+import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +65,10 @@ except ImportError:  # pragma: no cover - environment guard, see requirements/te
 
 BLOCKING_SEVERITIES = {"CRITICAL", "HIGH"}
 
+OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{id}"
+# Waiver-file ecosystem names -> OSV `affected[].package.ecosystem` names.
+OSV_ECOSYSTEMS = {"python": "PyPI", "rust": "crates.io", "go": "Go", "npm": "npm"}
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -69,6 +84,7 @@ class Waiver:
     ecosystem: str
     reason: str
     expires: datetime.date
+    package: str = ""
 
 
 def load_waivers(path: Path) -> dict[tuple[str, str], Waiver]:
@@ -103,8 +119,62 @@ def load_waivers(path: Path) -> dict[tuple[str, str], Waiver]:
             ecosystem=str(entry["ecosystem"]),
             reason=str(entry["reason"]),
             expires=expires,
+            package=str(entry.get("package") or ""),
         )
     return waivers
+
+
+def fetch_osv_advisory(vuln_id: str) -> dict:
+    with urllib.request.urlopen(OSV_VULN_URL.format(id=vuln_id), timeout=30) as resp:
+        return json.load(resp)
+
+
+def fixed_versions(advisory: dict, waiver: Waiver) -> list[str]:
+    """Every ``fixed`` version the advisory lists for the waiver's package.
+
+    Matches on the waiver's ecosystem and, when the waiver names one, its
+    package — an advisory can span several packages, and only a fix for the
+    waived one makes the waiver stale.
+    """
+    ecosystem = OSV_ECOSYSTEMS.get(waiver.ecosystem, waiver.ecosystem).lower()
+    fixes: list[str] = []
+    for affected in advisory.get("affected", []) or []:
+        pkg = affected.get("package", {}) or {}
+        if pkg.get("ecosystem", "").lower() != ecosystem:
+            continue
+        if waiver.package and pkg.get("name", "").lower() != waiver.package.lower():
+            continue
+        for rng in affected.get("ranges", []) or []:
+            fixes.extend(e["fixed"] for e in rng.get("events", []) or [] if "fixed" in e)
+    return fixes
+
+
+def find_stale_waivers(
+    waivers: dict[tuple[str, str], Waiver],
+    fetch: Callable[[str], dict] = fetch_osv_advisory,
+) -> list[tuple[Waiver, list[str]]]:
+    """Waivers whose advisory now has an upstream fix, with the fixed versions."""
+    stale = []
+    for waiver in waivers.values():
+        fixes = fixed_versions(fetch(waiver.id), waiver)
+        if fixes:
+            stale.append((waiver, fixes))
+    return stale
+
+
+def check_stale(waivers: dict[tuple[str, str], Waiver], fetch: Callable[[str], dict]) -> int:
+    stale = find_stale_waivers(waivers, fetch)
+    print("── stale waiver check ──────────────────────────")
+    for waiver, fixes in stale:
+        print(
+            f"STALE  {waiver.id} in {waiver.package or '<package>'} ({waiver.ecosystem}) — "
+            f"fixed upstream in {', '.join(fixes)}. Upgrade the dependency and remove the waiver."
+        )
+    if stale:
+        print("FAIL — see docs/dependency_policy.md#stale-vulnerability-waivers for remediation.")
+        return 1
+    print(f"PASS — {len(waivers)} waiver(s), none has an available upstream fix.")
+    return 0
 
 
 def _severity_from_cvss_score(score: float) -> str:
@@ -319,16 +389,33 @@ def evaluate(
     return ok, lines
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scanner", required=True, choices=["osv", "cargo-audit", "govulncheck", "npm-audit"])
-    parser.add_argument("--report", required=True, type=Path, help="Path to the scanner's JSON/NDJSON output")
+    parser.add_argument("--scanner", choices=["osv", "cargo-audit", "govulncheck", "npm-audit"])
+    parser.add_argument("--report", type=Path, help="Path to the scanner's JSON/NDJSON output")
+    parser.add_argument(
+        "--check-stale", action="store_true", help="Fail if a waived advisory now has an upstream fix"
+    )
+    parser.add_argument("--osv-dir", type=Path, help="Read OSV advisories from <dir>/<id>.json")
     parser.add_argument(
         "--waivers",
         type=Path,
         default=Path(__file__).resolve().parent.parent / "security" / "vulnerability-waivers.yml",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.check_stale:
+        fetch = fetch_osv_advisory
+        if args.osv_dir:
+            osv_dir = args.osv_dir
+
+            def fetch(vuln_id: str) -> dict:
+                return json.loads((osv_dir / f"{vuln_id}.json").read_text())
+
+        return check_stale(load_waivers(args.waivers), fetch)
+
+    if not args.scanner or not args.report:
+        parser.error("--scanner and --report are required unless --check-stale is given")
 
     if not args.report.exists():
         print(f"FATAL: report file not found: {args.report}", file=sys.stderr)

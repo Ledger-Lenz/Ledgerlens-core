@@ -1,0 +1,96 @@
+name: Chaos Day Resilience Scorecard
+
+on:
+  schedule:
+    # Weekly chaos day: Monday at 04:00 UTC
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: chaos-staging
+  cancel-in-progress: false
+
+jobs:
+  chaos-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Configure Kubeconfig
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.STAGING_KUBECONFIG }}
+
+      - name: Validate Staging Cluster Connection
+        run: |
+          current_ns=$(kubectl config view --minify --output 'jsonpath={..namespace}')
+          if [[ "$current_ns" != *"staging"* ]]; then
+            echo "❌ Error: Target context namespace is not staging! Aborting."
+            exit 1
+          fi
+
+      - name: Download previous scorecard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          run_id=$(gh run list --workflow chaos-day.yml --status completed --limit 20 \
+            --json databaseId,conclusion -q '[.[] | select(.conclusion != "cancelled")][0].databaseId' || true)
+          if [[ -n "$run_id" ]]; then
+            gh run download "$run_id" --name resilience-scorecard --dir previous || true
+          fi
+
+      - name: Silence Alertmanager
+        run: |
+          curl -H "Content-Type: application/json" -d '{
+            "matchers": [{"name": "namespace", "value": "ledgerlens-staging", "isRegex": false}],
+            "startsAt": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",
+            "endsAt": "'$(date -u -d '+60 mins' +"%Y-%m-%dT%H:%M:%SZ")'",
+            "createdBy": "GHA-Chaos-Day",
+            "comment": "Silencing alerts for scheduled chaos day"
+          }' http://alertmanager.staging.ledgerlens.io/api/v2/silences || true
+
+      - name: Start load generator
+        run: |
+          python scripts/generate_traffic.py --url http://api.staging.ledgerlens.io --duration 1800 &
+
+      - name: Run chaos experiment suite
+        run: |
+          python chaos-mesh/run_chaos_day.py \
+            --health-url http://api.staging.ledgerlens.io/health \
+            --output-dir scorecard \
+            --previous previous/scorecard.json
+
+      - name: Publish scorecard summary
+        if: always()
+        run: cat scorecard/scorecard.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resilience-scorecard
+          path: scorecard/
+          retention-days: 400
+
+      - name: Emergency cleanup
+        if: failure()
+        run: |
+          for f in chaos-mesh/*.yaml; do kubectl delete -f "$f" --ignore-not-found=true; done

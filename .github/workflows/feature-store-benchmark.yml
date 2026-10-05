@@ -1,0 +1,69 @@
+name: Feature-store benchmark gate
+
+# Performance-regression gate for the streaming feature store (Issue #1040).
+# History is persisted in the Actions cache (latest entry restored via
+# restore-keys) and uploaded as the `feature-store-benchmark-history`
+# artifact; each run writes a trend chart to the job summary.
+# See benchmarks/README.md ("Feature-store regression gate").
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "detection/feature_store.py"
+      - "detection/feature_engineering.py"
+      - "ingestion/**"
+      - "tests/benchmark_feature_store.py"
+      - ".github/workflows/feature-store-benchmark.yml"
+
+jobs:
+  feature-store-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HISTORY: benchmarks/results/feature_store_history.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/test.txt
+
+      - name: Install from lockfile
+        run: |
+          pip install --upgrade pip==24.0
+          pip install -r requirements/test.txt
+          pip install -e . --no-deps
+
+      - name: Restore benchmark history
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.HISTORY }}
+          key: feature-store-bench-${{ github.run_id }}
+          restore-keys: feature-store-bench-
+
+      - name: Run regression gate
+        # Only main records results, so PRs are always compared with the
+        # main-branch baseline and a regressing PR can't move it.
+        run: >
+          python -m tests.benchmark_feature_store --gate
+          --history "$HISTORY"
+          ${{ github.event_name == 'push' && '--record' || '' }}
+
+      - name: Save benchmark history
+        if: always() && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.HISTORY }}
+          key: feature-store-bench-${{ github.run_id }}
+
+      - name: Upload benchmark history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-store-benchmark-history
+          path: ${{ env.HISTORY }}
+          if-no-files-found: ignore

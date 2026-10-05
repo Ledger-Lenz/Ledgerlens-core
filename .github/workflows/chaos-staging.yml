@@ -74,6 +74,7 @@ jobs:
       - name: Verify Recovery
         run: |
           python chaos-mesh/verify_experiment.py \
+            --experiment "${{ github.event.inputs.experiment || 'pod-kill-api.yaml' }}" \
             --url http://api.staging.ledgerlens.io \
             --metrics-url http://api.staging.ledgerlens.io/metrics \
             --timeout ${{ github.event.inputs.duration_seconds || 60 }}

@@ -284,6 +284,100 @@ func TestGetScore_ContextCancellation(t *testing.T) {
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
+func TestGetScore_ContextCancelledDuringBackoff(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	client := ledgerlens.NewClient(srv.URL, ledgerlens.WithRetryPolicy(ledgerlens.RetryPolicy{
+		MaxAttempts: 5, InitialBackoff: time.Minute, MaxBackoff: time.Minute,
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := client.GetScore(ctx, "GABC")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, time.Since(start), 2*time.Second, "cancellation must abort the backoff promptly")
+}
+
+// ---------------------------------------------------------------------------
+// Retry policy
+// ---------------------------------------------------------------------------
+
+func newRetryClient(t *testing.T, mux *http.ServeMux, attempts int) *ledgerlens.Client {
+	t.Helper()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return ledgerlens.NewClient(srv.URL, ledgerlens.WithRetryPolicy(ledgerlens.RetryPolicy{
+		MaxAttempts: attempts, InitialBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond,
+	}))
+}
+
+func TestGetScore_RetryThenSucceed(t *testing.T) {
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		writeJSON(t, w, map[string]interface{}{"wallet": "GABC", "scores": []interface{}{}})
+	})
+	client := newRetryClient(t, mux, 3)
+
+	_, err := client.GetScore(context.Background(), "GABC")
+	require.NoError(t, err)
+	assert.Equal(t, 3, calls)
+}
+
+func TestGetScore_RetryGivesUpAfterMaxAttempts(t *testing.T) {
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	client := newRetryClient(t, mux, 2)
+
+	_, err := client.GetScore(context.Background(), "GABC")
+	var apiErr *ledgerlens.LedgerLensAPIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	assert.Equal(t, 2, calls)
+}
+
+func TestGetScore_NoRetryOnClientError(t *testing.T) {
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/scores/GABC", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNotFound)
+	})
+	client := newRetryClient(t, mux, 3)
+
+	_, err := client.GetScore(context.Background(), "GABC")
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+}
+
+func TestRegisterWebhook_PostIsNeverRetried(t *testing.T) {
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	client := newRetryClient(t, mux, 3)
+
+	_, err := client.RegisterWebhook(context.Background(), ledgerlens.WebhookRegisterRequest{URL: "https://example.com", Secret: "s"})
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+}
+
 // ---------------------------------------------------------------------------
 // API key is not exposed through String/GoString
 // ---------------------------------------------------------------------------

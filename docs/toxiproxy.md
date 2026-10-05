@@ -40,6 +40,7 @@ Verified by grepping `tests/chaos/` for the proxy names and listen ports:
 | `tests/chaos/test_circuit_breaker.py`  | `horizon_partition` | `18001` | `latency`/`timeout` (5000 ms) to trip the circuit breaker; the pure unit-level circuit-breaker tests in the same file need no proxy |
 | `tests/chaos/test_redis_fallback.py`   | `redis_proxy`       | `16379` | proxy `disable`/`enable` to simulate connection-refused and recovery |
 | `tests/chaos/test_sqlite_wal_lock.py`  | none                | –       | Holds a DB write lock directly; does not touch Toxiproxy |
+| `tests/chaos/test_graph_shard_failure.py` | none           | –       | Kills graph-shard workers mid-operation and up to `shard_count - 1` simultaneously; asserts rebalancing, no ring loss, and recovery < 30 s. Overrides the Toxiproxy skip |
 
 `tests/chaos/conftest.py` owns the shared `ToxiproxyClient` helper and an
 `autouse`, session-scoped `require_toxiproxy` fixture that **skips the entire

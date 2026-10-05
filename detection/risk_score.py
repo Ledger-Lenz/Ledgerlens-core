@@ -8,6 +8,16 @@ data contract.
 Starting from v2, the schema includes optional uncertainty fields
 (``score_lower``, ``score_upper``, ``prediction_set``, ``coverage_guarantee``)
 populated by ``ConformalCalibrator`` during inference.
+
+On-chain publication decision (issue #941): the calibrated uncertainty
+interval is published **API-only** and is intentionally *not* written to the
+on-chain `RiskScore` struct. Rationale: (1) the interval is derived from a
+calibration set that is periodically refit, so publishing it on-chain would
+require a contract upgrade and re-attestation on every refit; (2) on-chain
+consumers act on the point score for settlement/gating, while the interval is
+advisory metadata for off-chain consumers reasoning about score reliability;
+(3) keeping the bounds off-chain avoids bloating per-wallet on-chain state.
+The point ``score`` remains the canonical on-chain value.
 """
 
 from __future__ import annotations
@@ -15,6 +25,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Aggregation contract version
+# ---------------------------------------------------------------------------
+# Bump this constant (and regenerate tests/score_version_golden.json) whenever
+# the aggregation formula, weights, clamp bounds, or field semantics change.
+SCORE_VERSION: str = "3"
 
 
 class RiskScore(BaseModel):
@@ -26,6 +43,13 @@ class RiskScore(BaseModel):
     confidence: int = Field(ge=0, le=100)
     disputed: bool = False
     timestamp: datetime
+
+    # Aggregation contract version — propagate unchanged through API responses
+    # and on-chain publications.  See module docstring for the versioned spec.
+    score_version: str = Field(
+        default=SCORE_VERSION,
+        description="Aggregation formula version; bump on any formula change",
+    )
 
     # Streaming latency field (optional, populated on the streaming path)
     latency_ms: float | None = Field(
@@ -79,7 +103,9 @@ class RiskScore(BaseModel):
 
         Optional uncertainty fields (``score_lower``, ``score_upper``,
         ``prediction_set``, ``coverage_guarantee``) are passed through to
-        the returned ``RiskScore`` when provided.
+        the returned ``RiskScore`` when provided. When only a conformal
+        interval is supplied, the bounds are clamped to the valid 0-100
+        range and ordered so ``score_lower <= score_upper``.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
@@ -99,6 +125,13 @@ class RiskScore(BaseModel):
         score = round(max(0.0, score - causal_adjustment))
         score = max(0, min(100, score))
 
+        if score_lower is not None and score_upper is not None:
+            lo = max(0.0, min(100.0, float(score_lower)))
+            hi = max(0.0, min(100.0, float(score_upper)))
+            if lo > hi:
+                lo, hi = hi, lo
+            score_lower, score_upper = lo, hi
+
         return cls(
             wallet=wallet,
             asset_pair=asset_pair,
@@ -107,6 +140,7 @@ class RiskScore(BaseModel):
             ml_flag=ml_flag,
             confidence=round(ml_confidence * 100),
             timestamp=datetime.now(timezone.utc),
+            score_version=SCORE_VERSION,
             score_lower=score_lower,
             score_upper=score_upper,
             prediction_set=prediction_set,
@@ -131,4 +165,3 @@ def temporal_risk_adjustment(
     snapshot_weight = 1.0 - temporal_weight
     final_score = snapshot_weight * snapshot_score + temporal_weight * (temporal_score * 100.0)
     return max(0, min(100, round(final_score)))
-

@@ -82,6 +82,44 @@ init_telemetry("ledgerlens")
 
 FastAPI routes are auto-instrumented via `opentelemetry-instrumentation-fastapi`.
 
+### End-to-end pipeline trace ID
+
+One trace ID (32 lowercase hex chars, W3C-compatible) follows a trade from
+ingestion to webhook delivery. The helpers are in `detection/tracing.py`:
+`ensure_trace_id()`, `current_trace_id()`, and `use_trace_id()`. They work with or
+without the OpenTelemetry SDK. With OTel installed, `use_trace_id()` parents new
+spans on the given trace, so the hops appear as one trace in Jaeger.
+
+| Hop | Where | How the trace ID travels |
+|---|---|---|
+| Ingestion | `HorizonStreamer._enqueue` | Generated (or kept, if already set) on `Trade.trace_id` |
+| Detection | Scoring code wraps work in `use_trace_id(trade.trace_id)`. A batch `run_pipeline` pass uses its `pipeline.run` trace. | Stamped as `trace_id` on queued webhook alerts and on event bus envelopes |
+| Webhook delivery | `detection/webhook_worker._deliver` | Top-level `trace_id` in the JSON body, `X-Trace-ID` header, W3C `traceparent` header. The `webhook.deliver` span joins the trace. |
+| API | `_trace_id_middleware` in `api/main.py` | `X-Trace-ID` response header. An inbound valid `X-Trace-ID` is honoured, otherwise the active OTel trace (or a new ID) is used. |
+
+`Trade.trace_id` is excluded from `model_dump()`, so persisted and exported
+trade shapes are unchanged.
+
+Example trace for one trade (`trace_id = 4bf92f3577b34da6a3ce929d0e0e4736`):
+
+```text
+4bf92f3577b34da6a3ce929d0e0e4736
+├─ ingestion   HorizonStreamer._enqueue       Trade(id="1-0").trace_id = 4bf92f35…
+├─ detection   use_trace_id(trade.trace_id)
+│   ├─ model.score_batch
+│   ├─ event bus envelope                     {"event": "risk_score.updated", "trace_id": "4bf92f35…", ...}
+│   └─ webhook enqueue                        payload["trace_id"] = "4bf92f35…"
+└─ delivery    webhook.deliver                POST subscriber
+                                              X-Trace-ID: 4bf92f3577b34da6a3ce929d0e0e4736
+                                              traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-<span>-01
+                                              body: {"event": "risk_score_alert", "trace_id": "4bf92f35…", "data": {...}}
+```
+
+Subscribers and API clients should log `X-Trace-ID` (or the payload `trace_id`)
+and quote it when reporting issues. Operators can then search Jaeger or the
+JSON logs for that ID. Continuity across ingestion, detection and delivery is
+covered by `tests/test_pipeline_trace_propagation.py`.
+
 ### mTLS Configuration
 
 To enable mTLS for the OTLP exporter, set all three of:

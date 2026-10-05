@@ -9,9 +9,13 @@ This module provides two client implementations:
 
 Rate limiting
 -------------
-``TokenBucketRateLimiter`` enforces a proactive per-client request budget so the
-pipeline stays below Horizon's per-IP rate limit before 429s occur.  When tokens
-are exhausted the acquirer yields the event loop rather than blocking a thread.
+The default limiter is ``ingestion.rate_limiter.HorizonAdaptiveRateLimiter``:
+a token bucket whose rate is re-derived from Horizon's ``X-Ratelimit-*``
+headers on every response, so the pipeline spends available quota without
+exceeding it.  A 429 pauses all callers (``Retry-After`` or exponential
+backoff) before header-driven tuning resumes.  ``TokenBucketRateLimiter`` is
+kept as a fixed-rate alternative.  When tokens are exhausted the acquirer
+yields the event loop rather than blocking a thread.
 
 Retry logic
 -----------
@@ -51,7 +55,15 @@ from datetime import datetime, timezone
 
 import httpx
 
+try:  # HTTP/2 needs the optional ``h2`` package (``pip install httpx[http2]``).
+    import h2  # noqa: F401
+
+    _HTTP2_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on installed extras
+    _HTTP2_AVAILABLE = False
+
 from ingestion.metrics import _normalise_endpoint, get_metrics
+from ingestion.rate_limiter import HorizonAdaptiveRateLimiter
 
 _metrics = get_metrics()
 logger = logging.getLogger(__name__)
@@ -511,9 +523,12 @@ class AsyncHorizonClient:
         max_retry_delay: float | None = None,
         version_guard: "VersionGuard | None | object" = _UNSET,
         probe_timeout: float = 5.0,
-        rate_limiter: "TokenBucketRateLimiter | None" = None,
+        rate_limiter: "HorizonAdaptiveRateLimiter | TokenBucketRateLimiter | None" = None,
         rate_limit_rps: float | None = None,
         rate_burst: float | None = None,
+        max_keepalive_connections: int | None = None,
+        keepalive_expiry: float = 60.0,
+        http2: bool | None = None,
     ) -> None:
         try:
             from config.settings import settings  # local import to avoid circular deps
@@ -522,7 +537,25 @@ class AsyncHorizonClient:
 
         self._base_url = base_url.rstrip("/")
         self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # Persistent pool sized to the concurrency cap so sustained polling
+        # never opens more sockets than it can use, and idle sockets survive
+        # between poll intervals.  HTTP/2 multiplexes requests over a single
+        # connection when Horizon negotiates it via ALPN; otherwise httpx
+        # transparently falls back to HTTP/1.1 keep-alive.
+        self._limits = httpx.Limits(
+            max_connections=max_concurrency,
+            max_keepalive_connections=(
+                max_keepalive_connections
+                if max_keepalive_connections is not None
+                else max_concurrency
+            ),
+            keepalive_expiry=keepalive_expiry,
+        )
+        self._client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=self._limits,
+            http2=_HTTP2_AVAILABLE if http2 is None else http2,
+        )
         self.max_retries = max_retries if max_retries is not None else (
             settings.horizon_max_retries if settings is not None else 3
         )
@@ -533,7 +566,7 @@ class AsyncHorizonClient:
             settings.horizon_max_retry_delay if settings is not None else 60.0
         )
         self._probe_timeout = probe_timeout
-        self._rate_limiter = rate_limiter or TokenBucketRateLimiter(
+        self._rate_limiter = rate_limiter or HorizonAdaptiveRateLimiter(
             rate=rate_limit_rps if rate_limit_rps is not None else (
                 settings.horizon_rate_limit_rps if settings is not None else 5.0
             ),
@@ -593,8 +626,19 @@ class AsyncHorizonClient:
             When the ``X-Stellar-Horizon-Version`` header is present and
             outside the configured ``[min_version, max_version)`` range.
         """
+        opened = False
+
+        async def _trace(event_name: str, info: dict) -> None:
+            nonlocal opened
+            if event_name == "connection.connect_tcp.started":
+                opened = True
+
+        extensions = {**kwargs.pop("extensions", {}), "trace": _trace}
         async with self._semaphore:
             response = await getattr(self._client, method.lower())(url, **kwargs)
+        observe = getattr(self._rate_limiter, "observe_response", None)
+        if observe is not None:
+            observe(response.status_code, response.headers)
         response.raise_for_status()
         if self._version_guard is not None:
             self._version_guard.check(response.headers, url)

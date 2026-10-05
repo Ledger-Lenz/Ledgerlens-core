@@ -56,6 +56,8 @@ services:
       - "18000:18000"   # Horizon proxy (latency scenario)
       - "18001:18001"   # Horizon partition proxy (circuit breaker scenario)
       - "16379:16379"   # Redis proxy (fallback scenario)
+      - "18002:18002"   # Soroban RPC proxy (latency / timeout / reset scenarios)
+      - "18003:18003"   # Oracle-node proxy (degraded oracle connectivity scenario)
     command: ["-host", "0.0.0.0", "-config", "/etc/toxiproxy/config.json"]
     volumes:
       - ./toxiproxy.json:/etc/toxiproxy/config.json:ro

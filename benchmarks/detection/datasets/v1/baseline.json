@@ -1,0 +1,15 @@
+{
+  "circular": {
+    "recall": 1.0
+  },
+  "layering": {
+    "recall": 0.95
+  },
+  "overall": {
+    "precision": 0.5217,
+    "recall": 0.9796
+  },
+  "self_matching": {
+    "recall": 1.0
+  }
+}

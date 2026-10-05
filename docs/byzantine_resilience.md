@@ -157,6 +157,37 @@ federation. In production, look for repeated "Krum round: excluded ..."
 warnings from `FederatedAggregationServer._select_krum_survivors` for the
 same participant across rounds.
 
+## Trimmed-Mean Aggregation (Issue #1037)
+
+After Krum filtering, the surviving updates are combined by a configurable
+rule, `settings.federated_aggregation_strategy` (or the
+`aggregation_strategy=` constructor argument of `FederatedAggregationServer`):
+
+| Strategy | Rule | Byzantine tolerance |
+|---|---|---|
+| `fedavg` (default) | Sample-weighted average | None per coordinate — one extreme update shifts the mean |
+| `trimmed_mean` | Per coordinate, drop the `floor(trim_fraction·n)` largest and smallest values, average the rest | Fewer than `trim_fraction·n` malicious participants (`settings.federated_trim_fraction`, default `0.2`, must be `< 0.5`) |
+
+Implementation: `detection/federated/robust_aggregation.py`. Tests simulating
+a poisoning minority: `tests/test_robust_aggregation.py`.
+
+### Trade-offs
+
+- **Convergence speed**: trimmed mean discards `2k` of `n` values per
+  coordinate, so honest signal is averaged over fewer participants; expect
+  higher round-to-round variance and slower convergence than FedAvg,
+  especially with small federations or non-IID data where honest outliers
+  are also trimmed.
+- **No sample weighting**: trimmed mean is unweighted by design (weighting
+  would let an attacker claiming many samples regain influence), so
+  participants with large datasets contribute no more than small ones.
+- **Tolerance ceiling**: guarantees hold only while the attacker controls
+  fewer than `k` participants; beyond that the trimmed mean offers no bound.
+  Raising `trim_fraction` increases tolerance but throws away more honest data.
+- **Guidance**: keep `fedavg` for small, vetted federations where admission
+  control already limits Byzantine risk; choose `trimmed_mean` for open or
+  larger federations (n ≥ 10) where a poisoning minority is plausible.
+
 ## Security Notes
 
 - **Score logging only**: Krum scores (scalars) and client indices are logged.

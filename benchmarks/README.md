@@ -1,7 +1,7 @@
 # Benchmarks
 
-This directory holds three standalone performance scripts. They are **not**
-correctness tests — they measure latency / throughput and, in two of the three
+This directory holds standalone performance scripts. They are **not**
+correctness tests — they measure latency / throughput and, in two
 cases, exit non-zero when a hard threshold is breached.
 
 | Script | What it measures | Run in CI? |
@@ -9,6 +9,10 @@ cases, exit non-zero when a hard threshold is breached.
 | `benchmark_scoring.py` | p50/p95/p99 latency of the scoring pipeline, with regression detection against a committed baseline | Helper functions only (see below) |
 | `benchmark_feature_engineering.py` | Numba JIT vs pure-Python speed of the `feature_engineering.py` hot loops | No — local only |
 | `horizon_checkpoint.py` | Cursor-checkpoint flush latency under a 10 000-event replay | No — local only |
+| `benchmark_vector_index.py` | ANN index build time, memory, query latency and recall from 1x to 10x+ wallet scale — results in `docs/vector_index_capacity.md` | No — local only |
+
+`benchmark_streaming_features.py` (see the end of this file) guards the
+streaming-features hot path.
 
 All three assume the project is installed (`pip install -e .` plus the test
 requirements) and are run from the repository root.
@@ -193,3 +197,52 @@ so compare like-for-like.
 
 Local-only. Not referenced by any workflow in `.github/workflows/` or by the
 `Makefile`.
+
+---
+
+## `benchmark_streaming_features.py`
+
+### Purpose
+
+Measures the per-trade latency of `StreamingFeatureEngine.update`, the
+function run for every trade on the real-time SSE path
+(`ingestion.horizon_streamer`), over 20 000 synthetic trades across 200
+wallets (seeded, after a 2 000-trade warm-up). It compares p50/p99 against
+`benchmarks/streaming_features_baseline.json` and exits non-zero if either
+exceeds the baseline by more than 2x.
+
+### How to run
+
+```bash
+python3 benchmarks/benchmark_streaming_features.py                    # compare
+python3 benchmarks/benchmark_streaming_features.py --update-baseline  # rewrite baseline
+pytest -m benchmark tests/test_streaming_hot_path_guard.py            # same gate as a test
+```
+
+### Profiling results and remediation
+
+`cProfile` of the hot path showed **no DB, network or file I/O** in
+`detection/streaming_features.py`. All of the synchronous cost was CPU work
+done on every trade:
+
+| Hot spot | Share of `update` time | Remediation |
+|----------|------------------------|-------------|
+| `WindowState.benford_metrics` (5 windows × every trade) | ~45% | Single pass over the 9 digits with precomputed `sqrt(p(1-p))`; no intermediate lists |
+| `pd.Timestamp` built twice per trade per wallet | ~9% | Stdlib `datetime` / integer arithmetic for epoch seconds and UTC hour |
+
+Per-update latency (Python 3.12, same machine, 3 runs each):
+
+| | p50 | p99 | mean |
+|---|---|---|---|
+| Before | 121–124 µs | 323–333 µs | 138–142 µs |
+| After | 86–91 µs | 217–354 µs (typically ~220–290) | 95–110 µs |
+
+### Regression gates
+
+- `tests/test_streaming_hot_path_guard.py` runs in standard CI. It statically
+  rejects blocking-I/O imports (`sqlite3`, `requests`, `httpx`, `socket`,
+  `redis`, `detection.storage`, ...) and calls (`open`, `sleep`, `connect`,
+  `read_csv`, ...) in `detection/streaming_features.py`. Anything that needs
+  I/O must be precomputed off the hot path and passed in.
+- The `benchmark`-marked test in the same file (and the script above) fails
+  when p50/p99 regress past 2x the committed baseline.
