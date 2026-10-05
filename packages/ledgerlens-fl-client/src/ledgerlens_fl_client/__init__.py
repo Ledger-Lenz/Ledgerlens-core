@@ -4,7 +4,7 @@ from .adapter import DataAdapter, CSVDirectoryAdapter
 from .client import FLClient
 from .models import RoundResult, ClientStatus
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "FLClient",

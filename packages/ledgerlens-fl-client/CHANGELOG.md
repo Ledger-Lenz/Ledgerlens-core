@@ -5,6 +5,16 @@ All notable changes to `ledgerlens-fl-client` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1](https://github.com/Ledger-Lenz/Ledgerlens-core/compare/fl-client-v0.1.0...fl-client-v0.1.1) (2026-10-05)
+
+
+### Documentation
+
+* document Docker build steps, panic messages, and add CHANGELOGs ([#791](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/791), [#792](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/792), [#793](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/793), [#794](https://github.com/Ledger-Lenz/Ledgerlens-core/issues/794)) ([3325df4](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/3325df4c536bb183e36b8881d522b73277915d07))
+* document Docker build steps, panic messages, and add CHANGELOGs… ([c229d88](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/c229d882a2848eef62b5201b43170491a5f0179e))
+* **fl-client:** add CHANGELOG.md and link from README ([73b51a9](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/73b51a9007de6f2e6b9f0d84a727fc6ea997cda1))
+* **fl-client:** add CHANGELOG.md to packages/ledgerlens-fl-client ([0bee9e4](https://github.com/Ledger-Lenz/Ledgerlens-core/commit/0bee9e4304f8bccdcb5699ef55d5972fa172a8f9))
+
 ## [Unreleased]
 
 _No changes pending release yet._

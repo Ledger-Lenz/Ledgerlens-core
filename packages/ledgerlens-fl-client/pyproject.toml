@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ledgerlens-fl-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone federated learning client for LedgerLens exchange partners"
 readme = "README.md"
 license = {text = "MIT"}
